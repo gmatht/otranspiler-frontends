@@ -167,25 +167,23 @@ func isIdent(s string) bool {
 	return true
 }
 
-func isAlphaNum_(c rune) bool {
+func isAlphaNum_(c byte) bool {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
 }
 
 func isWordStop(c byte) bool {
+	// Structural separators only. Chars with dedicated branches
+	// (apostrophe, dq, ref '$', escape '\\', backtick, '{') are
+	// EXCLUDED — the run must stop and the dedicated branch must fire.
 	return c == ' ' || c == '\t' || c == '|' || c == ';' || c == '(' ||
-		c == ')' || c == '<' || c == '>' || c == '\n' || c == '#' || c == '\\'
+		c == ')' || c == '<' || c == '>' || c == '\n' || c == '#'
 }
 
 func scanWord(src string, i int) (segs [][]any, startsWithDQ bool, ni int, err error) {
 	first := true
 	for i < len(src) {
 		c := src[i]
-		if isWordStop(c) {
-			break
-		}
-		if c == '#' && first {
-			break
-		}
+		// dedicated branches first (consume the char and continue)
 		if c == '\'' {
 			j := strings.IndexByte(src[i+1:], '\'')
 			if j < 0 {
@@ -243,6 +241,9 @@ func scanWord(src string, i int) (segs [][]any, startsWithDQ bool, ni int, err e
 				// accumulate literal run
 				k := j
 				for k < len(src) && src[k] != '"' && src[k] != '\\' && src[k] != '$' {
+					if src[k] == '\n' {
+						hasNewline = true
+					}
 					k++
 				}
 				parts = append(parts, []any{"lit", src[j:k]})
@@ -277,10 +278,15 @@ func scanWord(src string, i int) (segs [][]any, startsWithDQ bool, ni int, err e
 			return nil, false, i, &Unsupported{
 				fmt.Sprintf("construct char %q outside v1 subset", c),
 			}
+		} else if isWordStop(c) {
+			// structural separator (space, ;, |, #, etc.) ends the word
+			break
 		} else {
-			// accumulate a run of literal chars (stop at word boundaries)
+			// accumulate a run of literal chars; stop at structural
+			// word-boundaries AND at chars with dedicated branches
+			// (the outer loop handles '\''/"'/$/\\/`/{ next iteration)
 			k := i
-			for k < len(src) && !isWordStop(src[k]) {
+			for k < len(src) && !isWordStop(src[k]) && src[k] != '\'' && src[k] != '"' && src[k] != '$' && src[k] != '\\' && src[k] != '`' && src[k] != '{' {
 				k++
 			}
 			if k == i {
@@ -306,7 +312,7 @@ func scanRef(src string, i int) (name string, ni int, err error) {
 	j := i + 1
 	if j < len(src) && (isAlpha_(src[j]) || src[j] == '_') {
 		k := j
-		for k < len(src) && (isAlphaNum_(rune(src[k])) || src[k] == '_') {
+		for k < len(src) && (isAlphaNum_(src[k]) || src[k] == '_') {
 			k++
 		}
 		return src[j:k], k, nil
@@ -549,7 +555,7 @@ func collectAssigns(stmts []map[string]any) (assigns map[string][]map[string]any
 					}
 				}
 			}
-			if args, _ := e["args"].([]any); ok {
+			if args, ok := e["args"].([]any); ok {
 				for _, a := range args {
 					if am, ok := a.(map[string]any); ok {
 						walkExpr(am)
@@ -557,7 +563,7 @@ func collectAssigns(stmts []map[string]any) (assigns map[string][]map[string]any
 				}
 			}
 		case "Array":
-			if els, _ := e["elements"].([]any); ok {
+			if els, ok := e["elements"].([]any); ok {
 				for _, el := range els {
 					if em, ok := el.(map[string]any); ok {
 						walkExpr(em)
@@ -565,7 +571,7 @@ func collectAssigns(stmts []map[string]any) (assigns map[string][]map[string]any
 				}
 			}
 		case "Object":
-			if props, _ := e["properties"].([]any); ok {
+			if props, ok := e["properties"].([]any); ok {
 				for _, p := range props {
 					if pm, ok := p.(map[string]any); ok {
 						if v, ok := pm["value"].(map[string]any); ok {
@@ -575,7 +581,7 @@ func collectAssigns(stmts []map[string]any) (assigns map[string][]map[string]any
 				}
 			}
 		case "Interpolate":
-			if parts, _ := e["parts"].([]any); ok {
+			if parts, ok := e["parts"].([]any); ok {
 				for _, p := range parts {
 					if pm, ok := p.(map[string]any); ok {
 						if v, ok := pm["expr"].(map[string]any); ok {
