@@ -1,0 +1,514 @@
+{
+  "_comment": "ShIR JSON contract schema (ask A1), hand-authored from sh2perl/src/shir_json.rs. Node vocabulary for frontend output validation. A node is valid if type in this map and its fields are a subset of the listed required fields (with matching shapes). Keys in emitted JSON are alphabetically sorted (serde_json BTreeMap).",
+  "version": 1,
+  "program": {
+    "type": "Program",
+    "fields": {
+      "type": "str",
+      "imports": "str[]",
+      "requires": "str[]",
+      "var_types": "var_types_entry[]",
+      "subs": "sub[]",
+      "stmts": "stmt[]"
+    }
+  },
+  "var_types_entry": {
+    "fields": {
+      "name": "str",
+      "type": "enum[Int,Str]"
+    }
+  },
+  "sub": {
+    "type": "Sub",
+    "fields": {
+      "type": "str",
+      "name": "str",
+      "params": "str[]",
+      "body": "stmt[]"
+    }
+  },
+  "stmts": {
+    "Output": {
+      "fields": {
+        "type": "str",
+        "value": "expr",
+        "newline": "bool",
+        "target": "str|null"
+      }
+    },
+    "WriteFile": {
+      "fields": {
+        "type": "str",
+        "path": "expr",
+        "content": "expr",
+        "append": "bool"
+      }
+    },
+    "Assign": {
+      "fields": {
+        "type": "str",
+        "targets": "assign_target[]",
+        "expr": "expr"
+      }
+    },
+    "Declare": {
+      "fields": {
+        "type": "str",
+        "vars": "decl[]",
+        "init": "expr|null",
+        "local": "bool"
+      }
+    },
+    "DeclareArray": {
+      "fields": {
+        "type": "str",
+        "var": "str",
+        "sigil": "sigil",
+        "elements": "expr[]"
+      }
+    },
+    "If": {
+      "fields": {
+        "type": "str",
+        "cond": "expr",
+        "then": "stmt[]",
+        "elsifs": "elsif[]",
+        "else": "stmt[]"
+      }
+    },
+    "For": {
+      "fields": {
+        "type": "str",
+        "var": "str",
+        "iter": "expr",
+        "body": "stmt[]"
+      }
+    },
+    "While": {
+      "fields": {
+        "type": "str",
+        "cond": "expr",
+        "body": "stmt[]"
+      }
+    },
+    "DoWhile": {
+      "fields": {
+        "type": "str",
+        "body": "stmt[]",
+        "cond": "expr",
+        "until": "bool"
+      }
+    },
+    "Die": {
+      "fields": {
+        "type": "str",
+        "expr": "expr",
+        "carp": "bool"
+      }
+    },
+    "Warn": {
+      "fields": {
+        "type": "str",
+        "expr": "expr",
+        "carp": "bool"
+      }
+    },
+    "Exec": {
+      "fields": {
+        "type": "str",
+        "cmd": "expr",
+        "args": "expr[]",
+        "capture": "str|null",
+        "redirects": "expr[]",
+        "env": "env_entry[]",
+        "purity": "purity"
+      }
+    },
+    "Pipeline": {
+      "fields": {
+        "type": "str",
+        "stages": "stmt[][]",
+        "last_output": "str|null",
+        "capture": "str|null",
+        "cmd_str": "str|null",
+        "purity": "purity"
+      }
+    },
+    "Return": {
+      "fields": {
+        "type": "str",
+        "value": "expr|null"
+      }
+    },
+    "Exit": {
+      "fields": {
+        "type": "str",
+        "value": "expr|null"
+      }
+    },
+    "SetChildError": {
+      "fields": {
+        "type": "str",
+        "expr": "expr"
+      }
+    },
+    "Require": {
+      "fields": {
+        "type": "str",
+        "module": "str"
+      }
+    },
+    "RawText": {
+      "fields": {
+        "type": "str",
+        "text": "str"
+      }
+    },
+    "Case": {
+      "fields": {
+        "type": "str",
+        "discriminant": "expr",
+        "clauses": "case_clause[]"
+      }
+    },
+    "Redirect": {
+      "fields": {
+        "type": "str",
+        "inner": "stmt[]",
+        "redirects": "redirect[]"
+      }
+    },
+    "Function": {
+      "fields": {
+        "type": "str",
+        "name": "str",
+        "body": "stmt[]"
+      }
+    },
+    "Subshell": {
+      "fields": {
+        "type": "str",
+        "body": "stmt[]"
+      }
+    },
+    "Background": {
+      "fields": {
+        "type": "str",
+        "body": "stmt[]"
+      }
+    },
+    "Block": {
+      "fields": {
+        "type": "str",
+        "body": "stmt[]"
+      }
+    },
+    "Expr": {
+      "fields": {
+        "type": "str",
+        "expr": "expr"
+      }
+    }
+  },
+  "exprs": {
+    "Int": {
+      "fields": {
+        "type": "str",
+        "value": "int"
+      }
+    },
+    "Str": {
+      "fields": {
+        "type": "str",
+        "value": "str",
+        "style": "style"
+      }
+    },
+    "Var": {
+      "fields": {
+        "type": "str",
+        "name": "str",
+        "sigil": "sigil"
+      }
+    },
+    "Index": {
+      "fields": {
+        "type": "str",
+        "var": "str",
+        "key": "expr"
+      }
+    },
+    "BinOp": {
+      "fields": {
+        "type": "str",
+        "op": "binop",
+        "lhs": "expr",
+        "rhs": "expr"
+      }
+    },
+    "Call": {
+      "fields": {
+        "type": "str",
+        "func": "str",
+        "args": "expr[]",
+        "purity": "purity"
+      }
+    },
+    "MethodCall": {
+      "fields": {
+        "type": "str",
+        "object": "expr",
+        "method": "str",
+        "args": "expr[]"
+      }
+    },
+    "Ternary": {
+      "fields": {
+        "type": "str",
+        "cond": "expr",
+        "then": "expr",
+        "else": "expr"
+      }
+    },
+    "DefinedOr": {
+      "fields": {
+        "type": "str",
+        "expr": "expr",
+        "default": "expr"
+      }
+    },
+    "Interpolate": {
+      "fields": {
+        "type": "str",
+        "parts": "interp_part[]"
+      }
+    },
+    "Capture": {
+      "fields": {
+        "type": "str",
+        "expr": "expr",
+        "native": "bool"
+      }
+    },
+    "Regex": {
+      "fields": {
+        "type": "str",
+        "pattern": "str",
+        "flags": "str"
+      }
+    },
+    "Range": {
+      "fields": {
+        "type": "str",
+        "start": "int",
+        "end": "int"
+      }
+    },
+    "RawExpr": {
+      "fields": {
+        "type": "str",
+        "text": "str"
+      }
+    },
+    "Arrow": {
+      "fields": {
+        "type": "str",
+        "body": "stmt[]"
+      }
+    },
+    "Array": {
+      "fields": {
+        "type": "str",
+        "elements": "expr[]"
+      }
+    },
+    "Arith": {
+      "fields": {
+        "type": "str",
+        "ast": "arith"
+      }
+    },
+    "Bool": {
+      "fields": {
+        "type": "str",
+        "value": "bool"
+      }
+    },
+    "Json": {
+      "fields": {
+        "type": "str",
+        "value": "any"
+      }
+    },
+    "Ident": {
+      "fields": {
+        "type": "str",
+        "name": "str"
+      }
+    },
+    "Object": {
+      "fields": {
+        "type": "str",
+        "properties": "obj_prop[]"
+      }
+    }
+  },
+  "arith": {
+    "Num": {
+      "fields": {
+        "type": "str",
+        "value": "int"
+      }
+    },
+    "Var": {
+      "fields": {
+        "type": "str",
+        "name": "str"
+      }
+    },
+    "Index": {
+      "fields": {
+        "type": "str",
+        "var": "str",
+        "key": "arith"
+      }
+    },
+    "Bin": {
+      "fields": {
+        "type": "str",
+        "op": "str",
+        "lhs": "arith",
+        "rhs": "arith"
+      }
+    },
+    "Un": {
+      "fields": {
+        "type": "str",
+        "op": "str",
+        "arg": "arith"
+      }
+    },
+    "Cond": {
+      "fields": {
+        "type": "str",
+        "test": "arith",
+        "then": "arith",
+        "else": "arith"
+      }
+    },
+    "Assign": {
+      "fields": {
+        "type": "str",
+        "var": "str",
+        "op": "str",
+        "rhs": "arith"
+      }
+    },
+    "IncDec": {
+      "fields": {
+        "type": "str",
+        "var": "str",
+        "delta": "int",
+        "prefix": "bool"
+      }
+    }
+  },
+  "leaf": {
+    "assign_target": {
+      "fields": {
+        "var": "str",
+        "sigil": "sigil",
+        "indices": "expr[]"
+      }
+    },
+    "decl": {
+      "fields": {
+        "name": "str",
+        "sigil": "sigil"
+      }
+    },
+    "redirect": {
+      "fields": {
+        "fd": "int|null",
+        "mode": "str",
+        "target": "expr",
+        "interpolate": "bool"
+      }
+    },
+    "env_entry": {
+      "fields": {
+        "name": "str",
+        "value": "expr"
+      }
+    },
+    "obj_prop": {
+      "fields": {
+        "key": "str",
+        "value": "expr"
+      }
+    },
+    "case_clause": {
+      "fields": {
+        "patterns": "str[]",
+        "body": "stmt[]"
+      }
+    },
+    "elsif": {
+      "fields": {
+        "cond": "expr",
+        "body": "stmt[]"
+      }
+    },
+    "interp_part": {
+      "fields": {
+        "kind": "enum[lit,expr]",
+        "text": "str|opt",
+        "expr": "expr|opt"
+      }
+    }
+  },
+  "enums": {
+    "sigil": [
+      "null",
+      "Scalar",
+      "Array",
+      "Hash"
+    ],
+    "style": [
+      "SingleQuoted",
+      "DoubleQuoted",
+      "Command",
+      "Heredoc"
+    ],
+    "purity": [
+      "PureCpu",
+      "Emulable",
+      "Fs",
+      "Spawn",
+      "Control"
+    ],
+    "binop": [
+      "Add",
+      "Sub",
+      "Mul",
+      "Div",
+      "Mod",
+      "Pow",
+      "Concat",
+      "Eq",
+      "Ne",
+      "Lt",
+      "Gt",
+      "Le",
+      "Ge",
+      "And",
+      "Or",
+      "Not",
+      "BitAnd",
+      "BitOr",
+      "BitXor",
+      "ShiftL",
+      "ShiftR"
+    ]
+  }
+}
