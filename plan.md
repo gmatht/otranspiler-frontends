@@ -46,25 +46,72 @@ The ShIR JSON **is** the frontend contract. It already works end-to-end:
 backend uses, so a frontend that reproduces it byte-for-byte is provably
 faithful without touching the core.
 
-## 2. What we still need from the core (future, do NOT block on)
+## 2. How to update the core (ordered, minimal, additive)
 
-1. **A shir-JSON → backend path (deserializer).** Today `--shir` is
-   export-only (`shir_json.rs` hand-builds; `ir.rs` derives no Deserialize).
-   Frontend output currently validates against the core frontend but cannot
-   be *executed* by a backend without going through the Rust AST. Needed for
-   the pipe architecture to close: `shir-json → IrProgram` + a structural
-   gate on ingress (schema + whitelist, mirroring the ESTree gate).
-2. **Pinned machine-readable purity table.** `call_purity` +
-   `SYNC_BUILTINS` live in Rust; a frontend must mirror them (this session
-   embeds a copy). Publishing them as the A4 namespace JSON (workspace
-   harness) makes every frontend derive, not copy.
-3. **Schema versioning.** The A1 JSON needs a version field + schema so
-   frontends can fail loudly on drift instead of silently mis-emitting.
-4. **Optional:** `debashc_optimize_shir` C-ABI export (debashcl.wasm
-   precedent) for embedding, once the JSON pipe proves itself.
+Design principle: **frontends parse; the core optimizes and attaches facts.**
+Most of this work is *publishing what already exists*, not building new
+semantics. All changes are additive — backends ignore what they don't
+consume. Sequencing is dependency-ordered; nothing before 2.2 is blocking.
 
-None of these block starting; they block *finishing* (executing frontend
-output through backends).
+### 2.1 Contract versioning + schema pin (cheap, do first)
+- Add `"contract_version": 1` to the Program JSON.
+- The authoritative schema stays `shir_json.rs`; the workspace copy is
+  `frontends/shir-contract/schema.json` (keep in sync;
+  `check_schema.py` validates corpus output against it — 0 violations/70).
+- Any consumer (frontend, backend, validator) fails loudly on version
+  mismatch instead of silently mis-emitting.
+
+### 2.2 ShIR JSON deserializer — the load-bearing item
+- serde derives on the IR types (only `IrType` derives today) so the A1
+  JSON round-trips structurally.
+- `shir_json → IrProgram` reader with **ingress validation**: schema
+  conformance, node whitelist, no unknown shapes (mirror of the ESTree
+  structural gate).
+- CLI: `debashc --shir-in <file.json>` → optimize → `--estree`/`--perl`/…
+  — the "pipe" architecture closes: **frontend output can be executed by
+  any backend.** Prerequisite for the `O(F(S)) == C(S)` oracle (2.3) and
+  for executing non-shell frontend output at all.
+
+### 2.3 `--shir-unoptimized` export — pin the raw boundary
+- Today `ast_to_ir` runs `optimize_stmts` inline and the export attaches
+  var_types/purity. Add a raw mode: pre-`optimize_stmts`, pre-annotations.
+- Then three comparisons are possible, and error attribution is clean:
+  - `F(S)_raw == C(S)_raw` — frontend vs core frontend, raw (the
+    frontend's semantic output)
+  - `O(F(S)) == C(S)` — frontend through the REAL optimizer equals the
+    reference export (the architecture's oracle; needs 2.2)
+  - `C(S)_raw` vs `C(S)` — the optimizer's own footprint ("frontend
+    parsed wrong" vs "optimizer changed it")
+
+### 2.4 Publish A3 purity as data (the A4 namespace JSON)
+- `SYNC_BUILTINS` + `call_purity` live in Rust; publish as machine-readable
+  JSON so frontends **derive, not copy** (pysh.py embeds a mirror today).
+  The callee whitelist / structural gate consumes the same file.
+
+### 2.5 Source positions — the ONLY semantic extension
+- Optional `loc: {line, col}` on statements (side table or inline;
+  expressions inherit the enclosing statement's position).
+- Populated by the parser; **propagated through `optimize_stmts`** (folded
+  nodes keep their origin); serialized in A1.
+- Why: (a) `$LINENO`/`$BASH_LINENO`/trap-ERR are shell SEMANTICS (corpus:
+  064_23_complex_error_handling_traps.sh) — a faithful transpiler must
+  emit the ORIGINAL line numbers, not generated ones; (b) debugging
+  generated code is a universal backend need (Perl/C `#line`, JS source
+  maps). Passes the "universally useful + not derivable + additive" test
+  — the filter that rejected quote-style fidelity.
+
+### 2.6 Explicit non-extensions (do NOT add to the IR)
+- **Quote-style preference:** `StrStyle` capacity already exists; the
+  neutral path keeps normalizing plain words to `DoubleQuoted`. Target
+  idiom wins (Perl double-quoting a no-interpolation string is a
+  perlcritic smell; Python PEP 8 prefers double). Source-style fidelity is
+  a backend renderer policy reading the existing Str-vs-Interpolate shapes.
+- **Comments / cosmetic fidelity:** same reasoning; the RawText/verbatim
+  bridge covers round-trip needs.
+- **A second frontend-IR for general-purpose languages:** the shell-domain
+  ShIR is the contract; a Python/Perl/C-shaped IR would split the
+  ecosystem (rejected — see §8.5 for how consistency nets handle the
+  expressible intersection instead).
 
 ## 3. What we can build now, without modifying the core
 
@@ -74,7 +121,9 @@ output through backends).
 | `shir-contract/check_schema.py` | corpus coverage checker: every emitted node must fit the schema | this session |
 | `py-sh/` (pysh.py) | first frontend: shell-subset parser + A1/A2/A3 emitter, byte-identical to `debashc --shir` on its subset | this session |
 | `equiv.py` | equivalence harness: diff frontend vs `debashc --shir` per file (oracle = byte equality); `--strip-annotations` mode validates the semantic core without A2/A3 | this session |
-| go-frontend/ | ANTLR Go frontend (the discussed architecture) — next session; contract tooling above is language-neutral and reusable | next |
+| Tier A canonical formatters | per-backend-language format(input) == format(output) consistency nets — cheapest, no frontend needed | next |
+| go-frontend/ | ANTLR Go frontend (the discussed architecture) — contract tooling above is language-neutral and reusable | next |
+| consistency frontends | per backend language (Python → C → C++, defer Perl) covering the expressible core only; feed §8 nets | next |
 
 ## 4. py-sh subset (v1)
 
@@ -194,3 +243,94 @@ core-attached annotations in the future architecture). Next: grow the subset
 (redirects, pipelines, if/test, arith, `${}`, case, functions — each pinned
 first); port the emitter to Go/ANTLR (contract tooling is language-neutral);
 core deserializer to close the loop (plan §2.1).
+
+---
+
+## 8. Testing strategy (the pyramid) — agreed in discussion
+
+For every source/target language pair, four layers. The bottom layers are
+**execution-free** (arbitrary untrusted input is safe — no running the
+output); the top layer is the only semantic anchor and requires curated,
+trusted, side-effect-free examples.
+
+| Layer | Input space | Executes? | Catches |
+|---|---|---|---|
+| 1. crash/consistency fuzz (frontend+generator) | full, incl. malformed | no | panics, hangs, malformed output, refusal-path bugs |
+| 2. round-trip / idempotence / canonical-form nets | full, syntactically valid | no | frontend↔backend disagreement, non-idempotence, verbatim-bridge violations, non-idiomatic rendering |
+| 3. oracle hierarchy (`F==C`, `O(F)==C`) | frontend subset ∩ corpus | no | frontend lowering fidelity (shell family) |
+| 4. curated behavioral equivalence | small, trusted, side-effect-free | yes | actual semantic correctness vs the reference impl (bash, CPython, …) |
+
+### 8.1 Layer 2 details — per-language consistency nets
+For each language L with an idiomatic source-rendering backend:
+- **Tier A (cheapest, no frontend):** canonical-form round-trip —
+  `format(L → shIR → L) == format(input)` with a per-language formatter
+  (black/gofmt/clang-format). Catches non-idiomatic/divergent rendering.
+- **Tier B (consistency frontend):** full parse-tree round-trip —
+  `ANTLR(L → shIR → L)` vs `ANTLR(input)`; enforces (a) **idempotence**
+  `emit(parse(emit(parse(x)))) == emit(parse(x))`, (b) **verbatim-bridge
+  fidelity** (refused constructs byte-identical), (c) canonical equality.
+- **Scope:** the nets only mean something on the expressible intersection
+  (the simple imperative core); the rest is verbatim-trivial or refused.
+  Consistency frontends are deliberately partial.
+- **ESTree caveat:** nets apply only to backends that render idiomatic
+  source (Perl today; Python/C/C++ when those backends exist). The ESTree
+  leaf emits runtime-dispatch JS — excluded; the net is a forcing function
+  for idiomatic backend rendering.
+
+### 8.2 The anchoring rule (judge one side only if the other is anchored)
+- Shell: the core's backend is anchored behaviorally (vs bash) → `F==C`
+  judges frontends. New languages: **anchor the backend behaviorally first**
+  (output vs the reference impl on a curated corpus), THEN round-trip nets
+  judge the frontend lowering.
+- **Consistency ≠ correctness:** two self-consistent errors cancel. Layers
+  1–3 are regression/crash/coverage nets, never semantic proofs; layer 4 is
+  the only semantic anchor.
+
+### 8.3 What the tests need from the core
+- `--shir-in` (2.2) for `O(F)==C` and for executing frontend output.
+- `--shir-unoptimized` (2.3) for error attribution.
+- `loc` (2.5) for line-number semantics + debugging.
+- `contract_version` (2.1) so every consumer fails loudly on drift.
+
+### 8.4 Sequencing
+1. Tier A formatters per backend language (cheapest consistency value).
+2. `--shir-unoptimized` + `--shir-in` in the core (needs a coordinated
+   commit — pause/coordinate with the ESTree worker).
+3. Consistency frontends in difficulty order: **Python** (demo, py2py
+   thread) → **C** (cheap grammar) → defer **C++** (very hard) and
+   **Perl** (pure-ANTLR infeasible — context-dependent lexing; best
+   semantic fit, hand-rolled parser if ever).
+4. Curated behavioral corpora per backend language (layer 4) as backends
+   land.
+
+### 8.5 What consistency nets tell us about the IR
+Each frontend's supported subset empirically maps the IR's expressible
+intersection for its language; the round-trip proves the subset round-trips
+faithfully. This is the answer to "how universal is the IR?" — measured per
+language, not asserted.
+
+## 9. Learnings from the design discussion (session 2)
+
+- **L8 — The oracle is only as strong as its anchor.** `F(S) == C(S)` judges
+the frontend only because the core's backend is separately anchored
+behaviorally (vs bash). For a new source language there is no `C`, so
+round-trip tests judge the pair (or the backend, under a trust assumption)
+— anchor the behavioral side first, then the structural tests mean
+something.
+- **L9 — "Unoptimised" vs "optimised" conflation.** The session's oracle
+compares F against C's final export (which includes `optimize_stmts`
+effects + annotations). v1 is benign (constant folding inert; dead-assign
+conservative) but the honest formulation is `O(F(S)) == C(S)` once the
+deserializer lands; `--shir-unoptimized` pins the raw boundary.
+- **L10 — Execution-free testing is the only safe way to cover arbitrary
+input.** Behavioral tests require curated, known-safe, side-effect-free
+inputs (the shell corpus is safe only because it's curated). Crash-fuzz +
+round-trip nets cover the full input space at zero execution risk;
+consistency ≠ correctness, so they complement, never replace, the curated
+behavioral layer.
+- **L11 — Line numbers are semantics, not metadata.** `$LINENO`/`$BASH_LINENO`
+/ trap-ERR require emitting the ORIGINAL source lines — the strongest
+argument for `loc` (2.5). Quote-style fidelity failed the same test:
+available in shell/Python/Perl but entangled with per-language semantics
+(semantic in shell/Perl, cosmetic in Python, char-vs-string in C), so the
+preference doesn't transfer and `StrStyle` capacity suffices.
