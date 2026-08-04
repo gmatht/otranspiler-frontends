@@ -25,7 +25,7 @@ while true; do
     # heavy: wait for low load, then build
     bash "$WORKSPACE/setup_backends.sh" --wait >> "$LOG" 2>&1 || true
     echo "[$(date +%FT%T)] posix-sh-go: build start" >> "$LOG"
-    if make build >> "$LOG" 2>&1; then
+    if make test >> "$LOG" 2>if make build >> "$LOG" 2>&1; then1; then
       # commit within scope
       git -C "$WORKSPACE" add $changes 2>/dev/null || true
       git -C "$WORKSPACE" commit -m "frontend posix-sh-go: build/fix" >> "$LOG" 2>&1 || true

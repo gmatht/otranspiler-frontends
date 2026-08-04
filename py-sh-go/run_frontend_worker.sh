@@ -23,7 +23,7 @@ while true; do
   if [ -n "$changes" ]; then
     bash "$WORKSPACE/setup_backends.sh" --wait >> "$LOG" 2>&1 || true
     echo "[$(date +%FT%T)] py-sh-go: build start" >> "$LOG"
-    if make build >> "$LOG" 2>&1; then
+    if make test >> "$LOG" 2>if make build >> "$LOG" 2>&1; then1; then
       fail_count=0
       git -C "$WORKSPACE" add $changes 2>/dev/null || true
       git -C "$WORKSPACE" commit -m "frontend py-sh-go: build/fix" >> "$LOG" 2>&1 || true
