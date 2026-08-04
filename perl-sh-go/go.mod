@@ -1,4 +1,4 @@
-module github.com/gmatht/sh2loop/frontends/go-sh
+module github.com/gmatht/sh2loop/frontends/perl-sh-go
 
 go 1.21
 

@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
 frontends/go-sh/go-sh
+frontends/py-sh-go/py-sh-go
+frontends/posix-sh-go/posix-sh-go
+frontends/perl-sh-go/perl-sh-go
+frontends/loop-*.log

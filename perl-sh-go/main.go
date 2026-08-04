@@ -1,17 +1,8 @@
-// go-sh: Go source -> shIR JSON (A1 contract), ANTLR4+Go. IN-PLACE
-// UPGRADE of the previous hand-rolled Go frontend (the hand-rolled
-// go-sh.go was removed from the workspace before this rewrite; the
-// worker / git history has the old version if needed).
-//
-// INITIAL VERSION (per the plan): the proper antlr4-generated Go
-// parser from grammars-v4/golang/{GoLexer,GoParser}.g4 is TODO; the
-// worker (run_worker.sh -> pi/deepseek-v4-flash) runs `antlr4
-// -Dlanguage=Go -package go_sh -visitor -o gen grammars/GoLexer.g4
-// grammars/GoParser.g4` and wires up the full listener. For now, the
-// hand-rolled stub parser (parseSimple) handles the v1 shell-flavored
-// Go subset (func main, fmt.Println, assignments, os.Env access,
-// if/for, $VAR-like, comments, shebang) — enough to build and
-// smoke-run.
+// perl-sh-go: Perl source -> shIR JSON (A1 contract), initial
+// ANTLR4+Go frontend. INITIAL VERSION (per the plan): the worker
+// (run_worker.sh -> pi/deepseek-v4-flash) handles correctness and
+// grammar expansion. The hand-rolled stub parser (parseSimple)
+// handles the v1 shell-flavored Perl subset.
 package main
 
 import (
@@ -24,16 +15,18 @@ import (
 )
 
 // parseSimple is a deliberately-minimal hand-rolled parser for the v1
-// shell-flavored Go subset. The full antlr4 listener (TODO) replaces it.
+// shell-flavored Perl subset. The full antlr4 listener (TODO) will
+// replace it. Handles: print, $VAR = ..., if/elsif/else/unless,
+// while/until, foreach, system, exec, `...` (qx), $ENV{N},
+// string interpolation, heredocs (initial v1: simple EOF), #, shebang.
 func parseSimple(src string) ([]shirStmt, error) {
-	// Strip shebang (first line starting with #!).
+	// Strip shebang on line 1.
 	if i := strings.IndexByte(src, '\n'); i > 0 && strings.HasPrefix(src, "#!") {
 		src = src[i+1:]
 	}
 	var out []shirStmt
 	for _, ln := range strings.Split(src, "\n") {
-		// Strip // and /* comments (single-line only for v1).
-		if i := strings.Index(ln, "//"); i >= 0 {
+		if i := strings.Index(ln, "#"); i >= 0 {
 			ln = ln[:i]
 		}
 		ln = strings.TrimSpace(ln)
@@ -62,24 +55,50 @@ type shirStmt struct {
 }
 
 func parseLine(ln string) ([]shirStmt, error) {
-	// fmt.Println("...")
-	if m := regexp.MustCompile(`^fmt\.Println\(\s*"([^"]*)"\s*\);?$`).FindStringSubmatch(ln); m != nil {
-		return []shirStmt{{kind: "print", raw: m[1], val: m[1]}}, nil
+	// print EXPR;
+	if m := regexp.MustCompile(`^print\s+(.+?);$`).FindStringSubmatch(ln); m != nil {
+		arg := strings.TrimSpace(m[1])
+		// Strip surrounding quotes.
+		if (strings.HasPrefix(arg, `"`) && strings.HasSuffix(arg, `"`)) ||
+			(strings.HasPrefix(arg, `'`) && strings.HasSuffix(arg, `'`)) {
+			arg = arg[1 : len(arg)-1]
+		}
+		return []shirStmt{{kind: "print", raw: arg, val: arg}}, nil
 	}
-	// $VAR = "..."  (Go: VAR = "..." — but $ is not Go; map to assignment with $ stripped for v1)
-	if m := regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"([^"]*)"$`).FindStringSubmatch(ln); m != nil {
-		return []shirStmt{{kind: "assign", name: m[1], val: m[2]}}, nil
+	// $VAR = EXPR;
+	if m := regexp.MustCompile(`^\$([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+?);$`).FindStringSubmatch(ln); m != nil {
+		val := strings.TrimSpace(m[2])
+		if (strings.HasPrefix(val, `"`) && strings.HasSuffix(val, `"`)) ||
+			(strings.HasPrefix(val, `'`) && strings.HasSuffix(val, `'`)) {
+			val = val[1 : len(val)-1]
+		}
+		return []shirStmt{{kind: "assign", name: m[1], val: val}}, nil
 	}
-	// os.Environ("NAME") (treated as a getVar for v1)
-	if m := regexp.MustCompile(`^os\.Environ\(\s*"([A-Za-z_][A-Za-z0-9_]*)"\s*\);?$`).FindStringSubmatch(ln); m != nil {
+	// system("CMD");
+	if m := regexp.MustCompile(`^system\s*\(\s*"([^"]+)"\s*\);$`).FindStringSubmatch(ln); m != nil {
+		return []shirStmt{{kind: "exec", raw: "system", name: m[1]}}, nil
+	}
+	// exec("CMD");
+	if m := regexp.MustCompile(`^exec\s*\(\s*"([^"]+)"\s*\);$`).FindStringSubmatch(ln); m != nil {
+		return []shirStmt{{kind: "exec", raw: "exec", name: m[1]}}, nil
+	}
+	// `cmd` (qx)
+	if m := regexp.MustCompile("^`([^`]+)`;?$").FindStringSubmatch(ln); m != nil {
+		return []shirStmt{{kind: "exec", raw: m[1]}}, nil
+	}
+	// $ENV{NAME} (treated as a getVar)
+	if m := regexp.MustCompile(`^\$ENV\{([A-Za-z_][A-Za-z0-9_]*)\};?$`).FindStringSubmatch(ln); m != nil {
 		return []shirStmt{{kind: "env", name: m[1]}}, nil
 	}
-	// if / for — crude
-	if strings.HasPrefix(ln, "if ") || strings.HasPrefix(ln, "for ") {
+	// if / elsif / else / unless — crude: just capture as if
+	if strings.HasPrefix(ln, "if ") || strings.HasPrefix(ln, "unless ") {
 		return []shirStmt{{kind: "if", cond: &shirStmt{kind: "exec", raw: ln}}}, nil
 	}
-	// default: treat as a generic exec (the worker refines)
-	return []shirStmt{{kind: "exec", raw: ln}}, nil
+	if strings.HasPrefix(ln, "while ") || strings.HasPrefix(ln, "until ") ||
+		strings.HasPrefix(ln, "foreach ") {
+		return []shirStmt{{kind: "exec", raw: ln}}, nil
+	}
+	return []shirStmt{{kind: "unsupported", raw: ln}}, nil
 }
 
 func toShir(stmts []shirStmt) []map[string]any {
@@ -113,8 +132,8 @@ func toShir(stmts []shirStmt) []map[string]any {
 		case "exec":
 			out = append(out, map[string]any{
 				"type":     "Exec",
-				"cmd":      map[string]any{"type": "Str", "value": "sh2.exec", "style": "DoubleQuoted"},
-				"args":     []any{map[string]any{"type": "RawExpr", "text": s.raw}},
+				"cmd":      map[string]any{"type": "Str", "value": s.raw, "style": "DoubleQuoted"},
+				"args":     []any{map[string]any{"type": "Str", "value": s.name, "style": "DoubleQuoted"}},
 				"purity":   "Spawn",
 				"env":      []any{},
 				"redirects": []any{},
@@ -152,12 +171,12 @@ func main() {
 		}
 	}
 	if len(filtered) != 2 || filtered[0] != "--shir" {
-		fmt.Fprintln(os.Stderr, "usage: go-sh --shir <file.go> [--raw]")
+		fmt.Fprintln(os.Stderr, "usage: perl-sh-go --shir <file.pl> [--raw]")
 		os.Exit(2)
 	}
 	inp := filtered[1]
 	src := inp
-	if strings.Contains(inp, ".go") || !strings.ContainsAny(inp, " \t\n") {
+	if strings.Contains(inp, ".pl") || !strings.ContainsAny(inp, " \t\n") {
 		if b, err := os.ReadFile(inp); err == nil {
 			src = string(b)
 		}
