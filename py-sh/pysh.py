@@ -34,6 +34,9 @@ SYNC_BUILTINS = {
 
 # Builtins whose semantics are outside the v1 subset (store writes / arith /
 # control flow): refusing them is honest — "unsupported" beats a wrong shape.
+# A1 contract version (must match sh2perl src/shir_json.rs CONTRACT_VERSION).
+CONTRACT_VERSION = 1
+
 REFUSE_BUILTINS = {
     "let", "eval", "declare", "typeset", "local", "readonly", "export",
     "unset", "read", "readarray", "mapfile", "shift", "source", "trap",
@@ -449,6 +452,7 @@ def compile_(src):
             i += 1
     return O(dict(
         type="Program",
+        contract_version=1,
         imports=[],
         requires=[],
         var_types=var_types(stmts),

@@ -5,6 +5,7 @@
     "type": "Program",
     "fields": {
       "type": "str",
+      "contract_version": "int",
       "imports": "str[]",
       "requires": "str[]",
       "var_types": "var_types_entry[]",
@@ -510,5 +511,6 @@
       "ShiftL",
       "ShiftR"
     ]
-  }
+  },
+  "_contract_version": 1
 }
