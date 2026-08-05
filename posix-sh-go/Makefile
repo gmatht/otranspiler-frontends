@@ -1,9 +1,10 @@
 # posix-sh-go: POSIX shell source -> shIR JSON (A1 contract), ANTLR4+Go.
-# INITIAL VERSION: the hand-rolled stub parser in main.go handles the v1
-# shell-flavored subset; `build` compiles it (the antlr4 generation from
-# grammars/POSIX.g4 is the WORKER's job — not a build blocker). `test`
-# runs the BYTE-EQUALITY ORACLE vs the core's `debashc --shir`. A passing
-# test = real progress (correct output); a mismatch = the gap to fix.
+# WORKER REWRITE (2026-08-05): main.go is a faithful hand-rolled port of the
+# core frontend (lexer+parser in main.go, lowering in lowering.go, A2
+# var-type analysis + A1 JSON emitter in analysis.go). `test` runs the
+# BYTE-EQUALITY ORACLE vs the core's `debashc --shir FILE --raw` — the
+# emitted JSON must be byte-identical (the A1 contract). A passing test =
+# real progress (correct output); a mismatch = the gap to fix.
 
 ANTLR4 ?= antlr4
 DEBASHC ?= $(abspath ../../sh2perl/target/debug/debashc)

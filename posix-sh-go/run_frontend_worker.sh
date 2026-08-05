@@ -2,7 +2,7 @@
 # posix-sh-go scoped worker — FAILURE-DRIVEN.
 set -euo pipefail
 cd "$(dirname "$0")"
-WORKSPACE="$(cd .. && pwd)"
+WORKSPACE="$(cd ../.. && pwd)"
 LOG="$WORKSPACE/loop-frontend-posix-sh-go.log"
 echo "[$(date +%FT%T)] frontend posix-sh-go worker started (pid=$$)" >> "$LOG"
 fail_count=0
