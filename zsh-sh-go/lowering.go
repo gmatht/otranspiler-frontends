@@ -356,7 +356,11 @@ func zshSliceKey(name, key string) (Expr, bool) {
 	if errA != nil || errB != nil || a < 1 || b < a {
 		return nil, false
 	}
-	return call("param", []Expr{st("slice"), st(name), st(strconv.Itoa(a - 1)), st(strconv.Itoa(b - a + 1))}), true
+	// wrapped in join like the core's partIR slice: a plain-name slice is
+	// ambiguous (array or scalar at runtime) — the runtime join handles
+	// both (arrays join with space, scalars are identity)
+	slice := call("param", []Expr{st("slice"), st(name), st(strconv.Itoa(a - 1)), st(strconv.Itoa(b - a + 1))})
+	return call("join", []Expr{slice}), true
 }
 
 // partIR — StringPart → IR (mirror part_ir).
