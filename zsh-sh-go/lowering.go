@@ -329,6 +329,36 @@ func echoPlaceholder(raw string) []*Command {
 	return []*Command{echoPlaceholderCmd(raw)}
 }
 
+// zshIndexKey — canonical 0-based A1 subscript (PLAN v12): a 1-based
+// positive literal becomes n-1; "@"/"*"/negative/dynamic subscripts pass
+// through raw (a negative index counts from the end in BOTH bases —
+// base-invariant). The executor is language-blind since the frontend
+// normalizes at emit.
+func zshIndexKey(key string) string {
+	if n, err := strconv.Atoi(key); err == nil && n >= 1 {
+		return strconv.Itoa(n - 1)
+	}
+	return key
+}
+
+// zshSliceKey — `a,b` (zsh 1-based INCLUSIVE substring range, e.g.
+// `${s[2,3]}`) → the bash-shaped 0-based param("slice", name, off, len)
+// form every backend understands (off = a-1, len = b-a+1). Returns
+// ok=false when key is not a comma-range (or is degenerate — zsh renders
+// those empty, and so does the executor's bad-subscript path).
+func zshSliceKey(name, key string) (Expr, bool) {
+	comma := strings.IndexByte(key, ',')
+	if comma < 0 {
+		return nil, false
+	}
+	a, errA := strconv.Atoi(key[:comma])
+	b, errB := strconv.Atoi(key[comma+1:])
+	if errA != nil || errB != nil || a < 1 || b < a {
+		return nil, false
+	}
+	return call("param", []Expr{st("slice"), st(name), st(strconv.Itoa(a - 1)), st(strconv.Itoa(b - a + 1))}), true
+}
+
 // partIR — StringPart → IR (mirror part_ir).
 func partIR(part *Part, cmds map[string][]*Command) Expr {
 	if part.IsLit {
@@ -354,7 +384,10 @@ func partIR(part *Part, cmds map[string][]*Command) Expr {
 		}
 		return call("capture", []Expr{&ArrowE{Body: commandArrowStmts(body)}})
 	case part.MapKind == "access":
-		inner := call("arrayIndex", []Expr{st(part.MapName), st(part.MapKey)})
+		if slice, ok := zshSliceKey(part.MapName, part.MapKey); ok {
+			return call("join", []Expr{slice})
+		}
+		inner := call("arrayIndex", []Expr{st(part.MapName), st(zshIndexKey(part.MapKey))})
 		if part.MapKey == "@" || part.MapKey == "*" {
 			return call("join", []Expr{inner})
 		}
@@ -531,7 +564,10 @@ func wordIR(w *Word, cmds map[string][]*Command) Expr {
 	case "array":
 		return call("getVar", []Expr{st(w.ArrayName)})
 	case "mapaccess":
-		return call("arrayIndex", []Expr{st(w.MapName), st(w.MapKey)})
+		if slice, ok := zshSliceKey(w.MapName, w.MapKey); ok {
+			return slice
+		}
+		return call("arrayIndex", []Expr{st(w.MapName), st(zshIndexKey(w.MapKey))})
 	case "mapkeys":
 		return call("arrayItems", []Expr{st(w.MapName)})
 	case "maplen":

@@ -30,12 +30,20 @@ build:
 	rm -f zsh-sh-go
 	$(GO) build -o zsh-sh-go .
 
+# PLAN v12: zsh arrays are 1-based but the A1 contract is canonical
+# 0-based — the frontend normalizes subscripts at emit, which the core's
+# bash parse cannot match byte-for-byte. Files with array subscripts skip
+# byte-equality (executed-stdout is the semantic anchor; byte-equality is
+# only a conformance net where the core parses faithfully). `${#x}` /
+# `${#a[@]}` (length) have no subscript and stay byte-compared.
 test: build
 	@for f in testdata/*.zsh; do \
 	  bn=$$(basename $$f); \
 	  ./zsh-sh-go --shir $$f --raw > /tmp/$$bn.mine 2>/dev/null || { echo "FAIL $$bn (frontend)"; exit 1; }; \
 	  $(DEBASHC) --shir $$f --raw > /tmp/$$bn.core 2>/dev/null || { echo "FAIL $$bn (core)"; exit 1; }; \
-	  if diff -q /tmp/$$bn.mine /tmp/$$bn.core > /dev/null; then \
+	  if grep -qEf "$(abspath ../../harness/zsh-subscript.ere)" "$$f"; then \
+	    echo "OK $$bn (array-subscript file — byte-equality waived; stdout oracle only)"; \
+	  elif diff -q /tmp/$$bn.mine /tmp/$$bn.core > /dev/null; then \
 	    echo "OK $$bn (byte-equal)"; \
 	  else \
 	    echo "DIFF $$bn (frontend != core — the gap the worker fixes)"; \
