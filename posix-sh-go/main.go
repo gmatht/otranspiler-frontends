@@ -78,12 +78,22 @@ type Part struct {
 // AST commands (mirror ast.rs Command)
 // ─────────────────────────────────────────────────────────────────────
 
-type EnvVar struct{ Name string; Val *Word }
+type EnvVar struct {
+	Name string
+	Val  *Word
+}
 
 type Redirect struct {
-	FD     *int
-	Op     string // "in" "out" "append" "inout" "outerr" "inerr"
+	FD *int
+	Op string // "in" "out" "append" "inout" "outerr" "inerr"
+	// "heredoc" "heredoc-tabs" "herestring"
 	Target *Word
+	// heredoc: delimiter + body state (the body is read after the whole
+	// command line is parsed — see readHeredocBodies)
+	HeredocDelim     string
+	HeredocQuoted    bool
+	HeredocBodyStart int // absolute source offset of the first body line
+	HeredocBody      string
 }
 
 type Command struct {
@@ -97,10 +107,12 @@ type Command struct {
 	AssignVar string
 	AssignOp  string // "=" "+=" "-=" "*=" "/=" "%="
 	AssignVal *Word
+	// function definition (name() { ... })
+	FuncName string
 	// if
-	Cond  *Command
-	Then  []*Command
-	Else  *Command
+	Cond *Command
+	Then []*Command
+	Else *Command
 	// while
 	Until bool
 	Body  []*Command
@@ -1570,6 +1582,9 @@ func (p *Parser) parseCommand() (*Command, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := p.readHeredocBodies(cmd); err != nil {
+		return nil, err
+	}
 	p.skipInlineWSAndComments()
 	if p.peek() == '&' && p.peekAt(1) != '&' {
 		p.pos++
@@ -1595,7 +1610,9 @@ func (p *Parser) parseCommandBase() (*Command, error) {
 		return p.parseFor()
 	case "case":
 		return p.parseCase()
-	case "function", "select":
+	case "function":
+		return p.parseFunctionKeyword()
+	case "select":
 		return nil, fmt.Errorf("unsupported construct %q at %d", p.peekKeyword(), p.pos)
 	}
 	if p.starts("[[") && isWordDelim(p.peekAt(2)) {
@@ -2415,6 +2432,131 @@ func (p *Parser) parseSubshell() (*Command, error) {
 	return &Command{Kind: "subshell", BodyCmds: cmds}, nil
 }
 
+// isFunctionDefAhead — non-consuming lookahead for the POSIX function
+// definition `ident WS* ( WS* ) WS* {` (mirrors parse_command's
+// implicit-function-definition check: identifier followed by `()` and a
+// brace-open body). Only the `name() {` form is recognized — a bare
+// `f()` without a brace body is not a function def.
+func (p *Parser) isFunctionDefAhead() bool {
+	i := p.pos
+	if i >= len(p.src) || !isIdentStart(p.src[i]) {
+		return false
+	}
+	for i < len(p.src) && isIdentChar(p.src[i]) {
+		i++
+	}
+	for i < len(p.src) && (isWS(p.src[i]) || isNL(p.src[i])) {
+		i++
+	}
+	if i >= len(p.src) || p.src[i] != '(' {
+		return false
+	}
+	i++
+	for i < len(p.src) && (isWS(p.src[i]) || isNL(p.src[i])) {
+		i++
+	}
+	if i >= len(p.src) || p.src[i] != ')' {
+		return false
+	}
+	i++
+	for i < len(p.src) && (isWS(p.src[i]) || isNL(p.src[i])) {
+		i++
+	}
+	return i < len(p.src) && p.src[i] == '{'
+}
+
+// parseFunctionKeyword — `function name [()] { body }` (mirrors the core's
+// parse_function: the `function` keyword form; an optional parameter list
+// is consumed and discarded — lowering keeps only the name and the body).
+// The body is the brace-wrapped command list, or a single command when no
+// braces follow (the core's fallback).
+func (p *Parser) parseFunctionKeyword() (*Command, error) {
+	p.pos += len("function")
+	p.skipWSAndComments()
+	name, err := p.parseWord()
+	if err != nil {
+		return nil, err
+	}
+	if name.Kind == "interp" && len(name.Parts) == 1 && name.Parts[0].IsLit {
+		name = &Word{Kind: "lit", Text: name.Parts[0].Lit}
+	}
+	if name.Kind != "lit" {
+		return nil, fmt.Errorf("function: name must be a literal at %d", p.pos)
+	}
+	p.skipWSAndComments()
+	if p.peek() == '(' {
+		// optional parameter list — consumed, discarded (mirrors the core)
+		p.pos++
+		for !p.eof() {
+			p.skipWSAndComments()
+			if p.peek() == ')' {
+				p.pos++
+				break
+			}
+			if p.peek() == ',' {
+				p.pos++
+				continue
+			}
+			if _, err := p.parseWord(); err != nil {
+				return nil, err
+			}
+		}
+		p.skipWSAndComments()
+	}
+	var body *Command
+	if p.peek() == '{' {
+		body, err = p.parseBlock()
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		// fallback: a single command body (mirrors the core)
+		body, err = p.parseCommand()
+		if err != nil {
+			return nil, err
+		}
+	}
+	if body.Kind == "block" {
+		return &Command{Kind: "function", FuncName: name.Text, BodyCmds: body.BodyCmds}, nil
+	}
+	return &Command{Kind: "function", FuncName: name.Text, BodyCmds: []*Command{body}}, nil
+}
+
+// parseFunctionDef — `name() { body }` (mirrors parse_posix_function:
+// identifier, `( )`, brace-wrapped command list). The body uses the same
+// brace loop as parseBlock; the returned Command carries the function
+// name and the body command list.
+func (p *Parser) parseFunctionDef() (*Command, error) {
+	name, err := p.parseWord()
+	if err != nil {
+		return nil, err
+	}
+	// SI with a single literal part collapses to a Literal (same as the
+	// command-name handling in parseSimpleCommand)
+	if name.Kind == "interp" && len(name.Parts) == 1 && name.Parts[0].IsLit {
+		name = &Word{Kind: "lit", Text: name.Parts[0].Lit}
+	}
+	if name.Kind != "lit" {
+		return nil, fmt.Errorf("function: name must be a literal at %d", p.pos)
+	}
+	p.skipWSAndComments()
+	if p.peek() != '(' {
+		return nil, fmt.Errorf("function: expected '(' at %d", p.pos)
+	}
+	p.pos++
+	p.skipWSAndComments()
+	if p.peek() != ')' {
+		return nil, fmt.Errorf("function: expected ')' at %d", p.pos)
+	}
+	p.pos++
+	p.skipWSAndComments()
+	body, err := p.parseBlock()
+	if err != nil {
+		return nil, err
+	}
+	return &Command{Kind: "function", FuncName: name.Text, BodyCmds: body.BodyCmds}, nil
+}
+
 // parseBlock — `{ cmds; }`
 func (p *Parser) parseBlock() (*Command, error) {
 	p.pos++ // {
@@ -2456,7 +2598,9 @@ func (p *Parser) parsePipelineSegment() (*Command, error) {
 		return p.parseFor()
 	case "case":
 		return p.parseCase()
-	case "function", "select":
+	case "function":
+		return p.parseFunctionKeyword()
+	case "select":
 		return nil, fmt.Errorf("unsupported construct %q", p.peekKeyword())
 	}
 	if p.peek() == '!' {
@@ -2527,6 +2671,9 @@ func (p *Parser) parseAndOrCont(first *Command) (*Command, error) {
 			if err != nil {
 				return nil, err
 			}
+			if err := p.readHeredocBodies(seg); err != nil {
+				return nil, err
+			}
 			pipeCmds = append(pipeCmds, seg)
 			continue
 		}
@@ -2559,6 +2706,9 @@ func (p *Parser) parseAndOrCont(first *Command) (*Command, error) {
 			if err != nil {
 				return nil, err
 			}
+			if err := p.readHeredocBodies(seg); err != nil {
+				return nil, err
+			}
 			right := []*Command{seg}
 			for {
 				p.skipWSAndComments()
@@ -2571,6 +2721,9 @@ func (p *Parser) parseAndOrCont(first *Command) (*Command, error) {
 					}
 					seg2, err = p.parseCommandRedirects(seg2)
 					if err != nil {
+						return nil, err
+					}
+					if err := p.readHeredocBodies(seg2); err != nil {
 						return nil, err
 					}
 					right = append(right, seg2)
@@ -2774,6 +2927,31 @@ func (p *Parser) parseSimpleCommand() (*Command, error) {
 		envs = append(envs, EnvVar{Name: name, Val: val})
 		envOps[name] = op
 		p.skipInlineWSAndComments()
+	}
+	// implicit function definition: `name() { body }` (mirrors
+	// parse_command/parse_pipeline_segment's identifier lookahead →
+	// parse_posix_function). Runs BEFORE the env-var handling: env
+	// assignments prefixing a function def wrap into a Block, exactly
+	// like the core (Block[Assignment..., Function]).
+	if isIdentStart(p.peek()) && p.isFunctionDefAhead() {
+		fn, err := p.parseFunctionDef()
+		if err != nil {
+			return nil, err
+		}
+		if len(envs) > 0 {
+			sort.Slice(envs, func(i, j int) bool { return envs[i].Name < envs[j].Name })
+			var cmds []*Command
+			for _, ev := range envs {
+				op := envOps[ev.Name]
+				if op == "" {
+					op = "="
+				}
+				cmds = append(cmds, &Command{Kind: "assign", AssignVar: ev.Name, AssignOp: op, AssignVal: ev.Val})
+			}
+			cmds = append(cmds, fn)
+			return &Command{Kind: "block", BodyCmds: cmds}, nil
+		}
+		return fn, nil
 	}
 	if len(envs) > 0 {
 		if p.hasFollowingCommand() {
@@ -3171,12 +3349,22 @@ func (p *Parser) parseRedirect() (*Redirect, error) {
 		fd = &n
 	}
 	op := ""
+	heredocQuoted := false
 	switch {
 	case p.starts(">>"):
 		op = "append"
 		p.pos += 2
-	case p.starts("<<-"), p.starts("<<<"), p.starts("<<"):
-		return nil, fmt.Errorf("heredoc not supported")
+	case p.starts("<<-"):
+		op = "heredoc-tabs"
+		p.pos += 3
+		heredocQuoted = p.heredocDelimQuoted()
+	case p.starts("<<<"):
+		op = "herestring"
+		p.pos += 3
+	case p.starts("<<"):
+		op = "heredoc"
+		p.pos += 2
+		heredocQuoted = p.heredocDelimQuoted()
 	case p.starts(">&"):
 		op = "outerr"
 		p.pos += 2
@@ -3210,7 +3398,115 @@ func (p *Parser) parseRedirect() (*Redirect, error) {
 	if err != nil {
 		return nil, err
 	}
+	if op == "heredoc" || op == "heredoc-tabs" {
+		delim, ok := heredocDelimFromWord(target)
+		if !ok {
+			return nil, fmt.Errorf("heredoc: delimiter must be a literal at %d", p.pos)
+		}
+		// backslash-quoted delimiter: `<<\EOF` → delimiter `EOF` (the core
+		// strips the leading backslash and marks the heredoc quoted)
+		if heredocQuoted && len(delim) > 0 && delim[0] == '\\' {
+			delim = delim[1:]
+		}
+		// The body begins at the first newline following the delimiter
+		// (whatever else shares the header line is skipped, mirroring the
+		// core's parse_heredoc); the actual line read is deferred to
+		// readHeredocBodies so the whole command line parses first.
+		start := p.pos
+		for start < len(p.src) && p.src[start] != '\n' {
+			start++
+		}
+		if start < len(p.src) {
+			start++
+		}
+		return &Redirect{FD: fd, Op: op, Target: target,
+			HeredocDelim: delim, HeredocQuoted: heredocQuoted, HeredocBodyStart: start}, nil
+	}
 	return &Redirect{FD: fd, Op: op, Target: target}, nil
+}
+
+// heredocDelimQuoted — non-consuming lookahead right after a `<<`/`<<-`
+// operator: a `'`, `"` or `\` (after optional whitespace) quotes the
+// delimiter (mirrors the core's detect_heredoc_quoted observable rules).
+func (p *Parser) heredocDelimQuoted() bool {
+	i := p.pos
+	for i < len(p.src) && isWS(p.src[i]) {
+		i++
+	}
+	return i < len(p.src) && (p.src[i] == '\'' || p.src[i] == '"' || p.src[i] == '\\')
+}
+
+// heredocDelimFromWord — mirror heredoc_delim_from_word: a literal or a
+// single-literal interpolation is a usable delimiter.
+func heredocDelimFromWord(w *Word) (string, bool) {
+	switch w.Kind {
+	case "lit":
+		return w.Text, true
+	case "interp":
+		if len(w.Parts) == 1 && w.Parts[0].IsLit {
+			return w.Parts[0].Lit, true
+		}
+	}
+	return "", false
+}
+
+// readHeredocBodies — after a command's redirects are collected, read the
+// body of any pending heredoc redirects. Called from parseCommand (and the
+// pipeline-segment paths) once the whole command line has been parsed.
+func (p *Parser) readHeredocBodies(cmd *Command) error {
+	if cmd == nil {
+		return nil
+	}
+	var rds []*Redirect
+	rds = append(rds, cmd.Redirect...)
+	for c := cmd.Inner; c != nil; c = c.Inner {
+		rds = append(rds, c.Redirect...)
+	}
+	for _, r := range rds {
+		if (r.Op == "heredoc" || r.Op == "heredoc-tabs") && r.HeredocBody == "" {
+			body, err := p.readHeredocBody(r)
+			if err != nil {
+				return err
+			}
+			r.HeredocBody = body
+		}
+	}
+	return nil
+}
+
+// readHeredocBody — read lines from the recorded body start until the
+// delimiter line (exclusive); `<<-` strips leading tabs per line. Mirrors
+// the core's parse_heredoc (delimiter comparison via TrimSpace; EOF without
+// the delimiter returns the collected body).
+func (p *Parser) readHeredocBody(r *Redirect) (string, error) {
+	delim := r.HeredocDelim
+	p.pos = r.HeredocBodyStart
+	var body strings.Builder
+	for !p.eof() {
+		lineEnd := p.pos
+		for lineEnd < len(p.src) && p.src[lineEnd] != '\n' {
+			lineEnd++
+		}
+		line := p.src[p.pos:lineEnd]
+		if strings.TrimSpace(line) == delim {
+			p.pos = lineEnd
+			if p.pos < len(p.src) && p.src[p.pos] == '\n' {
+				p.pos++
+			}
+			return body.String(), nil
+		}
+		if r.Op == "heredoc-tabs" {
+			line = strings.TrimLeft(line, "\t")
+		}
+		body.WriteString(line)
+		if lineEnd < len(p.src) {
+			body.WriteByte('\n')
+			p.pos = lineEnd + 1
+		} else {
+			p.pos = lineEnd
+		}
+	}
+	return body.String(), nil
 }
 
 // normalizeFlags — mirror parser/normalize.rs normalize_combined_flags.

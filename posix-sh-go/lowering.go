@@ -5,10 +5,6 @@ import (
 	"strings"
 )
 
-
-
-
-
 // ─────────────────────────────────────────────────────────────────────
 // IR expressions / statements (mirror shir_json.rs shapes)
 // ─────────────────────────────────────────────────────────────────────
@@ -19,7 +15,10 @@ type StrE struct{ Value, Style string } // style: DoubleQuoted|SingleQuoted|Comm
 type IntE struct{ Value int64 }
 type BoolE struct{ Value bool }
 type VarE struct{ Name string } // not produced by word lowering (only analysis)
-type CallE struct{ Func string; Args []Expr }
+type CallE struct {
+	Func string
+	Args []Expr
+}
 type InterpE struct{ Parts []InterpPartE }
 type InterpPartE struct {
 	IsLit bool
@@ -30,15 +29,24 @@ type ArrayE struct{ Elems []Expr }
 type ObjectE struct {
 	Props []PropE // sorted by key (BTreeMap order)
 }
-type PropE struct{ Key string; Val Expr }
+type PropE struct {
+	Key string
+	Val Expr
+}
 type ArrowE struct{ Body []Stmt }
 type ArithE struct{ Ast ArithAst }
 type JsonE struct{ Value interface{} }
-type BinOpE struct{ Op string; Lhs, Rhs Expr }
+type BinOpE struct {
+	Op       string
+	Lhs, Rhs Expr
+}
 
 type Stmt interface{}
 
-type AssignS struct{ Var string; Expr Expr }
+type AssignS struct {
+	Var  string
+	Expr Expr
+}
 type ExprS struct{ Expr Expr }
 type IfS struct {
 	Cond   Expr
@@ -46,8 +54,15 @@ type IfS struct {
 	Elsifs [][2]interface{} // always empty in our lowering
 	Else   []Stmt
 }
-type WhileS struct{ Cond Expr; Body []Stmt }
-type ForS struct{ Var string; Iter Expr; Body []Stmt }
+type WhileS struct {
+	Cond Expr
+	Body []Stmt
+}
+type ForS struct {
+	Var  string
+	Iter Expr
+	Body []Stmt
+}
 type RedirectS struct {
 	Inner     []Stmt
 	Redirects []RedirectIR
@@ -55,7 +70,10 @@ type RedirectS struct {
 type BlockS struct{ Body []Stmt }
 type BackgroundS struct{ Body []Stmt }
 type SubshellS struct{ Body []Stmt }
-type FunctionS struct{ Name string; Body []Stmt }
+type FunctionS struct {
+	Name string
+	Body []Stmt
+}
 type ReturnS struct{ Value Expr } // nil → null
 type CaseS struct {
 	Disc    Expr
@@ -587,12 +605,28 @@ func forItemIR(w *Word, cmds map[string][]*Command) Expr {
 type ArithAst interface{}
 type ArithNum struct{ Val int64 }
 type ArithVar struct{ Name string }
-type ArithIndex struct{ Var string; Key ArithAst }
-type ArithBin struct{ Op string; Lhs, Rhs ArithAst }
-type ArithUn struct{ Op string; Arg ArithAst }
+type ArithIndex struct {
+	Var string
+	Key ArithAst
+}
+type ArithBin struct {
+	Op       string
+	Lhs, Rhs ArithAst
+}
+type ArithUn struct {
+	Op  string
+	Arg ArithAst
+}
 type ArithCond struct{ Test, Then, Else ArithAst }
-type ArithAssign struct{ Var, Op string; Rhs ArithAst }
-type ArithIncDec struct{ Var string; Delta int64; Prefix bool }
+type ArithAssign struct {
+	Var, Op string
+	Rhs     ArithAst
+}
+type ArithIncDec struct {
+	Var    string
+	Delta  int64
+	Prefix bool
+}
 
 type arithParser struct {
 	src []byte
@@ -1373,6 +1407,10 @@ func stmtForCommand(cmd *Command) Stmt {
 	case "for":
 		items := mergedWordsIR(cmd.Items, func(w *Word) Expr { return forItemIR(w, nil) })
 		return &ForS{Var: cmd.ForVar, Iter: &ArrayE{Elems: items}, Body: bodyStmtsOfList(cmd.ForBody)}
+	case "function":
+		// mirrors Command::Function → IrStmt::Function (body flattened
+		// from the Block, like body_stmts(&Command::Block(..)))
+		return &FunctionS{Name: cmd.FuncName, Body: bodyStmtsOfList(cmd.BodyCmds)}
 	case "pipeline":
 		var stages []Expr
 		for _, c := range cmd.Stages {
@@ -1449,6 +1487,12 @@ func redirectToIR(r *Redirect) RedirectIR {
 		mode, defaultFD = "a", 1
 	case "inout":
 		mode, defaultFD = "r+", 0
+	case "heredoc":
+		mode, defaultFD = "heredoc", 0
+	case "heredoc-tabs":
+		mode, defaultFD = "heredoc-tabs", 0
+	case "herestring":
+		mode, defaultFD = "herestring", 0
 	case "outerr":
 		mode, defaultFD = "w", 2
 	case "inerr":
@@ -1469,10 +1513,17 @@ func redirectToIR(r *Redirect) RedirectIR {
 	var target Expr
 	if isDup {
 		target = st("&" + r.Target.Text)
+	} else if r.Op == "heredoc" || r.Op == "heredoc-tabs" {
+		// the heredoc body IS the target (mirror redirect_to_ir)
+		target = st(r.HeredocBody)
 	} else {
 		target = wordIR(r.Target, nil)
 	}
-	return RedirectIR{FD: fd, Mode: mode, Target: target, Interpolate: true}
+	interp := true
+	if (r.Op == "heredoc" || r.Op == "heredoc-tabs") && r.HeredocQuoted {
+		interp = false
+	}
+	return RedirectIR{FD: fd, Mode: mode, Target: target, Interpolate: interp}
 }
 
 // redirectSpecObject — mirror redirect_spec_object_persist (arrow context).
