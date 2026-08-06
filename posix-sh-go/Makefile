@@ -21,6 +21,10 @@ gen:
 	@exit 1
 
 build:
+	# self-healing: a stale/corrupt output (e.g. an interrupted build leaves
+	# a non-object file) makes `go build -o` refuse to overwrite it and the
+	# gate wedges. Drop it first; the fresh binary is always rebuilt.
+	rm -f posix-sh-go
 	$(GO) build -o posix-sh-go .
 
 test: build
