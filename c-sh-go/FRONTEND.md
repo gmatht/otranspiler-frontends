@@ -3,16 +3,19 @@
 C source -> A1 shIR JSON (the shell-flavored subset of C).
 
 Yours (in THIS dir): the lexer, parser, emitter, tests. The v1 subset
-(t01–t07, all green): printf, int assignments (+=/-=), binary arith,
+(t01–t15, all green): printf, int assignments (+=/-=), binary arith,
 comparisons, if/else, while, for (lowered to the equivalent while — the
-A1 For node is for value-list iteration), function signatures (skipped;
-the body becomes the program), return (skipped), comments, #include.
-
-Scope: per cxx-rust-adequacy.md, shIR is a shell process model — pointers,
-structs, headers, types, arrays-by-value, stdlib calls beyond printf are
-NOT expressible. REFUSE (exit 1) rather than half-parse; every new
-construct lands by pinning the executable shape first (probe: gcc vs
-A1->ESTree->JS) — the executed-stdout oracle in frontends-stdout.sh `c`.
+A1 For node is for value-list iteration; the header may declare its
+counter `for (int i = 1; ...)` and use postfix i++/i--), function
+signatures (skipped; the body becomes the program), return (skipped),
+comments, #include. Stdlib string calls lower to shell-native shapes:
+strlen("lit") folds to the constant length, strlen(x) is the A1
+param("len") `${#x}` idiom, atoi("lit") folds to its integer text,
+atoi(x) is the value itself (the store is string-typed; Arith coerces);
+(int)/(char) casts are identity. Anything else REFUSES (exit 1) —
+refuse > guess; every new construct lands by pinning the executable
+shape first (probe: gcc vs A1->ESTree->JS) — the executed-stdout oracle
+in frontends-stdout.sh `c`.
 
 Shared (do NOT fork): the core (src/shir.rs, ir.rs, estree.rs, parser/);
 harness/frontend-stdout.sh (the `c` lang case); setup_backends.sh (the

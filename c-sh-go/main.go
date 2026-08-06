@@ -131,6 +131,53 @@ func execPrintf(args []any) map[string]any {
 	return map[string]any{"type": "Expr", "expr": call("exec", []any{st("printf"), map[string]any{"elements": args, "type": "Array"}})}
 }
 
+// refuse — unsupported constructs fail loud (refuse > guess).
+func refuse(msg string) {
+	fmt.Fprintln(os.Stderr, "REFUSE: "+msg)
+	os.Exit(1)
+}
+
+// callNode — a C stdlib function-call expression in a VALUE position.
+// The v1 subset implements the pure conversions the shell runtime
+// already models:
+//   strlen(s) — a string LITERAL is a compile-time constant (fold to its
+//     length); a VARIABLE lowers to ${#s} — the A1 param("len", name)
+//     idiom, which the estree renderer lowers to String(v).length for
+//     lifted vars (exact for the NUL-free subset).
+//   atoi(s)  — a literal folds to its integer text (C leading-digit
+//     parse, 0 on failure); a variable IS its value (the store is
+//     string-typed; the Arith nodes coerce).
+// Anything else REFUSES (exit 1) — refuse > guess.
+func callNode(e *expr) any {
+	if len(e.args) != 1 {
+		refuse("unsupported function call " + e.name)
+	}
+	a := e.args[0]
+	switch e.name {
+	case "strlen":
+		if a.kind == "str" {
+			return st(strconv.Itoa(len(a.num)))
+		}
+		if a.kind == "id" {
+			return call("param", []any{st("len"), st(a.name)})
+		}
+	case "atoi":
+		if a.kind == "str" {
+			s := strings.TrimSpace(a.num)
+			n, err := strconv.Atoi(s)
+			if err != nil {
+				n = 0 // C atoi: no leading digits -> 0
+			}
+			return st(strconv.Itoa(n))
+		}
+		if a.kind == "id" {
+			return call("getVar", []any{st(a.name)})
+		}
+	}
+	refuse("unsupported function call " + e.name)
+	return nil
+}
+
 // ── lexer ────────────────────────────────────────────────────────────
 type tok struct{ kind, text string } // id num str op ; { } ( ) , + += - -= * / % ! == != < > <= >= && ||
 
@@ -201,7 +248,7 @@ func lex(src string) ([]tok, error) {
 				two = src[i : i+2]
 			}
 			switch two {
-			case "==", "!=", "<=", ">=", "&&", "||", "+=", "-=":
+			case "==", "!=", "<=", ">=", "&&", "||", "+=", "-=", "++", "--":
 				out = append(out, tok{"op", two})
 				i += 2
 				continue
@@ -248,11 +295,12 @@ func (p *parser) expectOp(s string) error {
 
 // expr: or -> and -> cmp -> add -> mul -> unary -> primary
 type expr struct {
-	kind string // num id bin addr deref str index
+	kind string // num id bin addr deref str index call
 	num  string
 	name string
 	op   string
 	l, r *expr
+	args []*expr // call: the argument expressions
 }
 
 func (p *parser) expr() (*expr, error) { return p.orExpr() }
@@ -405,9 +453,42 @@ func (p *parser) primary() (*expr, error) {
 			}
 			return &expr{kind: "index", l: &expr{kind: "id", name: t.text}, r: idx}, nil
 		}
+		if p.isOp("(") {
+			// id(args) — a function call (strlen / atoi in the v1 subset)
+			p.next()
+			var args []*expr
+			if !p.isOp(")") {
+				for {
+					a, err := p.expr()
+					if err != nil {
+						return nil, err
+					}
+					args = append(args, a)
+					if p.isOp(")") {
+						break
+					}
+					if err := p.expectOp(","); err != nil {
+						return nil, err
+					}
+				}
+			}
+			p.next() // )
+			return &expr{kind: "call", name: t.text, args: args}, nil
+		}
 		return &expr{kind: "id", name: t.text}, nil
 	case "op":
 		if t.text == "(" {
+			// `(int) e` / `(char) e` — a C type cast (identity in the v1
+			// subset: every value is a string in the shell store)
+			if p.p+2 < len(p.ts) {
+				n1, n2 := p.ts[p.p+1], p.ts[p.p+2]
+				if n1.kind == "id" && (n1.text == "int" || n1.text == "char") && n2.kind == "op" && n2.text == ")" {
+					p.next()
+					p.next()
+					p.next()
+					return p.unaryExpr()
+				}
+			}
 			p.next()
 			e, err := p.expr()
 			if err != nil {
@@ -446,6 +527,8 @@ func valueNode(e *expr) any {
 			return call("unsupported", []any{st("raw pointer value use of " + e.name)})
 		}
 		return call("getVar", []any{st(e.name)})
+	case "call":
+		return callNode(e)
 	case "addr":
 		// &x — a handle to x's storage (allocation_id + offset; offset 0)
 		if e.l != nil && e.l.kind == "id" {
@@ -827,10 +910,28 @@ func (p *parser) stmt() (any, error) {
 // ';' (the for header's separators are consumed by the for loop itself).
 func (p *parser) forHeaderAssign() (any, error) {
 	t := p.peek()
+	if t == nil {
+		return nil, nil
+	}
+	// a declaration in the for header: `for (int i = 1; ...)` — the type
+	// keyword is consumed, the declaration lowers like a plain assignment
+	if t.kind == "id" && (t.text == "int" || t.text == "char") {
+		p.next()
+		t = p.peek()
+	}
 	if t == nil || t.kind != "id" {
 		return nil, nil
 	}
 	name := p.next().text
+	if p.isOp("++") || p.isOp("--") {
+		// i++ / i-- — postfix increment, lowered to i = i +/- 1
+		op := p.next().text
+		return p.buildAssign(name, "=", &expr{
+			kind: "bin", op: op[:1],
+			l: &expr{kind: "id", name: name},
+			r: &expr{kind: "num", num: "1"},
+		})
+	}
 	if p.isOp("=") || p.isOp("+=") || p.isOp("-=") {
 		op := p.next().text
 		e, err := p.expr()
@@ -889,6 +990,18 @@ func (p *parser) simpleAssign() (any, error) {
 		}, nil
 	}
 	name := p.next().text
+	if p.isOp("++") || p.isOp("--") {
+		// x++ / x-- — postfix increment (lowered to x = x +/- 1)
+		op := p.next().text
+		if err := p.expectOp(";"); err != nil {
+			return nil, err
+		}
+		return p.buildAssign(name, "=", &expr{
+			kind: "bin", op: op[:1],
+			l: &expr{kind: "id", name: name},
+			r: &expr{kind: "num", num: "1"},
+		})
+	}
 	if p.isOp("=") || p.isOp("+=") || p.isOp("-=") {
 		op := p.next().text
 		e, err := p.expr()
