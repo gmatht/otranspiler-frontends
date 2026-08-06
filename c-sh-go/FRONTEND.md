@@ -54,3 +54,17 @@ Non-static pointers (p passed to a function, p = p + n in a loop) refuse
 
 Worker: ./run_frontend_worker.sh — failure-driven (make test -> pi
 deepseek-v4-turbo -> commit/stash -> trap/escalate).
+
+Out-parameter elimination (harness/outparam_to_returns.py): a function
+whose param is a PURE WRITE-TARGET (memStore through the handle, never
+read, no escape) is transformed per the param's role:
+  write-only  -> the value is ECHOED and the caller CAPTURES it (the shell
+                 value-return channel — fnCall returns STATUS, not values,
+                 so x = $(f) is the faithful form): f(&x) -> x=$(f)
+  read+write  -> PASS-BY-VALUE + return: the caller passes the current
+                 value, the param renumbers: f(&x) -> x=$(f $x)
+  read-only   -> pass-by-value input (no return use)
+Param renumbering is applied when the dropped out-param shifts the
+read-params ($2 -> $1). Verified: fill (pure return, f()) and copy
+(pass-by-value, f(x)) — before (seam) and after (echo+capture) both
+output a=7 b=7; the after has zero mem.* calls.
