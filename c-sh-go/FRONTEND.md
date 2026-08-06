@@ -52,6 +52,16 @@ Verified t11: gcc == estree (20/30/10/99), zero pointer machinery.
 Non-static pointers (p passed to a function, p = p + n in a loop) refuse
 — the seam or a follow-up handles those.
 
+Static alias folding (the zero-cost scalar case): `int *p = &x;` where x
+is a scalar and p never escapes -> p is ELIMINATED — *p reads/writes
+become x directly, the alias chain (`int *q = p`) folds through, and the
+emitted program is exactly as if written without pointers (t12: gcc ==
+estree 5/9, zero mem calls, zero pointer vars). This makes the seam
+unnecessary for the most common scalar-pointer pattern and sidesteps the
+store-vs-lifted-binding problem entirely (the writes ARE the variable).
+Raw pointer-value uses (p == NULL, printf %p) refuse via the unsupported
+marker.
+
 Worker: ./run_frontend_worker.sh — failure-driven (make test -> pi
 deepseek-v4-turbo -> commit/stash -> trap/escalate).
 
