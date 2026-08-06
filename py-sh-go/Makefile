@@ -28,9 +28,17 @@ gen:
 build:
 	$(GO) build -o py-sh-go .
 
-# Byte-equality oracle: for each testdata file, frontend --shir vs
-# debashc --shir (core); the JSON must be byte-equal (the A1 contract).
-test: build
+# Self-heal the ingress-acceptance oracle: a missing core debashc binary
+# (fresh checkout, interrupted core build) wedges the gate as a confusing
+# "FAIL <file> (emit is not valid A1 shIR)". Build it on demand; the
+# oracle is read-only here (mirrors zsh-sh-go/Makefile).
+$(DEBASHC):
+	cd $(abspath ../../sh2perl) && cargo build --bin debashc
+
+# Ingress-acceptance oracle: the emitted A1 shIR JSON must be accepted by
+# the core deserializer (--shir-in-estree); then the executed-stdout gate
+# compares the transpiled run vs native python3.
+test: build $(DEBASHC)
 	@for f in testdata/*.py; do \
 	  bn=$$(basename $$f); \
 	  ./py-sh-go --shir $$f --raw > /tmp/$$bn.mine 2>/dev/null || { echo "FAIL $$bn (frontend emit)"; exit 1; }; \
