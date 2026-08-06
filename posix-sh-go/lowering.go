@@ -26,6 +26,9 @@ type InterpPartE struct {
 	Expr  Expr
 }
 type ArrayE struct{ Elems []Expr }
+// RangeE — the shIR contract's numeric-range For.iterable shape
+// (`for i in $(seq A B)` after the seq-range lift; PLAN §5.6).
+type RangeE struct{ Start, End int64 }
 type ObjectE struct {
 	Props []PropE // sorted by key (BTreeMap order)
 }
@@ -112,7 +115,7 @@ func callPurity(fn string, args []Expr) string {
 	switch fn {
 	case "contains", "join", "brace", "idiv", "imod", "arith", "arithEval",
 		"trimCapture", "dirname", "basename", "not", "guard", "caseMatch",
-		"param", "callDirect":
+		"param", "callDirect", "split":
 		return "PureCpu"
 	case "getVar", "setVar", "setLastExit", "assign", "test", "grepText",
 		"listVar", "setArray", "setArrayAppend", "arrayItems", "arrayKeys",
@@ -581,6 +584,17 @@ func argWordIR(w *Word, cmds map[string][]*Command) Expr {
 			elems = append(elems, st(e))
 		}
 		return call("setArray", []Expr{st(w.ArrayName), &ArrayE{Elems: elems}, &BoolE{Value: false}})
+	case "var":
+		// UNQUOTED pure expansion in exec-arg position (`echo $y`, `set -- $y`)
+		// and for-items: bash field-splits it on IFS into separate args
+		// (mirror core arg_word_ir). A bare Word::Variable is unquoted by
+		// construction — quoted `"$y"` is an interp and never reaches here.
+		// `$@`/`$*` keep the bare read (the runtime's positional-join
+		// semantics, like for_item_ir's listVar arm).
+		if w.VarName != "@" && w.VarName != "*" {
+			return call("split", []Expr{call("getVar", []Expr{st(w.VarName)})})
+		}
+		return wordIR(w, cmds)
 	}
 	return wordIR(w, cmds)
 }
@@ -596,6 +610,251 @@ func forItemIR(w *Word, cmds map[string][]*Command) Expr {
 		}
 	}
 	return argWordIR(w, cmds)
+}
+
+// ── seq-range-for lift (port of transforms/seq_range_for.rs) ──────────
+// `for i in $(seq A B)` → native numeric-range iterable. Conservative on
+// every point (see the core transform's doc): plain integer args, no
+// leading zeros, 1- or 2-arg form, bounded span, and the body must never
+// WRITE the loop var (a counter loop's update would derail the sequence
+// — the materialized word list re-iterates regardless, bash semantics).
+
+const maxSafeInt = int64(1) << 53
+const maxSeqSpan = int64(1_000_000)
+
+func tryLiftSeqRange(iter Expr, body []Stmt, varName string) Expr {
+	// `Array([captureWords(Arrow([Expr(exec("seq", args))]))])` — the
+	// for-items array wrapping a single command-substitution item.
+	ae, ok := iter.(*ArrayE)
+	if !ok || len(ae.Elems) != 1 {
+		return iter
+	}
+	c, ok := ae.Elems[0].(*CallE)
+	if !ok || c.Func != "captureWords" || len(c.Args) != 1 {
+		return iter
+	}
+	ar, ok := c.Args[0].(*ArrowE)
+	if !ok || len(ar.Body) != 1 {
+		return iter
+	}
+	es, ok := ar.Body[0].(*ExprS)
+	if !ok {
+		return iter
+	}
+	ec, ok := es.Expr.(*CallE)
+	if !ok || ec.Func != "exec" || len(ec.Args) != 2 {
+		return iter
+	}
+	name, ok := ec.Args[0].(*StrE)
+	if !ok || name.Value != "seq" {
+		return iter
+	}
+	seqArgs, ok := ec.Args[1].(*ArrayE)
+	if !ok {
+		return iter
+	}
+	var vals []int64
+	for _, a := range seqArgs.Elems {
+		v, ok := seqArgInt(a)
+		if !ok {
+			return iter
+		}
+		vals = append(vals, v)
+	}
+	var start, end int64
+	switch len(vals) {
+	case 1: // `seq LAST` — GNU seq starts at 1
+		start, end = 1, vals[0]
+	case 2: // `seq FIRST LAST` — default step 1
+		start, end = vals[0], vals[1]
+	default: // 3-arg step forms (`seq A S B`), flags, >3 args: keep the
+		// runtime captureWords path (a step would need a stride the
+		// Range node lacks)
+		return iter
+	}
+	if end > start {
+		if end-start > maxSeqSpan {
+			return iter
+		}
+	} else if start-end > maxSeqSpan {
+		return iter
+	}
+	if stmtsWriteVar(body, varName) {
+		return iter
+	}
+	return &RangeE{Start: start, End: end}
+}
+
+// seqArgInt — a seq argument must be a plain integer literal: no floats
+// (locale formatting), no leading zeros (GNU seq pads `01 02 …`; bash
+// arithmetic reads `010` as OCTAL 8), no flags, within double-precision
+// exactness (JS doubles step integers exactly only up to 2^53).
+func seqArgInt(a Expr) (int64, bool) {
+	var s string
+	switch t := a.(type) {
+	case *StrE:
+		s = t.Value
+	case *IntE:
+		if t.Value < -maxSafeInt || t.Value > maxSafeInt {
+			return 0, false
+		}
+		return t.Value, true
+	default:
+		return 0, false
+	}
+	if s == "" || (len(s) > 1 && s[0] == '0') {
+		return 0, false
+	}
+	if len(s) > 2 && strings.HasPrefix(s, "-0") {
+		return 0, false
+	}
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	if v < -maxSafeInt || v > maxSafeInt {
+		return 0, false
+	}
+	return v, true
+}
+
+// ── body-write scan (mirror stmts_write_var / expr_writes_var) ───────
+// a counter loop's `i++` re-reads the binding, so a body that writes the
+// loop var would derail the sequence. Conservative: any assignment /
+// store write / store-writing builtin mentioning the var.
+
+func stmtsWriteVar(stmts []Stmt, varName string) bool {
+	for _, s := range stmts {
+		if stmtWritesVar(s, varName) {
+			return true
+		}
+	}
+	return false
+}
+
+func stmtWritesVar(st Stmt, varName string) bool {
+	switch t := st.(type) {
+	case *AssignS:
+		return t.Var == varName
+	case *ExprS:
+		return exprWritesVar(t.Expr, varName)
+	case *IfS:
+		return stmtsWriteVar(t.Then, varName) || stmtsWriteVar(t.Else, varName)
+	case *WhileS:
+		return stmtsWriteVar(t.Body, varName)
+	case *ForS:
+		// a nested `for var in …` REASSIGNS var in bash (the inner
+		// iteration clobbers the outer binding until the outer body
+		// ends) — count the loop-var binding itself as a write
+		return t.Var == varName || stmtsWriteVar(t.Body, varName)
+	case *CaseS:
+		for _, cl := range t.Clauses {
+			if stmtsWriteVar(cl.Body, varName) {
+				return true
+			}
+		}
+	case *PipelineS:
+		for _, stage := range t.Stages {
+			if stmtsWriteVar(stage, varName) {
+				return true
+			}
+		}
+	case *RedirectS:
+		return stmtsWriteVar(t.Inner, varName)
+	case *BlockS:
+		return stmtsWriteVar(t.Body, varName)
+	case *SubshellS:
+		return stmtsWriteVar(t.Body, varName)
+	case *BackgroundS:
+		return stmtsWriteVar(t.Body, varName)
+	case *FunctionS:
+		return stmtsWriteVar(t.Body, varName)
+	}
+	return false
+}
+
+func exprWritesVar(e Expr, varName string) bool {
+	switch t := e.(type) {
+	case *CallE:
+		// store write: sh2.setVar("var", …)
+		if t.Func == "setVar" {
+			if len(t.Args) > 0 {
+				if n, ok := t.Args[0].(*StrE); ok && n.Value == varName {
+					return true
+				}
+			}
+		}
+		// store-writing builtins: `read i`, `unset i`, `declare -i i`,
+		// `let i=i+1`, `eval 'i=…'` — the runtime writes the named vars
+		// into the store. Conservative: the var name appearing as an
+		// exact arg (`read i`) or as an identifier inside a
+		// `let`/`eval` expression (`let i=i+1`) counts.
+		if t.Func == "exec" || t.Func == "builtin" {
+			if len(t.Args) > 1 {
+				if n, ok := t.Args[0].(*StrE); ok && isStoreWriter(n.Value) {
+					if arr, ok2 := t.Args[1].(*ArrayE); ok2 {
+						for _, a := range arr.Elems {
+							if w, ok3 := a.(*StrE); ok3 {
+								if n.Value == "let" || n.Value == "eval" {
+									if containsIdent(w.Value, varName) {
+										return true
+									}
+								} else if w.Value == varName {
+									return true
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		for _, a := range t.Args {
+			if exprWritesVar(a, varName) {
+				return true
+			}
+		}
+	case *ArrowE:
+		return stmtsWriteVar(t.Body, varName)
+	}
+	return false
+}
+
+func isStoreWriter(name string) bool {
+	switch name {
+	case "read", "readarray", "mapfile", "unset", "let", "eval",
+		"declare", "typeset", "local":
+		return true
+	}
+	return false
+}
+
+// containsIdent — does `s` contain `var` as a standalone identifier
+// (word-boundary delimited)? For `let 'i=i+1'` / `eval 'i=$x'` arg strings.
+func containsIdent(s, varName string) bool {
+	if varName == "" {
+		return false
+	}
+	for _, c := range varName {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_') {
+			return false
+		}
+	}
+	i := 0
+	for i < len(s) {
+		c := s[i]
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '_' {
+			start := i
+			for i < len(s) && (s[i] >= 'a' && s[i] <= 'z' || s[i] >= 'A' && s[i] <= 'Z' || s[i] >= '0' && s[i] <= '9' || s[i] == '_') {
+				i++
+			}
+			if s[start:i] == varName {
+				return true
+			}
+		} else {
+			i++
+		}
+	}
+	return false
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1406,7 +1665,8 @@ func stmtForCommand(cmd *Command) Stmt {
 		return &WhileS{Cond: cond, Body: bodyStmtsOfList(cmd.Body)}
 	case "for":
 		items := mergedWordsIR(cmd.Items, func(w *Word) Expr { return forItemIR(w, nil) })
-		return &ForS{Var: cmd.ForVar, Iter: &ArrayE{Elems: items}, Body: bodyStmtsOfList(cmd.ForBody)}
+		body := bodyStmtsOfList(cmd.ForBody)
+		return &ForS{Var: cmd.ForVar, Iter: tryLiftSeqRange(&ArrayE{Elems: items}, body, cmd.ForVar), Body: body}
 	case "function":
 		// mirrors Command::Function → IrStmt::Function (body flattened
 		// from the Block, like body_stmts(&Command::Block(..)))

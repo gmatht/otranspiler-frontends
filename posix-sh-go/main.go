@@ -1669,15 +1669,39 @@ func (p *Parser) isAssignmentStart() bool {
 	// NB: `x-=2` lexes as Ident("x-") + Assign — the `*?-` chars stay in
 	// the name; only `=`, `+=`, `/=` and `%=` can follow the run
 	after := byte(0)
-	if save+len(run) < len(p.src) {
-		after = p.src[save+len(run)]
+	idx := save + len(run)
+	if idx < len(p.src) {
+		after = p.src[idx]
+	}
+	if after == '[' {
+		// balanced `[...]` index suffix — `arr[1]=X`, `map[k]=v` (mirror
+		// parse_assignment_target's index suffix)
+		depth := 1
+		idx++
+		for idx < len(p.src) && depth > 0 {
+			if p.src[idx] == '[' {
+				depth++
+			}
+			if p.src[idx] == ']' {
+				depth--
+			}
+			idx++
+		}
+		if depth != 0 {
+			p.pos = save
+			return false
+		}
+		after = 0
+		if idx < len(p.src) {
+			after = p.src[idx]
+		}
 	}
 	if after == '=' {
 		p.pos = save
 		return true
 	}
 	if after == '+' || after == '/' || after == '%' {
-		if save+len(run)+1 < len(p.src) && p.src[save+len(run)+1] == '=' {
+		if idx+1 < len(p.src) && p.src[idx+1] == '=' {
 			p.pos = save
 			return true
 		}
@@ -1694,6 +1718,27 @@ func (p *Parser) parseStandaloneAssignment() (*Command, error) {
 	envOps := map[string]string{}
 	for {
 		name := p.scanIdentRun()
+		if p.peek() == '[' {
+			// indexed target `arr[1]=X`: keep the raw `arr[1]` name (the
+			// core's parse_assignment_target appends the bracket suffix)
+			var sb strings.Builder
+			sb.WriteString(name)
+			sb.WriteByte('[')
+			p.pos++
+			depth := 1
+			for !p.eof() && depth > 0 {
+				c := p.peek()
+				sb.WriteByte(c)
+				if c == '[' {
+					depth++
+				}
+				if c == ']' {
+					depth--
+				}
+				p.pos++
+			}
+			name = sb.String()
+		}
 		op := "="
 		if p.starts("+=") || p.starts("/=") || p.starts("%=") {
 			op = p.src[p.pos : p.pos+2]
@@ -3326,11 +3371,19 @@ func (p *Parser) parseArrayElems() ([]string, error) {
 			p.pos++
 			return elems, nil
 		}
-		w, err := p.parseWord()
-		if err != nil {
+		// RAW source text per element (mirror parse_array_elements' raw
+		// Vec<String>): parseWord loses the source for `$x`-style words
+		// (Text is empty), so slice the source and strip the quotes —
+		// quoted elements keep their inner text (`"a b"` → `a b`).
+		start := p.pos
+		if _, err := p.parseWord(); err != nil {
 			return nil, err
 		}
-		elems = append(elems, w.Text)
+		raw := strings.TrimSpace(p.src[start:p.pos])
+		if len(raw) >= 2 && ((raw[0] == '"' && raw[len(raw)-1] == '"') || (raw[0] == '\'' && raw[len(raw)-1] == '\'')) {
+			raw = raw[1 : len(raw)-1]
+		}
+		elems = append(elems, raw)
 	}
 }
 
