@@ -32,6 +32,12 @@ var addrTaken = map[string]bool{}
 // becomes (array, index) and every use folds to direct array indexing;
 // the pointer variable is compile-time only, never emitted.
 var arrayVars = map[string]bool{}
+// scalarAliases — STATIC ALIAS FOLDING for scalars: `int *p = &x;` where
+// x is a scalar and p never escapes -> p is ELIMINATED; *p reads/writes
+// become x directly (zero pointer machinery, zero mem calls). The alias
+// chain (`int *q = p;`) folds too. Raw pointer-value uses (p == NULL,
+// printf("%p", p)) refuse via the unsupported marker.
+var scalarAliases = map[string]string{}
 var ptrTargets = map[string]ptrTarget{}
 
 type ptrTarget struct {
@@ -76,6 +82,34 @@ func foldIndex(e *expr) (int, bool) {
 	return 0, false
 }
 
+// recordPtrTarget — for a pointer variable `name` initialized with expr e:
+// array target -> ptrTargets; scalar &x -> scalarAliases; pointer copy
+// (p = q) -> chase the existing alias. Returns true if recorded (emit nothing).
+func recordPtrTarget(name string, e *expr) bool {
+	if e == nil {
+		return false
+	}
+	if t, ok := ptrTargetFromExpr(e); ok {
+		ptrTargets[name] = t
+		return true
+	}
+	if e.kind == "addr" && e.l != nil && e.l.kind == "id" && !arrayVars[e.l.name] {
+		scalarAliases[name] = e.l.name
+		return true
+	}
+	if e.kind == "id" {
+		if t, ok := scalarAliases[e.name]; ok {
+			scalarAliases[name] = t
+			return true
+		}
+		if t, ok := ptrTargets[e.name]; ok {
+			ptrTargets[name] = t
+			return true
+		}
+	}
+	return false
+}
+
 // charPtrVars — `char *name` declarations: the POINTER-TO-STRING lowering.
 // A char* is lowered to the string itself — no mem.* handles, no arena:
 //   &"lit"     -> the literal string
@@ -86,9 +120,6 @@ func foldIndex(e *expr) (int, bool) {
 var charPtrVars = map[string]bool{}
 
 func assignStmt(name string, expr any) map[string]any {
-	if addrTaken[name] {
-		return map[string]any{"type": "Expr", "expr": call("setVar", []any{st(name), expr})}
-	}
 	return map[string]any{
 		"expr":    expr,
 		"targets": []any{map[string]any{"indices": []any{}, "sigil": nil, "var": name}},
@@ -411,6 +442,9 @@ func valueNode(e *expr) any {
 	case "str":
 		return st(e.num)
 	case "id":
+		if _, ok := scalarAliases[e.name]; ok {
+			return call("unsupported", []any{st("raw pointer value use of " + e.name)})
+		}
 		return call("getVar", []any{st(e.name)})
 	case "addr":
 		// &x — a handle to x's storage (allocation_id + offset; offset 0)
@@ -419,8 +453,11 @@ func valueNode(e *expr) any {
 		}
 		return call("addrOf", []any{valueNode(e.l)})
 	case "deref":
-		// *p on a static pointer-into-array — reduce to arrayIndex(arr, base)
+		// *p on a statically-aliased scalar — the alias folding: direct read
 		if e.l != nil && e.l.kind == "id" {
+			if t, ok := scalarAliases[e.l.name]; ok {
+				return call("getVar", []any{st(t)})
+			}
 			if t, ok := ptrTargets[e.l.name]; ok {
 				return call("arrayIndex", []any{st(t.arr), st(strconv.Itoa(t.base))})
 			}
@@ -630,14 +667,9 @@ func (p *parser) stmt() (any, error) {
 			if err := p.expectOp(";"); err != nil {
 				return nil, err
 			}
-			// pointer-to-array reduction: the pointer's target is static —
-			// record (array, base) and emit NOTHING (compile-time only)
-			if t, ok := ptrTargetFromExpr(e); ok {
-				ptrTargets[name.text] = t
-				return nil, nil
-			}
-			if isPtr && e.kind == "id" && arrayVars[e.name] {
-				ptrTargets[name.text] = ptrTarget{arr: e.name, base: 0}
+			// static pointer target (array / scalar alias / copy): the pointer
+			// is compile-time only — emit NOTHING
+			if isPtr && recordPtrTarget(name.text, e) {
 				return nil, nil
 			}
 			return assignStmt(name.text, valueNode(e)), nil
@@ -839,9 +871,14 @@ func (p *parser) simpleAssign() (any, error) {
 		if err := p.expectOp(";"); err != nil {
 			return nil, err
 		}
-		// *p = v on a static pointer-into-array — reduce to the baked-name
-		// array assign (the core's arr[1]=x shape; the runtime handles it)
+		// *p = v on a statically-aliased scalar — the alias folding: a direct
+		// assignment to the aliased var
 		if target != nil && target.kind == "id" {
+			if t, ok := scalarAliases[target.name]; ok {
+				return assignStmt(t, valueNode(e)), nil
+			}
+			// *p = v on a static pointer-into-array — reduce to the baked-name
+			// array assign (the core's arr[1]=x shape; the runtime handles it)
 			if t, ok := ptrTargets[target.name]; ok {
 				return assignStmt(t.arr+"["+strconv.Itoa(t.base)+"]", valueNode(e)), nil
 			}
@@ -861,11 +898,8 @@ func (p *parser) simpleAssign() (any, error) {
 		if err := p.expectOp(";"); err != nil {
 			return nil, err
 		}
-		if op == "=" {
-			if t, ok := ptrTargetFromExpr(e); ok {
-				ptrTargets[name] = t
-				return nil, nil
-			}
+		if op == "=" && recordPtrTarget(name, e) {
+			return nil, nil
 		}
 		return p.buildAssign(name, op, e)
 	}
@@ -891,6 +925,58 @@ func (p *parser) block() ([]any, error) {
 		return nil, err
 	}
 	return body, nil
+}
+
+// applyStoreRouting — after the whole program is parsed (and the pointer
+// folding is fully known), route the assignments of address-taken vars
+// that were NOT folded (their storage is still reachable through the
+// mem.* seam, which reads/writes the sh2 store — a native JS binding
+// would be invisible to it) through setVar. Folded vars keep the native
+// Assign stmt: the alias writes ARE the variable, so no store is needed.
+func applyStoreRouting(stmts []any) []any {
+	folded := map[string]bool{}
+	for _, v := range scalarAliases {
+		folded[v] = true
+	}
+	for _, t := range ptrTargets {
+		folded[t.arr] = true
+	}
+	var walk func([]any) []any
+	walk = func(ss []any) []any {
+		if len(ss) == 0 {
+			return []any{}
+		}
+		var out []any
+		for _, sx := range ss {
+			m, ok := sx.(map[string]any)
+			if !ok {
+				out = append(out, st)
+				continue
+			}
+			if m["type"] == "Assign" {
+				tgts, _ := m["targets"].([]any)
+				if len(tgts) > 0 {
+					t0, _ := tgts[0].(map[string]any)
+					if v, _ := t0["var"].(string); v != "" && addrTaken[v] && !folded[v] {
+						out = append(out, map[string]any{
+							"type": "Expr",
+							"expr": call("setVar", []any{st(v), m["expr"]}),
+						})
+						continue
+					}
+				}
+			}
+			// recurse into compound stmts (if/while/block bodies)
+			for _, key := range []string{"then", "else", "body"} {
+				if b, ok := m[key].([]any); ok {
+					m[key] = walk(b)
+				}
+			}
+			out = append(out, sx)
+		}
+		return out
+	}
+	return walk(stmts)
 }
 
 // ── main ─────────────────────────────────────────────────────────────
@@ -929,6 +1015,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "REFUSE: "+err.Error())
 		os.Exit(1)
 	}
+	stmts = applyStoreRouting(stmts)
 	prog := map[string]any{
 		"type":             "Program",
 		"contract_version": 1,
