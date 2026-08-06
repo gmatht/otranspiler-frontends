@@ -1,0 +1,2 @@
+# built artifact (mirror posix-sh-go convention: never commit the binary)
+/zsh-sh-go
