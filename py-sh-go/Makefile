@@ -28,12 +28,16 @@ gen:
 build:
 	$(GO) build -o py-sh-go .
 
-# Self-heal the ingress-acceptance oracle: a missing core debashc binary
-# (fresh checkout, interrupted core build) wedges the gate as a confusing
-# "FAIL <file> (emit is not valid A1 shIR)". Build it on demand; the
-# oracle is read-only here (mirrors zsh-sh-go/Makefile).
-$(DEBASHC):
-	cd $(abspath ../../sh2perl) && cargo build --bin debashc
+# Self-heal the ingress-acceptance oracle: a missing OR STALE core
+# debashc binary wedges the gate as a confusing "FAIL <file> (emit is
+# not valid A1 shIR)". Rebuild it on demand whenever the checked-out
+# core sources are newer than the binary (the estree worker's cargo
+# build may replace target/debug/debashc mid-gate — see the retry in
+# `test` below); the oracle is read-only here (mirrors zsh-sh-go/Makefile).
+CORE ?= $(abspath ../../sh2perl)
+CORE_SRC := $(wildcard $(CORE)/src/*.rs $(CORE)/src/parser/*.rs)
+$(DEBASHC): $(CORE_SRC)
+	cd $(CORE) && cargo build --bin debashc
 
 # Ingress-acceptance oracle: the emitted A1 shIR JSON must be accepted by
 # the core deserializer (--shir-in-estree); then the executed-stdout gate
@@ -49,8 +53,18 @@ test: build $(DEBASHC)
 	  if $(DEBASHC) --shir-in-estree /tmp/$$bn.mine > /dev/null 2>&1; then \
 	    echo "OK $$bn (valid A1 shIR — the core deserializer accepts it)"; \
 	  else \
-	    echo "FAIL $$bn (emit is not valid A1 shIR — the gap the worker fixes)"; \
-	    exit 1; \
+	    st=$$?; \
+	    # One retry: a concurrent core rebuild may replace the binary \
+	    # mid-gate (exec failure / crash -> exit 126/127/>=128), which \
+	    # is NOT an emit defect. A genuine rejection (exit 1) fails \
+	    # the retry too, so nothing is masked. \
+	    sleep 1; \
+	    if $(DEBASHC) --shir-in-estree /tmp/$$bn.mine > /dev/null 2>&1; then \
+	      echo "OK $$bn (valid A1 shIR — first probe exit $$st, transient oracle hiccup, retry accepted)"; \
+	    else \
+	      echo "FAIL $$bn (emit is not valid A1 shIR — the gap the worker fixes; first probe exit $$st)"; \
+	      exit 1; \
+	    fi; \
 	  fi; \
 	done
 	@echo "--- executed-stdout comparison (native vs JS/ESTree) ---"
