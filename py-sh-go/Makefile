@@ -1,9 +1,11 @@
 # py-sh-go: Python source -> shIR JSON (A1 contract), ANTLR4+Go.
-# INITIAL VERSION: the hand-rolled stub parser in main.go handles the v1
-# shell-flavored subset; `build` compiles it (the antlr4 generation from
-# grammars/Python3Lexer.g4 + Python3Parser.g4 is the WORKER's job — it is
-# not a build blocker). `test` runs the BYTE-EQUALITY ORACLE: the frontend
-# emit must byte-match the core's `debashc --shir` for the same source.
+# The hand-rolled recursive-descent parser + lowerer in main.go handles the
+# v1 shell-flavored Python subset (the t01-t52 language-ladder corpus);
+# `build` compiles it (the antlr4 generation from grammars/Python3Lexer.g4
+# + Python3Parser.g4 is the WORKER's job — it is not a build blocker).
+# `test` runs the INGRESS-ACCEPTANCE oracle (the core deserializer must
+# accept the emitted A1) + the EXECUTED-STDOUT gate: the transpiled
+# ESTree run's stdout must match the native python3 run for every test.
 # A passing test = real progress (correct output); a mismatch = the gap
 # the worker's pi should fix.
 
