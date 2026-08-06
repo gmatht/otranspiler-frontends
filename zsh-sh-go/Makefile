@@ -36,7 +36,13 @@ build:
 # byte-equality (executed-stdout is the semantic anchor; byte-equality is
 # only a conformance net where the core parses faithfully). `${#x}` /
 # `${#a[@]}` (length) have no subscript and stay byte-compared.
-test: build
+# Self-heal the byte-equality oracle too: a missing core debashc binary
+# (fresh checkout, interrupted core build) wedges the gate as a confusing
+# "FAIL <file> (core)". Build it on demand; the oracle is read-only here.
+$(DEBASHC):
+	cd $(abspath ../../sh2perl) && cargo build --bin debashc
+
+test: build $(DEBASHC)
 	@for f in testdata/*.zsh; do \
 	  bn=$$(basename $$f); \
 	  ./zsh-sh-go --shir $$f --raw > /tmp/$$bn.mine 2>/dev/null || { echo "FAIL $$bn (frontend)"; exit 1; }; \

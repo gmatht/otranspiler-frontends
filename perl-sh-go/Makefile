@@ -16,6 +16,13 @@ GO ?= /snap/go/current/bin/go
 
 all: build
 
+# The ingress oracle (--shir-in-estree) is the core's debashc binary,
+# normally built by the estree worker. Build it when missing so this
+# gate is self-sufficient (cargo's file lock serializes concurrent
+# builds; a no-op when already present).
+$(DEBASHC):
+	cd ../../sh2perl && cargo build --bin debashc
+
 # TODO: generate the Go parser from grammars/Perl.g4 (the worker wires
 # this via pi/deepseek-v4-flash). The stub in main.go is the initial impl.
 gen:
@@ -25,7 +32,7 @@ gen:
 build:
 	$(GO) build -o perl-sh-go .
 
-test: build
+test: build $(DEBASHC)
 	@for f in testdata/*.pl; do \
 	  bn=$$(basename $$f); \
 	  ./perl-sh-go --shir $$f --raw > /tmp/$$bn.mine 2>/dev/null || { echo "FAIL $$bn (frontend emit)"; exit 1; }; \

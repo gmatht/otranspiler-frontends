@@ -34,6 +34,7 @@ type PropE struct {
 	Val Expr
 }
 type ArrowE struct{ Body []Stmt }
+type RangeE struct{ Start, End int64 } // numeric-range For.iterable (the seq_range_for transform)
 type ArithE struct{ Ast ArithAst }
 type JsonE struct{ Value interface{} }
 type BinOpE struct {
@@ -112,7 +113,7 @@ func callPurity(fn string, args []Expr) string {
 	switch fn {
 	case "contains", "join", "brace", "idiv", "imod", "arith", "arithEval",
 		"trimCapture", "dirname", "basename", "not", "guard", "caseMatch",
-		"param", "callDirect":
+		"split", "param", "callDirect":
 		return "PureCpu"
 	case "getVar", "setVar", "setLastExit", "assign", "test", "grepText",
 		"listVar", "setArray", "setArrayAppend", "arrayItems", "arrayKeys",
@@ -140,6 +141,362 @@ func callPurity(fn string, args []Expr) string {
 
 func call(fn string, args []Expr) *CallE { return &CallE{Func: fn, Args: args} }
 func st(s string) *StrE                  { return &StrE{Value: s, Style: "DoubleQuoted"} }
+
+// ── seq-range-for transform (mirror transforms/seq_range_for.rs) ─────
+// `for i in $(seq A B)` → native numeric range loop: rewrites the
+// captureWords for-item to a bare Range iterable. Runs after
+// optimizeStmts, before the A2 analyses (mirror ast_to_ir).
+
+const maxSafeInt = int64(1) << 53
+const maxSeqSpan = int64(1_000_000)
+
+func applyTransforms(stmts []Stmt) bool {
+	changed := false
+	for _, s := range stmts {
+		changed = transformStmt(s) || changed
+	}
+	return changed
+}
+
+func transformStmts(stmts []Stmt) bool {
+	changed := false
+	for _, s := range stmts {
+		changed = transformStmt(s) || changed
+	}
+	return changed
+}
+
+func transformStmt(st Stmt) bool {
+	switch t := st.(type) {
+	case *ForS:
+		changed := transformStmts(t.Body)
+		if start, end, ok := seqRangeBounds(t.Iter); ok && !stmtsWriteVar(t.Body, t.Var) {
+			// A BARE Range — the shIR contract's numeric-range For.iterable
+			// shape (PLAN §5.6): the backend matches Range directly.
+			t.Iter = &RangeE{Start: start, End: end}
+			changed = true
+		}
+		return changed
+	case *WhileS:
+		return transformStmts(t.Body)
+	case *BlockS:
+		return transformStmts(t.Body)
+	case *SubshellS:
+		return transformStmts(t.Body)
+	case *BackgroundS:
+		return transformStmts(t.Body)
+	case *FunctionS:
+		return transformStmts(t.Body)
+	case *IfS:
+		changed := transformStmts(t.Then) || transformStmts(t.Else)
+		for _, pair := range t.Elsifs {
+			if b, ok := pair[1].([]Stmt); ok {
+				changed = transformStmts(b) || changed
+			}
+		}
+		return changed
+	case *PipelineS:
+		changed := false
+		for _, stage := range t.Stages {
+			changed = transformStmts(stage) || changed
+		}
+		return changed
+	case *RedirectS:
+		return transformStmts(t.Inner)
+	case *CaseS:
+		changed := false
+		for _, cl := range t.Clauses {
+			changed = transformStmts(cl.Body) || changed
+		}
+		return changed
+	case *ExprS:
+		return transformExpr(t.Expr)
+	case *AssignS:
+		return transformExpr(t.Expr)
+	}
+	return false
+}
+
+func transformExpr(e Expr) bool {
+	switch t := e.(type) {
+	case *ArrowE:
+		return transformStmts(t.Body)
+	case *CallE:
+		changed := false
+		for _, a := range t.Args {
+			changed = transformExpr(a) || changed
+		}
+		return changed
+	case *ArrayE:
+		changed := false
+		for _, a := range t.Elems {
+			changed = transformExpr(a) || changed
+		}
+		return changed
+	case *ObjectE:
+		changed := false
+		for _, p := range t.Props {
+			changed = transformExpr(p.Val) || changed
+		}
+		return changed
+	}
+	return false
+}
+
+// seqRangeBounds — the `[lo, hi]` integer bounds when `iter` is the
+// `$(seq …)` capture shape: `Array([captureWords(Arrow([Expr(exec("seq",
+// args))]))])` (for-items array wrapping a single command-substitution
+// item) or the bare call. Nothing else matches.
+func seqRangeBounds(iter Expr) (int64, int64, bool) {
+	var call *CallE
+	switch t := iter.(type) {
+	case *ArrayE:
+		if len(t.Elems) != 1 {
+			return 0, 0, false
+		}
+		c, ok := t.Elems[0].(*CallE)
+		if !ok {
+			return 0, 0, false
+		}
+		call = c
+	case *CallE:
+		call = t
+	default:
+		return 0, 0, false
+	}
+	if call.Func != "captureWords" {
+		return 0, 0, false
+	}
+	// exactly one statement in the capture: `exec("seq", args)`
+	if len(call.Args) != 1 {
+		return 0, 0, false
+	}
+	arrow, ok := call.Args[0].(*ArrowE)
+	if !ok || len(arrow.Body) != 1 {
+		return 0, 0, false
+	}
+	es, ok := arrow.Body[0].(*ExprS)
+	if !ok {
+		return 0, 0, false
+	}
+	ec, ok := es.Expr.(*CallE)
+	if !ok || ec.Func != "exec" {
+		return 0, 0, false
+	}
+	// bare exec: name + arg array only (env/redirects disqualify)
+	if len(ec.Args) != 2 {
+		return 0, 0, false
+	}
+	name, ok := ec.Args[0].(*StrE)
+	if !ok || name.Value != "seq" {
+		return 0, 0, false
+	}
+	seqArgs, ok := ec.Args[1].(*ArrayE)
+	if !ok {
+		return 0, 0, false
+	}
+	vals := make([]int64, 0, len(seqArgs.Elems))
+	for _, a := range seqArgs.Elems {
+		v, ok := seqArgInt(a)
+		if !ok {
+			return 0, 0, false
+		}
+		vals = append(vals, v)
+	}
+	switch len(vals) {
+	case 1: // `seq LAST` — GNU seq starts at 1
+		return rangeBounds(1, vals[0])
+	case 2: // `seq FIRST LAST` — default step 1
+		return rangeBounds(vals[0], vals[1])
+	}
+	// 3-arg step forms (`seq A S B`), flags, >3 args: keep the runtime
+	// path (a step would need a stride the Range node lacks)
+	return 0, 0, false
+}
+
+func rangeBounds(start, end int64) (int64, int64, bool) {
+	span := end - start
+	if span < 0 {
+		span = -span
+	}
+	if span <= maxSeqSpan {
+		return start, end, true
+	}
+	return 0, 0, false
+}
+
+// A seq argument must be a plain integer literal: no floats (locale
+// formatting), no leading zeros (GNU seq pads `01 02 …`; bash arithmetic
+// reads `010` as OCTAL 8), no flags, within double-precision exactness.
+func seqArgInt(a Expr) (int64, bool) {
+	var s string
+	switch t := a.(type) {
+	case *StrE:
+		s = t.Value
+	case *IntE:
+		u := t.Value
+		if u < 0 {
+			u = -u
+		}
+		if u <= maxSafeInt {
+			return t.Value, true
+		}
+		return 0, false
+	default:
+		return 0, false
+	}
+	if s == "" || (len(s) > 1 && strings.HasPrefix(s, "0")) {
+		return 0, false
+	}
+	if strings.HasPrefix(s, "-") && len(s) > 2 && strings.HasPrefix(s, "-0") {
+		return 0, false // -01: same octal/padding concern
+	}
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	u := v
+	if u < 0 {
+		u = -u
+	}
+	if u <= maxSafeInt {
+		return v, true
+	}
+	return 0, false
+}
+
+// ── body-write scan: a counter loop's `i++` re-reads the binding, so a
+// body that writes the loop var would derail the sequence (the
+// materialized word list re-iterates regardless — bash semantics).
+// Conservative: any assignment / store write / store-writing builtin
+// mentioning the var.
+
+func stmtsWriteVar(stmts []Stmt, v string) bool {
+	for _, s := range stmts {
+		if stmtWritesVar(s, v) {
+			return true
+		}
+	}
+	return false
+}
+
+func stmtWritesVar(st Stmt, v string) bool {
+	switch t := st.(type) {
+	case *AssignS:
+		return t.Var == v // plain scalar targets only (indices empty by construction)
+	case *ExprS:
+		return exprWritesVar(t.Expr, v)
+	case *IfS:
+		return stmtsWriteVar(t.Then, v) || stmtsWriteVar(t.Else, v)
+	case *WhileS:
+		return stmtsWriteVar(t.Body, v)
+	case *BlockS:
+		return stmtsWriteVar(t.Body, v)
+	case *SubshellS:
+		return stmtsWriteVar(t.Body, v)
+	case *BackgroundS:
+		return stmtsWriteVar(t.Body, v)
+	case *FunctionS:
+		return stmtsWriteVar(t.Body, v)
+	case *ForS:
+		// a nested `for var in …` REASSIGNS var in bash (the inner
+		// iteration clobbers the outer binding) — count the loop-var
+		// binding itself as a write
+		return t.Var == v || stmtsWriteVar(t.Body, v)
+	case *CaseS:
+		for _, cl := range t.Clauses {
+			if stmtsWriteVar(cl.Body, v) {
+				return true
+			}
+		}
+		return false
+	case *PipelineS:
+		for _, stage := range t.Stages {
+			if stmtsWriteVar(stage, v) {
+				return true
+			}
+		}
+		return false
+	case *RedirectS:
+		return stmtsWriteVar(t.Inner, v)
+	}
+	return false
+}
+
+func exprWritesVar(e Expr, v string) bool {
+	switch t := e.(type) {
+	case *CallE:
+		// store write: sh2.setVar("var", …)
+		if t.Func == "setVar" && len(t.Args) > 0 {
+			if n, ok := t.Args[0].(*StrE); ok && n.Value == v {
+				return true
+			}
+		}
+		// store-writing builtins: `read i`, `unset i`, `let i=i+1`, …
+		if (t.Func == "exec" || t.Func == "builtin") && len(t.Args) > 0 {
+			if n, ok := t.Args[0].(*StrE); ok {
+				switch n.Value {
+				case "read", "readarray", "mapfile", "unset", "let", "eval",
+					"declare", "typeset", "local":
+					if len(t.Args) > 1 {
+						if wargs, ok := t.Args[1].(*ArrayE); ok {
+							for _, a := range wargs.Elems {
+								if w, ok := a.(*StrE); ok {
+									if n.Value == "let" || n.Value == "eval" {
+										if containsIdent(w.Value, v) {
+											return true
+										}
+									} else if w.Value == v {
+										return true
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		for _, a := range t.Args {
+			if exprWritesVar(a, v) {
+				return true
+			}
+		}
+		return false
+	case *ArrowE:
+		return stmtsWriteVar(t.Body, v)
+	}
+	return false
+}
+
+// containsIdent — does `s` contain `var` as a standalone identifier
+// (word-boundary delimited)? For `let 'i=i+1'` / `eval 'i=$x'` arg strings.
+func containsIdent(s, v string) bool {
+	if v == "" {
+		return false
+	}
+	for _, c := range v {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_') {
+			return false
+		}
+	}
+	i := 0
+	b := []byte(s)
+	for i < len(b) {
+		c := b[i]
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '_' {
+			start := i
+			for i < len(b) && (b[i] >= 'a' && b[i] <= 'z' || b[i] >= 'A' && b[i] <= 'Z' || b[i] >= '0' && b[i] <= '9' || b[i] == '_') {
+				i++
+			}
+			if string(b[start:i]) == v {
+				return true
+			}
+		} else {
+			i++
+		}
+	}
+	return false
+}
 
 // ─────────────────────────────────────────────────────────────────────
 // quote removal (mirror shell_quote_removal)
@@ -615,6 +972,16 @@ func argWordIR(w *Word, cmds map[string][]*Command) Expr {
 			return st(globMagic + s2)
 		}
 		return st(s2)
+	// UNQUOTED pure expansion in exec-arg position (`echo $y`, `set -- $y`):
+	// bash field-splits it on IFS into separate args. A bare Kind "var" is
+	// unquoted by construction — quoted `"$y"` and `pre$y` merge into
+	// "interp" and keep the bare getVar (mirror shir.rs arg_word_ir). `$@`/
+	// `$*` keep the bare read (positional-join semantics).
+	case "var":
+		if w.VarName != "@" && w.VarName != "*" {
+			return call("split", []Expr{call("getVar", []Expr{st(w.VarName)})})
+		}
+		return call("getVar", []Expr{st(w.VarName)})
 	case "array":
 		var elems []Expr
 		for _, e := range w.ArrayElems {

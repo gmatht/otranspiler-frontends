@@ -1668,7 +1668,8 @@ func (p *Parser) parseCommandBase() (*Command, error) {
 
 // isAssignmentStart — Identifier immediately followed by `=`/`+=` (a
 // plain, non-keyword identifier): parse_command dispatches these to
-// parse_standalone_assignment.
+// parse_standalone_assignment. `ident[..]=` (array-element write, the
+// index baked into the name) also counts.
 func (p *Parser) isAssignmentStart() bool {
 	if p.eof() || !isIdentStart(p.peek()) {
 		return false
@@ -1681,26 +1682,56 @@ func (p *Parser) isAssignmentStart() bool {
 			return false
 		}
 	}
-	// the operator must IMMEDIATELY follow the identifier run
-	// (scanIdentRun advanced p.pos — measure from `save`)
-	// NB: `x-=2` lexes as Ident("x-") + Assign — the `*?-` chars stay in
-	// the name; only `=`, `+=`, `/=` and `%=` can follow the run
+	if p.peek() == '[' {
+		// consume the bracket index (zsh-normalized — see scanBracketName)
+		p.scanBracketName(run)
+	}
+	// the operator must IMMEDIATELY follow the name
+	// (scanIdentRun/scanBracketName advanced p.pos — measure from there)
 	after := byte(0)
-	if save+len(run) < len(p.src) {
-		after = p.src[save+len(run)]
+	if p.pos < len(p.src) {
+		after = p.src[p.pos]
 	}
 	if after == '=' {
 		p.pos = save
 		return true
 	}
 	if after == '+' || after == '/' || after == '%' {
-		if save+len(run)+1 < len(p.src) && p.src[save+len(run)+1] == '=' {
+		if p.pos+1 < len(p.src) && p.src[p.pos+1] == '=' {
 			p.pos = save
 			return true
 		}
 	}
 	p.pos = save
 	return false
+}
+
+// scanBracketName — `ident[...]`: consume the bracket index and return
+// the full assignment-target name with the index baked in (`a[2]`). The
+// index is zsh-normalized (positive integer literal → 0-based) per the
+// v12 array-base decision — reads already normalize via zshIndexKey, and
+// writes must too (the runner's setVar/assign index is 0-based for
+// every language). Caller guarantees p.peek() == '['.
+func (p *Parser) scanBracketName(run string) string {
+	p.pos++ // consume [
+	var idx strings.Builder
+	depth := 1
+	for !p.eof() && depth > 0 {
+		ch := p.peek()
+		if ch == '[' {
+			depth++
+		}
+		if ch == ']' {
+			depth--
+			if depth == 0 {
+				p.pos++
+				break
+			}
+		}
+		idx.WriteByte(ch)
+		p.pos++
+	}
+	return run + "[" + zshIndexKey(idx.String()) + "]"
 }
 
 // parseStandaloneAssignment — mirrors parse_standalone_assignment: env
@@ -1710,7 +1741,11 @@ func (p *Parser) parseStandaloneAssignment() (*Command, error) {
 	var envs []EnvVar
 	envOps := map[string]string{}
 	for {
-		name := p.scanIdentRun()
+		run := p.scanIdentRun()
+		name := run
+		if p.peek() == '[' {
+			name = p.scanBracketName(run) // `a[2]=X` — array-element write
+		}
 		op := "="
 		if p.starts("+=") || p.starts("/=") || p.starts("%=") {
 			op = p.src[p.pos : p.pos+2]
@@ -2843,11 +2878,14 @@ func (p *Parser) parseSimpleCommand() (*Command, error) {
 			p.pos = save
 			break
 		}
+		name := run
+		if p.peek() == '[' {
+			name = p.scanBracketName(run) // `a[2]=X` — array-element write
+		}
 		if !(p.peek() == '=' || p.starts("+=") || p.starts("/=") || p.starts("%=")) {
 			p.pos = save
 			break
 		}
-		name := run
 		op := "="
 		if p.starts("+=") || p.starts("/=") || p.starts("%=") {
 			op = p.src[p.pos : p.pos+2]

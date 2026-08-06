@@ -465,6 +465,8 @@ func arithWrittenVars(ast ArithAst) []string {
 // iterNumeric — mirror iter_numeric.
 func iterNumeric(e Expr) (bool, bool) { // (numeric, known)
 	switch t := e.(type) {
+	case *RangeE:
+		return true, true // the Range iterable is numeric by construction
 	case *ArrayE:
 		numeric := true
 		known := true
@@ -2281,6 +2283,8 @@ func exprJSON(e Expr) map[string]interface{} {
 	switch t := e.(type) {
 	case *IntE:
 		return map[string]interface{}{"type": "Int", "value": t.Value}
+	case *RangeE:
+		return map[string]interface{}{"type": "Range", "start": t.Start, "end": t.End}
 	case *StrE:
 		return map[string]interface{}{"type": "Str", "value": t.Value, "style": t.Style}
 	case *VarE:
@@ -2538,6 +2542,7 @@ func shirForSource(src string) ([]byte, error) {
 		}
 	}
 	stmts = optimizeStmts(stmts)
+	applyTransforms(stmts) // mirror ast_to_ir: worker-submitted transforms (seq-range-for)
 	vt := analyzeVarTypes(stmts)
 	vl := analyzeStringLengths(stmts)
 	vc := analyzeVarConst(stmts)

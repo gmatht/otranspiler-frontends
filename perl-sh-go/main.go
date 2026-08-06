@@ -450,6 +450,14 @@ func tokenize(src string, lines []string) ([]token, error) {
 			i++
 			continue
 		}
+		if c == '^' {
+			// regex anchor (s/^he//, m/^.../) — also xor, never used by
+			// the subset; the substitution parser re-joins these tokens
+			// into the pattern string.
+			push(tOp, "^", "", false)
+			i++
+			continue
+		}
 		if c == '?' {
 			push(tOp, "?", "", false)
 			i++
@@ -656,10 +664,12 @@ func (p *parser) parseSubstAssign() []map[string]any {
 	p.expect("=~")
 	p.expect("s")
 	p.expect("/")
-	pat := p.substPart()
-	p.expect("/")
-	rep := p.substPart()
-	p.expect("/")
+	pat, closed := p.scanDelimited()
+	rep := ""
+	if !closed {
+		// the `//` token already closed both halves (empty replacement)
+		rep, _ = p.scanDelimited()
+	}
 	// flags: g (global) — the runtime's // replace is global; anything
 	// else is ignored (the corpus uses g only).
 	if t2 := p.peek(); t2 != nil && t2.kind == tIdent {
@@ -678,24 +688,59 @@ func (p *parser) parseSubstAssign() []map[string]any {
 	if srcName == "" {
 		p.fail("=~ substitution: source must be a variable")
 	}
+	// s/^pat// → prefix strip (param "#", or "##" for a greedy `.*` run);
+	// s/pat$// → suffix strip ("%" / "%%"); any other form stays the
+	// global replace ("//"). The runtime's #/##/%/%% ops are glob-based,
+	// and a leading `.*` / trailing `.*` is exactly a greedy regex run.
+	op := "//"
+	p2 := pat
+	if rep == "" {
+		if strings.HasPrefix(pat, "^") {
+			p2 = strings.TrimPrefix(pat, "^")
+			if strings.HasPrefix(p2, ".*") {
+				op = "##"
+				p2 = "*" + strings.TrimPrefix(p2, ".*")
+			} else {
+				op = "#"
+			}
+		} else if strings.HasSuffix(pat, "$") {
+			p2 = strings.TrimSuffix(pat, "$")
+			if strings.HasSuffix(p2, ".*") {
+				op = "%%"
+				p2 = strings.TrimSuffix(p2, ".*") + "*"
+			} else {
+				op = "%"
+			}
+		}
+	}
 	return []map[string]any{assignStmt(name, callExpr("param", []any{
-		strLit("//"), strLit(srcName), strLit(pat), strLit(rep),
+		strLit(op), strLit(srcName), strLit(p2), strLit(rep),
 	}, "Emulable"))}
 }
 
-func (p *parser) substPart() string {
-	t := p.next()
-	if t == nil {
-		p.fail("substitution: expected pattern/replacement")
+// scanDelimited scans tokens up to (and consuming) a `/` or `//`
+// delimiter, re-joining the tokens the lexer splits regex/pattern
+// metacharacters into (`s/^he//` lexes `^`, `he`, then the merged `//`).
+// The boolean reports whether the closing delimiter was the merged `//`
+// token, which closes BOTH halves at once (empty replacement).
+func (p *parser) scanDelimited() (string, bool) {
+	var sb strings.Builder
+	for {
+		t := p.peek()
+		if t == nil || t.kind == tEOF {
+			p.fail("unterminated /.../ pattern")
+		}
+		if t.kind == tOp && (t.text == "/" || t.text == "//") {
+			p.next()
+			return sb.String(), t.text == "//"
+		}
+		if t.kind == tStr {
+			sb.WriteString(t.raw)
+		} else {
+			sb.WriteString(t.text)
+		}
+		p.next()
 	}
-	switch t.kind {
-	case tStr:
-		return t.raw
-	case tIdent, tNum, tVar:
-		return t.text
-	}
-	p.fail("substitution: bad pattern/replacement token")
-	return ""
 }
 
 // ── print / printf ───────────────────────────────────────────────────
@@ -1428,6 +1473,15 @@ var cmpOps = map[string]bool{
 func (p *parser) parseCmp() *node {
 	l := p.parseConcat()
 	t := p.peek()
+	if t != nil && t.kind == tOp && t.text == "=~" {
+		// `$s =~ /pat/` — perl regex match; the pattern is scanned as a
+		// /-delimited run (regex metachars lex as separate tokens) and
+		// lowered to the runtime test's `=~` binop (JS RegExp test).
+		p.next()
+		p.expect("/")
+		pat, _ := p.scanDelimited()
+		return &node{kind: "regextest", text: pat, kids: []*node{l}}
+	}
 	if t != nil && t.kind == tOp && cmpOps[t.text] {
 		p.next()
 		r := p.parseConcat()
@@ -1752,6 +1806,25 @@ func (p *parser) interpFromString(raw string, dq bool) []any {
 			i += 2
 			continue
 		}
+		if c == '@' && i+1 < len(raw) {
+			// @a[1..2] — array slice interpolation (perl joins the
+			// elements with a space): join(param("slice", name, lo, len)).
+			rest := raw[i+1:]
+			if m := identRe.FindString(rest); m != "" {
+				j := i + 1 + len(m)
+				if j < len(raw) && raw[j] == '[' {
+					if close := strings.IndexByte(raw[j+1:], ']'); close >= 0 {
+						flush()
+						parts = append(parts, map[string]any{
+							"kind": "expr",
+							"expr": p.lowerArraySlice(m, raw[j+1:j+1+close]),
+						})
+						i = j + 1 + close + 1
+						continue
+					}
+				}
+			}
+		}
 		if c == '$' && i+1 < len(raw) {
 			rest := raw[i+1:]
 			if rest[0] == '$' {
@@ -1819,6 +1892,27 @@ func (p *parser) interpFromString(raw string, dq bool) []any {
 	return parts
 }
 
+// lowerArraySlice lowers `@name[lo..hi]` (or `@name[i]`) — perl's array
+// slice in interpolation — to join(param("slice", name, lo, len)): the
+// runtime's slice op returns the element ARRAY and join() space-joins it
+// (perl's list-in-string behaviour).
+func (p *parser) lowerArraySlice(name, inner string) map[string]any {
+	lo := int64(0)
+	hi := int64(0)
+	if k := strings.Index(inner, ".."); k >= 0 {
+		lo = mustInt(strings.TrimSpace(inner[:k]))
+		hi = mustInt(strings.TrimSpace(inner[k+2:]))
+	} else {
+		hi = mustInt(strings.TrimSpace(inner))
+	}
+	slice := callExpr("param", []any{
+		strLit("slice"), strLit(name),
+		arithNode(map[string]any{"type": "Num", "value": lo}),
+		arithNode(map[string]any{"type": "Num", "value": hi - lo + 1}),
+	}, "Emulable")
+	return callExpr("join", []any{slice}, "Emulable")
+}
+
 func decodeEsc(c byte) byte {
 	switch c {
 	case 'n':
@@ -1874,6 +1968,11 @@ func (p *parser) lowerCond(n *node) string {
 		return n.text + " " + p.condOperand(n.kids[0])
 	case "pn":
 		return p.lowerCond(n.kids[0])
+	case "regextest":
+		// `$s =~ /^h/` — the runtime test tokenizer expands $s itself
+		// and its `=~` binop is a JS RegExp test; the pattern stays raw
+		// (^ . * $ are ordinary word chars there).
+		return p.condOperand(n.kids[0]) + " =~ " + n.text
 	case "arith", "neg":
 		return "$((" + p.arithText(n) + "))"
 	case "bare":
