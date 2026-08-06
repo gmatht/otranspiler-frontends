@@ -12,9 +12,12 @@
 // Subset (v2, corpus-defined): package/import/func-main boilerplate,
 // fmt.Println/Print/Printf, os.Getenv/Setenv/WriteFile/Stat,
 // exec.Command(...).Output()/.Run(), bufio.NewReader(os.Stdin)+ReadString,
-// := / = / += / ++ / multi-assign, string-concat + arithmetic exprs,
-// len(), slicing, indexing, array literals + range-for, if/else if/else,
-// for cond, for init;cond;post, switch/case/default, func literals
+// bufio.NewScanner(os.Stdin)+for sc.Scan()/sc.Text() (while-read),
+// := / = / += / ++ / multi-assign, indexed assign a[1]=x, append(a, ...),
+// strings.ReplaceAll (${s//o/n}) + strings.Contains (grep idiom),
+// string-concat + arithmetic exprs, len(), slicing, indexing, array
+// literals + range-for, if/else if/else, for cond, for init;cond;post
+// (→ seq Range when numeric), switch/case/default, func literals
 // (params -> $1.., fresh vars -> `local`), go-func background,
 // raw-string heredocs, comments, shebang.
 //
@@ -289,6 +292,20 @@ func execStmt(cmd string, words []map[string]any, purity string) map[string]any 
 			"args":   []any{strExpr(cmd), map[string]any{"type": "Array", "elements": elems}},
 			"purity": purity,
 		},
+	}
+}
+
+// execCond builds a Call(fn=exec) usable as an If/While cond (the
+// `while read x` shape).
+func execCond(cmd string, words []map[string]any) map[string]any {
+	elems := make([]any, len(words))
+	for i, w := range words {
+		elems[i] = w
+	}
+	return map[string]any{
+		"type": "Call", "func": "exec",
+		"args":   []any{strExpr(cmd), map[string]any{"type": "Array", "elements": elems}},
+		"purity": "Emulable",
 	}
 }
 
@@ -867,6 +884,14 @@ func (p *parser) printfStmt() []map[string]any {
 		parts := []any{partLit(before), partExpr(p.exprToWord(args[0]))}
 		return []map[string]any{execStmt("echo", []map[string]any{interpParts(parts)}, "Emulable")}
 	}
+	// one %d + trailing \n → echo-interpolation (the `count=${#a[@]}` shape)
+	if len(args) == 1 && strings.Count(decoded, "%d") == 1 &&
+		strings.Count(decoded, "%s") == 0 && strings.HasSuffix(decoded, "\n") {
+		before := strings.TrimSuffix(decoded, "\n")
+		before = strings.Replace(before, "%d", "", 1)
+		parts := []any{partLit(before), partExpr(p.exprToWord(args[0]))}
+		return []map[string]any{execStmt("echo", []map[string]any{interpParts(parts)}, "Emulable")}
+	}
 	var words []map[string]any
 	words = append(words, interpLit(fmtTok.raw))
 	for _, a := range args {
@@ -954,6 +979,16 @@ func (p *parser) parseAssignStmt() []map[string]any {
 			targets = append(targets, p.expect(tIdent, "").text)
 		}
 	}
+	// indexed assign: a[1] = "X" → target var "a[1]" (the `arr[1]=X` shape)
+	if p.atPunct("[") {
+		if len(targets) != 1 {
+			p.failf("indexed assign with multiple targets (v2)")
+		}
+		p.pos++
+		idx := p.expect(tNum, "").text
+		p.expect(tPunct, "]")
+		targets[0] = targets[0] + "[" + idx + "]"
+	}
 	// function call statement: f(args)
 	if p.atPunct("(") {
 		p.pos++
@@ -1037,11 +1072,14 @@ func (p *parser) parseAssignStmt() []map[string]any {
 		}
 		return []map[string]any{p.captureAssign(targets, args)}
 	}
-	// r := bufio.NewReader(os.Stdin)
+	// r := bufio.NewReader(os.Stdin)  /  sc := bufio.NewScanner(os.Stdin)
 	if p.atIdent("bufio") {
 		p.next()
 		p.expect(tPunct, ".")
-		p.expect(tIdent, "NewReader")
+		m := p.expect(tIdent, "").text
+		if m != "NewReader" && m != "NewScanner" {
+			p.failf("unsupported bufio.%s (v2)", m)
+		}
 		p.expect(tPunct, "(")
 		p.skipNL()
 		p.expect(tIdent, "os")
@@ -1075,6 +1113,26 @@ func (p *parser) parseAssignStmt() []map[string]any {
 
 	// generic RHS
 	rhs := p.parseExpr()
+
+	// a = append(a, "c", "d") → setArrayAppend (the `arr+=(c d)` shape)
+	if rhs.kind == "call" && rhs.callee == "append" {
+		if len(rhs.args) < 2 || rhs.args[0].kind != "var" {
+			p.failf("append needs (array, elems...) (v2)")
+		}
+		var elems []any
+		for _, a := range rhs.args[1:] {
+			if a.kind != "str" && a.kind != "num" {
+				p.failf("append elements must be literals (v2)")
+			}
+			elems = append(elems, strExpr(a.text))
+		}
+		p.registerVar(rhs.args[0].name, "Array")
+		return []map[string]any{assignStmt(rhs.args[0].name, map[string]any{
+			"type": "Call", "func": "setArrayAppend",
+			"args":   []any{strExpr(rhs.args[0].name), map[string]any{"type": "Array", "elements": elems}},
+			"purity": "Emulable",
+		})}
+	}
 
 	// err := cmd.Run() — exec the stored command
 	if rhs.kind == "call" && strings.HasSuffix(rhs.callee, ".Run") {
@@ -1291,6 +1349,22 @@ func (p *parser) parseFor() []map[string]any {
 			"body": body,
 		}}
 	}
+	// for sc.Scan() { → While(read sc) — bufio.Scanner stdin loop
+	if p.pos+3 < len(p.toks) && p.tok().kind == tIdent && p.stdinRdr[p.tok().text] &&
+		p.toks[p.pos+1].text == "." && p.toks[p.pos+2].kind == tIdent &&
+		p.toks[p.pos+2].text == "Scan" && p.toks[p.pos+3].text == "(" {
+		scName := p.next().text
+		p.pos += 2 // . Scan
+		p.expect(tPunct, "(")
+		p.skipNL()
+		p.expect(tPunct, ")")
+		body := p.parseBlockStmts()
+		return []map[string]any{{
+			"type": "While",
+			"cond": execCond("read", []map[string]any{strExpr(scName)}),
+			"body": body,
+		}}
+	}
 	// for i := 1; i <= 2; i++ {  — header form
 	if p.tok().kind == tIdent && p.toks[p.pos+1].text == ":=" {
 		initName := p.next().text
@@ -1309,6 +1383,28 @@ func (p *parser) parseFor() []map[string]any {
 		post := []map[string]any{assignStmt(postName,
 			arithBin(arithVar(postName), "+", arithNum(1)))}
 		body := p.parseBlockStmts()
+		// `i := N; i <= M; i++` (or `i < M`) → the core's For Range
+		// (`for i in $(seq N M)`) shape — byte-identical lowering.
+		if rhs.kind == "num" && initName == postName &&
+			cond.kind == "binop" && cond.BOpKind == "cmp" &&
+			cond.lhs.kind == "var" && cond.lhs.name == initName &&
+			cond.rhs.kind == "num" {
+			if start, err := strconv.Atoi(rhs.text); err == nil {
+				if end, err2 := strconv.Atoi(cond.rhs.text); err2 == nil {
+					if cond.BOp == "<" {
+						end--
+					}
+					if cond.BOp == "<" || cond.BOp == "<=" {
+						return []map[string]any{{
+							"type": "For",
+							"var":  initName,
+							"iter": map[string]any{"type": "Range", "start": start, "end": end},
+							"body": body,
+						}}
+					}
+				}
+			}
+		}
 		body = append(body, post...)
 		return append(pre, map[string]any{
 			"type": "While",
@@ -1552,6 +1648,20 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 				return getVarExpr(e.args[0].text)
 			}
 			p.failf("os.Getenv needs a string literal (v2)")
+		case "strings.ReplaceAll":
+			// ReplaceAll(s, old, new) → ${s//old/new} (ALL occurrences)
+			if len(e.args) == 3 && e.args[0].kind == "var" &&
+				e.args[1].kind == "str" && e.args[2].kind == "str" {
+				return paramCall("//", e.args[0].name, e.args[1].text, e.args[2].text)
+			}
+			p.failf("strings.ReplaceAll needs (var, str, str) (v2)")
+		}
+		// sc.Text() inside a scanner read-loop → the read var
+		if strings.HasSuffix(e.callee, ".Text") {
+			base := strings.TrimSuffix(e.callee, ".Text")
+			if p.stdinRdr[base] {
+				return getVarExpr(base)
+			}
 		}
 		p.failf("unsupported call %q in word position (v2)", e.callee)
 	case "binop":
@@ -1561,16 +1671,42 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 	return nil
 }
 
-// arithOrConcat: `+` with a string operand → concat Interpolate;
-// otherwise (and all * / -) → Arith.
+// arithOrConcat: `+` chains involving a string (literal, Str-typed var,
+// index/param — anything non-numeric) → concat Interpolate, flattening
+// the whole add chain into parts; otherwise (and all * / -) → Arith.
 func (p *parser) arithOrConcat(e *expr) map[string]any {
-	if e.kind == "add" && (p.operandKind(e.lhs) == "str" || p.operandKind(e.rhs) == "str") {
+	if e.kind == "add" && p.addHasString(e) {
 		var parts []any
-		parts = append(parts, p.concatPart(e.lhs))
-		parts = append(parts, p.concatPart(e.rhs))
+		p.addConcatParts(e, &parts)
 		return interpParts(parts)
 	}
 	return p.exprToArith(e)
+}
+
+// addHasString: does this add chain involve a string anywhere? (An
+// `a[0] + " " + a[1]` chain has no direct string operand at the top
+// level, so a shallow check misses it.)
+func (p *parser) addHasString(e *expr) bool {
+	switch e.kind {
+	case "add":
+		return p.addHasString(e.lhs) || p.addHasString(e.rhs)
+	case "str", "rawstr":
+		return true
+	case "var":
+		return e.name == "nil" || p.varTypes[e.name] == "Str"
+	}
+	return false
+}
+
+// addConcatParts: flatten a concat chain into parts; a sub-chain that
+// is itself pure arithmetic stays a single expr part (its Arith value).
+func (p *parser) addConcatParts(e *expr, parts *[]any) {
+	if e.kind == "add" && p.addHasString(e) {
+		p.addConcatParts(e.lhs, parts)
+		p.addConcatParts(e.rhs, parts)
+		return
+	}
+	*parts = append(*parts, p.concatPart(e))
 }
 
 func (p *parser) concatPart(e *expr) any {
@@ -1671,6 +1807,19 @@ func (p *parser) condToJSON(c *expr) map[string]any {
 			"lhs": p.condToJSON(c.lhs), "rhs": p.condToJSON(c.rhs),
 		}
 	}
+	// strings.Contains(haystack, needle) → the `X | grep Y` contains
+	// shape (haystack: var → getVar, literal → Interpolate; needle:
+	// SingleQuoted — matching the core).
+	if c.kind == "call" && c.callee == "strings.Contains" {
+		if len(c.args) != 2 {
+			p.failf("strings.Contains needs (haystack, needle) (v2)")
+		}
+		return map[string]any{
+			"type": "Call", "func": "contains",
+			"args":   []any{p.containsWord(c.args[0]), p.containsNeedle(c.args[1])},
+			"purity": "PureCpu",
+		}
+	}
 	return testCall(p.condTestString(c))
 }
 
@@ -1717,6 +1866,29 @@ func (p *parser) condTestString(c *expr) string {
 	}
 	p.failf("unsupported comparison %q (v2)", c.BOp)
 	return ""
+}
+
+// containsWord: the haystack word of a strings.Contains cond.
+func (p *parser) containsWord(e *expr) map[string]any {
+	switch e.kind {
+	case "str":
+		return interpLit(e.text)
+	case "var":
+		if n, ok := p.paramNumber(e.name); ok {
+			return getVarExpr(strconv.Itoa(n))
+		}
+		return getVarExpr(e.name)
+	}
+	p.failf("unsupported contains haystack (v2): %s", e.kind)
+	return nil
+}
+
+// containsNeedle: the grep pattern — a SingleQuoted Str (core shape).
+func (p *parser) containsNeedle(e *expr) map[string]any {
+	if e.kind != "str" {
+		p.failf("contains needle must be a string literal (v2)")
+	}
+	return map[string]any{"type": "Str", "value": e.text, "style": "SingleQuoted"}
 }
 
 // condOperandQ: `==`/`!=` operand — quoted: `"$x"` / `"lit"` / `"42"`.
