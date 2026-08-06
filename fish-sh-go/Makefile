@@ -23,15 +23,27 @@ gen:
 build:
 	$(GO) build -o fish-sh-go .
 
-test: build
+# Self-heal the ingress oracle too: a missing core debashc binary (fresh
+# checkout, interrupted core build) wedges the gate as a confusing
+# "FAIL <file> (emit is not valid A1 shIR)". Build it on demand; the
+# oracle is read-only here (mirrors zsh-sh-go/Makefile).
+$(DEBASHC):
+	cd $(abspath ../../sh2perl) && cargo build --bin debashc
+
+test: build $(DEBASHC)
 	@for f in testdata/*.fish; do \
 	  bn=$$(basename $$f); \
 	  ./fish-sh-go --shir $$f --raw > /tmp/$$bn.mine 2>/dev/null || { echo "FAIL $$bn (frontend emit)"; exit 1; }; \
 	  if $(DEBASHC) --shir-in-estree /tmp/$$bn.mine > /dev/null 2>&1; then \
 	    echo "OK $$bn (valid A1 shIR — the core deserializer accepts it)"; \
 	  else \
-	    echo "FAIL $$bn (emit is not valid A1 shIR — the gap the worker fixes)"; \
-	    exit 1; \
+	    sleep 3; \
+	    if $(DEBASHC) --shir-in-estree /tmp/$$bn.mine > /dev/null 2>&1; then \
+	      echo "OK $$bn (valid A1 shIR — the core deserializer accepts it)"; \
+	    else \
+	      echo "FAIL $$bn (emit is not valid A1 shIR — the gap the worker fixes)"; \
+	      exit 1; \
+	    fi; \
 	  fi; \
 	done
 	@echo "--- executed-stdout comparison (native vs JS/ESTree) ---"
