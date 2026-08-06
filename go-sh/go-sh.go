@@ -324,16 +324,18 @@ type expr struct {
 	// var
 	name string
 	// arith / concat / binop
-	op    string
-	lhs   *expr
-	rhs   *expr
+	op  string
+	lhs *expr
+	rhs *expr
 	// binop comparisons
 	BOp     string // "==" "!=" "<" "<=" ">" ">=" "&&" "||"
 	BOpKind string // "cmp" | "and" | "or"
 	// index/slice/strlen/arrlen
 	target *expr
-	idx1   string
+	idx1   string // literal bound (plain number)
 	idx2   string
+	idx1e  *expr // expression bound (Go computed indices)
+	idx2e  *expr
 	// call
 	callee string
 	args   []*expr
@@ -513,20 +515,29 @@ func (p *parser) parsePostfix() *expr {
 			p.pos++
 			p.skipNL()
 			lo, hi := "", ""
+			var loE, hiE *expr
 			if !p.atPunct(":") {
-				lo = p.expect(tNum, "").text
+				if p.tok().kind == tNum {
+					lo = p.next().text
+				} else {
+					loE = p.parseExpr()
+				}
 			}
 			if p.atPunct(":") {
 				p.pos++
 				p.skipNL()
-				if p.tok().kind == tNum {
-					hi = p.next().text
+				if !p.atPunct("]") {
+					if p.tok().kind == tNum {
+						hi = p.next().text
+					} else {
+						hiE = p.parseExpr()
+					}
 				}
 				p.expect(tPunct, "]")
-				e = &expr{kind: "slice", target: e, idx1: lo, idx2: hi}
+				e = &expr{kind: "slice", target: e, idx1: lo, idx2: hi, idx1e: loE, idx2e: hiE}
 			} else {
 				p.expect(tPunct, "]")
-				e = &expr{kind: "index", target: e, idx1: lo}
+				e = &expr{kind: "index", target: e, idx1: lo, idx1e: loE}
 			}
 		case p.atPunct("."):
 			p.pos++
@@ -1604,31 +1615,16 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 	case "add", "mul", "neg":
 		return p.arithOrConcat(e)
 	case "index":
+		if e.idx1e != nil {
+			p.failf("index key must be a number literal (v2)")
+		}
 		if e.target != nil && e.target.kind == "var" {
 			return joinCall(paramCall("", e.target.name+"["+e.idx1+"]"))
 		}
 		p.failf("index target must be a var (v2)")
 	case "slice":
 		if e.target != nil && e.target.kind == "var" {
-			// A1 slice args are (var, start, LENGTH) — Go's [i:j] end index
-			// is EXCLUSIVE, so emit length = j - i (t37; matches the
-			// ${s:off:len} shape the core emits). Open ends: `s[:j]` starts
-			// at 0; `s[i:]` / `s[:]` carry no length (the runtime renders
-			// that as `v.slice(off)` — the ${s:off} shape).
-			lo, loErr := strconv.Atoi(e.idx1)
-			hi, hiErr := strconv.Atoi(e.idx2)
-			switch {
-			case e.idx2 == "":
-				start := e.idx1
-				if e.idx1 == "" {
-					start = "0"
-				}
-				return joinCall(paramCall("slice", e.target.name, start, ""))
-			case loErr == nil && hiErr == nil:
-				return joinCall(paramCall("slice", e.target.name,
-					strconv.Itoa(lo), strconv.Itoa(hi-lo)))
-			}
-			return joinCall(paramCall("slice", e.target.name, e.idx1, e.idx2))
+			return p.sliceWord(e)
 		}
 		p.failf("slice target must be a var (v2)")
 	case "strlen":
@@ -1655,6 +1651,29 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 				return paramCall("//", e.args[0].name, e.args[1].text, e.args[2].text)
 			}
 			p.failf("strings.ReplaceAll needs (var, str, str) (v2)")
+		case "strings.TrimPrefix":
+			// TrimPrefix(s, p) → ${s#p} — remove ONE leading literal
+			// (bash `#` strips a single occurrence; a glob-metachar p
+			// would glob-match in the shell, so literals only).
+			if len(e.args) == 2 && e.args[0].kind == "var" && e.args[1].kind == "str" {
+				return paramCall("#", e.args[0].name, e.args[1].text)
+			}
+			p.failf("strings.TrimPrefix needs (var, str) (v2)")
+		case "strings.TrimSuffix":
+			// TrimSuffix(s, p) → ${s%p} — remove ONE trailing literal.
+			if len(e.args) == 2 && e.args[0].kind == "var" && e.args[1].kind == "str" {
+				return paramCall("%", e.args[0].name, e.args[1].text)
+			}
+			p.failf("strings.TrimSuffix needs (var, str) (v2)")
+		case "strings.Join":
+			// Join(arr[lo:hi], " ") → ${arr[@]:lo:len} joined with a space
+			// — exactly the A1 join(param("slice", …)) shape (the runtime
+			// joins arrays with " ", matching Go's space separator).
+			if len(e.args) == 2 && e.args[1].kind == "str" && e.args[1].text == " " &&
+				e.args[0].kind == "slice" && e.args[0].target != nil && e.args[0].target.kind == "var" {
+				return p.sliceWord(e.args[0])
+			}
+			p.failf(`strings.Join needs (arr[lo:hi], " ") (v2)`)
 		}
 		// sc.Text() inside a scanner read-loop → the read var
 		if strings.HasSuffix(e.callee, ".Text") {
@@ -1669,6 +1688,84 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 	}
 	p.failf("unsupported expression %q (v2 subset)", e.kind)
 	return nil
+}
+
+// sliceWord lowers a slice expr to its A1 word JSON. A1 slice args are
+// (var, start, LENGTH) — Go's [i:j] end index is EXCLUSIVE, so emit
+// length = j - i (t37; matches the ${s:off:len} shape the core emits).
+// Open ends: `s[:j]` starts at 0; `s[i:]` / `s[:]` carry no length (the
+// runtime renders that as `v.slice(off)` — the ${s:off} shape).
+//
+// Computed bounds (Go index expressions) lower to the parameter-
+// expansion glob ops, which are EXACT for literal needles:
+//   - x[strings.LastIndex(x, n)+1:] → ${x##*n} — the longest-prefix
+//     removal of `*n` strips through the LAST occurrence of n, which is
+//     precisely Go's LastIndex(n)+1 tail.
+//   - x[:strings.Index(x, n)] → ${x%%n*} — the longest-suffix removal
+//     of `n*` strips from the FIRST occurrence of n, Go's exclusive
+//     end index.
+func (p *parser) sliceWord(e *expr) map[string]any {
+	name := e.target.name
+	// x[strings.LastIndex(x, n)+1:] → param("##", x, "*"+n)
+	if e.idx2e == nil && e.idx2 == "" && e.idx1e != nil {
+		if v, n, ok := p.lastIndexPlusOne(e.idx1e); ok && v == name {
+			return paramCall("##", name, "*"+n)
+		}
+	}
+	// x[:strings.Index(x, n)] → param("%%", x, n+"*")
+	if e.idx1e == nil && e.idx1 == "" && e.idx2e != nil {
+		if v, n, ok := p.indexCall(e.idx2e); ok && v == name {
+			return paramCall("%%", name, n+"*")
+		}
+	}
+	if e.idx1e != nil || e.idx2e != nil {
+		p.failf("unsupported computed slice bound (v2)")
+	}
+	lo, loErr := strconv.Atoi(e.idx1)
+	hi, hiErr := strconv.Atoi(e.idx2)
+	switch {
+	case e.idx2 == "":
+		start := e.idx1
+		if e.idx1 == "" {
+			start = "0"
+		}
+		return joinCall(paramCall("slice", name, start, ""))
+	case loErr == nil && hiErr == nil:
+		return joinCall(paramCall("slice", name,
+			strconv.Itoa(lo), strconv.Itoa(hi-lo)))
+	}
+	return joinCall(paramCall("slice", name, e.idx1, e.idx2))
+}
+
+// lastIndexPlusOne: matches `strings.LastIndex(v, "n") + 1` (the Go
+// idiom for "one past the last occurrence") → (v, n).
+func (p *parser) lastIndexPlusOne(e *expr) (string, string, bool) {
+	if e == nil || e.kind != "add" || e.op != "+" {
+		return "", "", false
+	}
+	if e.rhs == nil || e.rhs.kind != "num" || e.rhs.text != "1" {
+		return "", "", false
+	}
+	if e.lhs == nil || e.lhs.kind != "call" || e.lhs.callee != "strings.LastIndex" {
+		return "", "", false
+	}
+	// (same (var, str) arg shape as Index)
+	if len(e.lhs.args) != 2 || e.lhs.args[0].kind != "var" || e.lhs.args[1].kind != "str" {
+		return "", "", false
+	}
+	return e.lhs.args[0].name, e.lhs.args[1].text, true
+}
+
+// indexCall: matches `strings.Index(v, "n")` → (v, n). Literal n only —
+// a glob-metachar needle would change meaning under the `%`/`#` ops.
+func (p *parser) indexCall(e *expr) (string, string, bool) {
+	if e == nil || e.kind != "call" || e.callee != "strings.Index" {
+		return "", "", false
+	}
+	if len(e.args) != 2 || e.args[0].kind != "var" || e.args[1].kind != "str" {
+		return "", "", false
+	}
+	return e.args[0].name, e.args[1].text, true
 }
 
 // arithOrConcat: `+` chains involving a string (literal, Str-typed var,
@@ -1819,6 +1916,22 @@ func (p *parser) condToJSON(c *expr) map[string]any {
 			"args":   []any{p.containsWord(c.args[0]), p.containsNeedle(c.args[1])},
 			"purity": "PureCpu",
 		}
+	}
+	// strings.HasPrefix(s, p) / strings.HasSuffix(s, p) → the `[[ $s ==
+	// p* ]]` / `[[ $s == *p ]]` glob-test shape (the core's `$s==p*`
+	// string; the operand stays quoted, the pattern bare so the glob
+	// engine sees it — t68).
+	if c.kind == "call" && (c.callee == "strings.HasPrefix" || c.callee == "strings.HasSuffix") {
+		if len(c.args) != 2 || c.args[0].kind != "var" || c.args[1].kind != "str" {
+			p.failf("%s needs (var, str) (v2)", c.callee)
+		}
+		pat := c.args[1].text
+		if c.callee == "strings.HasSuffix" {
+			pat = "*" + pat
+		} else {
+			pat = pat + "*"
+		}
+		return testCall(p.condOperandQ(c.args[0]) + "=" + pat)
 	}
 	return testCall(p.condTestString(c))
 }
