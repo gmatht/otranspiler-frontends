@@ -40,10 +40,10 @@ test: build
 	    exit 1; \
 	  fi; \
 	done
-
-worker: test
 	@echo "--- executed-stdout comparison (native vs JS/ESTree) ---"
 	@bash "$(abspath ../../harness/frontend-stdout.sh)" sh ./posix-sh-go testdata "$(DEBASHC)" || exit 1
+
+worker: test
 	@echo "posix-sh-go worker gate: byte-equality + executed-stdout passed"
 
 clean:

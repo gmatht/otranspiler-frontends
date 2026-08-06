@@ -34,10 +34,10 @@ test: build
 	    exit 1; \
 	  fi; \
 	done
-
-worker: test
 	@echo "--- executed-stdout comparison (native vs JS/ESTree) ---"
 	@bash "$(abspath ../../harness/frontend-stdout.sh)" fish ./fish-sh-go testdata "$(DEBASHC)" || exit 1
+
+worker: test
 	@echo "fish-sh-go worker gate: ingress acceptance + executed-stdout passed"
 
 clean:
