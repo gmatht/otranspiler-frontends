@@ -26,6 +26,15 @@ func call(f string, args []any) map[string]any {
 // bindings, and the mem.* seam reads/writes the store — divergence).
 var addrTaken = map[string]bool{}
 
+// charPtrVars — `char *name` declarations: the POINTER-TO-STRING lowering.
+// A char* is lowered to the string itself — no mem.* handles, no arena:
+//   &"lit"     -> the literal string
+//   s + n      -> a substring (param slice)
+//   s[i]       -> a 1-char slice
+//   %s / %c    -> the string / first char
+// The pointer IS the string; the seam is bypassed entirely.
+var charPtrVars = map[string]bool{}
+
 func assignStmt(name string, expr any) map[string]any {
 	if addrTaken[name] {
 		return map[string]any{"type": "Expr", "expr": call("setVar", []any{st(name), expr})}
@@ -158,7 +167,7 @@ func (p *parser) expectOp(s string) error {
 
 // expr: or -> and -> cmp -> add -> mul -> unary -> primary
 type expr struct {
-	kind string // num id bin addr deref
+	kind string // num id bin addr deref str index
 	num  string
 	name string
 	op   string
@@ -290,8 +299,23 @@ func (p *parser) primary() (*expr, error) {
 	case "num":
 		p.next()
 		return &expr{kind: "num", num: t.text}, nil
+	case "str":
+		p.next()
+		return &expr{kind: "str", num: t.text}, nil
 	case "id":
 		p.next()
+		if p.isOp("[") {
+			// id[expr] — indexing (pointer-to-string lowering: a 1-char slice)
+			p.next()
+			idx, err := p.expr()
+			if err != nil {
+				return nil, err
+			}
+			if err := p.expectOp("]"); err != nil {
+				return nil, err
+			}
+			return &expr{kind: "index", l: &expr{kind: "id", name: t.text}, r: idx}, nil
+		}
 		return &expr{kind: "id", name: t.text}, nil
 	case "op":
 		if t.text == "(" {
@@ -326,6 +350,8 @@ func valueNode(e *expr) any {
 	switch e.kind {
 	case "num":
 		return st(e.num)
+	case "str":
+		return st(e.num)
 	case "id":
 		return call("getVar", []any{st(e.name)})
 	case "addr":
@@ -337,8 +363,32 @@ func valueNode(e *expr) any {
 	case "deref":
 		// *p — load through the handle
 		return call("memLoad", []any{valueNode(e.l)})
+	case "index":
+		// s[i] on a char* — the pointer-to-string lowering: a 1-char slice
+		if e.l != nil && e.l.kind == "id" && charPtrVars[e.l.name] {
+			return call("param", []any{st("slice"), st(e.l.name), offsetArg(e.r), st("1")})
+		}
+		return nil
+	case "bin":
+		// char* + n / char* - n — pointer arithmetic lowered to a substring
+		if (e.op == "+" || e.op == "-") && e.l != nil && e.l.kind == "id" && charPtrVars[e.l.name] {
+			off := e.r
+			if e.op == "-" {
+				off = &expr{kind: "bin", op: "-", l: &expr{kind: "num", num: "0"}, r: e.r}
+			}
+			return call("param", []any{st("slice"), st(e.l.name), offsetArg(off), st("")})
+		}
 	}
 	return map[string]any{"ast": arithNode(e), "type": "Arith"}
+}
+
+// offsetArg — a literal slice offset as its string form (dynamic offsets
+// via a variable index are a follow-up; the runner's sliceOff parses arith).
+func offsetArg(e *expr) any {
+	if e != nil && e.kind == "num" {
+		return st(e.num)
+	}
+	return st("0")
 }
 
 // testExpr — C comparison → the bash test-expression string ($x -gt 1).
@@ -415,7 +465,7 @@ func (p *parser) stmt() (any, error) {
 		return nil, nil
 	}
 	switch {
-	case p.isId("int") || p.isId("return"):
+	case p.isId("int") || p.isId("char") || p.isId("return"):
 		kw := p.next().text
 		if kw == "return" {
 			for !p.isOp(";") && p.peek() != nil {
@@ -424,13 +474,18 @@ func (p *parser) stmt() (any, error) {
 			p.next() // consume ;
 			return nil, nil // return: no stdout effect in the v1 subset
 		}
-		// int [*]* NAME ( = expr )? ;  — pointers: `int *p` / `int **pp`
+		// [int|char] [*]* NAME ( = expr )? ;  — pointers: `int *p` / `char *s`
+		isPtr := false
 		for p.isOp("*") {
 			p.next()
+			isPtr = true
 		}
 		name := p.next()
 		if name.kind != "id" {
-			return nil, fmt.Errorf("expected identifier after int")
+			return nil, fmt.Errorf("expected identifier after type")
+		}
+		if kw == "char" && isPtr {
+			charPtrVars[name.text] = true
 		}
 		// function signature `int main ( ) {`
 		if p.isOp("(") {
