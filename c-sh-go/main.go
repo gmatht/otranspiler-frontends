@@ -9,6 +9,7 @@ package main
 // them identically. Unsupported constructs fail loud (refuse > guess).
 import (
 	"encoding/json"
+	"regexp"
 	"fmt"
 	"os"
 	"strconv"
@@ -20,7 +21,15 @@ func st(s string) any { return map[string]any{"style": "DoubleQuoted", "type": "
 func call(f string, args []any) map[string]any {
 	return map[string]any{"args": args, "func": f, "purity": "Emulable", "type": "Call"}
 }
+// addrTaken — names whose address is taken (&x): their storage must live
+// in the sh2 store (the emitter would otherwise lift them to native JS
+// bindings, and the mem.* seam reads/writes the store — divergence).
+var addrTaken = map[string]bool{}
+
 func assignStmt(name string, expr any) map[string]any {
+	if addrTaken[name] {
+		return map[string]any{"type": "Expr", "expr": call("setVar", []any{st(name), expr})}
+	}
 	return map[string]any{
 		"expr":    expr,
 		"targets": []any{map[string]any{"indices": []any{}, "sigil": nil, "var": name}},
@@ -107,7 +116,7 @@ func lex(src string) ([]tok, error) {
 				i += 2
 				continue
 			}
-			if strings.ContainsRune("=+-*/%!<>;{}()[],", rune(c)) {
+			if strings.ContainsRune("=+-*/%!<>&;{}()[],", rune(c)) {
 				out = append(out, tok{"op", string(c)})
 				i++
 			} else {
@@ -149,7 +158,7 @@ func (p *parser) expectOp(s string) error {
 
 // expr: or -> and -> cmp -> add -> mul -> unary -> primary
 type expr struct {
-	kind string // num id bin
+	kind string // num id bin addr deref
 	num  string
 	name string
 	op   string
@@ -187,6 +196,14 @@ func (p *parser) andExpr() (*expr, error) {
 	}
 	return l, nil
 }
+func isCmpOp(op string) bool {
+	switch op {
+	case "==", "!=", "<", ">", "<=", ">=":
+		return true
+	}
+	return false
+}
+
 func (p *parser) cmpExpr() (*expr, error) {
 	l, err := p.addExpr()
 	if err != nil {
@@ -194,7 +211,7 @@ func (p *parser) cmpExpr() (*expr, error) {
 	}
 	for {
 		t := p.peek()
-		if t == nil || t.kind != "op" || !strings.ContainsRune("==!<>", rune(t.text[0])) {
+		if t == nil || t.kind != "op" || !isCmpOp(t.text) {
 			break
 		}
 		op := t.text
@@ -246,6 +263,22 @@ func (p *parser) unaryExpr() (*expr, error) {
 		}
 		return &expr{kind: "bin", op: "!", l: e}, nil
 	}
+	if p.isOp("&") {
+		p.next()
+		e, err := p.unaryExpr()
+		if err != nil {
+			return nil, err
+		}
+		return &expr{kind: "addr", l: e}, nil
+	}
+	if p.isOp("*") {
+		p.next()
+		e, err := p.unaryExpr()
+		if err != nil {
+			return nil, err
+		}
+		return &expr{kind: "deref", l: e}, nil
+	}
 	return p.primary()
 }
 func (p *parser) primary() (*expr, error) {
@@ -290,11 +323,20 @@ func arithNode(e *expr) any {
 	return map[string]any{"type": "Num", "value": 0}
 }
 func valueNode(e *expr) any {
-	if e.kind == "num" {
+	switch e.kind {
+	case "num":
 		return st(e.num)
-	}
-	if e.kind == "id" {
+	case "id":
 		return call("getVar", []any{st(e.name)})
+	case "addr":
+		// &x — a handle to x's storage (allocation_id + offset; offset 0)
+		if e.l != nil && e.l.kind == "id" {
+			return call("addrOf", []any{st(e.l.name)})
+		}
+		return call("addrOf", []any{valueNode(e.l)})
+	case "deref":
+		// *p — load through the handle
+		return call("memLoad", []any{valueNode(e.l)})
 	}
 	return map[string]any{"ast": arithNode(e), "type": "Arith"}
 }
@@ -382,7 +424,10 @@ func (p *parser) stmt() (any, error) {
 			p.next() // consume ;
 			return nil, nil // return: no stdout effect in the v1 subset
 		}
-		// int NAME ( = expr )? ;
+		// int [*]* NAME ( = expr )? ;  — pointers: `int *p` / `int **pp`
+		for p.isOp("*") {
+			p.next()
+		}
 		name := p.next()
 		if name.kind != "id" {
 			return nil, fmt.Errorf("expected identifier after int")
@@ -595,9 +640,28 @@ func (p *parser) buildAssign(name, op string, e *expr) (any, error) {
 }
 
 func (p *parser) simpleAssign() (any, error) {
-	t := p.peek()
-	if t == nil || t.kind != "id" {
-		return nil, fmt.Errorf("unexpected token: %v", t)
+	if p.isOp("*") {
+		// *p = v — a store through the handle
+		p.next()
+		target, err := p.expr()
+		if err != nil {
+			return nil, err
+		}
+		if !p.isOp("=") && !p.isOp("+=") && !p.isOp("-=") {
+			return nil, fmt.Errorf("expected assignment after deref")
+		}
+		p.next()
+		e, err := p.expr()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expectOp(";"); err != nil {
+			return nil, err
+		}
+		return map[string]any{
+			"type": "Expr",
+			"expr": call("memStore", []any{valueNode(target), valueNode(e)}),
+		}, nil
 	}
 	name := p.next().text
 	if p.isOp("=") || p.isOp("+=") || p.isOp("-=") {
@@ -654,7 +718,13 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
-	ts, err := lex(string(src))
+	srcStr := string(src)
+	// pre-scan: address-taken names (&x) keep their storage in the store
+	addrTaken = map[string]bool{}
+	for _, m := range regexp.MustCompile(`&([A-Za-z_][A-Za-z0-9_]*)`).FindAllStringSubmatch(srcStr, -1) {
+		addrTaken[m[1]] = true
+	}
+	ts, err := lex(srcStr)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "REFUSE: "+err.Error())
 		os.Exit(1)
