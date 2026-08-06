@@ -3,8 +3,11 @@ package main
 // c-sh-go: C source -> A1 shIR JSON (the shell-flavored subset of C).
 // v1 subset: printf, int assignments (+=/-=), binary arith, comparisons,
 // if/else, while, for (lowered to the equivalent while — the A1 For node
-// is for value-list iteration), function signatures (skipped; the body
-// becomes the program), return (skipped), comments, #include (skipped).
+// is for value-list iteration), function signatures (skipped; main's body
+// becomes the program), user functions (a single pure `return <expr>;`
+// body — a call with LITERAL args constant-folds through it; the body is
+// never emitted), return (skipped), strcmp/strlen/atoi (literal-arg
+// folding, see foldCallConst), comments, #include (skipped).
 // Emit shapes mirror the py-sh-go frontend so the estree runner executes
 // them identically. Unsupported constructs fail loud (refuse > guess).
 import (
@@ -147,35 +150,240 @@ func refuse(msg string) {
 //   atoi(s)  — a literal folds to its integer text (C leading-digit
 //     parse, 0 on failure); a variable IS its value (the store is
 //     string-typed; the Arith nodes coerce).
-// Anything else REFUSES (exit 1) — refuse > guess.
+//   strcmp(a, b) / a user function call — constant-fold when every
+//     argument is a literal (see foldCallConst); anything else REFUSES
+//     (exit 1) — refuse > guess.
 func callNode(e *expr) any {
-	if len(e.args) != 1 {
+	switch e.name {
+	case "strlen", "atoi":
+		if len(e.args) != 1 {
+			refuse("unsupported function call " + e.name)
+		}
+		a := e.args[0]
+		if e.name == "strlen" {
+			if a.kind == "str" {
+				return st(strconv.Itoa(len(a.num)))
+			}
+			if a.kind == "id" {
+				return call("param", []any{st("len"), st(a.name)})
+			}
+		} else {
+			if a.kind == "str" {
+				s := strings.TrimSpace(a.num)
+				n, err := strconv.Atoi(s)
+				if err != nil {
+					n = 0 // C atoi: no leading digits -> 0
+				}
+				return st(strconv.Itoa(n))
+			}
+			if a.kind == "id" {
+				return call("getVar", []any{st(a.name)})
+			}
+		}
 		refuse("unsupported function call " + e.name)
 	}
-	a := e.args[0]
-	switch e.name {
-	case "strlen":
-		if a.kind == "str" {
-			return st(strconv.Itoa(len(a.num)))
-		}
-		if a.kind == "id" {
-			return call("param", []any{st("len"), st(a.name)})
-		}
-	case "atoi":
-		if a.kind == "str" {
-			s := strings.TrimSpace(a.num)
-			n, err := strconv.Atoi(s)
-			if err != nil {
-				n = 0 // C atoi: no leading digits -> 0
-			}
-			return st(strconv.Itoa(n))
-		}
-		if a.kind == "id" {
-			return call("getVar", []any{st(a.name)})
-		}
+	// strcmp / user functions — fold with all-literal args; refuse otherwise
+	if s, ok := foldCallConst(e, nil); ok {
+		return st(s)
 	}
 	refuse("unsupported function call " + e.name)
 	return nil
+}
+
+// userFuncs — USER function definitions (`static int triple(int n) {
+// return n * 3; }`). The v1 subset models a function as a single PURE
+// return expression: a call with LITERAL arguments constant-folds through
+// the body (substitution + evaluation); the A1 v1 grammar has no call
+// stack, so anything richer (variable args, body side effects) REFUSES.
+// The body is never emitted — only main's body becomes the program.
+type userFunc struct {
+	params []string
+	ret    *expr // the return expression (nil for `return;` / empty body)
+}
+
+var userFuncs = map[string]*userFunc{}
+
+// boolStr — a C truth value as its string form (the store is string-typed).
+func boolStr(b bool) string {
+	if b {
+		return "1"
+	}
+	return "0"
+}
+
+// foldConst — evaluate a pure v1 expression over a LITERAL environment to
+// its string constant. C int semantics (int64) for the arithmetic subset;
+// comparisons and &&/||/! yield 1/0; ==/!= on non-numeric literals falls
+// back to string equality (strcmp("a","b") == 0 folds through this).
+func foldConst(e *expr, env map[string]string) (string, bool) {
+	if e == nil {
+		return "", false
+	}
+	switch e.kind {
+	case "num", "str":
+		return e.num, true
+	case "id":
+		v, ok := env[e.name]
+		return v, ok
+	case "call":
+		return foldCallConst(e, env)
+	case "bin":
+		switch e.op {
+		case "+", "-", "*", "/", "%":
+			l, ok1 := foldConst(e.l, env)
+			r, ok2 := foldConst(e.r, env)
+			if !ok1 || !ok2 {
+				return "", false
+			}
+			a, err1 := strconv.ParseInt(l, 10, 64)
+			b, err2 := strconv.ParseInt(r, 10, 64)
+			if err1 != nil || err2 != nil {
+				return "", false
+			}
+			var v int64
+			switch e.op {
+			case "+":
+				v = a + b
+			case "-":
+				v = a - b
+			case "*":
+				v = a * b
+			case "/":
+				if b == 0 {
+					return "", false
+				}
+				v = a / b // C truncation toward zero (Go division matches)
+			case "%":
+				if b == 0 {
+					return "", false
+				}
+				v = a % b
+			}
+			return strconv.FormatInt(v, 10), true
+		case "==", "!=", "<", ">", "<=", ">=":
+			l, ok1 := foldConst(e.l, env)
+			r, ok2 := foldConst(e.r, env)
+			if !ok1 || !ok2 {
+				return "", false
+			}
+			a, err1 := strconv.ParseInt(l, 10, 64)
+			b, err2 := strconv.ParseInt(r, 10, 64)
+			if err1 == nil && err2 == nil {
+				c := a
+				d := b
+				switch e.op {
+				case "==":
+					return boolStr(c == d), true
+				case "!=":
+					return boolStr(c != d), true
+				case "<":
+					return boolStr(c < d), true
+				case ">":
+					return boolStr(c > d), true
+				case "<=":
+					return boolStr(c <= d), true
+				case ">=":
+					return boolStr(c >= d), true
+				}
+			}
+			// non-numeric operands: string equality only (C's byte-wise
+			// ordering of arbitrary strings is not modeled)
+			if e.op == "==" {
+				return boolStr(l == r), true
+			}
+			if e.op == "!=" {
+				return boolStr(l != r), true
+			}
+			return "", false
+		case "&&", "||":
+			l, ok1 := foldConst(e.l, env)
+			r, ok2 := foldConst(e.r, env)
+			if !ok1 || !ok2 {
+				return "", false
+			}
+			a, err1 := strconv.ParseInt(l, 10, 64)
+			b, err2 := strconv.ParseInt(r, 10, 64)
+			if err1 != nil || err2 != nil {
+				return "", false
+			}
+			if e.op == "&&" {
+				return boolStr(a != 0 && b != 0), true
+			}
+			return boolStr(a != 0 || b != 0), true
+		case "!":
+			v, ok := foldConst(e.l, env)
+			if !ok {
+				return "", false
+			}
+			n, err := strconv.ParseInt(v, 10, 64)
+			if err != nil {
+				return "", false
+			}
+			return boolStr(n == 0), true
+		}
+	}
+	return "", false
+}
+
+// foldCallConst — a stdlib/user call with all-literal arguments -> its
+// string constant. strlen("lit") folds to the length, atoi("lit") to its
+// integer text, strcmp(a,b) to the SIGN of the C result (-1/0/1 — the
+// magnitude is implementation-defined). A user function call substitutes
+// the literal args for the params and folds the return expression.
+func foldCallConst(e *expr, env map[string]string) (string, bool) {
+	if e == nil {
+		return "", false
+	}
+	switch e.name {
+	case "strlen":
+		if len(e.args) == 1 {
+			if s, ok := foldConst(e.args[0], env); ok {
+				return strconv.Itoa(len(s)), true
+			}
+		}
+	case "atoi":
+		if len(e.args) == 1 {
+			if s, ok := foldConst(e.args[0], env); ok {
+				t := strings.TrimSpace(s)
+				n, err := strconv.Atoi(t)
+				if err != nil {
+					n = 0 // C atoi: no leading digits -> 0
+				}
+				return strconv.Itoa(n), true
+			}
+		}
+	case "strcmp":
+		if len(e.args) == 2 {
+			a, ok1 := foldConst(e.args[0], env)
+			b, ok2 := foldConst(e.args[1], env)
+			if ok1 && ok2 {
+				switch {
+				case a == b:
+					return "0", true
+				case a < b:
+					return "-1", true
+				default:
+					return "1", true
+				}
+			}
+		}
+	}
+	// user function: substitute the literal args for the params, fold the body
+	if fn, ok := userFuncs[e.name]; ok {
+		if len(e.args) != len(fn.params) || fn.ret == nil {
+			return "", false
+		}
+		sub := map[string]string{}
+		for i, a := range e.args {
+			v, ok := foldConst(a, env)
+			if !ok {
+				return "", false
+			}
+			sub[fn.params[i]] = v
+		}
+		return foldConst(fn.ret, sub)
+	}
+	return "", false
 }
 
 // ── lexer ────────────────────────────────────────────────────────────
@@ -268,7 +476,11 @@ func isIdent(c byte) bool {
 }
 
 // ── parser ───────────────────────────────────────────────────────────
-type parser struct{ ts []tok; p int }
+type parser struct {
+	ts       []tok
+	p        int
+	retExpr  *expr // the most recent `return <expr>;` (user-function bodies)
+}
 
 func (p *parser) peek() *tok {
 	if p.p < len(p.ts) {
@@ -511,6 +723,20 @@ func arithNode(e *expr) any {
 		return map[string]any{"type": "Num", "value": n}
 	case "id":
 		return map[string]any{"type": "Var", "name": e.name}
+	case "call":
+		// a call in an arithmetic context (strcmp(a,b) < 0, triple(2) + 1):
+		// fold to a constant when every argument is literal. The A1 Arith
+		// grammar has no Call node, so a variable value cannot be modeled
+		// — refuse (refuse > guess; silently folding to 0 would be a lie).
+		s, ok := foldCallConst(e, nil)
+		if !ok {
+			refuse("unsupported function call " + e.name + " in arithmetic context")
+		}
+		n, err := strconv.Atoi(s)
+		if err != nil {
+			refuse("unsupported function call " + e.name + " (non-integer value)")
+		}
+		return map[string]any{"type": "Num", "value": n}
 	case "bin":
 		return map[string]any{"type": "Bin", "lhs": arithNode(e.l), "op": e.op, "rhs": arithNode(e.r)}
 	}
@@ -661,13 +887,26 @@ func (p *parser) stmt() (any, error) {
 		return nil, nil
 	}
 	switch {
+	case p.isId("static"):
+		// storage-class qualifier — `static int triple(...)`: consume and
+		// fall through to the type-keyword handling
+		p.next()
+		return p.stmt()
 	case p.isId("int") || p.isId("char") || p.isId("return"):
 		kw := p.next().text
 		if kw == "return" {
-			for !p.isOp(";") && p.peek() != nil {
-				p.next()
+			var e *expr
+			if !p.isOp(";") {
+				var err error
+				e, err = p.expr()
+				if err != nil {
+					return nil, err
+				}
 			}
-			p.next() // consume ;
+			if err := p.expectOp(";"); err != nil {
+				return nil, err
+			}
+			p.retExpr = e // captured for user-function constant folding
 			return nil, nil // return: no stdout effect in the v1 subset
 		}
 		// [int|char] [*]* NAME ( = expr )? ;  — pointers: `int *p` / `char *s`
@@ -683,23 +922,57 @@ func (p *parser) stmt() (any, error) {
 		if kw == "char" && isPtr {
 			charPtrVars[name.text] = true
 		}
-		// function signature `int main ( ) {`
+		// function signature `int main ( void ) {` — or a USER function
+		// `static int triple ( int n ) { return n * 3; }`. main's body
+		// becomes the program; a user function is registered for
+		// literal-arg constant folding (the body is parsed for its return
+		// expression but never emitted).
 		if p.isOp("(") {
 			p.next()
-			depth := 1
-			for depth > 0 {
-				tk := p.next()
-				if tk == nil {
-					break
-				}
-				if tk.kind == "op" && tk.text == "(" {
-					depth++
-				}
-				if tk.kind == "op" && tk.text == ")" {
-					depth--
+			var params []string
+			if !p.isOp(")") {
+				if p.isId("void") {
+					p.next() // main(void)
+				} else {
+					for {
+						t := p.peek()
+						if t == nil || t.kind != "id" || (t.text != "int" && t.text != "char") {
+							return nil, fmt.Errorf("expected parameter type (int|char) at token %v", t)
+						}
+						p.next() // int | char
+						for p.isOp("*") {
+							p.next()
+						}
+						pn := p.next()
+						if pn == nil || pn.kind != "id" {
+							return nil, fmt.Errorf("expected parameter name at token %v", pn)
+						}
+						params = append(params, pn.text)
+						if p.isOp(")") {
+							break
+						}
+						if err := p.expectOp(","); err != nil {
+							return nil, err
+						}
+					}
 				}
 			}
-			return nil, nil // signature consumed; the body follows as a block
+			p.next() // )
+			if name.text == "main" {
+				return nil, nil // signature consumed; the body follows as a block
+			}
+			// a user function: the v1 subset is a single pure return
+			// expression — body side effects cannot be folded, refuse
+			p.retExpr = nil
+			body, err := p.block()
+			if err != nil {
+				return nil, err
+			}
+			if len(body) > 0 {
+				refuse("user function body must be a single return in the v1 subset: " + name.text)
+			}
+			userFuncs[name.text] = &userFunc{params: params, ret: p.retExpr}
+			return nil, nil
 		}
 		if p.isOp("[") {
 			// array declaration: name[ size ] ( = { e, e, ... } )? ;
