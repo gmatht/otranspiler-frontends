@@ -40,5 +40,17 @@ naturally when the pattern fits" branch: a char* IS a string, so the
 allocation_id + offset machinery is bypassed entirely. Dynamic indices
 (s[i] with i a variable) and writable buffers are follow-ups.
 
+Pointer-to-array reduction (the natural case for contiguous storage):
+`int a[3] = {...}`, `int *p = &a[1]` — the pointer's target is STATICALLY
+known, so p becomes the compile-time pair (array, base) and every use
+folds to direct array indexing: *p -> a[base], p[k] -> a[base+k],
+*p = v -> the baked-name array write. The pointer variable is never
+emitted. This is the target-natural form for every language with
+indexable storage (JS/Perl/Python arrays, Go slices, C identity); the
+shell family has no memory-like arrays, so the seam stays the floor.
+Verified t11: gcc == estree (20/30/10/99), zero pointer machinery.
+Non-static pointers (p passed to a function, p = p + n in a loop) refuse
+— the seam or a follow-up handles those.
+
 Worker: ./run_frontend_worker.sh — failure-driven (make test -> pi
 deepseek-v4-turbo -> commit/stash -> trap/escalate).

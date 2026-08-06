@@ -26,6 +26,56 @@ func call(f string, args []any) map[string]any {
 // bindings, and the mem.* seam reads/writes the store — divergence).
 var addrTaken = map[string]bool{}
 
+// arrayVars — `int a[3]` declarations: lowered to setArray (the runtime's
+// array store). ptrTargets — a pointer whose target is STATICALLY known
+// (p = &a[1] / p = a): the POINTER-TO-ARRAY reduction — the pointer
+// becomes (array, index) and every use folds to direct array indexing;
+// the pointer variable is compile-time only, never emitted.
+var arrayVars = map[string]bool{}
+var ptrTargets = map[string]ptrTarget{}
+
+type ptrTarget struct {
+	arr  string
+	base int
+}
+
+// ptrTargetFromExpr — is e a statically-resolvable pointer-into-array?
+// &a[i] -> (a, i); &a / a (decay) -> (a, 0).
+func ptrTargetFromExpr(e *expr) (ptrTarget, bool) {
+	if e == nil {
+		return ptrTarget{}, false
+	}
+	if e.kind == "addr" && e.l != nil {
+		if e.l.kind == "index" && e.l.l != nil && e.l.l.kind == "id" && arrayVars[e.l.l.name] {
+			b, ok := foldIndex(e.l.r)
+			return ptrTarget{arr: e.l.l.name, base: b}, ok
+		}
+		if e.l.kind == "id" && arrayVars[e.l.name] {
+			return ptrTarget{arr: e.l.name, base: 0}, true
+		}
+	}
+	if e.kind == "id" && arrayVars[e.name] {
+		return ptrTarget{arr: e.name, base: 0}, true
+	}
+	return ptrTarget{}, false
+}
+
+// foldIndex — a literal index (num, or unary-minus num) as an int.
+func foldIndex(e *expr) (int, bool) {
+	if e == nil {
+		return 0, false
+	}
+	if e.kind == "num" {
+		n, err := strconv.Atoi(e.num)
+		return n, err == nil
+	}
+	if e.kind == "bin" && e.op == "-" && e.l != nil && e.l.kind == "num" && e.l.num == "0" && e.r != nil && e.r.kind == "num" {
+		n, err := strconv.Atoi(e.r.num)
+		return -n, err == nil
+	}
+	return 0, false
+}
+
 // charPtrVars — `char *name` declarations: the POINTER-TO-STRING lowering.
 // A char* is lowered to the string itself — no mem.* handles, no arena:
 //   &"lit"     -> the literal string
@@ -264,6 +314,14 @@ func (p *parser) mulExpr() (*expr, error) {
 	return l, nil
 }
 func (p *parser) unaryExpr() (*expr, error) {
+	if p.isOp("-") {
+		p.next()
+		e, err := p.unaryExpr()
+		if err != nil {
+			return nil, err
+		}
+		return &expr{kind: "bin", op: "-", l: &expr{kind: "num", num: "0"}, r: e}, nil
+	}
 	if p.isOp("!") {
 		p.next()
 		e, err := p.unaryExpr()
@@ -361,12 +419,30 @@ func valueNode(e *expr) any {
 		}
 		return call("addrOf", []any{valueNode(e.l)})
 	case "deref":
+		// *p on a static pointer-into-array — reduce to arrayIndex(arr, base)
+		if e.l != nil && e.l.kind == "id" {
+			if t, ok := ptrTargets[e.l.name]; ok {
+				return call("arrayIndex", []any{st(t.arr), st(strconv.Itoa(t.base))})
+			}
+		}
 		// *p — load through the handle
 		return call("memLoad", []any{valueNode(e.l)})
 	case "index":
 		// s[i] on a char* — the pointer-to-string lowering: a 1-char slice
 		if e.l != nil && e.l.kind == "id" && charPtrVars[e.l.name] {
 			return call("param", []any{st("slice"), st(e.l.name), offsetArg(e.r), st("1")})
+		}
+		// p[k] on a static pointer-into-array — the pointer-to-array
+		// reduction: fold to arrayIndex(arr, base+k)
+		if e.l != nil && e.l.kind == "id" {
+			if t, ok := ptrTargets[e.l.name]; ok {
+				if k, ok := foldIndex(e.r); ok {
+					return call("arrayIndex", []any{st(t.arr), st(strconv.Itoa(t.base + k))})
+				}
+			}
+			if arrayVars[e.l.name] {
+				return call("arrayIndex", []any{st(e.l.name), offsetArg(e.r)})
+			}
 		}
 		return nil
 	case "bin":
@@ -505,6 +581,46 @@ func (p *parser) stmt() (any, error) {
 			}
 			return nil, nil // signature consumed; the body follows as a block
 		}
+		if p.isOp("[") {
+			// array declaration: name[ size ] ( = { e, e, ... } )? ;
+			p.next()
+			if _, err := p.expr(); err != nil {
+				return nil, err
+			}
+			if err := p.expectOp("]"); err != nil {
+				return nil, err
+			}
+			arrayVars[name.text] = true
+			if p.isOp("=") {
+				p.next()
+				if err := p.expectOp("{"); err != nil {
+					return nil, err
+				}
+				var elems []any
+				if !p.isOp("}") {
+					for {
+						e, err := p.expr()
+						if err != nil {
+							return nil, err
+						}
+						elems = append(elems, valueNode(e))
+						if p.isOp("}") {
+							break
+						}
+						if err := p.expectOp(","); err != nil {
+							return nil, err
+						}
+					}
+				}
+				p.next() // }
+				if err := p.expectOp(";"); err != nil {
+					return nil, err
+				}
+				return map[string]any{"type": "Expr", "expr": call("setArray", []any{st(name.text), map[string]any{"elements": elems, "type": "Array"}})}, nil
+			}
+			p.next() // bare `int a[3];`
+			return nil, nil
+		}
 		if p.isOp("=") {
 			p.next()
 			e, err := p.expr()
@@ -513,6 +629,16 @@ func (p *parser) stmt() (any, error) {
 			}
 			if err := p.expectOp(";"); err != nil {
 				return nil, err
+			}
+			// pointer-to-array reduction: the pointer's target is static —
+			// record (array, base) and emit NOTHING (compile-time only)
+			if t, ok := ptrTargetFromExpr(e); ok {
+				ptrTargets[name.text] = t
+				return nil, nil
+			}
+			if isPtr && e.kind == "id" && arrayVars[e.name] {
+				ptrTargets[name.text] = ptrTarget{arr: e.name, base: 0}
+				return nil, nil
 			}
 			return assignStmt(name.text, valueNode(e)), nil
 		}
@@ -713,6 +839,13 @@ func (p *parser) simpleAssign() (any, error) {
 		if err := p.expectOp(";"); err != nil {
 			return nil, err
 		}
+		// *p = v on a static pointer-into-array — reduce to the baked-name
+		// array assign (the core's arr[1]=x shape; the runtime handles it)
+		if target != nil && target.kind == "id" {
+			if t, ok := ptrTargets[target.name]; ok {
+				return assignStmt(t.arr+"["+strconv.Itoa(t.base)+"]", valueNode(e)), nil
+			}
+		}
 		return map[string]any{
 			"type": "Expr",
 			"expr": call("memStore", []any{valueNode(target), valueNode(e)}),
@@ -727,6 +860,12 @@ func (p *parser) simpleAssign() (any, error) {
 		}
 		if err := p.expectOp(";"); err != nil {
 			return nil, err
+		}
+		if op == "=" {
+			if t, ok := ptrTargetFromExpr(e); ok {
+				ptrTargets[name] = t
+				return nil, nil
+			}
 		}
 		return p.buildAssign(name, op, e)
 	}
