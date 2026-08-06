@@ -12,9 +12,20 @@ GO ?= /snap/go/current/bin/go
 all: build
 
 build:
+	# self-healing: a stale/corrupt output (e.g. an interrupted build leaves
+	# a non-object file) makes `go build -o` refuse to overwrite it and the
+	# gate wedges. Drop it first; the fresh binary is always rebuilt.
+	rm -f c-sh-go
 	$(GO) build -o c-sh-go .
 
-test: build
+# Self-heal the ingress oracle too: a missing core debashc binary (fresh
+# checkout, interrupted core build) wedges the gate as a confusing
+# "FAIL <file> (emit is not valid A1 shIR)". Build it on demand; the
+# oracle is read-only here.
+$(DEBASHC):
+	cd $(abspath ../../sh2perl) && cargo build --bin debashc
+
+test: build $(DEBASHC)
 	@for f in testdata/*.c; do \
 	  bn=$$(basename $$f); \
 	  ./c-sh-go --shir $$f --raw > /tmp/$$bn.mine 2>/dev/null || { echo "FAIL $$bn (frontend emit)"; exit 1; }; \
