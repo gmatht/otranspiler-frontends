@@ -2,7 +2,7 @@
 # go-sh scoped worker — FAILURE-DRIVEN.
 set -euo pipefail
 cd "$(dirname "$0")"
-WORKSPACE="$(cd .. && pwd)"
+WORKSPACE="$(cd ../.. && pwd)"
 LOG="$WORKSPACE/loop-frontend-go-sh.log"
 echo "[$(date +%FT%T)] frontend go-sh worker started (pid=$$)" >> "$LOG"
 fail_count=0

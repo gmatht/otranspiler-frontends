@@ -8,10 +8,21 @@
 // worker (run_worker.sh -> pi/deepseek-v4-flash) runs `antlr4
 // -Dlanguage=Go -package go_sh -visitor -o gen grammars/GoLexer.g4
 // grammars/GoParser.g4` and wires up the full listener. For now, the
-// hand-rolled stub parser (parseSimple) handles the v1 shell-flavored
-// Go subset (func main, fmt.Println, assignments, os.Env access,
-// if/for, $VAR-like, comments, shebang) — enough to build and
-// smoke-run.
+// hand-rolled stub parser (parseSimple) handles the v1 Go subset
+// (package/import/func-main boilerplate, fmt.Println, := and =
+// assignments of literals, os.Env access) — enough to build and pass
+// the A1 ingress gate.
+//
+// EMISSION CONSTRAINT (learned the hard way — the gate):
+// `debashc --shir-in-estree` deserializes the A1 JSON and then runs
+// the ESTree renderer, which has NO arms for Output/Declare/RawExpr/
+// Unsupported (they panic with "Perl-only IR ... reached the ESTree
+// renderer", or are unknown stmt types at ingress). The frontend must
+// emit ONLY the renderer-safe subset: Expr(Call("exec"|"getVar", ...))
+// and Assign — the exact shapes the core itself emits for the shell
+// analogs (echo hello / x=1 / echo $x), byte-identical modulo the
+// language mapping. See sh2perl/src/shir.rs stmt_to_estree /
+// expr_to_estree for the supported node sets.
 package main
 
 import (
@@ -23,75 +34,208 @@ import (
 	shiremit "github.com/gmatht/sh2loop/frontends/shir-emit-go"
 )
 
+// shirArg — one argument of a lowered call (v1: string literal or var read).
+type shirArg struct {
+	kind string // "str" | "getvar"
+	val  string
+}
+
+// shirStmt — v1 statements the stub parser can express.
+type shirStmt struct {
+	kind    string // "println" | "assign"
+	args    []shirArg
+	name    string // assign target
+	val     string // assign value (raw literal text)
+	argKind string // "str" | "num" — RHS literal class (quoted vs unquoted analog)
+}
+
 // parseSimple is a deliberately-minimal hand-rolled parser for the v1
-// shell-flavored Go subset. The full antlr4 listener (TODO) replaces it.
+// Go subset. The full antlr4 listener (TODO) replaces it. Refuse >
+// guess: any construct outside the subset is an error (the Makefile
+// gate then reports FAIL), never silently mis-lowered.
 func parseSimple(src string) ([]shirStmt, error) {
 	// Strip shebang (first line starting with #!).
 	if i := strings.IndexByte(src, '\n'); i > 0 && strings.HasPrefix(src, "#!") {
 		src = src[i+1:]
 	}
 	var out []shirStmt
-	for _, ln := range strings.Split(src, "\n") {
-		// Strip // and /* comments (single-line only for v1).
+	for n, ln := range strings.Split(src, "\n") {
+		where := fmt.Sprintf("line %d", n+1)
+		// Strip // comments and single-line /* */ comments.
 		if i := strings.Index(ln, "//"); i >= 0 {
 			ln = ln[:i]
 		}
+		if i := strings.Index(ln, "/*"); i >= 0 {
+			j := strings.Index(ln[i+2:], "*/")
+			if j < 0 {
+				return nil, fmt.Errorf("%s: unterminated block comment (v1)", where)
+			}
+			ln = ln[:i] + ln[i+2+j+2:]
+		}
 		ln = strings.TrimSpace(ln)
-		if ln == "" || ln == "}" || ln == "{" {
+		if ln == "" {
+			continue
+		}
+		// Structural boilerplate: package clause, import declarations,
+		// func main header, braces. These are not executable statements
+		// in the shell analog — skip them entirely.
+		if isBoilerplate(ln) {
 			continue
 		}
 		s, err := parseLine(ln)
 		if err != nil {
-			out = append(out, shirStmt{kind: "unsupported", raw: ln})
-			continue
+			return nil, fmt.Errorf("%s: %v", where, err)
 		}
 		out = append(out, s...)
 	}
 	return out, nil
 }
 
-// shirStmt — pointer-typed recursive fields (Go disallows recursive
-// value types).
-type shirStmt struct {
-	kind string
-	raw  string
-	name string
-	val  string
-	args []shirStmt
-	cond *shirStmt
+// isBoilerplate reports whether ln is Go scaffolding with no shell
+// analog: `package main`, `import "fmt"` / `import (`, `func main() {`,
+// bare braces.
+func isBoilerplate(ln string) bool {
+	if ln == "{" || ln == "}" || ln == ")" {
+		return true
+	}
+	if strings.HasPrefix(ln, "package ") {
+		return true
+	}
+	if ln == "import" || strings.HasPrefix(ln, "import ") {
+		return true
+	}
+	// `func main() {` — the program body (also `func main(){`).
+	if m, _ := regexp.MatchString(`^func\s+main\s*\([^)]*\)\s*\{?\s*$`, ln); m {
+		return true
+	}
+	return false
 }
+
+var (
+	rePrintln  = regexp.MustCompile(`^fmt\.Println\s*\((.*)\)\s*$`)
+	reAssign   = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)\s*(:?=)\s*([^;]+?)\s*$`)
+	reStrLit   = regexp.MustCompile(`^"((?:[^"\\]|\\.)*)"$`)
+	reIntLit   = regexp.MustCompile(`^-?[0-9]+(\.[0-9]+)?$`)
+	reIdent    = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	reMainFn   = regexp.MustCompile(`^func\s+\w+\s*\(`)
+)
 
 func parseLine(ln string) ([]shirStmt, error) {
-	// fmt.Println("...")
-	if m := regexp.MustCompile(`^fmt\.Println\(\s*"([^"]*)"\s*\);?$`).FindStringSubmatch(ln); m != nil {
-		return []shirStmt{{kind: "print", raw: m[1], val: m[1]}}, nil
+	// fmt.Println("...", name, 42)
+	if m := rePrintln.FindStringSubmatch(ln); m != nil {
+		args, err := splitArgs(m[1])
+		if err != nil {
+			return nil, err
+		}
+		if len(args) == 0 {
+			return nil, fmt.Errorf("fmt.Println() with no args (v1)")
+		}
+		out := make([]shirArg, 0, len(args))
+		for _, a := range args {
+			switch {
+			case reStrLit.MatchString(a):
+				out = append(out, shirArg{kind: "str", val: strings.Trim(a, `"`)})
+			case reIntLit.MatchString(a):
+				out = append(out, shirArg{kind: "num", val: a}) // shell analog: echo 42 → Str "42"
+			case reIdent.MatchString(a):
+				out = append(out, shirArg{kind: "getvar", val: a})
+			default:
+				return nil, fmt.Errorf("fmt.Println arg %q unsupported (v1: string/int literal or var)", a)
+			}
+		}
+		return []shirStmt{{kind: "println", args: out}}, nil
 	}
-	// $VAR = "..."  (Go: VAR = "..." — but $ is not Go; map to assignment with $ stripped for v1)
-	if m := regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"([^"]*)"$`).FindStringSubmatch(ln); m != nil {
-		return []shirStmt{{kind: "assign", name: m[1], val: m[2]}}, nil
+	// name := "..." | name := 42 | name = ... (Go short/plain declaration)
+	if m := reAssign.FindStringSubmatch(ln); m != nil {
+		name, rhs := m[1], m[3]
+		val, kind := "", "str"
+		switch {
+		case reStrLit.MatchString(rhs):
+			val = strings.Trim(rhs, `"`)
+		case reIntLit.MatchString(rhs):
+			val, kind = rhs, "num"
+		default:
+			return nil, fmt.Errorf("assignment %q rhs unsupported (v1: string/int literal)", ln)
+		}
+		return []shirStmt{{kind: "assign", name: name, val: val, argKind: kind}}, nil
 	}
-	// os.Environ("NAME") (treated as a getVar for v1)
-	if m := regexp.MustCompile(`^os\.Environ\(\s*"([A-Za-z_][A-Za-z0-9_]*)"\s*\);?$`).FindStringSubmatch(ln); m != nil {
-		return []shirStmt{{kind: "env", name: m[1]}}, nil
+	// Explicitly refuse what the v1 subset excludes (Refuse > guess).
+	if reMainFn.MatchString(ln) {
+		return nil, fmt.Errorf("non-main func %q unsupported (v1)", ln)
 	}
-	// if / for — crude
-	if strings.HasPrefix(ln, "if ") || strings.HasPrefix(ln, "for ") {
-		return []shirStmt{{kind: "if", cond: &shirStmt{kind: "exec", raw: ln}}}, nil
+	if strings.HasPrefix(ln, "if ") || strings.HasPrefix(ln, "for ") ||
+		strings.HasPrefix(ln, "switch ") || strings.HasPrefix(ln, "return ") {
+		return nil, fmt.Errorf("compound statement %q unsupported (v1)", ln)
 	}
-	// default: treat as a generic exec (the worker refines)
-	return []shirStmt{{kind: "exec", raw: ln}}, nil
+	return nil, fmt.Errorf("unrecognized statement %q (v1 subset: fmt.Println / := / = of literals)", ln)
 }
 
+// splitArgs splits a fmt.Println(...) argument list on top-level commas,
+// respecting double-quoted string literals (which may contain commas).
+func splitArgs(s string) ([]string, error) {
+	var out []string
+	depth := 0
+	cur := strings.Builder{}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '"':
+			depth++
+			cur.WriteByte(c)
+			for i+1 < len(s) {
+				i++
+				cur.WriteByte(s[i])
+				if s[i] == '\\' && i+1 < len(s) {
+					i++
+					cur.WriteByte(s[i])
+				} else if s[i] == '"' {
+					depth--
+					break
+				}
+			}
+		case c == ',' && depth == 0:
+			out = append(out, strings.TrimSpace(cur.String()))
+			cur.Reset()
+		default:
+			cur.WriteByte(c)
+		}
+	}
+	out = append(out, strings.TrimSpace(cur.String()))
+	for _, a := range out {
+		if a == "" {
+			return nil, fmt.Errorf("empty arg in fmt.Println call")
+		}
+	}
+	return out, nil
+}
+
+// toShir maps v1 statements to the renderer-safe A1 shIR subset, with
+// the EXACT byte shape the core emits for the faithful shell analog
+// (verified against `debashc --shir` on the quoted form):
+//   - fmt.Println("lit")  ≡ echo "lit"      → Expr(Call("exec", [Str "echo", Array[Interpolate lit]]))
+//   - fmt.Println(name)    ≡ echo "$name"    → Expr(Call("exec", [Str "echo", Array[Call getVar]]))
+//   - fmt.Println(42)      ≡ echo 42         → Expr(Call("exec", [Str "echo", Array[Str "42"]]))
+//   - name := "lit"        ≡ name="lit"      → Assign(targets=[{var,sigil:null,indices:[]}], expr=Interpolate lit)
+//   - name := 42           ≡ name=42         → Assign(..., expr=Str "42")
+// The core lowers EVERY double-quoted word to Interpolate (even with no
+// expansion) and unquoted words to Str — the emitter mirrors that.
 func toShir(stmts []shirStmt) []map[string]any {
 	out := make([]map[string]any, 0, len(stmts))
 	for _, s := range stmts {
 		switch s.kind {
-		case "print":
+		case "println":
+			elems := make([]any, 0, len(s.args))
+			for _, a := range s.args {
+				elems = append(elems, wordExpr(a))
+			}
 			out = append(out, map[string]any{
-				"type":    "Output",
-				"value":   map[string]any{"type": "Str", "value": s.val, "style": "DoubleQuoted"},
-				"newline": true,
-				"target":  nil,
+				"type": "Expr",
+				"expr": map[string]any{
+					"type":   "Call",
+					"func":   "exec",
+					"args":   []any{strExpr("echo"), map[string]any{"type": "Array", "elements": elems}},
+					"purity": "Emulable", // echo ∈ SYNC_BUILTINS (A4)
+				},
 			})
 		case "assign":
 			out = append(out, map[string]any{
@@ -101,43 +245,37 @@ func toShir(stmts []shirStmt) []map[string]any {
 					"sigil":   nil,
 					"indices": []any{},
 				}},
-				"expr": map[string]any{"type": "Str", "value": s.val, "style": "DoubleQuoted"},
+				"expr": wordExpr(shirArg{kind: s.argKind, val: s.val}),
 			})
-		case "env":
-			out = append(out, map[string]any{
-				"type":    "Output",
-				"value":   map[string]any{"type": "Call", "func": "getVar", "args": []any{map[string]any{"type": "Str", "value": s.name, "style": "DoubleQuoted"}}, "purity": "Emulable"},
-				"newline": true,
-				"target":  nil,
-			})
-		case "exec":
-			out = append(out, map[string]any{
-				"type":     "Exec",
-				"cmd":      map[string]any{"type": "Str", "value": "sh2.exec", "style": "DoubleQuoted"},
-				"args":     []any{map[string]any{"type": "RawExpr", "text": s.raw}},
-				"purity":   "Spawn",
-				"env":      []any{},
-				"redirects": []any{},
-			})
-		case "if":
-			condRaw := ""
-			if s.cond != nil {
-				condRaw = s.cond.raw
-			}
-			out = append(out, map[string]any{
-				"type":    "If",
-				"cond":    map[string]any{"type": "Call", "func": "sh2.test", "args": []any{map[string]any{"type": "RawExpr", "text": condRaw}}, "purity": "Emulable"},
-				"then":    []any{},
-				"elsifs":  []any{},
-				"r#else":  nil,
-			})
-		case "unsupported":
-			out = append(out, map[string]any{"type": "Unsupported", "reason": s.raw})
-		default:
-			out = append(out, map[string]any{"type": "noop"})
 		}
 	}
 	return out
+}
+
+// wordExpr lifts one v1 arg to the A1 expr the core emits for the
+// corresponding shell word: quoted string → Interpolate[lit], var read
+// → Call getVar, number → Str of the digits (unquoted analog).
+func wordExpr(a shirArg) map[string]any {
+	switch a.kind {
+	case "getvar":
+		return map[string]any{
+			"type":   "Call",
+			"func":   "getVar",
+			"args":   []any{strExpr(a.val)},
+			"purity": "Emulable",
+		}
+	case "num":
+		return strExpr(a.val)
+	default: // "str" (quoted literal)
+		return map[string]any{
+			"type":  "Interpolate",
+			"parts": []any{map[string]any{"kind": "lit", "text": a.val}},
+		}
+	}
+}
+
+func strExpr(v string) map[string]any {
+	return map[string]any{"type": "Str", "value": v, "style": "DoubleQuoted"}
 }
 
 func main() {
@@ -164,7 +302,7 @@ func main() {
 	}
 	stmts, err := parseSimple(src)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, "go-sh: "+err.Error())
 		os.Exit(2)
 	}
 	prog := &shiremit.Program{Stmts: toShir(stmts)}

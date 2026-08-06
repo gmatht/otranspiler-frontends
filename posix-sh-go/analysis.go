@@ -992,6 +992,525 @@ func analyzeVarTypes(stmts []Stmt) []VarTypeOut {
 type VarTypeOut struct{ Name, Type string }
 
 // ─────────────────────────────────────────────────────────────────────
+// A1b: max-string-length verdicts (mirror analyze_string_lengths — the
+// transform the C backend asked for: fixed buffers instead of heap). A
+// fixed-point over the assignments: each var's bound is the max over its
+// assignment RHS lengths (Str literals, Interpolate = the literal parts +
+// the interpolated vars' bounds); captures/calls/binops are unbounded
+// (None); a loop-accumulated `s="$s$x"` grows past the cap each
+// iteration and flips to None (the cap guarantees termination).
+// ─────────────────────────────────────────────────────────────────────
+
+type VarLenOut struct{ Name string; MaxLen *uint64 } // nil = unbounded
+
+type lenAssign struct {
+	name string
+	rhs  Expr
+}
+
+const strLenCap uint64 = 4096
+const strLenIterLimit = 1024
+
+func satAdd64(a, b uint64) uint64 {
+	if a > ^uint64(0)-b {
+		return ^uint64(0)
+	}
+	return a + b
+}
+
+// collectLenAssigns — mirror the assignment-collection walk inside
+// analyze_string_lengths: Assign targets with no indices, plus the
+// `local name=value` / `declare name=value` / `export name=value`
+// declaration assignments (the exec/builtin call's args carry "name=" +
+// the value). If/While/For/Subshell/Background/Block/Redirect/Function
+// bodies are walked; Case and Pipeline statements are NOT (as in the
+// core).
+func collectLenAssigns(st Stmt, assigns *[]lenAssign) {
+	switch t := st.(type) {
+	case *AssignS:
+		*assigns = append(*assigns, lenAssign{t.Var, t.Expr})
+	case *ExprS:
+		c, ok := t.Expr.(*CallE)
+		if !ok || len(c.Args) < 2 {
+			return
+		}
+		cn, ok := c.Args[0].(*StrE)
+		if !ok {
+			return
+		}
+		if cn.Value != "local" && cn.Value != "declare" && cn.Value != "readonly" && cn.Value != "export" {
+			return
+		}
+		arr, ok := c.Args[1].(*ArrayE)
+		if !ok {
+			return
+		}
+		i := 0
+		for i < len(arr.Elems) {
+			if nv, ok := arr.Elems[i].(*StrE); ok {
+				if eq := strings.Index(nv.Value, "="); eq >= 0 {
+					name := nv.Value[:eq]
+					value := nv.Value[eq+1:]
+					if name != "" {
+						// the value may be inline ("" for `name=$(...)`)
+						// or the NEXT array element: ["sqrt_n=", [value]]
+						var v Expr
+						nextIsArray := false
+						if i+1 < len(arr.Elems) {
+							next := arr.Elems[i+1]
+							if inner, ok := next.(*ArrayE); ok {
+								nextIsArray = true
+								if len(inner.Elems) == 1 {
+									v = inner.Elems[0]
+								} else {
+									v = next
+								}
+							} else {
+								v = next
+							}
+						} else if !strings.Contains(value, "$") {
+							// inline literal
+							v = &StrE{Value: value, Style: "DoubleQuoted"}
+						} else {
+							break
+						}
+						*assigns = append(*assigns, lenAssign{name, v})
+						if nextIsArray {
+							i += 2
+							continue
+						}
+					}
+				}
+			}
+			i++
+		}
+	case *IfS:
+		for _, b := range t.Then {
+			collectLenAssigns(b, assigns)
+		}
+		for _, b := range t.Else {
+			collectLenAssigns(b, assigns)
+		}
+	case *WhileS:
+		for _, b := range t.Body {
+			collectLenAssigns(b, assigns)
+		}
+	case *ForS:
+		for _, b := range t.Body {
+			collectLenAssigns(b, assigns)
+		}
+	case *SubshellS:
+		for _, b := range t.Body {
+			collectLenAssigns(b, assigns)
+		}
+	case *BackgroundS:
+		for _, b := range t.Body {
+			collectLenAssigns(b, assigns)
+		}
+	case *BlockS:
+		for _, b := range t.Body {
+			collectLenAssigns(b, assigns)
+		}
+	case *RedirectS:
+		for _, b := range t.Inner {
+			collectLenAssigns(b, assigns)
+		}
+	case *FunctionS:
+		for _, b := range t.Body {
+			collectLenAssigns(b, assigns)
+		}
+	}
+}
+
+// exprStrLen — mirror expr_len (the per-expr bound; None = unbounded).
+func exprStrLen(e Expr, lens map[string]*uint64, cap uint64) *uint64 {
+	switch t := e.(type) {
+	case *StrE:
+		v := uint64(len(t.Value))
+		return &v
+	case *IntE:
+		v := uint64(20) // the max digit count
+		return &v
+	case *VarE:
+		return lens[t.Name]
+	case *InterpE:
+		var total uint64
+		for _, p := range t.Parts {
+			var l uint64
+			if p.IsLit {
+				l = uint64(len(p.Lit))
+			} else {
+				l2 := exprStrLen(p.Expr, lens, cap)
+				if l2 == nil {
+					return nil
+				}
+				l = *l2
+			}
+			total = satAdd64(total, l)
+			if total > cap {
+				return nil
+			}
+		}
+		return &total
+	case *CallE:
+		if t.Func == "getVar" {
+			if len(t.Args) > 0 {
+				if n, ok := t.Args[0].(*StrE); ok {
+					return lens[n.Value]
+			}
+			}
+			return nil
+		}
+		if t.Func == "capture" {
+			if len(t.Args) > 0 {
+				return captureBound(t.Args[0], lens, cap)
+			}
+			return nil
+		}
+		return nil
+	case *BinOpE:
+		switch t.Op {
+		case "Concat": // a . b = max(a)+max(b)
+			l := exprStrLen(t.Lhs, lens, cap)
+			if l == nil {
+				return nil
+			}
+			r := exprStrLen(t.Rhs, lens, cap)
+			if r == nil {
+				return nil
+			}
+			v := satAdd64(*l, *r)
+			return &v
+		case "Eq", "Ne", "Lt", "Gt", "Le", "Ge", "And", "Or", "Not":
+			v := uint64(1) // comparisons/logicals yield 0/1
+			return &v
+		default:
+			v := uint64(20) // the numeric/bitwise ops -> a number
+			return &v
+		}
+	case *ArithE:
+		v := uint64(20) // $((...)) -> a number
+		return &v
+	}
+	return nil // calls / arrays — unbounded
+}
+
+// captureStages — mirror capture_stages (the wrapped command's stages).
+func captureStages(e Expr) []Expr {
+	switch t := e.(type) {
+	case *CallE:
+		if t.Func == "pipeline" {
+			if len(t.Args) > 0 {
+				if arr, ok := t.Args[0].(*ArrayE); ok {
+					return arr.Elems
+				}
+			}
+			return []Expr{e}
+		}
+		if t.Func == "exec" || t.Func == "builtin" {
+			// the stages may sit in the exec's args directly
+			// ([Arrow, Arrow]) or wrapped in a single Array
+			// ([Array([Arrow, Arrow])]) — both appear in the corpus
+			if len(t.Args) > 0 {
+				if arr, ok := t.Args[0].(*ArrayE); ok && allArrows(arr.Elems) {
+					return arr.Elems
+				}
+			}
+			var stages []Expr
+			for _, a := range t.Args {
+				if _, ok := a.(*ArrowE); ok {
+					stages = append(stages, a)
+				}
+			}
+			if len(stages) == 0 {
+				return []Expr{e}
+			}
+			return stages
+		}
+	case *ArrowE:
+		// a single-command stage: the call IS the stage
+		for _, st := range t.Body {
+			es, ok := st.(*ExprS)
+			if !ok {
+				continue
+			}
+			c, ok := es.Expr.(*CallE)
+			if !ok {
+				continue
+			}
+			if c.Func != "exec" && c.Func != "builtin" && c.Func != "pipeline" {
+				return []Expr{c}
+			}
+			// the inner call's args ARE the stages (or the pipeline's
+			// [Array([Arrow, ...])])
+			if len(c.Args) > 0 {
+				if arr, ok := c.Args[0].(*ArrayE); ok && allArrows(arr.Elems) {
+					return arr.Elems
+				}
+			}
+			var stages []Expr
+			for _, a := range c.Args {
+				if _, ok := a.(*ArrowE); ok {
+					stages = append(stages, a)
+				}
+			}
+			if len(stages) == 0 {
+				return []Expr{c}
+			}
+			return stages
+		}
+		return nil
+	}
+	return []Expr{e}
+}
+
+func allArrows(es []Expr) bool {
+	for _, a := range es {
+		if _, ok := a.(*ArrowE); !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// stageCmd — mirror stage_cmd (the command name of a pipeline stage).
+func stageCmd(stage Expr) (string, bool) {
+	switch t := stage.(type) {
+	case *ArrowE:
+		for _, st := range t.Body {
+			es, ok := st.(*ExprS)
+			if !ok {
+				continue
+			}
+			c, ok := es.Expr.(*CallE)
+			if !ok || (c.Func != "exec" && c.Func != "builtin") {
+				continue
+			}
+			if len(c.Args) > 0 {
+				if n, ok := c.Args[0].(*StrE); ok {
+					return n.Value, true
+				}
+			}
+		}
+		return "", false
+	case *CallE:
+		if t.Func == "exec" || t.Func == "builtin" {
+			if len(t.Args) > 0 {
+				if n, ok := t.Args[0].(*StrE); ok {
+					return n.Value, true
+				}
+			}
+		}
+		return "", false
+	}
+	return "", false
+}
+
+func grepArg(args []Expr) string {
+	for _, a := range args {
+		if sv, ok := a.(*StrE); ok && len(sv.Value) == 2 && sv.Value[0] == '-' {
+			return sv.Value
+		}
+	}
+	return ""
+}
+
+// captureBound — mirror capture_bound: the capture's bound depends on the
+// CAPTURED COMMAND: bc yields a fixed-width number; the filters
+// (grep/sed/tr/...) yield output no larger than the input — bounded by
+// the pipeline's FIRST stage when that is a bounded echo; everything else
+// is unbounded.
+func captureBound(e Expr, lens map[string]*uint64, cap uint64) *uint64 {
+	stages := captureStages(e)
+	if len(stages) == 0 {
+		return nil
+	}
+	last := stages[len(stages)-1]
+	cmdName, ok := stageCmd(last)
+	if !ok {
+		return nil
+	}
+	// the grep OPTIONS change the bound: -q emits nothing, -c emits
+	// a count (a number), the rest filter (<= the input)
+	lastFlag := ""
+	if arr, ok := last.(*ArrowE); ok {
+		for _, st := range arr.Body {
+			es, ok := st.(*ExprS)
+			if !ok {
+				continue
+			}
+			c, ok := es.Expr.(*CallE)
+			if !ok || len(c.Args) < 2 {
+				continue
+			}
+			items, ok := c.Args[1].(*ArrayE)
+			if !ok {
+				continue
+			}
+			if f := grepArg(items.Elems); f != "" {
+				lastFlag = f
+				break
+			}
+		}
+	}
+	// zero-output builtins — the capture is the empty string (the
+	// guard applies to the whole or-pattern in the core, so "true"
+	// without -q falls through to the default: unbounded)
+	if cmdName == "true" || cmdName == "false" || cmdName == ":" ||
+		cmdName == "test" || cmdName == "[" || cmdName == "[[" || cmdName == "grep" {
+		if lastFlag == "-q" {
+			v := uint64(0)
+			return &v
+		}
+	}
+	switch cmdName {
+	case "bc":
+		v := uint64(40) // an arbitrary-precision number (the primes sqrt case)
+		return &v
+	case "wc":
+		v := uint64(20) // always numbers (the -l/-w/-c counts)
+		return &v
+	case "grep":
+		if lastFlag == "-c" {
+			v := uint64(20)
+			return &v
+		}
+		// the filters: output <= input — the FIRST stage's bound
+		return captureBound(stages[0], lens, cap)
+	case "md5sum":
+		v := uint64(32)
+		return &v
+	case "sha1sum":
+		v := uint64(40)
+		return &v
+	case "sha256sum":
+		v := uint64(64)
+		return &v
+	case "sha512sum":
+		v := uint64(128)
+		return &v
+	case "date":
+		v := uint64(30) // the timestamp
+		return &v
+	case "umask":
+		v := uint64(4) // an octal
+		return &v
+	case "expr":
+		v := uint64(20) // a number (or a short string)
+		return &v
+	case "seq":
+		return nil // the item count unknown
+	case "echo", "printf":
+		// the output is the args' joined lengths (skip the command
+		// name; the real args live in the trailing Array) — the
+		// stage may be an Arrow wrapping the call, or a bare Call
+		var call *CallE
+		if arr, ok := last.(*ArrowE); ok {
+			for _, st := range arr.Body {
+				if es, ok := st.(*ExprS); ok {
+					if c, ok := es.Expr.(*CallE); ok {
+						call = c
+						break
+					}
+				}
+			}
+		} else if c, ok := last.(*CallE); ok {
+			call = c
+		}
+		var total uint64
+		if call != nil {
+			for _, a := range call.Args {
+				var l uint64
+				if items, ok := a.(*ArrayE); ok {
+					var t uint64
+					for _, it := range items.Elems {
+						l2 := exprStrLen(it, lens, cap)
+						if l2 == nil {
+							return nil
+						}
+						t = satAdd64(t, *l2)
+					}
+					l = t
+				} else {
+					l2 := exprStrLen(a, lens, cap)
+					if l2 == nil {
+						return nil
+					}
+					l = *l2
+				}
+				total = satAdd64(satAdd64(total, l), 1)
+			}
+		}
+		if total > cap {
+			return nil
+		}
+		return &total
+	case "sed", "tr", "head", "tail", "sort", "uniq", "cut",
+		"cat", "paste", "rev", "join", "basename", "dirname", "comm":
+		// the filters: output <= input — the FIRST stage's bound
+		return captureBound(stages[0], lens, cap)
+	}
+	return nil
+}
+
+// analyzeStringLengths — mirror analyze_string_lengths. Returns the
+// (name, max_len) pairs sorted by name, matching the core's BTreeMap.
+func analyzeStringLengths(stmts []Stmt) []VarLenOut {
+	var assigns []lenAssign
+	for _, st := range stmts {
+		collectLenAssigns(st, &assigns)
+	}
+	names := map[string]bool{}
+	for _, a := range assigns {
+		names[a.name] = true
+	}
+	var sorted []string
+	for n := range names {
+		sorted = append(sorted, n)
+	}
+	sort.Strings(sorted)
+	lens := map[string]*uint64{}
+	for _, n := range sorted {
+		z := uint64(0)
+		lens[n] = &z
+	}
+	for it := 0; it < strLenIterLimit; it++ {
+		changed := false
+		for _, a := range assigns {
+			cur := lens[a.name]
+			if cur == nil {
+				continue
+			}
+			l := exprStrLen(a.rhs, lens, strLenCap)
+			var newv *uint64
+			if l != nil {
+				if *l > strLenCap {
+					newv = nil
+				} else {
+					m := *l
+					if *cur > m {
+						m = *cur
+					}
+					newv = &m
+				}
+			}
+			if (newv == nil) != (cur == nil) || (newv != nil && *newv != *cur) {
+				lens[a.name] = newv
+				changed = true
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+	var out []VarLenOut
+	for _, n := range sorted {
+		out = append(out, VarLenOut{Name: n, MaxLen: lens[n]})
+	}
+	return out
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // optimize (mirror optimize_stmts: arith-const fold; self-assign removal
 // is a no-op for our node shapes — IrExpr::Var is never produced)
 // ─────────────────────────────────────────────────────────────────────
@@ -1244,13 +1763,14 @@ func redirectsJSON(rs []RedirectIR) []interface{} {
 }
 
 // programJSON — the A1 program with stmt_lines.
-func programJSON(stmts []Stmt, varTypes []VarTypeOut) []byte {
+func programJSON(stmts []Stmt, varTypes []VarTypeOut, varLengths []VarLenOut) []byte {
 	prog := map[string]interface{}{
 		"type":             "Program",
 		"contract_version": contractVersion,
 		"imports":          []string{},
 		"requires":         []string{},
 		"var_types":        varTypesJSON(varTypes),
+		"var_lengths":      varLengthsJSON(varLengths),
 		"stmt_lines":       []interface{}{},
 		"subs":             []interface{}{},
 		"stmts":            stmtsJSON(stmts),
@@ -1273,6 +1793,18 @@ func varTypesJSON(vts []VarTypeOut) []interface{} {
 	return out
 }
 
+func varLengthsJSON(vls []VarLenOut) []interface{} {
+	out := make([]interface{}, len(vls))
+	for i, v := range vls {
+		var ml interface{}
+		if v.MaxLen != nil {
+			ml = *v.MaxLen
+		}
+		out[i] = map[string]interface{}{"name": v.Name, "max_len": ml}
+	}
+	return out
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // driver: file → A1 JSON
 // ─────────────────────────────────────────────────────────────────────
@@ -1291,7 +1823,8 @@ func shirForSource(src string) ([]byte, error) {
 	}
 	stmts = optimizeStmts(stmts)
 	vt := analyzeVarTypes(stmts)
-	return programJSON(stmts, vt), nil
+	vl := analyzeStringLengths(stmts)
+	return programJSON(stmts, vt, vl), nil
 }
 
 func main() {

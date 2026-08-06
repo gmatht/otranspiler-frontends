@@ -11,7 +11,7 @@
 # Fix surface: this dir + harness/* (NEVER the core src/*).
 set -euo pipefail
 cd "$(dirname "$0")"
-WORKSPACE="$(cd .. && pwd)"
+WORKSPACE="$(cd ../.. && pwd)"
 LOG="$WORKSPACE/loop-frontend-py-sh-go.log"
 echo "[$(date +%FT%T)] frontend py-sh-go worker started (pid=$$)" >> "$LOG"
 fail_count=0
