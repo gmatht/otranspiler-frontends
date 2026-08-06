@@ -8,5 +8,9 @@ system("echo from-system");
 $x = `ls -l`;
 if ($name eq "world") { print "one\n"; }
 unless ($name eq "x") { print "two\n"; }
-while ($n < 10) { print "n\n"; }
+$n = 0;
+while ($n < 3) {
+    print "n\n";
+    $n++;
+}
 foreach my $x (a, b, c) { print $x; }

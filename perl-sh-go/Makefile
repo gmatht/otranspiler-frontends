@@ -1,9 +1,12 @@
 # perl-sh-go: Perl source -> shIR JSON (A1 contract), ANTLR4+Go.
-# INITIAL VERSION: the hand-rolled stub parser in main.go handles the v1
-# shell-flavored subset; `build` compiles it (the antlr4 generation from
-# grammars/Perl.g4 is the WORKER's job — not a build blocker). `test`
-# runs the BYTE-EQUALITY ORACLE vs the core's `debashc --shir`. A passing
-# test = real progress (correct output); a mismatch = the gap to fix.
+# The hand-rolled recursive-descent parser in main.go lowers the v1 Perl
+# subset (testdata/) to the A1 shIR vocabulary; `build` compiles it (the
+# antlr4 generation from grammars/Perl.g4 is the WORKER's TODO — not a
+# build blocker). `test` runs the BYTE-EQUALITY ORACLE vs the core's
+# ESTree backend: the emitted A1 must survive the strict ingress
+# (`debashc --shir-in-estree`) AND, executed through the reference
+# runner, match native perl stdout byte-for-byte. A passing test = real
+# progress (correct output); a mismatch = the gap to fix.
 
 ANTLR4 ?= antlr4
 DEBASHC ?= $(abspath ../../sh2perl/target/debug/debashc)
