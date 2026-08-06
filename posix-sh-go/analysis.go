@@ -1511,6 +1511,696 @@ func analyzeStringLengths(stmts []Stmt) []VarLenOut {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// A1c: const/var verdicts (mirror analyze_var_const — the const-markup
+// ask: which assigned vars are write-once, single-site, never
+// runtime-written → `Const`, everything else `Var`). Sorted by name;
+// every assigned var gets a verdict (missing names = never assigned).
+// ─────────────────────────────────────────────────────────────────────
+
+type VarConstOut struct{ Name, Kind string }
+
+type varConstAcc struct {
+	sites          map[string]int
+	multiRun       map[string]bool
+	runtimeWritten map[string]bool
+	arithWritten   map[string]bool
+	indexWritten   map[string]bool
+	dynamic        bool
+}
+
+func (acc *varConstAcc) site(name string, multiRun bool) {
+	acc.sites[name]++
+	if multiRun {
+		acc.multiRun[name] = true
+	}
+}
+
+var constStoreWrite = map[string]bool{
+	"read": true, "readarray": true, "mapfile": true, "unset": true,
+}
+var constDeclAssign = map[string]bool{
+	"local": true, "declare": true, "readonly": true, "export": true, "typeset": true,
+}
+var constDynamicWrite = map[string]bool{
+	"eval": true, "source": true, ".": true,
+}
+
+// builtinNames — identifier names in a builtin's arg list: each Str is
+// `name` or `name=value`; nested Arrays recurse (mirror of
+// builtin_names).
+func builtinNames(es []Expr, out map[string]bool) {
+	for _, a := range es {
+		switch t := a.(type) {
+		case *ArrayE:
+			builtinNames(t.Elems, out)
+		case *StrE:
+			name := strings.SplitN(t.Value, "=", 2)[0]
+			if isPlainIdent(name) {
+				out[name] = true
+			}
+		}
+	}
+}
+
+// classifyBuiltin — the exec/builtin command shape: args[0] = command
+// name, args[1] = the arg-list Array. Classifies the write, if any
+// (mirror of classify_builtin).
+func classifyBuiltin(args []Expr, acc *varConstAcc, multiRun bool) {
+	if len(args) < 2 {
+		return
+	}
+	cn, ok := args[0].(*StrE)
+	if !ok {
+		return
+	}
+	rest, ok := args[1].(*ArrayE)
+	if !ok {
+		return
+	}
+	cname := cn.Value
+	if constDynamicWrite[cname] {
+		acc.dynamic = true
+		return
+	}
+	if constStoreWrite[cname] {
+		names := map[string]bool{}
+		builtinNames(rest.Elems, names)
+		for n := range names {
+			acc.runtimeWritten[n] = true
+		}
+		return
+	}
+	if cname == "let" {
+		// `let x=5` / `let x++` — the runtime evaluates arith strings;
+		// every bare identifier is a potential write (mirror of
+		// arith_idents).
+		names := map[string]bool{}
+		for _, a := range rest.Elems {
+			if sv, ok := a.(*StrE); ok {
+				markAllIdents(sv.Value, names)
+			}
+		}
+		for n := range names {
+			acc.runtimeWritten[n] = true
+		}
+		return
+	}
+	if constDeclAssign[cname] {
+		names := map[string]bool{}
+		builtinNames(rest.Elems, names)
+		for n := range names {
+			acc.site(n, multiRun)
+		}
+	}
+}
+
+func walkExprConst(e Expr, acc *varConstAcc, multiRun bool) {
+	switch t := e.(type) {
+	case *ArithE:
+		for _, w := range arithWrittenVars(t.Ast) {
+			acc.arithWritten[w] = true
+		}
+		walkArithConst(t.Ast, acc, multiRun)
+	case *ArrowE:
+		for _, st := range t.Body {
+			walkStmtConst(st, acc, multiRun)
+		}
+	case *CallE:
+		if t.Func == "setVar" || t.Func == "setArray" {
+			if len(t.Args) == 2 {
+				if n, ok := t.Args[0].(*StrE); ok {
+					acc.site(n.Value, multiRun)
+				}
+			}
+		}
+		if t.Func == "exec" || t.Func == "builtin" {
+			classifyBuiltin(t.Args, acc, multiRun)
+		}
+		for _, a := range t.Args {
+			walkExprConst(a, acc, multiRun)
+		}
+	case *InterpE:
+		for _, p := range t.Parts {
+			if !p.IsLit {
+				walkExprConst(p.Expr, acc, multiRun)
+			}
+		}
+	case *ArrayE:
+		for _, el := range t.Elems {
+			walkExprConst(el, acc, multiRun)
+		}
+	case *ObjectE:
+		for _, p := range t.Props {
+			walkExprConst(p.Val, acc, multiRun)
+		}
+	case *BinOpE:
+		walkExprConst(t.Lhs, acc, multiRun)
+		walkExprConst(t.Rhs, acc, multiRun)
+	}
+}
+
+func walkArithConst(a ArithAst, acc *varConstAcc, multiRun bool) {
+	switch t := a.(type) {
+	case *ArithIndex:
+		walkArithConst(t.Key, acc, multiRun)
+	case *ArithBin:
+		walkArithConst(t.Lhs, acc, multiRun)
+		walkArithConst(t.Rhs, acc, multiRun)
+	case *ArithUn:
+		walkArithConst(t.Arg, acc, multiRun)
+	case *ArithCond:
+		walkArithConst(t.Test, acc, multiRun)
+		walkArithConst(t.Then, acc, multiRun)
+		walkArithConst(t.Else, acc, multiRun)
+	case *ArithAssign:
+		// writes already recorded via arithWrittenVars above
+		walkArithConst(t.Rhs, acc, multiRun)
+	}
+}
+
+func walkStmtConst(st Stmt, acc *varConstAcc, multiRun bool) {
+	switch t := st.(type) {
+	case *AssignS:
+		// array-element writes arrive with the index baked into the
+		// name (`arr[1]=z` → var "arr[1]") — the store owns the element
+		if !strings.Contains(t.Var, "[") {
+			acc.site(t.Var, multiRun)
+		} else {
+			acc.indexWritten[strings.SplitN(t.Var, "[", 2)[0]] = true
+		}
+		walkExprConst(t.Expr, acc, multiRun)
+	case *IfS:
+		walkExprConst(t.Cond, acc, multiRun)
+		for _, s := range t.Then {
+			walkStmtConst(s, acc, multiRun)
+		}
+		for _, e := range t.Elsifs {
+			if c, ok := e[0].(Expr); ok {
+				walkExprConst(c, acc, multiRun)
+			}
+			if b, ok := e[1].([]Stmt); ok {
+				for _, s := range b {
+					walkStmtConst(s, acc, multiRun)
+				}
+			}
+		}
+		for _, s := range t.Else {
+			walkStmtConst(s, acc, multiRun)
+		}
+	case *ForS:
+		// loop vars + loop bodies run per iteration
+		acc.site(t.Var, true)
+		walkExprConst(t.Iter, acc, multiRun)
+		for _, s := range t.Body {
+			walkStmtConst(s, acc, true)
+		}
+	case *WhileS:
+		walkExprConst(t.Cond, acc, multiRun)
+		for _, s := range t.Body {
+			walkStmtConst(s, acc, true)
+		}
+	case *FunctionS:
+		// a function may run 0..N times — its sites are multi-run
+		for _, s := range t.Body {
+			walkStmtConst(s, acc, true)
+		}
+	case *SubshellS:
+		for _, s := range t.Body {
+			walkStmtConst(s, acc, multiRun)
+		}
+	case *BackgroundS:
+		for _, s := range t.Body {
+			walkStmtConst(s, acc, multiRun)
+		}
+	case *BlockS:
+		for _, s := range t.Body {
+			walkStmtConst(s, acc, multiRun)
+		}
+	case *RedirectS:
+		for _, s := range t.Inner {
+			walkStmtConst(s, acc, multiRun)
+		}
+		for _, r := range t.Redirects {
+			walkExprConst(r.Target, acc, multiRun)
+		}
+	case *CaseS:
+		walkExprConst(t.Disc, acc, multiRun)
+		for _, cl := range t.Clauses {
+			for _, s := range cl.Body {
+				walkStmtConst(s, acc, multiRun)
+			}
+		}
+	case *PipelineS:
+		for _, stage := range t.Stages {
+			for _, s := range stage {
+				walkStmtConst(s, acc, multiRun)
+			}
+		}
+	case *ExprS:
+		walkExprConst(t.Expr, acc, multiRun)
+	case *ReturnS:
+		if t.Value != nil {
+			walkExprConst(t.Value, acc, multiRun)
+		}
+	}
+}
+
+// analyzeVarConst — mirror analyze_var_const. Sorted by name for
+// deterministic serialization.
+func analyzeVarConst(stmts []Stmt) []VarConstOut {
+	acc := &varConstAcc{
+		sites:          map[string]int{},
+		multiRun:       map[string]bool{},
+		runtimeWritten: map[string]bool{},
+		arithWritten:   map[string]bool{},
+		indexWritten:   map[string]bool{},
+	}
+	for _, s := range stmts {
+		walkStmtConst(s, acc, false)
+	}
+	names := map[string]bool{}
+	for n := range acc.sites {
+		names[n] = true
+	}
+	for n := range acc.runtimeWritten {
+		names[n] = true
+	}
+	for n := range acc.arithWritten {
+		names[n] = true
+	}
+	for n := range acc.indexWritten {
+		names[n] = true
+	}
+	var sorted []string
+	for n := range names {
+		sorted = append(sorted, n)
+	}
+	sort.Strings(sorted)
+	var out []VarConstOut
+	for _, n := range sorted {
+		kind := "Var"
+		if acc.sites[n] == 1 && !acc.multiRun[n] && !acc.runtimeWritten[n] &&
+			!acc.arithWritten[n] && !acc.indexWritten[n] && !acc.dynamic {
+			kind = "Const"
+		}
+		out = append(out, VarConstOut{Name: n, Kind: kind})
+	}
+	return out
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// A1d: variable lifetimes (mirror shir_passes::lifetime::
+// analyze_var_lifetimes — the C backend's fixed-buffer transform input:
+// per-var live spans (first/last statement positions of a pre-order
+// walk) + the escape bit). Sorted by name.
+// ─────────────────────────────────────────────────────────────────────
+
+type VarLifetimeOut struct {
+	Name    string
+	First   int
+	Last    int
+	Escapes bool
+}
+
+type lifetimeAcc struct {
+	first   map[string]int
+	last    map[string]int
+	escapes map[string]bool
+}
+
+// access — record one access (def or use) at the current position.
+func access(name string, pos int, acc *lifetimeAcc, inClosure bool) {
+	if _, ok := acc.first[name]; !ok {
+		acc.first[name] = pos
+	}
+	acc.last[name] = pos
+	if inClosure {
+		// a closure may outlive the scope where the var's buffer lives
+		acc.escapes[name] = true
+	}
+}
+
+func walkStmtsLife(stmts []Stmt, pos *int, acc *lifetimeAcc, inClosure, copied bool) {
+	for _, st := range stmts {
+		*pos++
+		walkStmtLife(st, pos, acc, inClosure, copied)
+	}
+}
+
+func walkStmtLife(st Stmt, pos *int, acc *lifetimeAcc, inClosure, copied bool) {
+	p := *pos
+	switch t := st.(type) {
+	case *AssignS:
+		// plain scalar def (our lowering never emits index targets)
+		access(t.Var, p, acc, inClosure)
+		walkExprLife(t.Expr, p, acc, inClosure)
+	case *IfS:
+		walkExprLife(t.Cond, p, acc, inClosure)
+		walkStmtsLife(t.Then, pos, acc, inClosure, copied)
+		for _, e := range t.Elsifs {
+			if c, ok := e[0].(Expr); ok {
+				walkExprLife(c, p, acc, inClosure)
+			}
+			if b, ok := e[1].([]Stmt); ok {
+				walkStmtsLife(b, pos, acc, inClosure, copied)
+			}
+		}
+		walkStmtsLife(t.Else, pos, acc, inClosure, copied)
+	case *ForS:
+		// the loop var is defined at the loop head, then per iteration
+		access(t.Var, p, acc, inClosure)
+		walkExprLife(t.Iter, p, acc, inClosure)
+		walkStmtsLife(t.Body, pos, acc, inClosure, copied)
+	case *WhileS:
+		walkExprLife(t.Cond, p, acc, inClosure)
+		walkStmtsLife(t.Body, pos, acc, inClosure, copied)
+	case *FunctionS:
+		// the function name is defined (callable)
+		access(t.Name, p, acc, inClosure)
+		// body: a function may run 0..N times; accesses count
+		walkStmtsLife(t.Body, pos, acc, inClosure, copied)
+	case *ReturnS:
+		// the value is handed to the caller, which may retain it
+		if t.Value != nil {
+			walkExprLife(t.Value, p, acc, inClosure)
+			markVarsEscape(t.Value, acc)
+		}
+	case *CaseS:
+		walkExprLife(t.Disc, p, acc, inClosure)
+		for _, cl := range t.Clauses {
+			walkStmtsLife(cl.Body, pos, acc, inClosure, copied)
+		}
+	case *RedirectS:
+		walkStmtsLife(t.Inner, pos, acc, inClosure, copied)
+		for _, r := range t.Redirects {
+			walkExprLife(r.Target, p, acc, inClosure)
+		}
+	case *BlockS:
+		walkStmtsLife(t.Body, pos, acc, inClosure, copied)
+	case *SubshellS:
+		// bash forks: the child observes the parent's values at fork
+		// time (uses); writes don't propagate back. Record accesses.
+		walkStmtsLife(t.Body, pos, acc, inClosure, true)
+	case *BackgroundS:
+		walkStmtsLife(t.Body, pos, acc, inClosure, true)
+	case *PipelineS:
+		for _, stage := range t.Stages {
+			walkStmtsLife(stage, pos, acc, inClosure, copied)
+		}
+	case *ExprS:
+		walkExprLife(t.Expr, p, acc, inClosure)
+	}
+}
+
+func walkExprLife(e Expr, pos int, acc *lifetimeAcc, inClosure bool) {
+	switch t := e.(type) {
+	case *VarE:
+		access(t.Name, pos, acc, inClosure)
+	case *CallE:
+		switch t.Func {
+		case "getVar":
+			// getVar("x") — a $x read
+			if len(t.Args) > 0 {
+				if n, ok := t.Args[0].(*StrE); ok {
+					access(n.Value, pos, acc, inClosure)
+				}
+			}
+			return
+		case "setVar":
+			// setVar("x", v) — a $x write
+			if len(t.Args) > 0 {
+				if n, ok := t.Args[0].(*StrE); ok {
+					access(n.Value, pos, acc, inClosure)
+				}
+			}
+			if len(t.Args) > 1 {
+				walkExprLife(t.Args[1], pos, acc, inClosure)
+			}
+			return
+		case "setArray", "setArrayAppend":
+			// array write — the array is heap storage
+			if len(t.Args) > 0 {
+				if n, ok := t.Args[0].(*StrE); ok {
+					access(n.Value, pos, acc, inClosure)
+					acc.escapes[n.Value] = true
+				}
+			}
+			for _, a := range t.Args[1:] {
+				walkExprLife(a, pos, acc, inClosure)
+			}
+			return
+		case "define", "fnCall":
+			for _, a := range t.Args {
+				walkExprLife(a, pos, acc, inClosure)
+			}
+			// define(name, Arrow) — the arrow is a closure: vars
+			// accessed inside it escape
+			if t.Func == "define" && len(t.Args) > 1 {
+				if arr, ok := t.Args[1].(*ArrowE); ok {
+					p := pos
+					walkStmtsLife(arr.Body, &p, acc, true, false)
+				}
+			}
+			return
+		case "exec", "pipeline", "capture", "captureWords", "redirect",
+			"subshell", "background", "forLoop", "whileLoop", "whileLoopSync",
+			"cstyleFor", "cstyleForSync", "forIn", "forOf", "commandSubstitution":
+			// subprocess boundaries: uses only (kernel copies)
+			for _, a := range t.Args {
+				walkExprLife(a, pos, acc, inClosure)
+			}
+			return
+		}
+		// everything else: walk args as ordinary expressions
+		for _, a := range t.Args {
+			walkExprLife(a, pos, acc, inClosure)
+		}
+	case *InterpE:
+		for _, p := range t.Parts {
+			if !p.IsLit {
+				walkExprLife(p.Expr, pos, acc, inClosure)
+			}
+		}
+	case *ArrayE:
+		for _, el := range t.Elems {
+			walkExprLife(el, pos, acc, inClosure)
+		}
+	case *ObjectE:
+		for _, p := range t.Props {
+			walkExprLife(p.Val, pos, acc, inClosure)
+		}
+	case *ArrowE:
+		// a closure: every access inside escapes
+		p := pos
+		walkStmtsLife(t.Body, &p, acc, true, false)
+	case *ArithE:
+		walkArithLife(t.Ast, pos, acc, inClosure)
+	case *BinOpE:
+		walkExprLife(t.Lhs, pos, acc, inClosure)
+		walkExprLife(t.Rhs, pos, acc, inClosure)
+	}
+}
+
+func walkArithLife(a ArithAst, pos int, acc *lifetimeAcc, inClosure bool) {
+	switch t := a.(type) {
+	case *ArithVar:
+		access(t.Name, pos, acc, inClosure)
+	case *ArithIndex:
+		access(t.Var, pos, acc, inClosure)
+		walkArithLife(t.Key, pos, acc, inClosure)
+	case *ArithBin:
+		walkArithLife(t.Lhs, pos, acc, inClosure)
+		walkArithLife(t.Rhs, pos, acc, inClosure)
+	case *ArithUn:
+		walkArithLife(t.Arg, pos, acc, inClosure)
+	case *ArithCond:
+		walkArithLife(t.Test, pos, acc, inClosure)
+		walkArithLife(t.Then, pos, acc, inClosure)
+		walkArithLife(t.Else, pos, acc, inClosure)
+	case *ArithAssign:
+		// x=... in $(( )) — a def (read-modify-write)
+		access(t.Var, pos, acc, inClosure)
+		walkArithLife(t.Rhs, pos, acc, inClosure)
+	case *ArithIncDec:
+		// x++ / x-- — reads and writes
+		access(t.Var, pos, acc, inClosure)
+	}
+}
+
+// markVarsEscape — every variable appearing in an expression escapes
+// (array-element stores and function returns may retain it).
+func markVarsEscape(e Expr, acc *lifetimeAcc) {
+	switch t := e.(type) {
+	case *VarE:
+		if _, ok := acc.first[t.Name]; !ok {
+			acc.first[t.Name] = 0
+		}
+		acc.escapes[t.Name] = true
+	case *BinOpE:
+		markVarsEscape(t.Lhs, acc)
+		markVarsEscape(t.Rhs, acc)
+	case *CallE:
+		for _, a := range t.Args {
+			markVarsEscape(a, acc)
+		}
+	case *InterpE:
+		for _, p := range t.Parts {
+			if !p.IsLit {
+				markVarsEscape(p.Expr, acc)
+			}
+		}
+	case *ArrowE:
+		// a closure stores its whole environment
+		markStmtsVarsEscape(t.Body, acc)
+	case *ArrayE:
+		for _, el := range t.Elems {
+			markVarsEscape(el, acc)
+		}
+	case *ArithE:
+		markArithVarsEscape(t.Ast, acc)
+	case *ObjectE:
+		for _, p := range t.Props {
+			markVarsEscape(p.Val, acc)
+		}
+	}
+}
+
+func markStmtVarsEscape(st Stmt, acc *lifetimeAcc) {
+	switch t := st.(type) {
+	case *AssignS:
+		if _, ok := acc.first[t.Var]; !ok {
+			acc.first[t.Var] = 0
+		}
+		acc.escapes[t.Var] = true
+		markVarsEscape(t.Expr, acc)
+	case *IfS:
+		markVarsEscape(t.Cond, acc)
+		markStmtsVarsEscape(t.Then, acc)
+		for _, e := range t.Elsifs {
+			if c, ok := e[0].(Expr); ok {
+				markVarsEscape(c, acc)
+			}
+			if b, ok := e[1].([]Stmt); ok {
+				markStmtsVarsEscape(b, acc)
+			}
+		}
+		markStmtsVarsEscape(t.Else, acc)
+	case *ForS:
+		if _, ok := acc.first[t.Var]; !ok {
+			acc.first[t.Var] = 0
+		}
+		acc.escapes[t.Var] = true
+		markVarsEscape(t.Iter, acc)
+		markStmtsVarsEscape(t.Body, acc)
+	case *WhileS:
+		markVarsEscape(t.Cond, acc)
+		markStmtsVarsEscape(t.Body, acc)
+	case *ReturnS:
+		if t.Value != nil {
+			markVarsEscape(t.Value, acc)
+		}
+	case *CaseS:
+		markVarsEscape(t.Disc, acc)
+		for _, cl := range t.Clauses {
+			markStmtsVarsEscape(cl.Body, acc)
+		}
+	case *RedirectS:
+		markStmtsVarsEscape(t.Inner, acc)
+		for _, r := range t.Redirects {
+			markVarsEscape(r.Target, acc)
+		}
+	case *BlockS:
+		markStmtsVarsEscape(t.Body, acc)
+	case *SubshellS:
+		markStmtsVarsEscape(t.Body, acc)
+	case *BackgroundS:
+		markStmtsVarsEscape(t.Body, acc)
+	case *PipelineS:
+		for _, stage := range t.Stages {
+			markStmtsVarsEscape(stage, acc)
+		}
+	case *FunctionS:
+		if _, ok := acc.first[t.Name]; !ok {
+			acc.first[t.Name] = 0
+		}
+		acc.escapes[t.Name] = true
+		markStmtsVarsEscape(t.Body, acc)
+	case *ExprS:
+		markVarsEscape(t.Expr, acc)
+	}
+}
+
+func markStmtsVarsEscape(stmts []Stmt, acc *lifetimeAcc) {
+	for _, st := range stmts {
+		markStmtVarsEscape(st, acc)
+	}
+}
+
+func markArithVarsEscape(a ArithAst, acc *lifetimeAcc) {
+	switch t := a.(type) {
+	case *ArithVar:
+		if _, ok := acc.first[t.Name]; !ok {
+			acc.first[t.Name] = 0
+		}
+		acc.escapes[t.Name] = true
+	case *ArithIndex:
+		if _, ok := acc.first[t.Var]; !ok {
+			acc.first[t.Var] = 0
+		}
+		acc.escapes[t.Var] = true
+		markArithVarsEscape(t.Key, acc)
+	case *ArithBin:
+		markArithVarsEscape(t.Lhs, acc)
+		markArithVarsEscape(t.Rhs, acc)
+	case *ArithUn:
+		markArithVarsEscape(t.Arg, acc)
+	case *ArithCond:
+		markArithVarsEscape(t.Test, acc)
+		markArithVarsEscape(t.Then, acc)
+		markArithVarsEscape(t.Else, acc)
+	case *ArithAssign:
+		if _, ok := acc.first[t.Var]; !ok {
+			acc.first[t.Var] = 0
+		}
+		acc.escapes[t.Var] = true
+		markArithVarsEscape(t.Rhs, acc)
+	case *ArithIncDec:
+		if _, ok := acc.first[t.Var]; !ok {
+			acc.first[t.Var] = 0
+		}
+		acc.escapes[t.Var] = true
+	}
+}
+
+// analyzeVarLifetimes — mirror analyze_var_lifetimes. Top-level stmts
+// are walked with a pre-order position counter; subs (Perl subroutines)
+// don't exist in our lowering. Sorted by name.
+func analyzeVarLifetimes(stmts []Stmt) []VarLifetimeOut {
+	acc := &lifetimeAcc{
+		first:   map[string]int{},
+		last:    map[string]int{},
+		escapes: map[string]bool{},
+	}
+	pos := 0
+	walkStmtsLife(stmts, &pos, acc, false, false)
+	var sorted []string
+	for n := range acc.first {
+		sorted = append(sorted, n)
+	}
+	sort.Strings(sorted)
+	var out []VarLifetimeOut
+	for _, n := range sorted {
+		out = append(out, VarLifetimeOut{
+			Name:    n,
+			First:   acc.first[n],
+			Last:    acc.last[n],
+			Escapes: acc.escapes[n],
+		})
+	}
+	return out
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // optimize (mirror optimize_stmts: arith-const fold; self-assign removal
 // is a no-op for our node shapes — IrExpr::Var is never produced)
 // ─────────────────────────────────────────────────────────────────────
@@ -1763,15 +2453,17 @@ func redirectsJSON(rs []RedirectIR) []interface{} {
 }
 
 // programJSON — the A1 program with stmt_lines.
-func programJSON(stmts []Stmt, varTypes []VarTypeOut, varLengths []VarLenOut) []byte {
+func programJSON(stmts []Stmt, varTypes []VarTypeOut, varLengths []VarLenOut, varConst []VarConstOut, varLifetimes []VarLifetimeOut) []byte {
 	prog := map[string]interface{}{
 		"type":             "Program",
 		"contract_version": contractVersion,
 		"imports":          []string{},
 		"requires":         []string{},
 		"var_types":        varTypesJSON(varTypes),
-		"var_lengths":      varLengthsJSON(varLengths),
 		"stmt_lines":       []interface{}{},
+		"var_lengths":      varLengthsJSON(varLengths),
+		"var_const":        varConstJSON(varConst),
+		"var_lifetimes":    varLifetimesJSON(varLifetimes),
 		"subs":             []interface{}{},
 		"stmts":            stmtsJSON(stmts),
 	}
@@ -1805,6 +2497,27 @@ func varLengthsJSON(vls []VarLenOut) []interface{} {
 	return out
 }
 
+func varConstJSON(vcs []VarConstOut) []interface{} {
+	out := make([]interface{}, len(vcs))
+	for i, v := range vcs {
+		out[i] = map[string]interface{}{"name": v.Name, "kind": v.Kind}
+	}
+	return out
+}
+
+func varLifetimesJSON(vls []VarLifetimeOut) []interface{} {
+	out := make([]interface{}, len(vls))
+	for i, v := range vls {
+		out[i] = map[string]interface{}{
+			"name":    v.Name,
+			"first":   v.First,
+			"last":    v.Last,
+			"escapes": v.Escapes,
+		}
+	}
+	return out
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // driver: file → A1 JSON
 // ─────────────────────────────────────────────────────────────────────
@@ -1824,7 +2537,9 @@ func shirForSource(src string) ([]byte, error) {
 	stmts = optimizeStmts(stmts)
 	vt := analyzeVarTypes(stmts)
 	vl := analyzeStringLengths(stmts)
-	return programJSON(stmts, vt, vl), nil
+	vc := analyzeVarConst(stmts)
+	vlif := analyzeVarLifetimes(stmts)
+	return programJSON(stmts, vt, vl, vc, vlif), nil
 }
 
 func main() {
