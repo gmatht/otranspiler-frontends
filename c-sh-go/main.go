@@ -120,9 +120,6 @@ func recordPtrTarget(name string, e *expr) bool {
 var charPtrVars = map[string]bool{}
 
 func assignStmt(name string, expr any) map[string]any {
-	if addrTaken[name] {
-		return map[string]any{"type": "Expr", "expr": call("setVar", []any{st(name), expr})}
-	}
 	return map[string]any{
 		"expr":    expr,
 		"targets": []any{map[string]any{"indices": []any{}, "sigil": nil, "var": name}},
@@ -930,6 +927,58 @@ func (p *parser) block() ([]any, error) {
 	return body, nil
 }
 
+// applyStoreRouting — after the whole program is parsed (and the pointer
+// folding is fully known), route the assignments of address-taken vars
+// that were NOT folded (their storage is still reachable through the
+// mem.* seam, which reads/writes the sh2 store — a native JS binding
+// would be invisible to it) through setVar. Folded vars keep the native
+// Assign stmt: the alias writes ARE the variable, so no store is needed.
+func applyStoreRouting(stmts []any) []any {
+	folded := map[string]bool{}
+	for _, v := range scalarAliases {
+		folded[v] = true
+	}
+	for _, t := range ptrTargets {
+		folded[t.arr] = true
+	}
+	var walk func([]any) []any
+	walk = func(ss []any) []any {
+		if len(ss) == 0 {
+			return []any{}
+		}
+		var out []any
+		for _, sx := range ss {
+			m, ok := sx.(map[string]any)
+			if !ok {
+				out = append(out, st)
+				continue
+			}
+			if m["type"] == "Assign" {
+				tgts, _ := m["targets"].([]any)
+				if len(tgts) > 0 {
+					t0, _ := tgts[0].(map[string]any)
+					if v, _ := t0["var"].(string); v != "" && addrTaken[v] && !folded[v] {
+						out = append(out, map[string]any{
+							"type": "Expr",
+							"expr": call("setVar", []any{st(v), m["expr"]}),
+						})
+						continue
+					}
+				}
+			}
+			// recurse into compound stmts (if/while/block bodies)
+			for _, key := range []string{"then", "else", "body"} {
+				if b, ok := m[key].([]any); ok {
+					m[key] = walk(b)
+				}
+			}
+			out = append(out, sx)
+		}
+		return out
+	}
+	return walk(stmts)
+}
+
 // ── main ─────────────────────────────────────────────────────────────
 func main() {
 	args := os.Args[1:]
@@ -966,6 +1015,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "REFUSE: "+err.Error())
 		os.Exit(1)
 	}
+	stmts = applyStoreRouting(stmts)
 	prog := map[string]any{
 		"type":             "Program",
 		"contract_version": 1,
