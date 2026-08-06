@@ -495,6 +495,10 @@ func iterNumeric(e Expr) (bool, bool) { // (numeric, known)
 		if t.Func == "brace" {
 			return braceNumeric(t.Args)
 		}
+	case *RangeE:
+		// a lifted seq-range iterable is numeric by construction
+		// (iter_numeric(Range) == Some(true))
+		return true, true
 	}
 	return false, false
 }
@@ -2301,6 +2305,8 @@ func exprJSON(e Expr) map[string]interface{} {
 		return map[string]interface{}{"type": "Interpolate", "parts": parts}
 	case *ArrayE:
 		return map[string]interface{}{"type": "Array", "elements": exprsJSON(t.Elems)}
+	case *RangeE:
+		return map[string]interface{}{"type": "Range", "start": t.Start, "end": t.End}
 	case *ObjectE:
 		var props []interface{}
 		for _, p := range t.Props {
