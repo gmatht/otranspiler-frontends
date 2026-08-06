@@ -45,7 +45,9 @@ test: build
 	done
 
 worker: test
-	@echo "zsh-sh-go worker gate: byte-equality on testdata/ passed"
+	@echo "--- executed-stdout comparison (native vs JS/ESTree) ---"
+	@bash "$(abspath ../../harness/frontend-stdout.sh)" zsh ./zsh-sh-go testdata "$(DEBASHC)" || exit 1
+	@echo "zsh-sh-go worker gate: ingress acceptance + executed-stdout passed"
 
 clean:
 	rm -f zsh-sh-go /tmp/*.mine /tmp/*.core

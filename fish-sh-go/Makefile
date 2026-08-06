@@ -1,8 +1,10 @@
 # fish-sh-go: fish source -> shIR JSON (A1 contract), ANTLR4+Go.
-# INITIAL VERSION: the hand-rolled stub parser in fish-sh-go.go handles the
-# v1 fish subset (echo, set NAME VALUE); `build` compiles it (the antlr4
-# generation from a fish grammar is the WORKER's job). `test` runs the
-# INGRESS-ACCEPTANCE gate: the emitted A1 shIR JSON must be VALID (the
+# INITIAL VERSION: the hand-rolled recursive-descent parser in fish-sh-go.go
+# handles the v1 fish subset (echo/set/if/while/for/switch/function,
+# external cmds, pipes/redirects/heredocs/background, $vars, "interp",
+# (cmd) subs); `build` compiles it (the antlr4 generation from
+# grammars/FishLexer.g4 + FishParser.g4 is the WORKER's job). `test` runs
+# the INGRESS-ACCEPTANCE gate: the emitted A1 shIR JSON must be VALID (the
 # core's deserializer accepts it via --shir-in-estree). Fish is not
 # POSIX-compatible, so byte-equality vs debashc --shir is impossible —
 # the progress signal is valid A1 shIR from the renderer-safe subset.
@@ -34,7 +36,9 @@ test: build
 	done
 
 worker: test
-	@echo "fish-sh-go worker gate: ingress acceptance on testdata/ passed"
+	@echo "--- executed-stdout comparison (native vs JS/ESTree) ---"
+	@bash "$(abspath ../../harness/frontend-stdout.sh)" fish ./fish-sh-go testdata "$(DEBASHC)" || exit 1
+	@echo "fish-sh-go worker gate: ingress acceptance + executed-stdout passed"
 
 clean:
 	rm -f fish-sh-go /tmp/*.mine

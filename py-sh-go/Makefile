@@ -45,7 +45,9 @@ test: build
 	done
 
 worker: test
-	@echo "py-sh-go worker gate: byte-equality on testdata/ passed"
+	@echo "--- executed-stdout comparison (native vs JS/ESTree) ---"
+	@bash "$(abspath ../../harness/frontend-stdout.sh)" py ./py-sh-go testdata "$(DEBASHC)" || exit 1
+	@echo "py-sh-go worker gate: ingress acceptance + executed-stdout passed"
 
 clean:
 	rm -f py-sh-go /tmp/*.mine /tmp/*.core

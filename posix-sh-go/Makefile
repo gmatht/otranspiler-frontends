@@ -42,7 +42,9 @@ test: build
 	done
 
 worker: test
-	@echo "posix-sh-go worker gate: byte-equality on testdata/ passed"
+	@echo "--- executed-stdout comparison (native vs JS/ESTree) ---"
+	@bash "$(abspath ../../harness/frontend-stdout.sh)" sh ./posix-sh-go testdata "$(DEBASHC)" || exit 1
+	@echo "posix-sh-go worker gate: byte-equality + executed-stdout passed"
 
 clean:
 	rm -f posix-sh-go /tmp/*.mine /tmp/*.core

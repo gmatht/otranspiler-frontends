@@ -39,7 +39,9 @@ test: build
 	done
 
 worker: test
-	@echo "perl-sh-go worker gate: byte-equality on testdata/ passed"
+	@echo "--- executed-stdout comparison (native vs JS/ESTree) ---"
+	@bash "$(abspath ../../harness/frontend-stdout.sh)" pl ./perl-sh-go testdata "$(DEBASHC)" || exit 1
+	@echo "perl-sh-go worker gate: ingress acceptance + executed-stdout passed"
 
 clean:
 	rm -f perl-sh-go /tmp/*.mine /tmp/*.core
