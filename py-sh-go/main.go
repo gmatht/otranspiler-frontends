@@ -736,6 +736,16 @@ func (p *parser) parseExprStmt(toks []tok) (Stmt, error) {
 		// plain targets: NAME (, NAME)*
 		var targets []string
 		i := 0
+		// NAME [ index ] — array-element write; the index is baked into
+		// the target name ("a[1]"), exactly the core frontend's own
+		// `arr[1]=z` → var "arr[1]" convention (shir.rs: the store owns
+		// the element; the runtime setVar routes a[1] names).
+		if len(lhs) == 4 && lhs[0].kind == tIdent && lhs[1].kind == tOp && lhs[1].text == "[" &&
+			(lhs[2].kind == tNum || lhs[2].kind == tIdent) &&
+			lhs[3].kind == tOp && lhs[3].text == "]" {
+			targets = append(targets, lhs[0].text+"["+lhs[2].text+"]")
+			i = len(lhs)
+		}
 		for i < len(lhs) {
 			if lhs[i].kind != tIdent {
 				return nil, fmt.Errorf("bad assignment target")
@@ -1025,6 +1035,15 @@ func (e *exprParser) parseCmp() (Expr, error) {
 			}
 			return &CompareE{Op: t.text, Lhs: lhs, Rhs: rhs}, nil
 		}
+	}
+	// `in` — substring containment (a keyword identifier, not an op)
+	if e.isKw("in") {
+		e.next()
+		rhs, err := e.parseAdd()
+		if err != nil {
+			return nil, err
+		}
+		return &CompareE{Op: "in", Lhs: lhs, Rhs: rhs}, nil
 	}
 	return lhs, nil
 }
@@ -1929,6 +1948,20 @@ func (l *lowerer) subscriptIR(t *SubscriptE) (map[string]any, error) {
 			}
 		}
 	}
+	// x.rsplit(sep, 1)[1] — the part after the LAST sep occurrence:
+	// ${x##*sep} (strip the longest prefix ending at the last sep).
+	// Python rsplit splits from the right (maxsplit=1) and [1] is the
+	// final element; the shell glob does the same greedy scan.
+	if mc, ok := t.Obj.(*MethodCallE); ok && mc.Name == "rsplit" && len(mc.Args) >= 1 {
+		if one, ok := t.Index.(*LitInt); ok && (one.Text == "1" || one.Text == "-1") {
+			if n, ok := mc.Obj.(*NameE); ok {
+				if sep, ok := mc.Args[0].(*LitStr); ok {
+					return call("param", []any{st("##"), st(n.Name), st("*" + sep.Value)}), nil
+				}
+			}
+		}
+		return nil, fmt.Errorf("rsplit subscript: expected var.rsplit(str, 1)[1]")
+	}
 	name, ok := t.Obj.(*NameE)
 	if !ok {
 		return nil, fmt.Errorf("subscript target must be a variable")
@@ -1946,6 +1979,17 @@ func (l *lowerer) subscriptIR(t *SubscriptE) (map[string]any, error) {
 	if t.SliceStart != nil {
 		if n, ok := t.SliceStart.(*LitInt); ok {
 			start = n.Text
+		}
+	}
+	// x[:x.find(p)] — everything before the FIRST occurrence of p:
+	// ${x%%p*} (strip the longest suffix that starts at p).
+	if mc, ok := t.SliceEnd.(*MethodCallE); ok && mc.Name == "find" && len(mc.Args) == 1 {
+		if t.SliceStart == nil {
+			if n2, ok := mc.Obj.(*NameE); ok && n2.Name == name.Name {
+				if pa, ok := mc.Args[0].(*LitStr); ok {
+					return call("param", []any{st("%%"), st(name.Name), st(pa.Value + "*")}), nil
+				}
+			}
 		}
 	}
 	if t.SliceEnd != nil {
@@ -1977,6 +2021,13 @@ func (l *lowerer) callIR(t *CallE, isStmt bool) (map[string]any, error) {
 			}
 		}
 		return nil, fmt.Errorf("len: expected a variable")
+	case "str":
+		// str(x) — identity (the shell has no string/number split;
+		// the value already reads as a string)
+		if len(t.Args) == 1 {
+			return l.argIR(t.Args[0])
+		}
+		return nil, fmt.Errorf("str: expected one argument")
 	case "os.environ":
 		if len(t.Args) == 1 {
 			if s, ok := t.Args[0].(*LitStr); ok {
@@ -1984,6 +2035,25 @@ func (l *lowerer) callIR(t *CallE, isStmt bool) (map[string]any, error) {
 			}
 		}
 		return nil, fmt.Errorf("os.environ: expected string key")
+	case "os.environ.get":
+		// os.environ.get("K") or os.environ.get("K", "default"). The
+		// two-arg form is `${K:-default}` — the core frontend's own
+		// lowering of DefaultValue is param(":-", name, default)
+		// (shir.rs param_ir), which the ESTree renderer supports
+		// (DefinedOr is Perl-only and panics the renderer).
+		if len(t.Args) == 1 || len(t.Args) == 2 {
+			if s, ok := t.Args[0].(*LitStr); ok {
+				if len(t.Args) == 2 {
+					d, err := l.argIR(t.Args[1])
+					if err != nil {
+						return nil, err
+					}
+					return call("param", []any{st(":-"), st(s.Value), d}), nil
+				}
+				return getVar(s.Value), nil
+			}
+		}
+		return nil, fmt.Errorf("os.environ.get: expected string key[, default]")
 	case "os.system":
 		if len(t.Args) == 1 {
 			if s, ok := t.Args[0].(*LitStr); ok {
@@ -2098,6 +2168,57 @@ func (l *lowerer) methodIR(t *MethodCallE) (map[string]any, error) {
 		return l.argIR(t.Obj)
 	case "wait":
 		return execCall("wait", []any{}), nil
+	case "removeprefix":
+		// s.removeprefix(p) — ${s#p} (strip the shortest prefix)
+		if len(t.Args) == 1 {
+			if n, ok := t.Obj.(*NameE); ok {
+				if pa, ok := t.Args[0].(*LitStr); ok {
+					return call("param", []any{st("#"), st(n.Name), st(pa.Value)}), nil
+				}
+			}
+		}
+		return nil, fmt.Errorf("removeprefix: expected var.removeprefix(str)")
+	case "removesuffix":
+		// s.removesuffix(p) — ${s%p} (strip the shortest suffix)
+		if len(t.Args) == 1 {
+			if n, ok := t.Obj.(*NameE); ok {
+				if pa, ok := t.Args[0].(*LitStr); ok {
+					return call("param", []any{st("%"), st(n.Name), st(pa.Value)}), nil
+				}
+			}
+		}
+		return nil, fmt.Errorf("removesuffix: expected var.removesuffix(str)")
+	case "join":
+		// " ".join(a[i:j]) — space-join an array slice: the runtime's
+		// param("slice", ...) returns the element ARRAY and join()
+		// space-joins it (the perl frontend's array-slice lowering).
+		// Only a literal space separator is expressible.
+		if len(t.Args) == 1 {
+			if sep, ok := t.Obj.(*LitStr); ok && sep.Value == " " {
+				sl, err := l.argIR(t.Args[0])
+				if err != nil {
+					return nil, err
+				}
+				return call("join", []any{sl}), nil
+			}
+		}
+		return nil, fmt.Errorf("join: expected \" \".join(list-or-slice)")
+	case "replace":
+		// s.replace(a, b) — `${s//a/b}` (all occurrences): the core
+		// frontend's SubstituteAll lowering is param("//", name,
+		// pat, rep) (shir.rs param_ir).
+		if len(t.Args) == 2 {
+			if n, ok := t.Obj.(*NameE); ok {
+				if pa, ok := t.Args[0].(*LitStr); ok {
+					rb, err := l.argIR(t.Args[1])
+					if err != nil {
+						return nil, err
+					}
+					return call("param", []any{st("//"), st(n.Name), st(pa.Value), rb}), nil
+				}
+			}
+		}
+		return nil, fmt.Errorf("replace: expected var.replace(str, str)")
 	case "write":
 		// fh.write("...") — handled at statement level (with-block)
 		return nil, fmt.Errorf("write handled at statement level")
@@ -2131,6 +2252,20 @@ func (l *lowerer) testIR(e Expr) (map[string]any, error) {
 			return call("test", []any{st(lt + " -le " + rt)}), nil
 		case ">=":
 			return call("test", []any{st(lt + " -ge " + rt)}), nil
+		case "in":
+			// `a in b` — substring containment → the core's contains
+			// helper (native String.includes, PureCpu). contains takes
+			// (haystack, needle); Python's `in` has the haystack on
+			// the right.
+			a, err := l.argIR(t.Lhs)
+			if err != nil {
+				return nil, err
+			}
+			b, err := l.argIR(t.Rhs)
+			if err != nil {
+				return nil, err
+			}
+			return call("contains", []any{b, a}), nil
 		}
 		return nil, fmt.Errorf("unsupported comparison %s", t.Op)
 	case *NotE:
@@ -2169,6 +2304,25 @@ func (l *lowerer) testIR(e Expr) (map[string]any, error) {
 			}
 		}
 		return nil, fmt.Errorf("unsupported condition call")
+	case *MethodCallE:
+		// s.startswith(p) / s.endswith(p) — a glob match against
+		// p* / *p: the runtime's caseMatch returns the matched
+		// pattern (truthy) or undefined (falsy).
+		if t.Name == "startswith" || t.Name == "endswith" {
+			if len(t.Args) == 1 {
+				if n, ok := t.Obj.(*NameE); ok {
+					if pa, ok := t.Args[0].(*LitStr); ok {
+						pat := pa.Value + "*"
+						if t.Name == "endswith" {
+							pat = "*" + pa.Value
+						}
+						return call("caseMatch", []any{getVar(n.Name), array([]any{st(pat)})}), nil
+					}
+				}
+			}
+			return nil, fmt.Errorf("%s: expected var.%s(str)", t.Name, t.Name)
+		}
+		return nil, fmt.Errorf("unsupported condition method")
 	case *NameE:
 		return call("test", []any{st("-n \"$" + t.Name + "\"")}), nil
 	}
@@ -2225,6 +2379,19 @@ func (l *lowerer) stmtIR(s Stmt) ([]map[string]any, error) {
 		}
 		return []map[string]any{whileStmt(cond, body)}, nil
 	case *ForS:
+		// for line in sys.stdin → `while read line; do ...; done` —
+		// the shell read-loop (the read builtin returns false at EOF,
+		// which the While cond branches on).
+		if at, ok := t.Iter.(*AttrE); ok {
+			if path, ok2 := dottedPath(at); ok2 && strings.Join(path, ".") == "sys.stdin" {
+				l.setType(t.Var, "str")
+				body, err := l.stmtsIR(t.Body)
+				if err != nil {
+					return nil, err
+				}
+				return []map[string]any{whileStmt(execCall("read", []any{st(t.Var)}), body)}, nil
+			}
+		}
 		iter, err := l.iterIR(t.Iter)
 		if err != nil {
 			return nil, err
@@ -2232,6 +2399,8 @@ func (l *lowerer) stmtIR(s Stmt) ([]map[string]any, error) {
 		// loop var typing
 		if lst, ok := t.Iter.(*ListE); ok && len(lst.Elems) > 0 {
 			l.setType(t.Var, l.typeOf(lst.Elems[0]))
+		} else if c, ok := t.Iter.(*CallE); ok && len(c.Path) == 1 && c.Path[0] == "range" {
+			l.setType(t.Var, "int")
 		} else {
 			l.setType(t.Var, "str")
 		}
@@ -2274,8 +2443,38 @@ func (l *lowerer) stmtIR(s Stmt) ([]map[string]any, error) {
 }
 
 func (l *lowerer) printIR(t *PrintS) ([]map[string]any, error) {
-	if len(t.Args) == 1 {
-		if p, ok := t.Args[0].(*PercentE); ok {
+	// Ternary args in word position have no A1 expression form (the
+	// ESTree renderer's IrExpr::Ternary is Perl-only) — hoist each into
+	// a fresh temp var via an If statement emitted before the print.
+	var pre []map[string]any
+	args := make([]Expr, len(t.Args))
+	tmpIdx := 0
+	for i, a := range t.Args {
+		if tr, ok := a.(*TernaryE); ok {
+			tmp := fmt.Sprintf("__t%d", tmpIdx)
+			tmpIdx++
+			cond, err := l.testIR(tr.Cond)
+			if err != nil {
+				return nil, err
+			}
+			thenIR, err := l.assignSimple(tmp, tr.Then)
+			if err != nil {
+				return nil, err
+			}
+			elseIR, err := l.assignSimple(tmp, tr.Else)
+			if err != nil {
+				return nil, err
+			}
+			pre = append(pre, ifStmt(cond, thenIR, elseIR))
+			l.setType(tmp, l.typeOf(tr))
+			args[i] = &NameE{Name: tmp}
+		} else {
+			args[i] = a
+		}
+	}
+	nt := &PrintS{Args: args}
+	if len(nt.Args) == 1 {
+		if p, ok := nt.Args[0].(*PercentE); ok {
 			// printf form: "%s-%s" % (a, b) → printf '%s-%s\n' a b
 			fmtStr, ok := p.Format.(*LitStr)
 			if !ok {
@@ -2289,14 +2488,14 @@ func (l *lowerer) printIR(t *PrintS) ([]map[string]any, error) {
 				}
 				words = append(words, ir)
 			}
-			return []map[string]any{exprStmt(execCall("printf", words))}, nil
+			return append(pre, exprStmt(execCall("printf", words))), nil
 		}
 	}
-	words, err := l.argListIR(t.Args)
+	words, err := l.argListIR(nt.Args)
 	if err != nil {
 		return nil, err
 	}
-	return []map[string]any{exprStmt(execCall("echo", words))}, nil
+	return append(pre, exprStmt(execCall("echo", words))), nil
 }
 
 func (l *lowerer) assignIR(t *AssignS) ([]map[string]any, error) {
@@ -2405,7 +2604,7 @@ func (l *lowerer) assignOne(target, op string, val Expr) ([]map[string]any, erro
 		}
 		return []map[string]any{backgroundStmt([]map[string]any{exprStmt(ir)})}, nil
 	}
-	// list literal → setArray
+	// list literal → setArray / setArrayAppend (arr += (...))
 	if lst, ok := val.(*ListE); ok {
 		var elems []any
 		for _, el := range lst.Elems {
@@ -2424,6 +2623,10 @@ func (l *lowerer) assignOne(target, op string, val Expr) ([]map[string]any, erro
 			elems = append(elems, ir)
 		}
 		l.setType(target, "list")
+		if op == "+=" {
+			// arr += (...) — the core's PlusAssign-Array lowering
+			return []map[string]any{assignStmt(target, call("setArrayAppend", []any{st(target), array(elems)}))}, nil
+		}
 		return []map[string]any{assignStmt(target, call("setArray", []any{st(target), array(elems)}))}, nil
 	}
 	// aug-assign
@@ -2553,6 +2756,36 @@ func (l *lowerer) iterIR(e Expr) (map[string]any, error) {
 	case *NameE:
 		// for x in arrvar → the core's "${arr[@]}" lowering
 		return array([]any{call("param", []any{st("slice"), st(t.Name), st("@"), st("")})}), nil
+	case *CallE:
+		// for i in range(a, b) → the core's native numeric-range
+		// iterable (seq_range_for's bare Range; INCLUSIVE end —
+		// Python's range end is exclusive, so hi = b-1). Bounds must
+		// be literal ints for the native-counter lowering.
+		if len(t.Path) == 1 && t.Path[0] == "range" {
+			if len(t.Args) < 1 || len(t.Args) > 2 {
+				return nil, fmt.Errorf("range: expected 1 or 2 arguments")
+			}
+			ints := make([]int64, 0, 2)
+			for _, a := range t.Args {
+				n, ok := a.(*LitInt)
+				if !ok {
+					return nil, fmt.Errorf("range: expected integer bounds")
+				}
+				v, err := strconv.ParseInt(n.Text, 10, 64)
+				if err != nil {
+					return nil, fmt.Errorf("range: bad integer %q", n.Text)
+				}
+				ints = append(ints, v)
+			}
+			var lo, hi int64
+			if len(ints) == 1 {
+				lo, hi = 0, ints[0]-1
+			} else {
+				lo, hi = ints[0], ints[1]-1
+			}
+			return map[string]any{"type": "Range", "start": lo, "end": hi}, nil
+		}
+		return nil, fmt.Errorf("unsupported iterable")
 	}
 	return nil, fmt.Errorf("unsupported iterable")
 }
