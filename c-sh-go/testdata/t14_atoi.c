@@ -1,5 +1,6 @@
 // t14_atoi: C atoi + arithmetic
 // diagnostics: program prints its result to stdout
+// DRIVER: frontend emit gap (atoi from <stdlib.h>).
 #include <stdio.h>
 #include <stdlib.h>
 

@@ -1,5 +1,6 @@
 // t15_for_arith: C arithmetic for loop
 // diagnostics: program prints its result to stdout
+// DRIVER: frontend emit gap (c-style for with int declarations).
 #include <stdio.h>
 
 int main(void) {
