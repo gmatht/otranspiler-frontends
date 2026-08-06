@@ -31,5 +31,14 @@ arena, real offsets, pointer arithmetic (needs the minimal type layer:
 element size + struct layout). The C backend could pass the seam through
 to real pointers instead of emulating.
 
+Pointer-to-string lowering (the natural case): `char *s = "lit"` lowers
+the POINTER TO THE STRING itself — no mem.* seam, no handles. s + n -> a
+substring (param slice -> native String.slice), s[i] -> a 1-char slice,
+%s/%c -> the string/char. Verified t10: gcc == estree with ZERO sh2.mem
+calls (contrast t08/t09 int* which use the seam). This is the "lower
+naturally when the pattern fits" branch: a char* IS a string, so the
+allocation_id + offset machinery is bypassed entirely. Dynamic indices
+(s[i] with i a variable) and writable buffers are follow-ups.
+
 Worker: ./run_frontend_worker.sh — failure-driven (make test -> pi
 deepseek-v4-turbo -> commit/stash -> trap/escalate).
