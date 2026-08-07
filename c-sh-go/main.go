@@ -1,4 +1,4 @@
-package main
+package clib
 
 // c-sh-go: C source -> A1 shIR JSON (the shell-flavored subset of C).
 // v1 subset: printf, int assignments (+=/-=), binary arith, comparisons,
@@ -12,9 +12,8 @@ package main
 // them identically. Unsupported constructs fail loud (refuse > guess).
 import (
 	"encoding/json"
-	"regexp"
 	"fmt"
-	"os"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -24,6 +23,7 @@ func st(s string) any { return map[string]any{"style": "DoubleQuoted", "type": "
 func call(f string, args []any) map[string]any {
 	return map[string]any{"args": args, "func": f, "purity": "Emulable", "type": "Call"}
 }
+
 // addrTaken — names whose address is taken (&x): their storage must live
 // in the sh2 store (the emitter would otherwise lift them to native JS
 // bindings, and the mem.* seam reads/writes the store — divergence).
@@ -35,6 +35,7 @@ var addrTaken = map[string]bool{}
 // becomes (array, index) and every use folds to direct array indexing;
 // the pointer variable is compile-time only, never emitted.
 var arrayVars = map[string]bool{}
+
 // scalarAliases — STATIC ALIAS FOLDING for scalars: `int *p = &x;` where
 // x is a scalar and p never escapes -> p is ELIMINATED; *p reads/writes
 // become x directly (zero pointer machinery, zero mem calls). The alias
@@ -257,10 +258,12 @@ func recordPtrTarget(name string, e *expr) bool {
 
 // charPtrVars — `char *name` declarations: the POINTER-TO-STRING lowering.
 // A char* is lowered to the string itself — no mem.* handles, no arena:
-//   &"lit"     -> the literal string
-//   s + n      -> a substring (param slice)
-//   s[i]       -> a 1-char slice
-//   %s / %c    -> the string / first char
+//
+//	&"lit"     -> the literal string
+//	s + n      -> a substring (param slice)
+//	s[i]       -> a 1-char slice
+//	%s / %c    -> the string / first char
+//
 // The pointer IS the string; the seam is bypassed entirely.
 var charPtrVars = map[string]bool{}
 
@@ -339,29 +342,31 @@ func wrapForContinues(stmts []any, update any) []any {
 	return out
 }
 
-// refuse — unsupported constructs fail loud (refuse > guess).
+// refuse — unsupported constructs fail loud (refuse > guess). Panic so
+// the library entry (Shir) can recover it as an error; the CLI and the
+// combined busybox both convert it to a stderr line + nonzero exit.
 func refuse(msg string) {
-	fmt.Fprintln(os.Stderr, "REFUSE: "+msg)
-	os.Exit(1)
+	panic(msg)
 }
 
 // callNode — a C stdlib function-call expression in a VALUE position.
 // The v1 subset implements the pure conversions the shell runtime
 // already models:
-//   strlen(s) — a string LITERAL is a compile-time constant (fold to its
-//     length); a VARIABLE lowers to ${#s} — the A1 param("len", name)
-//     idiom, which the estree renderer lowers to String(v).length for
-//     lifted vars (exact for the NUL-free subset).
-//   atoi(s)  — a literal folds to its integer text (C leading-digit
-//     parse, 0 on failure); a variable IS its value (the store is
-//     string-typed; the Arith nodes coerce).
-//   strcmp(a, b) / a user function call — constant-fold when every
-//     argument is a literal (see foldCallConst); anything else REFUSES
-//     (exit 1) — refuse > guess.
-//   malloc(n) / calloc(n, sz) — a heap allocation: the RUNTIME memAlloc
-//     arena call (the size must fold — the arena needs a concrete byte
-//     count). The returned handle lands in a store variable; every
-//     pointer use lowers to memLoad/memStore/memFree (see heapPtrs).
+//
+//	strlen(s) — a string LITERAL is a compile-time constant (fold to its
+//	  length); a VARIABLE lowers to ${#s} — the A1 param("len", name)
+//	  idiom, which the estree renderer lowers to String(v).length for
+//	  lifted vars (exact for the NUL-free subset).
+//	atoi(s)  — a literal folds to its integer text (C leading-digit
+//	  parse, 0 on failure); a variable IS its value (the store is
+//	  string-typed; the Arith nodes coerce).
+//	strcmp(a, b) / a user function call — constant-fold when every
+//	  argument is a literal (see foldCallConst); anything else REFUSES
+//	  (exit 1) — refuse > guess.
+//	malloc(n) / calloc(n, sz) — a heap allocation: the RUNTIME memAlloc
+//	  arena call (the size must fold — the arena needs a concrete byte
+//	  count). The returned handle lands in a store variable; every
+//	  pointer use lowers to memLoad/memStore/memFree (see heapPtrs).
 func callNode(e *expr) any {
 	switch e.name {
 	case "malloc":
@@ -1026,9 +1031,9 @@ func splitMacroArgs(ts []tok, from int) ([][]tok, int) {
 
 // ── parser ───────────────────────────────────────────────────────────
 type parser struct {
-	ts       []tok
-	p        int
-	retExpr  *expr // the most recent `return <expr>;` (user-function bodies)
+	ts      []tok
+	p       int
+	retExpr *expr // the most recent `return <expr>;` (user-function bodies)
 }
 
 func (p *parser) peek() *tok {
@@ -1602,7 +1607,7 @@ func (p *parser) stmt() (any, error) {
 			if err := p.expectOp(";"); err != nil {
 				return nil, err
 			}
-			p.retExpr = e // captured for user-function constant folding
+			p.retExpr = e   // captured for user-function constant folding
 			return nil, nil // return: no stdout effect in the v1 subset
 		}
 		// [int|char] [*]* NAME ( = expr )? ;  — pointers: `int *p` / `char *s`
@@ -2770,29 +2775,19 @@ func applyStoreRouting(stmts []any) []any {
 	return walk(stmts)
 }
 
-// ── main ─────────────────────────────────────────────────────────────
-func main() {
-	args := os.Args[1:]
-	var file string
-	for _, a := range args {
-		if a == "--shir" || a == "--raw" {
-			continue
+// ── Shir — c-sh-go as a library: C source -> A1 shIR JSON bytes (no
+// trailing newline). Both the CLI (cmd/c-sh-go) and the combined busybox
+// dispatch through this single entry point. Parser refusals panic (see
+// refuse) and are recovered here as errors. ───────────────────────────
+func Shir(src string) (out []byte, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("REFUSE: %v", r)
 		}
-		file = a
-	}
-	if file == "" {
-		fmt.Fprintln(os.Stderr, "usage: c-sh-go --shir <file.c> [--raw]")
-		os.Exit(2)
-	}
-	src, err := os.ReadFile(file)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(2)
-	}
-	srcStr := string(src)
+	}()
 	// pre-scan: address-taken names (&x) keep their storage in the store
 	addrTaken = map[string]bool{}
-	for _, m := range regexp.MustCompile(`&([A-Za-z_][A-Za-z0-9_]*)`).FindAllStringSubmatch(srcStr, -1) {
+	for _, m := range regexp.MustCompile(`&([A-Za-z_][A-Za-z0-9_]*)`).FindAllStringSubmatch(src, -1) {
 		addrTaken[m[1]] = true
 	}
 	// per-run state (the binary parses one file per invocation, but the
@@ -2803,18 +2798,16 @@ func main() {
 	structLayouts = map[string][]structMember{}
 	varStruct = map[string]string{}
 	macros = map[string]macro{}
-	preprocessDefines(srcStr)
-	ts, err := lex(srcStr)
+	preprocessDefines(src)
+	ts, err := lex(src)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "REFUSE: "+err.Error())
-		os.Exit(1)
+		return nil, fmt.Errorf("REFUSE: %w", err)
 	}
 	ts = expandMacros(ts)
 	pr := &parser{ts: ts}
 	stmts, err := pr.stmts()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "REFUSE: "+err.Error())
-		os.Exit(1)
+		return nil, fmt.Errorf("REFUSE: %w", err)
 	}
 	stmts = applyStoreRouting(stmts)
 	prog := map[string]any{
@@ -2830,10 +2823,5 @@ func main() {
 		"var_lifetimes":    []any{},
 		"var_types":        []any{},
 	}
-	out, err := json.Marshal(prog)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-	fmt.Println(string(out))
+	return json.Marshal(prog)
 }

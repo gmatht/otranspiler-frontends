@@ -16,7 +16,7 @@ build:
 	# a non-object file) makes `go build -o` refuse to overwrite it and the
 	# gate wedges. Drop it first; the fresh binary is always rebuilt.
 	rm -f c-sh-go
-	$(GO) build -o c-sh-go .
+	$(GO) build -o c-sh-go ./cmd/c-sh-go
 
 # Self-heal the ingress oracle too: a missing core debashc binary (fresh
 # checkout, interrupted core build) wedges the gate as a confusing
