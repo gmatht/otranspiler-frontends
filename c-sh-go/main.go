@@ -1396,12 +1396,15 @@ func valueNode(e *expr) any {
 	// Any float operand in the arithmetic (e.g. `x * 2.0`): the A1
 	// Arith AST is integer-only (`ArithAst::Num(i64)`), so the
 	// structured form would round `2.0` to `0`. Fall back to the
-	// runtime `sh2.arith(<string>)` call which evaluates the bash
-	// arithmetic expression natively (handles floats, divmod,
-	// parentheses, …). The string form is slower than the native AST
-	// but correct for the t23 printf("%.1f\n", 1.5*2.0) shape.
+	// runtime `sh2.fparith(<string>)` call which evaluates the C
+	// double expression with JS doubles (binary64 — the same IEEE-754
+	// format as C doubles). The string form is slower than the native
+	// AST but correct for the t23 printf("%.1f\n", 1.5*2.0) shape.
+	// (bash's `$(( ))` arith is INTEGER-only — the old `sh2.arith`
+	// fallback syntax-errored on `1.5`, the assignment was skipped,
+	// and printf saw an unset y → "0.0".)
 	if hasFloat(e) {
-		return call("arith", []any{st(exprToArithString(e))})
+		return call("fparith", []any{st(exprToArithString(e))})
 	}
 	return map[string]any{"ast": arithNode(e), "type": "Arith"}
 }
@@ -1487,6 +1490,9 @@ func testOperand(e *expr) string {
 }
 
 func testExpr(e *expr) string {
+	if hasFloat(e) {
+		refuse("float comparison in a condition (the bash test grammar is integer-only)")
+	}
 	if e.kind == "id" {
 		return "$" + e.name + " -ne 0"
 	}
@@ -2139,6 +2145,13 @@ func (p *parser) buildAssign(name, op string, e *expr) (any, error) {
 		return assignStmt(name, valueNode(e)), nil
 	}
 	arithOp := strings.TrimSuffix(op, "=")
+	if hasFloat(e) {
+		// A float operand in a compound assignment: the Arith AST is
+		// integer-only (arithNode would Atoi("2.0") to 0 — silent
+		// corruption). Route through the runtime float evaluator, the
+		// same seam as the valueNode fallback.
+		return assignStmt(name, call("fparith", []any{st("($" + name + " " + arithOp + " " + exprToArithString(e) + ")")})), nil
+	}
 	return assignStmt(name, map[string]any{"ast": map[string]any{
 		"type": "Bin", "lhs": map[string]any{"type": "Var", "name": name},
 		"op": arithOp, "rhs": arithNode(e)}, "type": "Arith"}), nil
