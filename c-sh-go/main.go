@@ -1363,15 +1363,21 @@ func valueNode(e *expr) any {
 			return call("param", []any{st("slice"), st(e.l.name), offsetArg(e.r), st("1")})
 		}
 		// p[k] on a static pointer-into-array — the pointer-to-array
-		// reduction: fold to arrayIndex(arr, base+k)
+		// reduction: fold to arrayIndex(arr, base+k); a DYNAMIC index
+		// lowers to arrayIndex(arr, arith("base + $i")) — the runtime
+		// arith substitutes the variable and evaluates.
 		if e.l != nil && e.l.kind == "id" {
 			if t, ok := ptrTargets[e.l.name]; ok {
 				if k, ok := foldIndex(e.r); ok {
 					return call("arrayIndex", []any{st(t.arr), st(strconv.Itoa(t.base + k))})
 				}
+				return call("arrayIndex", []any{st(t.arr), indexArith(e.r, t.base)})
 			}
 			if arrayVars[e.l.name] {
-				return call("arrayIndex", []any{st(e.l.name), offsetArg(e.r)})
+				if k, ok := foldIndex(e.r); ok {
+					return call("arrayIndex", []any{st(e.l.name), st(strconv.Itoa(k))})
+				}
+				return call("arrayIndex", []any{st(e.l.name), indexArith(e.r, 0)})
 			}
 			// p[k] on a heap pointer — mem arena element read at off+k
 			if hp, ok := heapPtrs[e.l.name]; ok {
@@ -1456,13 +1462,27 @@ func exprToArithString(e *expr) string {
 	return ""
 }
 
-// offsetArg — a literal slice offset as its string form (dynamic offsets
-// via a variable index are a follow-up; the runner's sliceOff parses arith).
+// offsetArg — a literal slice offset as its string form (a bare id
+// becomes "$name" — the runner's sliceOff parses arith).
 func offsetArg(e *expr) any {
 	if e != nil && e.kind == "num" {
 		return st(e.num)
 	}
+	if e != nil && e.kind == "id" {
+		return st("$" + e.name)
+	}
 	return st("0")
+}
+
+// indexArith — a dynamic array index as the runtime arith call:
+// arrayIndex(arr, arith("base + $i")) — arith substitutes $i and
+// evaluates the integer expression (a literal index folds earlier).
+func indexArith(e *expr, base int) any {
+	s := exprToArithString(e)
+	if base != 0 {
+		s = strconv.Itoa(base) + " + " + s
+	}
+	return call("arith", []any{st(s)})
 }
 
 // testExpr — C comparison → the bash test-expression string ($x -gt 1).
