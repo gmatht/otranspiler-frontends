@@ -1316,6 +1316,26 @@ func arithNode(e *expr) any {
 	}
 	return map[string]any{"type": "Num", "value": 0}
 }
+// derefFold — fold a nested deref (`**pp`) through the static alias
+// table: *pp where pp->p->x reads x's storage.
+func derefFold(e *expr) (string, bool) {
+	if e == nil {
+		return "", false
+	}
+	switch e.kind {
+	case "id":
+		t, ok := scalarAliases[e.name]
+		return t, ok
+	case "deref":
+		if t, ok := derefFold(e.l); ok {
+			if t2, ok2 := scalarAliases[t]; ok2 {
+				return t2, true
+			}
+		}
+	}
+	return "", false
+}
+
 func valueNode(e *expr) any {
 	switch e.kind {
 	case "num":
@@ -1342,7 +1362,8 @@ func valueNode(e *expr) any {
 		}
 		return call("addrOf", []any{valueNode(e.l)})
 	case "deref":
-		// *p on a statically-aliased scalar — the alias folding: direct read
+		// *p on a statically-aliased scalar — the alias folding: direct
+		// read, chasing the chain (`**pp` where pp->p->x reads x)
 		if e.l != nil && e.l.kind == "id" {
 			if t, ok := scalarAliases[e.l.name]; ok {
 				return call("getVar", []any{st(t)})
@@ -1353,6 +1374,28 @@ func valueNode(e *expr) any {
 			// *p on a heap pointer — the mem arena element read
 			if hp, ok := heapPtrs[e.l.name]; ok {
 				return call("memLoad", []any{call("getVar", []any{st(hp.root)}), st(strconv.Itoa(hp.off)), st(hp.elem)})
+			}
+		}
+		// **pp — deref of a deref through the alias chain: fold to the
+		// ultimate scalar's read
+		if e.l != nil && e.l.kind == "deref" {
+			if t, ok := derefFold(e.l); ok {
+				return call("getVar", []any{st(t)})
+			}
+		}
+		// *(q + n) on a pointer-into-array — fold to arrayIndex(arr,
+		// base+n) with a constant offset
+		if e.l != nil && e.l.kind == "bin" && e.l.l != nil && e.l.l.kind == "id" {
+			if t, ok := ptrTargets[e.l.l.name]; ok {
+				if k, ok := foldIndex(e.l.r); ok {
+					base := t.base
+					if e.l.op == "-" {
+						base -= k
+					} else {
+						base += k
+					}
+					return call("arrayIndex", []any{st(t.arr), st(strconv.Itoa(base))})
+				}
 			}
 		}
 		// *p — load through the handle
@@ -1798,8 +1841,9 @@ func (p *parser) stmt() (any, error) {
 				}
 				return map[string]any{"type": "Expr", "expr": call("setArray", []any{st(name.text), map[string]any{"elements": elems, "type": "Array"}})}, nil
 			}
-			p.next() // bare `int a[3];`
-			return nil, nil
+			p.next() // bare `int a[3];` — create the array so later
+			// individual writes (`a[i] = v`) build it in the runtime store
+			return map[string]any{"type": "Expr", "expr": call("setArray", []any{st(name.text), map[string]any{"elements": []any{}, "type": "Array"}})}, nil
 		}
 		if p.isOp("=") {
 			p.next()
