@@ -1313,6 +1313,12 @@ func arithNode(e *expr) any {
 		return map[string]any{"type": "Num", "value": n}
 	case "bin":
 		return map[string]any{"type": "Bin", "lhs": arithNode(e.l), "op": e.op, "rhs": arithNode(e.r)}
+	case "index", "deref", "addr":
+		// an array element / pointer deref inside arithmetic — the A1
+		// Arith grammar has no Call node, so a runtime array read cannot
+		// be modeled. Refuse (refuse > guess — silently folding to 0
+		// would be a lie). Lower the read to a temp first (`int v = p[i]`).
+		refuse("array/pointer read in an arithmetic context (lower it to a temp: int v = p[i])")
 	}
 	return map[string]any{"type": "Num", "value": 0}
 }
