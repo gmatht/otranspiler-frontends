@@ -22,17 +22,42 @@ Shared (do NOT fork): `frontends/shir-emit-go/` (the A1 JSON emitter),
 - `if [not] A==B (cmd) [else (cmd)]` — else only with the parenthesized
   form (real cmd requires the else on the closing-paren line); multi-line
   `( ... )` blocks supported
+- `if [not] defined VAR` / `if [not] exist FILE` / `if [not] errorlevel N`
+  (v1.1) — mapped to `[[ -n $var ]]` (the estree test tokenizer expands
+  `$var` but treats `${...}` as literal — `-n` is the mappable form;
+  an empty-but-set var counts as NOT defined, a batch difference) /
+  `[[ -e FILE ]]` / `[[ $? -ge N ]]`
 - `for %%v in (word list) do cmd|(block)` — `%%v` in the body is the
   loop-var read
+- `for /l %%v in (start 1 end) do …` (v1.1) — the A1 `Range` iterable,
+  unit step only; other steps refuse
+- `^` end-of-line continuation (v1.1) — joins the next non-empty line;
+  comments are exempt; inline `^` escapes refuse
 - `exit /b [N]` — the direct IrStmt::Exit statement (all backends render
   it: estree -> process.exit, sh -> exit, perl -> exit; the estree arm
   landed 2026-08-09)
+- `for /f ["delims=X tokens=1[,N...]"] %%v in (FILE | literal words | 'cmd') do …`
+  (v1.1) — line iteration with field tokens (read-builtin lowering; the
+  single-token case adds a discard var since read's last var gets the
+  remainder). `skip=`/`eol=`/`usebackq` and token sets not starting at 1
+  refuse. NOTE: the estree runtime caches read buffers per source, so two
+  for /f loops over the SAME file in one program see the second as empty
+  (runtime gap — use distinct files).
+- `> file` / `>> file` / `N>` / `N>>` redirects (v1.1) — the word-list
+  scan wraps the exec in a Redirect stmt.
+- batch builtin -> POSIX command mapping (v1.1): copy->cp, del/erase->rm,
+  type->cat, move/ren/rename->mv, rd->rmdir, md->mkdir, dir->ls, where->
+  which, xcopy->cp, ver->uname, find->grep -F, cls/title->no-op; common
+  flags translated (dir /b->-1, del /q->-f, /y->-f, ...). Batch `ren OLD
+  newname` resolves the bare destination into OLD's dir. NOTE: the estree
+  runner's exec allowlist derives from the SOURCE text — scripts using
+  mapped commands should mention the posix names in a comment.
 - `cmd1 & cmd2` statement separators
 
 Deliberately NOT in v1 (refuse loud, documented as worker items):
 - `call`, `setlocal`/`endlocal`, `shift`, `pause`, `start`, `pushd`/`popd`,
-  `set /p`, `if defined/exist/errorlevel`, `for /l /f /d /r`, `^` line
-  continuation, `|` pipes, delayed expansion `!var!`, `%cmdline%`
+  `set /p`, `for /d /r`, `for /f` with skip=/eol=/usebackq or token sets
+  not starting at 1, `|` pipes, delayed expansion `!var!`, `%cmdline%`
 
 ## Semantics notes
 

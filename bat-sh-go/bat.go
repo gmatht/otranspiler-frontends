@@ -63,6 +63,21 @@ func (p *parser) parseBlock(inBlock bool) ([]map[string]any, error) {
 		if inBlock && line == ")" {
 			return out, nil
 		}
+		// `^` end-of-line continuation (v1.1): joins the next non-empty
+		// line; comments are exempt; inline `^` escapes refuse.
+		for strings.HasSuffix(line, "^") &&
+			!strings.HasPrefix(line, "::") &&
+			!strings.HasPrefix(strings.ToLower(line), "rem ") && line != "rem" {
+			line = strings.TrimSuffix(line, "^")
+			for p.idx < len(p.lines) {
+				next := strings.TrimSpace(p.lines[p.idx])
+				p.idx++
+				if next != "" {
+					line += " " + next
+					break
+				}
+			}
+		}
 		st, err := p.parseLine(line)
 		if err != nil {
 			return nil, err
@@ -152,16 +167,136 @@ func (p *parser) parseCommand(s string) ([]map[string]any, string, error) {
 	case "call", "setlocal", "endlocal", "shift", "pause", "start", "pushd", "popd":
 		return nil, "", fmt.Errorf("unsupported batch command %q (v1 subset)", strings.ToLower(word))
 	default:
-		// external command
+		// external command: batch builtin -> POSIX name mapping (names +
+		// common flags), then simple `> file` / `2>> file` redirects.
+		wl := strings.ToLower(word)
+		if wl == "cls" || wl == "title" {
+			return nil, "", nil // no-op outside Windows
+		}
+		if mapped, ok := batchToPosix[wl]; ok {
+			word, rest = translateBatchCmd(wl, mapped, rest)
+			// batch `ren OLD newname` — the bare destination resolves
+			// relative to OLD's directory (mv would drop it in the cwd)
+			if wl == "ren" || wl == "rename" {
+				if dir, base, ok := strings.Cut(rest, " "); ok && !strings.Contains(base, "/") {
+					if i := strings.LastIndex(dir, "/"); i >= 0 {
+						rest = dir + " " + dir[:i+1] + base
+					}
+				}
+			}
+			w = mapped
+		} else if wl == "find" && rest != "" {
+			// batch `find "text" files...` (literal-string search) -> grep -F
+			word, rest = "grep", "-F "+rest
+		}
 		words, err := splitWords(word+" "+rest, p.forVars)
 		if err != nil {
 			return nil, "", err
+		}
+		if red, ok := wrapRedirect(words); ok {
+			return red, "", nil
 		}
 		return []map[string]any{execStmt(words, "Spawn")}, "", nil
 	}
 }
 
+// batchToPosix — batch builtin commands -> their POSIX equivalents (the
+// names differ; the flags are translated by translateBatchCmd). The
+// estree runner's exec allowlist derives from the SOURCE text, so a
+// batch script using these should mention the posix names in a comment.
+var batchToPosix = map[string]string{
+	"copy": "cp", "del": "rm", "erase": "rm", "type": "cat",
+	"move": "mv", "ren": "mv", "rename": "mv", "rd": "rmdir",
+	"md": "mkdir", "dir": "ls", "where": "which", "xcopy": "cp",
+	"ver": "uname", "find": "grep",
+}
+
+// translateBatchCmd maps a mapped command's batch flags to POSIX
+// equivalents (`dir /b` -> `ls -1`, `del /q` -> `rm -f`, ...). Unknown
+// flags pass through untouched (conservative — never guess).
+func translateBatchCmd(batch, posix, rest string) (string, string) {
+	var out []string
+	for _, tok := range strings.Fields(rest) {
+		if strings.HasPrefix(tok, "/") && len(tok) > 1 {
+			f := tok[1:]
+			switch batch {
+			case "dir":
+				switch f {
+				case "b":
+					out = append(out, "-1")
+				case "s":
+					out = append(out, "-R")
+				case "a":
+					out = append(out, "-a")
+				case "w":
+					out = append(out, "-C")
+				default:
+					out = append(out, tok)
+				}
+			case "del", "erase":
+				switch f {
+				case "q", "f":
+					out = append(out, "-f")
+				case "s":
+					out = append(out, "-r")
+				default:
+					out = append(out, tok)
+				}
+			case "copy", "move", "xcopy":
+				switch f {
+				case "y":
+					out = append(out, "-f")
+				case "s", "e":
+					if batch == "xcopy" {
+						out = append(out, "-r")
+					} else {
+						out = append(out, tok)
+					}
+				default:
+					out = append(out, tok)
+				}
+			default:
+				out = append(out, tok)
+			}
+		} else {
+			out = append(out, tok)
+		}
+	}
+	return posix, strings.Join(out, " ")
+}
+
 // splitWord splits the first whitespace-delimited word off s.
+// wrapRedirect — if the word list contains a `>` / `>>` / `N>` / `N>>`
+// token, wrap the exec in a Redirect stmt (batch's file-op workhorse).
+// Returns (stmts, redirected).
+func wrapRedirect(words []map[string]any) ([]map[string]any, bool) {
+	for i, wd := range words {
+		stxt, isStr := wd["value"].(string)
+		if !isStr || !strings.Contains(stxt, ">") {
+			continue
+		}
+		if i+1 >= len(words) {
+			continue // bare `>` — leave to the runtime/external
+		}
+		fd := 1
+		if len(stxt) > 1 && stxt[0] >= '0' && stxt[0] <= '9' {
+			fd = int(stxt[0] - '0')
+		}
+		mode := "w"
+		if strings.Contains(stxt, ">>") {
+			mode = "a"
+		}
+		return []map[string]any{{
+			"type":  "Redirect",
+			"inner": []any{execStmt(words[:i], "Spawn")},
+			"redirects": []any{map[string]any{
+				"fd": fd, "interpolate": true, "mode": mode, "target": words[i+1],
+			}},
+		}}, true
+	}
+	return nil, false
+}
+
 func splitWord(s string) (string, string) {
 	s = strings.TrimLeft(s, " \t")
 	i := 0
@@ -191,7 +326,11 @@ func (p *parser) parseEcho(rest string) ([]map[string]any, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	return []map[string]any{execStmt(append([]map[string]any{str("echo")}, words...), "Emulable")}, "", nil
+	all := append([]map[string]any{str("echo")}, words...)
+	if red, ok := wrapRedirect(all); ok {
+		return red, "", nil
+	}
+	return []map[string]any{execStmt(all, "Emulable")}, "", nil
 }
 
 // ── set ─────────────────────────────────────────────────────────────
@@ -258,10 +397,37 @@ func (p *parser) parseIf(rest string) ([]map[string]any, string, error) {
 		rest = strings.TrimSpace(rest[4:])
 	}
 	// condition: up to the first `(` (block form) or, in the command
-	// form, up to the first unquoted space.
-	cond, cmd, isBlock, err := splitCondition(rest)
-	if err != nil {
-		return nil, "", err
+	// form, up to the first unquoted space. v1.1 keyword conditions
+	// (`defined VAR` / `exist FILE` / `errorlevel N`) are two-part — the
+	// operand ends at the block/cmd.
+	var cond, cmd string
+	var isBlock bool
+	var err error
+	low := strings.ToLower(rest)
+	switch {
+	case strings.HasPrefix(low, "defined "):
+		cond, cmd, isBlock, err = splitCondition(rest[len("defined "):])
+		if err != nil {
+			return nil, "", err
+		}
+		cond = "-n $" + strings.ToLower(cond)
+	case strings.HasPrefix(low, "exist "):
+		cond, cmd, isBlock, err = splitCondition(rest[len("exist "):])
+		if err != nil {
+			return nil, "", err
+		}
+		cond = "-e " + cond
+	case strings.HasPrefix(low, "errorlevel"):
+		cond, cmd, isBlock, err = splitCondition(rest[len("errorlevel"):])
+		if err != nil {
+			return nil, "", err
+		}
+		cond = "$? -ge " + strings.TrimSpace(cond)
+	default:
+		cond, cmd, isBlock, err = splitCondition(rest)
+		if err != nil {
+			return nil, "", err
+		}
 	}
 	if cond == "" {
 		return nil, "", fmt.Errorf("if with empty condition: %q", rest)
@@ -319,6 +485,7 @@ func (p *parser) parseIf(rest string) ([]map[string]any, string, error) {
 // The condition runs to the first `(` (block form) or the first
 // unquoted space (command form).
 func splitCondition(s string) (string, string, bool, error) {
+	s = strings.TrimLeft(s, " \t")
 	inQuote := byte(0)
 	for i := 0; i < len(s); i++ {
 		c := s[i]
@@ -438,7 +605,13 @@ func findMatchingParen(s string) int {
 func (p *parser) parseFor(rest string) ([]map[string]any, string, error) {
 	rest = strings.TrimSpace(rest)
 	if strings.HasPrefix(rest, "/") {
-		return nil, "", fmt.Errorf("unsupported: for /%c (only the plain word-list form is in v1)", rest[1])
+		if strings.HasPrefix(rest, "/l") || strings.HasPrefix(rest, "/L") {
+			return p.parseForL(rest[2:])
+		}
+		if strings.HasPrefix(rest, "/f") || strings.HasPrefix(rest, "/F") {
+			return p.parseForF(rest[2:])
+		}
+		return nil, "", fmt.Errorf("unsupported: for /%c (v1.1: plain word-list, /l, /f)", rest[1])
 	}
 	if !strings.HasPrefix(rest, "%%") {
 		return nil, "", fmt.Errorf("expected %%var in for: %q", rest)
@@ -487,6 +660,252 @@ func (p *parser) parseFor(rest string) ([]map[string]any, string, error) {
 		"iter": map[string]any{"type": "Array", "elements": items},
 		"body": body,
 	}}, "", nil
+}
+
+// for /l — numeric loop over the A1 Range iterable (unit step only).
+func (p *parser) parseForL(rest string) ([]map[string]any, string, error) {
+	rest = strings.TrimSpace(rest)
+	if !strings.HasPrefix(rest, "%%") {
+		return nil, "", fmt.Errorf("expected %%var in for /l: %q", rest)
+	}
+	sp := strings.IndexByte(rest[2:], ' ')
+	if sp < 0 {
+		return nil, "", fmt.Errorf("malformed for /l: %q", rest)
+	}
+	varName := strings.ToLower(rest[2 : 2+sp])
+	rest = strings.TrimSpace(rest[2+sp:])
+	if !strings.HasPrefix(strings.ToLower(rest), "in ") {
+		return nil, "", fmt.Errorf("expected 'in' in for /l: %q", rest)
+	}
+	rest = strings.TrimSpace(rest[3:])
+	bounds, rest, err := p.parseParenList(rest)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(bounds) != 3 {
+		return nil, "", fmt.Errorf("for /l needs (start step end): got %d bounds", len(bounds))
+	}
+	start, ok1 := constInt(bounds[0])
+	step, ok2 := constInt(bounds[1])
+	end, ok3 := constInt(bounds[2])
+	if !ok1 || !ok2 || !ok3 {
+		return nil, "", fmt.Errorf("for /l bounds must be constant integers (no %%var%%): %q", rest)
+	}
+	if step != 1 {
+		return nil, "", fmt.Errorf("for /l step %d unsupported (the A1 Range iterable is unit-step only)", step)
+	}
+	rest = strings.TrimSpace(rest)
+	if !strings.HasPrefix(strings.ToLower(rest), "do ") {
+		return nil, "", fmt.Errorf("expected 'do' in for /l: %q", rest)
+	}
+	rest = strings.TrimSpace(rest[3:])
+	p.forVars[varName] = true
+	var body []map[string]any
+	if strings.HasPrefix(rest, "(") {
+		body, rest, err = p.parseParenBlock(rest)
+		if err != nil {
+			return nil, "", err
+		}
+	} else {
+		body, rest, err = p.parseCommand(rest)
+		if err != nil {
+			return nil, "", err
+		}
+	}
+	delete(p.forVars, varName)
+	if rest != "" {
+		return nil, "", fmt.Errorf("for /l trailing text: %q", rest)
+	}
+	return []map[string]any{{
+		"type": "For",
+		"var":  varName,
+		"iter": map[string]any{"type": "Range", "start": start, "end": end},
+		"body": body,
+	}}, "", nil
+}
+
+// for /f — line/token iteration: for /f "options" %%v in (source) do body
+// (v1.1: options delims=X, tokens=1[,N...] / tokens=*; sources (file),
+// (literal words...), ('command'); skip=/eol=/usebackq refuse).
+func (p *parser) parseForF(rest string) ([]map[string]any, string, error) {
+	rest = strings.TrimSpace(rest)
+	// the "options" string is optional (`for /f %%v in (...) do ...`)
+	opts := ""
+	if strings.HasPrefix(rest, "\"") {
+		qe := strings.Index(rest[1:], "\"")
+		if qe < 0 {
+			return nil, "", fmt.Errorf("for /f: unterminated options: %q", rest)
+		}
+		opts = rest[1 : 1+qe]
+		rest = strings.TrimSpace(rest[qe+2:])
+	}
+	if !strings.HasPrefix(rest, "%%") {
+		return nil, "", fmt.Errorf("expected %%var in for /f: %q", rest)
+	}
+	sp := strings.IndexByte(rest[2:], ' ')
+	if sp < 0 {
+		return nil, "", fmt.Errorf("malformed for /f: %q", rest)
+	}
+	firstVar := strings.ToLower(rest[2 : 2+sp])
+	rest = strings.TrimSpace(rest[2+sp:])
+	if !strings.HasPrefix(strings.ToLower(rest), "in ") {
+		return nil, "", fmt.Errorf("expected 'in' in for /f: %q", rest)
+	}
+	rest = strings.TrimSpace(rest[3:])
+	if !strings.HasPrefix(rest, "(") {
+		return nil, "", fmt.Errorf("expected '(' source in for /f: %q", rest)
+	}
+	pe := findMatchingParen(rest)
+	if pe < 0 {
+		return nil, "", fmt.Errorf("unterminated for /f source: %q", rest)
+	}
+	src := strings.TrimSpace(rest[1:pe])
+	rest = strings.TrimSpace(rest[pe+1:])
+	if !strings.HasPrefix(strings.ToLower(rest), "do ") {
+		return nil, "", fmt.Errorf("expected 'do' in for /f: %q", rest)
+	}
+	rest = strings.TrimSpace(rest[3:])
+
+	// options
+	delims := "" // default: whitespace (the runtime's IFS default)
+	tokens := "1"
+	for _, o := range strings.Fields(opts) {
+		switch {
+		case strings.HasPrefix(o, "delims="):
+			delims = o[len("delims="):]
+		case strings.HasPrefix(o, "tokens="):
+			tokens = o[len("tokens="):]
+		case strings.HasPrefix(o, "skip="), strings.HasPrefix(o, "eol="), o == "usebackq":
+			return nil, "", fmt.Errorf("unsupported for /f option %q (v1.1: delims + tokens only)", o)
+		default:
+			return nil, "", fmt.Errorf("unknown for /f option %q", o)
+		}
+	}
+	if tokens != "*" && tokens != "1" && !strings.HasPrefix(tokens, "1,") {
+		return nil, "", fmt.Errorf("unsupported for /f tokens %q (v1.1: tokens=1[,N...] or *)", tokens)
+	}
+	// token vars: tokens=1 -> firstVar; tokens=1,2,3 -> firstVar + the
+	// next letters (batch's %%a %%b %%c scheme); tokens=* -> firstVar.
+	readVars := []string{firstVar}
+	if tokens != "*" && tokens != "1" {
+		last := firstVar
+		for range strings.Split(tokens, ",") {
+			last = nextVarName(last)
+			readVars = append(readVars, last)
+		}
+	} else if tokens == "1" || tokens == "" {
+		// tokens=1: the read builtin's LAST var gets the remainder — a
+		// single var would swallow the whole line. Add a discard var so
+		// firstVar receives only the first field (batch's tokens=1).
+		readVars = append(readVars, "__frest")
+	}
+	for _, v := range readVars {
+		p.forVars[v] = true
+	}
+
+	// the source -> fd0: (file) redirects mode "r"; literal words and
+	// ('command') feed the read loop via a herestring (the runtime's
+	// string-source fd0).
+	var redirects []any
+	if strings.HasPrefix(src, "'") && strings.HasSuffix(src, "'") && len(src) > 1 {
+		// ('command') — capture its stdout, feed as herestring content
+		cmdText := strings.TrimSpace(src[1 : len(src)-1])
+		cmdWord, cmdRest := splitWord(cmdText)
+		cmdWords, err := splitWords(cmdWord+" "+cmdRest, p.forVars)
+		if err != nil {
+			return nil, "", err
+		}
+		capture := map[string]any{
+			"type": "Call", "func": "capture", "purity": "Spawn",
+			"args": []any{map[string]any{"type": "Arrow", "body": []any{execStmt(cmdWords, "Spawn")}}},
+		}
+		redirects = []any{map[string]any{
+			"fd": 0, "interpolate": true, "mode": "herestring", "target": capture,
+		}}
+	} else if len(strings.Fields(src)) <= 1 {
+		// (file) — the single word is a path
+		redirects = []any{map[string]any{
+			"fd": 0, "interpolate": true, "mode": "r", "target": str(src),
+		}}
+	} else {
+		// (literal words...) — each word is a "line" for /f
+		lines := strings.Join(strings.Fields(src), "\n") // the runtime adds the trailing \n
+		redirects = []any{map[string]any{
+			"fd": 0, "interpolate": true, "mode": "herestring",
+			"target": map[string]any{
+				"type":  "Interpolate",
+				"parts": []any{map[string]any{"kind": "lit", "text": lines}},
+			},
+		}}
+	}
+
+	// the read loop: While{ cond: read -r v1 v2 ... (IFS=delims) }
+	readArgs := []any{str("-r")}
+	for _, v := range readVars {
+		readArgs = append(readArgs, str(v))
+	}
+	condArgs := []any{str("read"), map[string]any{"type": "Array", "elements": readArgs}}
+	if delims != "" {
+		condArgs = append(condArgs, map[string]any{
+			"type":       "Object",
+			"properties": []any{map[string]any{"key": "IFS", "value": str(delims)}},
+		})
+	}
+	cond := map[string]any{
+		"type": "Call", "func": "exec", "purity": "Emulable", "args": condArgs,
+	}
+	var body []map[string]any
+	var err error
+	if strings.HasPrefix(rest, "(") {
+		body, rest, err = p.parseParenBlock(rest)
+	} else {
+		body, rest, err = p.parseCommand(rest)
+	}
+	for _, v := range readVars {
+		delete(p.forVars, v)
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	if rest != "" {
+		return nil, "", fmt.Errorf("for /f trailing text: %q", rest)
+	}
+	return []map[string]any{{
+		"type": "Redirect",
+		"inner": []any{map[string]any{
+			"type": "While", "cond": cond, "body": body,
+		}},
+		"redirects": redirects,
+	}}, "", nil
+}
+
+// nextVarName — batch's token-var naming scheme: `tokens=1,2 %%a` gives
+// %%a and %%b; a→b, b→c, ...
+func nextVarName(prev string) string {
+	c := prev[len(prev)-1]
+	if c == 'z' {
+		return prev + "x" // degenerate (batch wraps to aa) — rare
+	}
+	return prev[:len(prev)-1] + string(c+1)
+}
+
+// constInt — extract a constant integer from an A1 Int expr node or a
+// numeric Str node (parseParenList emits Str for literal items).
+func constInt(n map[string]any) (int, bool) {
+	switch n["type"] {
+	case "Int":
+		if v, ok := n["value"].(float64); ok {
+			return int(v), true
+		}
+	case "Str":
+		if s, ok := n["value"].(string); ok {
+			var v int
+			if _, err := fmt.Sscanf(s, "%d", &v); err == nil {
+				return v, true
+			}
+		}
+	}
+	return 0, false
 }
 
 // parseParenList parses "( item1 item2 ... )" — whitespace-split words.
