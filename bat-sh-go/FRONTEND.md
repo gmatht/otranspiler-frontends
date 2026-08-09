@@ -38,8 +38,12 @@ Shared (do NOT fork): `frontends/shir-emit-go/` (the A1 JSON emitter),
   fnCall binds the args to %%1..%%9 via the positional array, the sh
   renderer emits real `name() { ... return }` functions). `goto :eof` ->
   Return inside a subroutine / Exit at top level. Distinct from `goto`
-  (jump-with-return vs jump): goto targets stay inline as Goto/Label.
-  `call other.bat` refuses (v1.1: only `call :label`).
+  (jump-with-return vs jump): goto targets stay inline as Goto/Label —
+  and ONLY goto-target labels emit a Label stmt; fall-through markers
+  (nothing jumps to them) are dropped as no-ops, keeping the body inline
+  so batch's label fall-through semantics hold (t15 pins this — a
+  function model would lose the fall-through code). `call other.bat`
+  refuses (v1.1: only `call :label`).
 - `exit /b [N]` — the direct IrStmt::Exit statement (all backends render
   it: estree -> process.exit, sh -> exit, perl -> exit; the estree arm
   landed 2026-08-09)

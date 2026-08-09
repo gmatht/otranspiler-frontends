@@ -33,10 +33,10 @@ import (
 // Parse parses batch source into an A1 shIR program.
 func Parse(src string) (*shiremit.Program, error) {
 	lines := strings.Split(src, "\n")
-	main, subs := splitSections(lines)
+	main, subs, gotoTargets := splitSections(lines)
 	// main flow (label sections NOT in the called-subroutine set stay
 	// inline — batch falls through labels, so goto-targets must remain)
-	p := newParser(main)
+	p := newParser(main, gotoTargets)
 	mainStmts, err := p.parseBlock(false)
 	if err != nil {
 		return nil, err
@@ -46,7 +46,7 @@ func Parse(src string) (*shiremit.Program, error) {
 	var fnStmts []map[string]any
 	for _, sub := range subs {
 		name, bodyLines := sub[0], sub[1]
-		sp := newParser(strings.Split(bodyLines, "\n"))
+		sp := newParser(strings.Split(bodyLines, "\n"), gotoTargets)
 		sp.inSub = true
 		body, err := sp.parseBlock(false)
 		if err != nil {
@@ -64,7 +64,8 @@ func Parse(src string) (*shiremit.Program, error) {
 // targets are extracted (subs); the rest stay inline in main. `^`
 // continuations are joined first; paren depth is tracked so a `:x`
 // inside a `( ... )` block is not a label.
-func splitSections(lines []string) (main []string, subs [][2]string) {
+func splitSections(lines []string) (main []string, subs [][2]string, gotoTargets map[string]bool) {
+	gotoTargets = map[string]bool{}
 	// join ^ continuations (mirror the parser: skip empty lines)
 	var joined []string
 	for _, l := range lines {
@@ -86,22 +87,39 @@ func splitSections(lines []string) (main []string, subs [][2]string) {
 			names = append(names, strings.ToLower(strings.TrimSpace(ln[1:])))
 			continue
 		}
-		// scan the line for `call :label` references (the called set)
+		// scan the line for `call :label` and `goto label` references
 		low := strings.ToLower(ln)
 		for {
 			k := strings.Index(low, "call :")
-			if k < 0 {
+			g := strings.Index(low, "goto ")
+			if k < 0 && g < 0 {
 				break
 			}
-			j := k + len("call :")
-			e := j
-			for e < len(low) && (isNameChar(low[e]) || low[e] == ':') {
-				e++
+			if g >= 0 && (k < 0 || g < k) {
+				// goto <name> (not :eof)
+				j := g + len("goto ")
+				e := j
+				for e < len(low) && isNameChar(low[e]) {
+					e++
+				}
+				if e > j {
+					tgt := low[j:e]
+					if tgt != "eof" {
+						gotoTargets[tgt] = true
+					}
+				}
+				low = low[e:]
+			} else {
+				j := k + len("call :")
+				e := j
+				for e < len(low) && (isNameChar(low[e]) || low[e] == ':') {
+					e++
+				}
+				if e > j {
+					called[low[j:e]] = true
+				}
+				low = low[e:]
 			}
-			if e > j {
-				called[low[j:e]] = true
-			}
-			low = low[e:]
 		}
 		depth += strings.Count(ln, "(") - strings.Count(ln, ")")
 	}
@@ -129,18 +147,22 @@ func splitSections(lines []string) (main []string, subs [][2]string) {
 	} else {
 		main = append(main, joined[start:]...)
 	}
-	return main, subs
+	return main, subs, gotoTargets
 }
 
 type parser struct {
-	lines   []string
-	idx     int
-	forVars map[string]bool
-	inSub   bool // parsing a called-subroutine body (goto :eof -> Return)
+	lines       []string
+	idx         int
+	forVars     map[string]bool
+	gotoTargets map[string]bool // labels that `goto` targets (others are fall-through no-ops)
+	inSub       bool            // parsing a called-subroutine body (goto :eof -> Return)
 }
 
-func newParser(lines []string) *parser {
-	return &parser{lines: lines, forVars: map[string]bool{}}
+func newParser(lines []string, gotoTargets map[string]bool) *parser {
+	if gotoTargets == nil {
+		gotoTargets = map[string]bool{}
+	}
+	return &parser{lines: lines, forVars: map[string]bool{}, gotoTargets: gotoTargets}
 }
 
 // parseBlock reads statements until EOF, or until a bare `)` line when
@@ -196,7 +218,13 @@ func (p *parser) parseLine(line string) ([]map[string]any, error) {
 		return nil, nil
 	}
 	if strings.HasPrefix(line, ":") {
-		return []map[string]any{{"type": "Label", "name": strings.TrimSpace(line[1:])}}, nil
+		name := strings.ToLower(strings.TrimSpace(line[1:]))
+		if name != "eof" && p.gotoTargets[name] {
+			return []map[string]any{{"type": "Label", "name": name}}, nil
+		}
+		// fall-through marker — nothing jumps here: no-op (the following
+		// lines stay inline, matching batch's fall-through semantics)
+		return nil, nil
 	}
 	var out []map[string]any
 	rest := line
