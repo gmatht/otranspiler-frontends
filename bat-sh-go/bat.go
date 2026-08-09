@@ -146,7 +146,7 @@ func (p *parser) parseCommand(s string) ([]map[string]any, string, error) {
 	case "goto":
 		return []map[string]any{{"type": "Goto", "name": strings.TrimSpace(rest)}}, "", nil
 	case "exit":
-		return nil, "", fmt.Errorf("unsupported: exit /b (core gap — the ESTree renderer's stmt lowering has an unreachable! for IrStmt::Exit; queue a core-request)")
+		return p.parseExit(rest)
 	case "rem":
 		return nil, "", nil
 	case "call", "setlocal", "endlocal", "shift", "pause", "start", "pushd", "popd":
@@ -510,6 +510,24 @@ func (p *parser) parseParenList(s string) ([]map[string]any, string, error) {
 		items = append(items, e)
 	}
 	return items, rem, nil
+}
+
+func (p *parser) parseExit(rest string) ([]map[string]any, string, error) {
+	rest = strings.TrimSpace(rest)
+	if strings.HasPrefix(strings.ToLower(rest), "/b") {
+		rest = strings.TrimSpace(rest[2:])
+	}
+	// exit /b [N] — the direct IrStmt::Exit statement form (all backends
+	// render it: estree -> process.exit, sh -> exit, perl -> exit).
+	// `exit` without a code exits with the last status (lastExit).
+	if rest == "" {
+		return []map[string]any{{"type": "Exit", "value": nil}}, "", nil
+	}
+	var n int
+	if _, err := fmt.Sscanf(rest, "%d", &n); err != nil {
+		return nil, "", fmt.Errorf("exit /b code not an integer: %q", rest)
+	}
+	return []map[string]any{{"type": "Exit", "value": map[string]any{"type": "Int", "value": n}}}, "", nil
 }
 
 // ── words & expansion ───────────────────────────────────────────────

@@ -24,11 +24,12 @@ Shared (do NOT fork): `frontends/shir-emit-go/` (the A1 JSON emitter),
   `( ... )` blocks supported
 - `for %%v in (word list) do cmd|(block)` — `%%v` in the body is the
   loop-var read
+- `exit /b [N]` — the direct IrStmt::Exit statement (all backends render
+  it: estree -> process.exit, sh -> exit, perl -> exit; the estree arm
+  landed 2026-08-09)
 - `cmd1 & cmd2` statement separators
 
 Deliberately NOT in v1 (refuse loud, documented as worker items):
-- `exit /b` — the ESTree renderer's stmt lowering has `unreachable!` for
-  IrStmt::Exit (core gap; queue a core-request)
 - `call`, `setlocal`/`endlocal`, `shift`, `pause`, `start`, `pushd`/`popd`,
   `set /p`, `if defined/exist/errorlevel`, `for /l /f /d /r`, `^` line
   continuation, `|` pipes, delayed expansion `!var!`, `%cmdline%`
