@@ -2,6 +2,55 @@
 
 C source -> A1 shIR JSON (the shell-flavored subset of C).
 
+## v3 — mem-slice-2 + multi-return + the next rung (2026-08-10), 74/74
+
+Three stacked work items, each pinned by a testdata stdout example
+(t69–t74):
+
+- **mem-slice-2 (core request c-mem-slice2) — dynamic pointer
+  arithmetic**: the arena (numeric ids, element-size scaling) was
+  already runtime-side; this lands the missing dynamic POSITION model.
+  A pointer that is ever advanced/comparison-used carries its position
+  in a dedicated runtime handle var (the while-header cond is emitted
+  BEFORE the body's advance, so a compile-time offset could never
+  advance per-iteration — ptrNeedsDyn pre-scans the remaining tokens at
+  the declaration to force the runtime model). `p = p + n` / `p++` /
+  `p += n` lower to `memAdvance` (a NEW handle with the embedded
+  element offset); `p < end` / `p == end` lower to the runtime
+  `memTest` (position compare); reads/writes go through the handle's
+  embedded offset. The root var keeps the base `:0` allocation handle
+  (pointer-copy semantics: `int *p = a; a++` leaves p at the original
+  element). t69 walk-sum, t70 store-walk.
+- **multi-return (core request c-multi-return) — multi-out-param
+  functions**: `void getdim(int *w, int *h) { *w = 3; *h = 5; }` — the
+  out-param transform (harness/outparam_to_returns.py) now handles
+  MULTIPLE write-targets: each write-param's last store becomes an
+  `echo` (one value per line, in body order), the dropped write-params'
+  bindings are removed and later read-params renumber, and the caller
+  captures once and destructures via the runtime `line` helper (the
+  core renders `line` natively so the destructure takes the native
+  store-write path — a lifted destructured var would desync from a
+  runtime store write). Mixed shapes work: write + read-only non-
+  pointer params (`getdim(&w, &h, scale)` — renumbering) and
+  read-only pointer params (`copy(&dst, &src)` — `*dst = *src`). The
+  gate pipeline (Makefile + frontend-stdout.sh, lang c) runs the
+  transform on every emitted A1 (conservative identity for programs
+  without out-params). Statement-position user calls now emit fnCall
+  (they were silently DROPPED before — the call vanished).
+- **next rung — calls/ternaries inside ARITHMETIC** (previously "lower
+  it to a temp", now automated): hoistArithCalls rewrites any runtime
+  call or ternary nested inside arithmetic to a temp var (the A1 Arith
+  AST has no Call/Cond node), applied at printf args, declaration
+  initializers, plain and compound assignments (a compound RHS is an
+  implicit arith OPERAND, so even a top-level call there hoists) and
+  for headers. t73: `twice(x) + 1`, `add(x, 2) * 3`, `(x > 3 ? 10 : 20)
+  + 1`, `x += twice(x)`.
+- **switch fallthrough**: a case body that does NOT end with a break
+  merges the next case's arm (C semantics — the shared-body `case 1:
+  case 2: body` form and fallthrough into default both fall out). A
+  break in the MIDDLE of a case body is still stripped (the if-chain
+  has no mid-arm escape) — documented limitation.
+
 ## v2 subset (2026-08-10) — 68/68 gate, beyond the v1 refusal wall
 
 v2 lands the common C idioms v1 refused, each pinned by a testdata
@@ -45,12 +94,12 @@ stdout example (t58–t68):
   index — the mem-arena offset becomes a runtime arith call (the
   arena/element-size seam was already runtime-side).
 
-Still refused (honest, refuse > guess): ternary/bitwise/calls inside
-ARITHMETIC or test operands (lower to a temp), dynamic pointer
-ADVANCE (`p = p + n` with a runtime n — mem slice-2 advance),
-multi-return/multi-out-param functions, switch fallthrough,
-multi-char literals, `int a, b;` with pointers, char ordering
-comparisons.
+Still refused (honest, refuse > guess): calls/ternary inside TEST
+operands (`*p < 5` — a value read in a condition; lower to a temp),
+prefix ++/-- in EXPRESSION position (`x = ++i` — statements and for
+headers work), multi-char literals, `int a, b;` with pointers,
+multi-return with read+write pointer params, switch mid-arm breaks,
+char ordering comparisons (`c < 'b'`).
 
 ## v1 subset (the refusal wall the v2 idioms crossed)
 

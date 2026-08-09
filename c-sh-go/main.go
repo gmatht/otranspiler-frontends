@@ -62,6 +62,11 @@ type heapPtr struct {
 	root string // variable holding the memAlloc handle
 	elem string // C element type name ("int"/"char"/...) — the mem.* `type` arg
 	off  int    // static element offset (C pointer arithmetic: p = a + n)
+	dyn  bool   // position is RUNTIME (the pointer was advanced / re-targeted):
+	// the position lives in the hv handle var's embedded offset, never in
+	// the compile-time off (slice 2 dynamic pointer arithmetic — mem-slice2)
+	hv string // dedicated handle var when dyn (the pointer's own position
+	// handle; the root var always holds the base `:0` allocation handle)
 }
 
 var heapPtrs = map[string]heapPtr{}
@@ -164,6 +169,197 @@ func heapAssignRHS(name string, e *expr, declElem string) (hp heapPtr, isRoot, o
 		}
 	}
 	return heapPtr{}, false, false
+}
+
+// heapRefs — does the expression reference a heap-pointer variable?
+func heapRefs(e *expr) bool {
+	if e == nil {
+		return false
+	}
+	switch e.kind {
+	case "id":
+		_, ok := heapPtrs[e.name]
+		return ok
+	case "bin":
+		return heapRefs(e.l) || heapRefs(e.r)
+	case "deref", "addr", "index":
+		return heapRefs(e.l) || heapRefs(e.r)
+	case "call":
+		for _, a := range e.args {
+			if heapRefs(a) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// heapExprHasDyn — does the pointer expression reference any
+// runtime-position pointer (a dyn heapPtr)? A static pair fold is only
+// sound when every referenced pointer is compile-time.
+func heapExprHasDyn(e *expr) bool {
+	if e == nil {
+		return false
+	}
+	switch e.kind {
+	case "id":
+		if hp, ok := heapPtrs[e.name]; ok && hp.dyn {
+			return true
+		}
+	case "bin":
+		return heapExprHasDyn(e.l) || heapExprHasDyn(e.r)
+	case "call":
+		for _, a := range e.args {
+			if heapExprHasDyn(a) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// heapPos — resolve an expression to a heap POINTER POSITION (an A1
+// expr evaluating to the position HANDLE) + ok. An id of a heapPtr:
+// static -> memAdvance(base, off) (the base handle stays :0 — the
+// ORIGINAL position, C's pointer-copy semantics); dyn -> the dedicated
+// handle var. bin +/- of a position with a constant advances it.
+func heapPos(e *expr) (any, bool) {
+	if e == nil {
+		return nil, false
+	}
+	switch e.kind {
+	case "id":
+		if hp, ok := heapPtrs[e.name]; ok {
+			if hp.dyn {
+				return call("getVar", []any{st(hp.hv)}), true
+			}
+			return call("memAdvance", []any{call("getVar", []any{st(hp.root)}), st(strconv.Itoa(hp.off))}), true
+		}
+		return nil, false
+	case "bin":
+		if e.op == "+" || e.op == "-" {
+			if l, ok := heapPos(e.l); ok {
+				if k, ok2 := foldIndex(e.r); ok2 {
+					if e.op == "-" {
+						k = -k
+					}
+					return call("memAdvance", []any{l, st(strconv.Itoa(k))}), true
+				}
+			}
+			if r, ok := heapPos(e.r); ok {
+				if k, ok2 := foldIndex(e.l); ok2 && e.op == "+" {
+					return call("memAdvance", []any{r, st(strconv.Itoa(k))}), true
+				}
+			}
+		}
+	}
+	return nil, false
+}
+
+// heapCompareCall — a comparison whose operands are heap-pointer
+// positions: lower to the runtime memTest (the test-string grammar
+// cannot compare handles). One-sided (pointer vs non-pointer) refuses.
+func heapCompareCall(e *expr) (map[string]any, bool) {
+	if e == nil || e.kind != "bin" {
+		return nil, false
+	}
+	switch e.op {
+	case "==", "!=", "<", ">", "<=", ">=":
+	default:
+		return nil, false
+	}
+	lh, rh := heapRefs(e.l), heapRefs(e.r)
+	if lh != rh {
+		if lh || rh {
+			refuse("pointer vs non-pointer comparison is not in the subset")
+		}
+		return nil, false
+	}
+	if !lh {
+		return nil, false
+	}
+	l, ok1 := heapPos(e.l)
+	r, ok2 := heapPos(e.r)
+	if !ok1 || !ok2 {
+		return nil, false
+	}
+	return call("memTest", []any{st(e.op), l, r}), true
+}
+
+// markPtrDyn — transition a heapPtr to the runtime-position model: give
+// it a dedicated handle var (the position lives in the handle's embedded
+// offset from now on). Returns the updated pair.
+func (p *parser) markPtrDyn(name string, hp heapPtr) heapPtr {
+	if !hp.dyn {
+		hp.dyn = true
+		hp.hv = "___hp_" + name
+		heapPtrs[name] = hp
+	}
+	return heapPtrs[name]
+}
+
+// ptrAssignStmt — `p = <position>`: (re-)target the pointer at runtime;
+// the position (a handle expr) lands in the pointer's handle var.
+func (p *parser) ptrAssignStmt(name string, hp heapPtr, pos any) map[string]any {
+	hp = p.markPtrDyn(name, hp)
+	return storeAssignStmt(hp.hv, pos)
+}
+
+// ptrAdvanceStmt — `p++` / `p--` / `p += n` / `p -= n`: advance the
+// runtime position by a delta (element count, type-scaled at load/store).
+// The FIRST advance snapshots the current position into the new handle
+// var first (the base handle stays :0 — never mutated).
+func (p *parser) ptrAdvanceStmt(name string, hp heapPtr, delta string) map[string]any {
+	wasDyn := hp.dyn
+	hp = p.markPtrDyn(name, hp)
+	adv := storeAssignStmt(hp.hv, call("memAdvance", []any{call("getVar", []any{st(hp.hv)}), st(delta)}))
+	if !wasDyn {
+		init := storeAssignStmt(hp.hv, call("memAdvance", []any{call("getVar", []any{st(hp.root)}), st(strconv.Itoa(hp.off))}))
+		return map[string]any{"body": []any{init, adv}, "type": "Block"}
+	}
+	return adv
+}
+
+// ptrNeedsDyn — pre-scan the REMAINING tokens for uses of `name` that
+// force the runtime-position model (slice 2): pointer comparisons
+// (`p < end`, `end > p`) or self-advance (`p = p + n`, `p++`, `p += n`).
+// The frontend emits the while-header cond BEFORE the body's advance, so
+// a pointer that will advance in a loop must carry its position in a
+// runtime handle var from its DECLARATION (the compile-time off could
+// never advance per-iteration — the cond would bake the initial offset
+// and the loop would spin). `*p` / `&p` / `p[i]` (deref/addr/index) are
+// VALUE uses — not pointer-position uses.
+func ptrNeedsDyn(name string, rest []tok) bool {
+	for i := 0; i < len(rest); i++ {
+		t := rest[i]
+		if t.kind != "id" || t.text != name {
+			continue
+		}
+		if i > 0 {
+			prev := rest[i-1].text
+			if prev == "*" || prev == "&" || prev == "." || prev == "[" {
+				continue
+			}
+			// op-then-name: `end > p` / `q == p` — the comparison PRECEDES
+			if prev == "<" || prev == ">" || prev == "<=" || prev == ">=" || prev == "==" || prev == "!=" {
+				return true
+			}
+		}
+		if i+1 < len(rest) {
+			next := rest[i+1].text
+			switch next {
+			case "<", ">", "<=", ">=", "==", "!=", "++", "--", "+=", "-=":
+				return true
+			case "=":
+				// p = p (self-reassign) — the position must advance at
+				// runtime (the compile-time off cannot change per loop)
+				if i+2 < len(rest) && rest[i+2].kind == "id" && rest[i+2].text == name {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // exprUsesHeap — does the expression reference a heap-pointer variable
@@ -623,6 +819,17 @@ func userStmtsA1(stmts []*uStmt, params []string, ptrs map[string]string) []any 
 			if !isPtr {
 				continue
 			}
+			// the pointer PARAM's handle is the positional it was passed as
+			// ($N — the out-param transform classifies memStore targets by
+			// the positional; the leading `Assign name = getVar(N)` binding
+			// is identity, so the positional IS the handle either way)
+			pos := "1"
+			for i, pn := range params {
+				if pn == s.name {
+					pos = strconv.Itoa(i + 1)
+					break
+				}
+			}
 			// `*p = v` — memStore through the handle (writes the shell
 			// var / array element the pointer points at)
 			rhs := userExprA1(s.e, params)
@@ -635,7 +842,7 @@ func userStmtsA1(stmts []*uStmt, params []string, ptrs map[string]string) []any 
 				out = append(out, map[string]any{
 					"type":    "Assign",
 					"targets": []any{map[string]any{"var": tmp, "indices": []any{}, "sigil": nil}},
-					"expr":    call("memLoad", []any{call("getVar", []any{st(s.name)}), st("0"), st(elem)}),
+					"expr":    call("memLoad", []any{call("getVar", []any{st(pos)}), st("0"), st(elem)}),
 				})
 				rhs = map[string]any{
 					"type": "Arith",
@@ -650,7 +857,7 @@ func userStmtsA1(stmts []*uStmt, params []string, ptrs map[string]string) []any 
 			out = append(out, map[string]any{
 				"type": "Expr",
 				"expr": call("memStore", []any{
-					call("getVar", []any{st(s.name)}),
+					call("getVar", []any{st(pos)}),
 					st("0"), st(elem), rhs,
 				}),
 			})
@@ -722,7 +929,7 @@ type uStmt struct {
 	op      string // "=" | "+=" | "-="  (ptrinc: "++" | "--")
 	e       *expr  // assign rhs / while cond / return expr / deref rhs
 	body    []*uStmt
-	a1      any // a raw A1 statement (exec-carrier kind)
+	a1      any  // a raw A1 statement (exec-carrier kind)
 	ptrPost bool // derefstore: `*p++ = v` — advance the pointer after the store
 }
 
@@ -1833,8 +2040,12 @@ func valueNode(e *expr) any {
 			if t, ok := ptrTargets[e.l.name]; ok {
 				return call("arrayIndex", []any{st(t.arr), st(strconv.Itoa(t.base))})
 			}
-			// *p on a heap pointer — the mem arena element read
+			// *p on a heap pointer — the mem arena element read (a dyn
+			// pointer reads via its position handle's embedded offset)
 			if hp, ok := heapPtrs[e.l.name]; ok {
+				if hp.dyn {
+					return call("memLoad", []any{call("getVar", []any{st(hp.hv)}), st("0"), st(hp.elem)})
+				}
 				return call("memLoad", []any{call("getVar", []any{st(hp.root)}), st(strconv.Itoa(hp.off)), st(hp.elem)})
 			}
 		}
@@ -1884,8 +2095,16 @@ func valueNode(e *expr) any {
 				}
 				return call("arrayIndex", []any{st(e.l.name), indexArith(e.r, 0)})
 			}
-			// p[k] on a heap pointer — mem arena element read at off+k
+			// p[k] on a heap pointer — mem arena element read at off+k (a
+			// dyn pointer positions the read via its handle's embedded
+			// offset plus the index)
 			if hp, ok := heapPtrs[e.l.name]; ok {
+				if hp.dyn {
+					if k, ok := foldIndex(e.r); ok {
+						return call("memLoad", []any{call("getVar", []any{st(hp.hv)}), st(strconv.Itoa(k)), st(hp.elem)})
+					}
+					return call("memLoad", []any{call("getVar", []any{st(hp.hv)}), indexArith(e.r, 0), st(hp.elem)})
+				}
 				if k, ok := foldIndex(e.r); ok {
 					return call("memLoad", []any{call("getVar", []any{st(hp.root)}), st(strconv.Itoa(hp.off + k)), st(hp.elem)})
 				}
@@ -2020,6 +2239,60 @@ func operandIsString(e *expr) bool {
 	return false
 }
 
+// hoistToTemp — replace a nested runtime-call/ternary with a temp var,
+// emitting its value assignment first (the A1 Arith AST has no Call or
+// Cond node, so calls/ternaries nested inside arithmetic must be hoisted
+// to statement-level temps — the "lower it to a temp" discipline
+// automated). The temp is a plain store var; the arith then sees a Var.
+func (p *parser) hoistToTemp(e *expr, out *[]any) *expr {
+	userTempSeq++
+	tmp := "___t" + strconv.Itoa(userTempSeq)
+	*out = append(*out, assignStmt(tmp, valueNode(e)))
+	return &expr{kind: "id", name: tmp}
+}
+
+// hoistArithCalls — rewrite `e` so no runtime call or ternary remains
+// nested inside arithmetic (bin/un) operands: each is replaced by a temp
+// Var with the assignment appended to `out`. The TOP node of the value
+// (a top-level call/ternary) stays — valueNode lowers those directly
+// (fnValue / the runtime ternary).
+func (p *parser) hoistArithCalls(e *expr, out *[]any, top bool) *expr {
+	if e == nil {
+		return e
+	}
+	switch e.kind {
+	case "bin", "un":
+		e.l = p.hoistArithCalls(e.l, out, false)
+		e.r = p.hoistArithCalls(e.r, out, false)
+		if len(e.args) > 0 {
+			e.args[0] = p.hoistArithCalls(e.args[0], out, false)
+		}
+		return e
+	case "cond":
+		e.l = p.hoistArithCalls(e.l, out, false)
+		e.r = p.hoistArithCalls(e.r, out, false)
+		if len(e.args) > 0 {
+			e.args[0] = p.hoistArithCalls(e.args[0], out, false)
+		}
+		if top {
+			return e
+		}
+		return p.hoistToTemp(e, out)
+	case "call":
+		for i, a := range e.args {
+			e.args[i] = p.hoistArithCalls(a, out, false)
+		}
+		if top {
+			return e
+		}
+		if _, ok := foldCallConst(e, nil); ok {
+			return e
+		}
+		return p.hoistToTemp(e, out)
+	}
+	return e
+}
+
 func testOperand(e *expr) string {
 	switch e.kind {
 	case "num":
@@ -2080,6 +2353,11 @@ func condNeedsArith(e *expr) bool {
 // condCall — the A1 condition for `if`/`while`/...: the test-string
 // grammar when expressible, else the runtime arith-truth call.
 func condCall(c *expr) map[string]any {
+	// pointer-position comparisons lower to the runtime memTest (the
+	// test-string grammar cannot compare handles) — slice 2
+	if mc, ok := heapCompareCall(c); ok {
+		return mc
+	}
 	if condNeedsArith(c) {
 		return call("testArith", []any{st(exprToArithString(c))})
 	}
@@ -2471,24 +2749,50 @@ func (p *parser) stmt() (any, error) {
 			// heap pointer initializer (malloc / pointer copy / p = q + n)
 			if isPtr && kw != "char" {
 				if hp, isRoot, ok := heapAssignRHS(name.text, e, kw); ok {
-					heapPtrs[name.text] = hp
 					if isRoot {
 						// p itself holds the memAlloc handle — the store
 						// write (setVar: the mem seam reads the store)
+						heapPtrs[name.text] = hp
 						return storeAssignStmt(name.text, valueNode(e)), nil
 					}
+					// slice 2: a pointer whose later uses ADVANCE or COMPUTE
+					// its position at runtime (walk loops) carries it in a
+					// dedicated handle var from the declaration — the
+					// while-header cond is emitted BEFORE the body's advance,
+					// so a compile-time off could never advance per-iteration
+					if ptrNeedsDyn(name.text, p.ts[p.p:]) {
+						hp.dyn = true
+						hp.hv = "___hp_" + name.text
+						heapPtrs[name.text] = hp
+						return storeAssignStmt(hp.hv, call("memAdvance", []any{call("getVar", []any{st(hp.root)}), st(strconv.Itoa(hp.off))})), nil
+					}
+					heapPtrs[name.text] = hp
 					return nil, nil // compile-time pair only
 				}
 				refuse("unsupported pointer initializer for " + name.text)
 			}
-			return assignStmt(name.text, valueNode(e)), nil
+			// calls/ternaries nested inside the arithmetic initializer are
+			// hoisted to temps (the A1 Arith AST has no Call/Cond node)
+			var temps []any
+			e = p.hoistArithCalls(e, &temps, true)
+			init := assignStmt(name.text, valueNode(e))
+			if len(temps) > 0 {
+				return map[string]any{"body": append(temps, init), "type": "Block"}, nil
+			}
+			return init, nil
 		}
 		// bare declaration `int x;` / `int *p;`
 		if isPtr && kw != "char" {
 			// an uninitialized heap-pointer candidate: seed the base pair
 			// so a later `*p = v` / `p = q + n` resolves even if the first
-			// assignment is not the declaration
-			heapPtrs[name.text] = heapPtr{root: name.text, elem: kw, off: 0}
+			// assignment is not the declaration; a pointer whose later
+			// uses advance/compute its position goes runtime from the start
+			hp := heapPtr{root: name.text, elem: kw, off: 0}
+			if ptrNeedsDyn(name.text, p.ts[p.p:]) {
+				hp.dyn = true
+				hp.hv = "___hp_" + name.text
+			}
+			heapPtrs[name.text] = hp
 		}
 		p.next() // ;
 		return nil, nil
@@ -2654,8 +2958,9 @@ func (p *parser) stmt() (any, error) {
 			return nil, err
 		}
 		type swCase struct {
-			val  string
-			body []any
+			val           string
+			body          []any
+			endsWithBreak bool
 		}
 		var cases []swCase
 		var defBody []any
@@ -2676,11 +2981,11 @@ func (p *parser) stmt() (any, error) {
 				if err := p.expectOp(":"); err != nil {
 					return nil, err
 				}
-				body, err := p.caseBody()
+				body, ends, err := p.caseBody()
 				if err != nil {
 					return nil, err
 				}
-				cases = append(cases, swCase{v, body})
+				cases = append(cases, swCase{v, body, ends})
 				continue
 			}
 			if p.isId("default") {
@@ -2688,22 +2993,43 @@ func (p *parser) stmt() (any, error) {
 				if err := p.expectOp(":"); err != nil {
 					return nil, err
 				}
-				defBody, err = p.caseBody()
+				var ends bool
+				defBody, ends, err = p.caseBody()
 				if err != nil {
 					return nil, err
 				}
+				_ = ends // the default is last — nothing falls through it
 				continue
 			}
 			return nil, fmt.Errorf("expected case/default in switch at token %v", p.peek())
 		}
 		p.next() // }
-		// lower: if (x == c1) b1 else if (x == c2) b2 else default —
-		// nested Ifs in the else arm (the frontend's else-if shape).
+		// lower: the case ARMS are merged for FALLTHROUGH first (C
+		// semantics — a case body that does NOT end with a break runs the
+		// next case's arm too; the shared-body `case 1: case 2: body`
+		// form falls out: an empty body merges the next arm), then the
+		// dispatch chain: if (x == c1) arm1 else if (x == c2) arm2 ...
+		// else default. (A break in the MIDDLE of a case body is still
+		// stripped — the if-chain has no mid-arm escape.)
+		arms := make([][]any, len(cases))
+		var nextArm []any = defBody
+		for i := len(cases) - 1; i >= 0; i-- {
+			b := cases[i].body
+			if cases[i].endsWithBreak {
+				arms[i] = b
+			} else {
+				merged := make([]any, 0, len(b)+len(nextArm))
+				merged = append(merged, b...)
+				merged = append(merged, nextArm...)
+				arms[i] = merged
+			}
+			nextArm = arms[i]
+		}
 		elseB := defBody
 		for i := len(cases) - 1; i >= 0; i-- {
 			c := cases[i]
 			cond := &expr{kind: "bin", op: "==", l: disc, r: &expr{kind: "num", num: c.val}}
-			elseB = []any{map[string]any{"cond": condCall(cond), "then": c.body, "elsifs": []any{}, "else": elseB, "type": "If"}}
+			elseB = []any{map[string]any{"cond": condCall(cond), "then": arms[i], "elsifs": []any{}, "else": elseB, "type": "If"}}
 		}
 		if len(cases) == 0 {
 			return nil, nil
@@ -2746,18 +3072,24 @@ func (p *parser) stmt() (any, error) {
 		if err := p.expectOp("("); err != nil {
 			return nil, err
 		}
-		var args []any
+		var fmtStr string
+		var valueExprs []*expr
 		for {
 			tk := p.peek()
 			if tk != nil && tk.kind == "str" {
-				args = append(args, st(tk.text))
+				if fmtStr == "" {
+					fmtStr = tk.text
+				} else {
+					// a non-leading string literal arg is a VALUE
+					valueExprs = append(valueExprs, &expr{kind: "str", num: tk.text})
+				}
 				p.next()
 			} else {
 				e, err := p.expr()
 				if err != nil {
 					return nil, err
 				}
-				args = append(args, valueNode(e))
+				valueExprs = append(valueExprs, e)
 			}
 			if p.isOp(")") {
 				break
@@ -2769,6 +3101,17 @@ func (p *parser) stmt() (any, error) {
 		p.next() // )
 		if err := p.expectOp(";"); err != nil {
 			return nil, err
+		}
+		// calls/ternaries nested inside arithmetic args are hoisted to
+		// temps (the A1 Arith AST has no Call/Cond node)
+		var temps []any
+		args := []any{st(fmtStr)}
+		for _, e := range valueExprs {
+			e = p.hoistArithCalls(e, &temps, true)
+			args = append(args, valueNode(e))
+		}
+		if len(temps) > 0 {
+			return map[string]any{"body": append(temps, execPrintf(args)), "type": "Block"}, nil
 		}
 		return execPrintf(args), nil
 	case p.isId("int"):
@@ -2812,8 +3155,16 @@ func (p *parser) forHeaderAssign() (any, error) {
 	}
 	name := p.next().text
 	if p.isOp("++") || p.isOp("--") {
-		// i++ / i-- — postfix increment, lowered to i = i +/- 1
+		// i++ / i-- — postfix increment, lowered to i = i +/- 1; a heap
+		// pointer advances its runtime position handle instead (slice 2)
 		op := p.next().text
+		if hp, ok := heapPtrs[name]; ok {
+			d := "1"
+			if op == "--" {
+				d = "-1"
+			}
+			return p.ptrAdvanceStmt(name, hp, d), nil
+		}
 		return p.buildAssign(name, "=", &expr{
 			kind: "bin", op: op[:1],
 			l: &expr{kind: "id", name: name},
@@ -2826,7 +3177,43 @@ func (p *parser) forHeaderAssign() (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		return p.buildAssign(name, op, e)
+		// heap-pointer assignments in the for header (slice 2): `p = a`
+		// / `p = a + n` re-target, `p += n` / `p -= n` advance
+		if hp, ok := heapPtrs[name]; ok {
+			if op == "=" {
+				if pos, ok2 := heapPos(e); ok2 {
+					if !heapExprHasDyn(e) {
+						if hp2, _, ok3 := heapAssignRHS(name, e, hp.elem); ok3 {
+							heapPtrs[name] = hp2
+							return nil, nil
+						}
+					}
+					return p.ptrAssignStmt(name, hp, pos), nil
+				}
+			} else if op == "+=" || op == "-=" {
+				d := exprToArithString(e)
+				if op == "-=" {
+					d = "(0 - " + d + ")"
+				}
+				return p.ptrAdvanceStmt(name, hp, d), nil
+			}
+			refuse("compound pointer assignment " + op + " is not in the subset")
+		}
+		// calls/ternaries nested inside the arithmetic RHS are hoisted to
+		// temps (the A1 Arith AST has no Call/Cond node). A compound op's
+		// RHS is an implicit arith OPERAND (x + e), so even a top-level
+		// call/ternary there must hoist; a plain `=` keeps the top-level
+		// value node (fnValue / the runtime ternary lower it directly).
+		var temps []any
+		e = p.hoistArithCalls(e, &temps, op == "=")
+		stmt, err := p.buildAssign(name, op, e)
+		if err != nil {
+			return nil, err
+		}
+		if len(temps) > 0 {
+			return map[string]any{"body": append(temps, stmt), "type": "Block"}, nil
+		}
+		return stmt, nil
 	}
 	return nil, nil
 }
@@ -2904,8 +3291,15 @@ func (p *parser) simpleAssign() (any, error) {
 			if t, ok := ptrTargets[target.name]; ok {
 				return assignStmt(t.arr+"["+strconv.Itoa(t.base)+"]", valueNode(e)), nil
 			}
-			// *p = v on a heap pointer — the mem arena element store
+			// *p = v on a heap pointer — the mem arena element store (dyn
+			// pointers store through their position handle)
 			if hp, ok := heapPtrs[target.name]; ok {
+				if hp.dyn {
+					return map[string]any{
+						"type": "Expr",
+						"expr": call("memStore", []any{call("getVar", []any{st(hp.hv)}), st("0"), st(hp.elem), valueNode(e)}),
+					}, nil
+				}
 				return map[string]any{
 					"type": "Expr",
 					"expr": call("memStore", []any{call("getVar", []any{st(hp.root)}), st(strconv.Itoa(hp.off)), st(hp.elem), valueNode(e)}),
@@ -2919,10 +3313,18 @@ func (p *parser) simpleAssign() (any, error) {
 	}
 	name := p.next().text
 	if p.isOp("++") || p.isOp("--") {
-		// x++ / x-- — postfix increment (lowered to x = x +/- 1)
+		// x++ / x-- — postfix increment (lowered to x = x +/- 1); a heap
+		// pointer advances its runtime position handle instead (slice 2)
 		op := p.next().text
 		if err := p.expectOp(";"); err != nil {
 			return nil, err
+		}
+		if hp, ok := heapPtrs[name]; ok {
+			d := "1"
+			if op == "--" {
+				d = "-1"
+			}
+			return p.ptrAdvanceStmt(name, hp, d), nil
 		}
 		return p.buildAssign(name, "=", &expr{
 			kind: "bin", op: op[:1],
@@ -2983,8 +3385,21 @@ func (p *parser) simpleAssign() (any, error) {
 			refuse("compound assignment through an index is not in the v1 subset")
 		}
 		// a[i] = v on a heap pointer — the mem arena element store (the
-		// offset is static, or a runtime arith call for a dynamic index)
+		// offset is static, or a runtime arith call for a dynamic index;
+		// dyn pointers store through their position handle)
 		if hp, ok := heapPtrs[name]; ok {
+			if hp.dyn {
+				var off any
+				if k, ok2 := foldIndex(idx); ok2 {
+					off = st(strconv.Itoa(k))
+				} else {
+					off = indexArith(idx, 0)
+				}
+				return map[string]any{
+					"type": "Expr",
+					"expr": call("memStore", []any{call("getVar", []any{st(hp.hv)}), off, st(hp.elem), valueNode(e)}),
+				}, nil
+			}
 			var off any
 			if k, ok2 := foldIndex(idx); ok2 {
 				off = st(strconv.Itoa(hp.off + k))
@@ -3062,6 +3477,18 @@ func (p *parser) simpleAssign() (any, error) {
 		case "va_start", "va_end":
 			return nil, nil // no stdout effect in the v1 subset
 		}
+		// a USER function called as a statement: emit the fnCall (the
+		// value is discarded, the call executes). The out-param transform
+		// (harness/outparam_to_returns.py) rewrites these call sites for
+		// out-parameter functions — before that landed, such calls were
+		// silently DROPPED (getdim(&w, &h) emitted nothing, w/h stayed 0).
+		if _, ok := userFuncs[name]; ok {
+			argsA1 := make([]any, 0, len(args))
+			for _, a := range args {
+				argsA1 = append(argsA1, valueNode(a))
+			}
+			return map[string]any{"type": "Expr", "expr": call("fnCall", []any{st(name), map[string]any{"elements": argsA1, "type": "Array"}})}, nil
+		}
 		return nil, nil
 	}
 	if p.isAssignOp() {
@@ -3078,31 +3505,66 @@ func (p *parser) simpleAssign() (any, error) {
 		}
 		if _, isPtr := ptrDecls[name]; isPtr {
 			if op == "=" {
-				// a heap pointer (or pointer-copy / ptr-arith) assignment
-				if hp, isRoot, ok := heapAssignRHS(name, e, ptrDecls[name]); ok {
+				// root allocation: `p = malloc(...)` — p itself holds the
+				// memAlloc handle (the base `:0` handle; never advanced)
+				if hp, isRoot, ok := heapAssignRHS(name, e, ptrDecls[name]); ok && isRoot {
 					heapPtrs[name] = hp
-					if isRoot {
-						return storeAssignStmt(name, valueNode(e)), nil
-					}
-					return nil, nil
+					return storeAssignStmt(name, valueNode(e)), nil
 				}
-			} else {
-				// p += k / p -= k — in-place heap pointer arithmetic
-				if hp, ok := heapPtrs[name]; ok {
-					if k, ok2 := foldIndex(e); ok2 {
-						if op == "+=" {
-							hp.off += k
-						} else {
-							hp.off -= k
+				// a pointer POSITION assignment. When every involved
+				// pointer is static, keep the compile-time pair; when any
+				// is runtime-positioned (dyn), the position lands in the
+				// pointer's own handle var (slice-2 model).
+				if pos, ok2 := heapPos(e); ok2 {
+					if !heapExprHasDyn(e) {
+						if hp, _, ok3 := heapAssignRHS(name, e, ptrDecls[name]); ok3 {
+							heapPtrs[name] = hp
+							return nil, nil
 						}
-						heapPtrs[name] = hp
-						return nil, nil
 					}
+					return p.ptrAssignStmt(name, heapPtrs[name], pos), nil
+				}
+			} else if op == "+=" || op == "-=" {
+				// p += k / p -= k — in-place heap pointer arithmetic. A
+				// static pointer with a literal delta keeps the
+				// compile-time off; a runtime delta or a dyn pointer
+				// advances the runtime position handle.
+				if hp, ok := heapPtrs[name]; ok {
+					if !hp.dyn {
+						if k, ok2 := foldIndex(e); ok2 {
+							if op == "+=" {
+								hp.off += k
+							} else {
+								hp.off -= k
+							}
+							heapPtrs[name] = hp
+							return nil, nil
+						}
+					}
+					d := exprToArithString(e)
+					if op == "-=" {
+						d = "(0 - " + d + ")"
+					}
+					return p.ptrAdvanceStmt(name, hp, d), nil
 				}
 			}
 			refuse("unsupported pointer assignment to " + name)
 		}
-		return p.buildAssign(name, op, e)
+		// calls/ternaries nested inside the arithmetic RHS are hoisted to
+		// temps (the A1 Arith AST has no Call/Cond node). A compound op's
+		// RHS is an implicit arith OPERAND (x + e), so even a top-level
+		// call/ternary there must hoist; a plain `=` keeps the top-level
+		// value node (fnValue / the runtime ternary lower it directly).
+		var temps []any
+		e = p.hoistArithCalls(e, &temps, op == "=")
+		stmt, err := p.buildAssign(name, op, e)
+		if err != nil {
+			return nil, err
+		}
+		if len(temps) > 0 {
+			return map[string]any{"body": append(temps, stmt), "type": "Block"}, nil
+		}
+		return stmt, nil
 	}
 	// bare id ; — skip
 	for !p.isOp(";") && p.peek() != nil {
@@ -3156,12 +3618,17 @@ func (p *parser) stmtOrBlock() ([]any, error) {
 // break binds to the switch, which lowers to an if-chain — there is no
 // loop to signal (a break inside a loop INSIDE the case stays — it is
 // not at the case's top level).
-func (p *parser) caseBody() ([]any, error) {
+func (p *parser) caseBody() ([]any, bool, error) {
+	// the bool: did the body END with a `break`? (A trailing break is
+	// stripped — the if-chain arm ends there; a body WITHOUT one falls
+	// through to the next case's arm, C semantics — the switch lowering
+	// merges the arms.)
 	var out []any
+	endedWithBreak := false
 	for {
 		t := p.peek()
 		if t == nil {
-			return nil, fmt.Errorf("unterminated switch case")
+			return nil, endedWithBreak, fmt.Errorf("unterminated switch case")
 		}
 		if t.kind == "id" && (t.text == "case" || t.text == "default") {
 			break
@@ -3172,26 +3639,31 @@ func (p *parser) caseBody() ([]any, error) {
 		if t.kind == "op" && t.text == "{" {
 			inner, err := p.block()
 			if err != nil {
-				return nil, err
+				return nil, endedWithBreak, err
 			}
-			out = append(out, inner...)
+			if len(inner) > 0 {
+				out = append(out, inner...)
+				endedWithBreak = false
+			}
 			continue
 		}
 		s, err := p.stmt()
 		if err != nil {
-			return nil, err
+			return nil, endedWithBreak, err
 		}
 		if s == nil {
 			continue
 		}
 		if m, ok := s.(map[string]any); ok && m["type"] == "Expr" {
 			if e, ok := m["expr"].(map[string]any); ok && e["func"] == "break" {
+				endedWithBreak = true
 				continue
 			}
 		}
+		endedWithBreak = false
 		out = append(out, s)
 	}
-	return out, nil
+	return out, endedWithBreak, nil
 }
 
 // structDecl — `struct Tag { int x; int y; };` (a definition: the member
@@ -3405,17 +3877,17 @@ func (p *parser) userStmt() (*uStmt, error) {
 				}
 				return &uStmt{kind: "ptrinc", name: nm.text, op: op}, nil
 			}
-		if p.isAssignOp() {
-			op := p.next().text
-			e, err := p.expr()
-			if err != nil {
-				return nil, err
+			if p.isAssignOp() {
+				op := p.next().text
+				e, err := p.expr()
+				if err != nil {
+					return nil, err
+				}
+				if err := p.expectOp(";"); err != nil {
+					return nil, err
+				}
+				return &uStmt{kind: "assign", name: nm.text, op: op, e: e}, nil
 			}
-			if err := p.expectOp(";"); err != nil {
-				return nil, err
-			}
-			return &uStmt{kind: "assign", name: nm.text, op: op, e: e}, nil
-		}
 		}
 		if t.kind == "op" && t.text == "*" {
 			// *p = expr — a deref STORE (also *p++ = expr / *p-- = expr:
