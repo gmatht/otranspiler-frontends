@@ -29,6 +29,18 @@ test: build
 	done
 	@echo "--- executed-stdout comparison (recorded native vs JS/ESTree) ---"
 	@bash "$(abspath ../../harness/frontend-stdout.sh)" bat ./bat-sh-go testdata "$(DEBASHC)" || exit 1
+	@echo "--- cross-target agreement (sh render under dash vs ESTree under node) ---"
+	@for f in testdata/*.bat; do \
+	  bn=$$(basename $$f); \
+	  ./bat-sh-go --shir $$f --raw 2>/dev/null | $(DEBASHC) --shir-in-sh - 2>/dev/null > /tmp/$$bn.sh; \
+	  ./bat-sh-go --shir $$f --raw 2>/dev/null | $(DEBASHC) --shir-in-estree - 2>/dev/null > /tmp/$$bn.e.json; \
+	  dash /tmp/$$bn.sh 2>&1 > /tmp/$$bn.sh.out; \
+	  node "$(abspath ../../harness/estree-runner.mjs)" /tmp/$$bn.e.json --source $$f 2>&1 > /tmp/$$bn.estree.out; \
+	  if ! diff -q /tmp/$$bn.sh.out /tmp/$$bn.estree.out >/dev/null; then \
+	    echo "DIFF $$bn (sh vs estree output differs)"; exit 1; \
+	  fi; \
+	done
+	@echo "  cross-target: all sh vs estree outputs agree"
 
 worker: test
 	@echo "bat-sh-go worker gate: ingress acceptance + executed-stdout passed"

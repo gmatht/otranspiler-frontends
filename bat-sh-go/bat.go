@@ -557,7 +557,7 @@ func (p *parser) parseIf(rest string) ([]map[string]any, string, error) {
 		if err != nil {
 			return nil, "", err
 		}
-		cond = "-n $" + strings.ToLower(cond)
+		cond = "-n \"$" + strings.ToLower(cond) + "\""
 	case strings.HasPrefix(low, "exist "):
 		cond, cmd, isBlock, err = splitCondition(rest[len("exist "):])
 		if err != nil {
