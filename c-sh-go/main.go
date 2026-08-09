@@ -257,6 +257,13 @@ func recordPtrTarget(name string, e *expr) bool {
 	return false
 }
 
+// charVars — `char c;` declarations (non-pointer): the variable's value
+// is a 1-CHAR STRING in the store (there is no int type). Comparisons of
+// char vars / char literals must therefore use the STRING test operators
+// (`=` / `!=`), not the numeric `-eq`/`-ne` (which would coerce both
+// sides to 0). See testOperand.
+var charVars = map[string]bool{}
+
 // charPtrVars — `char *name` declarations: the POINTER-TO-STRING lowering.
 // A char* is lowered to the string itself — no mem.* handles, no arena:
 //
@@ -439,7 +446,12 @@ func callNode(e *expr) any {
 		for _, a := range e.args {
 			args = append(args, valueNode(a))
 		}
-		return call("fnCall", []any{st(e.name), map[string]any{"type": "Array", "elements": args}})
+		// fnValue — the VALUE-returning dispatch (a C function call in a
+		// value position carries its return value back; sh2.fnCall is the
+		// shell STATUS channel and would silently drop it — see the
+		// runtime fnValue). The perl backend renders the same A1 as a
+		// direct sub call (ir.rs); the estree backend as sh2.fnValue.
+		return call("fnValue", []any{st(e.name), map[string]any{"type": "Array", "elements": args}})
 	}
 	refuse("unsupported function call " + e.name)
 	return nil
@@ -473,24 +485,184 @@ func userExprA1(e *expr, params []string) any {
 	return st("")
 }
 
+// ptrAdvanceDelta — is this assignment a POINTER advance (`p = p + 1`,
+// `p += 2`, `p = p - 1`)? Returns the element delta. Only meaningful for
+// pointer params (checked by the caller).
+func ptrAdvanceDelta(s *uStmt) (int, bool) {
+	if s.name == "" || s.e == nil {
+		return 0, false
+	}
+	if s.op == "+=" || s.op == "-=" {
+		if s.e.kind != "num" {
+			return 0, false
+		}
+		n, err := strconv.Atoi(s.e.num)
+		if err != nil {
+			return 0, false
+		}
+		if s.op == "+=" {
+			return n, true
+		}
+		return -n, true
+	}
+	// s.op == "=": `p = p ± N`
+	if s.e.kind == "bin" && (s.e.op == "+" || s.e.op == "-") &&
+		s.e.l != nil && s.e.l.kind == "id" && s.e.l.name == s.name &&
+		s.e.r != nil && s.e.r.kind == "num" {
+		n, err := strconv.Atoi(s.e.r.num)
+		if err != nil {
+			return 0, false
+		}
+		if s.e.op == "-" {
+			n = -n
+		}
+		return n, true
+	}
+	return 0, false
+}
+
+// memAdvanceCall — `p = memAdvance(p, delta)` (a C pointer increment:
+// walk the slice-1 handle to the next element).
+func memAdvanceCall(name string, delta int) map[string]any {
+	return map[string]any{
+		"type":    "Assign",
+		"targets": []any{map[string]any{"var": name, "indices": []any{}, "sigil": nil}},
+		"expr":    call("memAdvance", []any{call("getVar", []any{st(name)}), st(strconv.Itoa(delta))}),
+	}
+}
+
+// userTempSeq — a monotonically increasing counter for the temp vars
+// compound assigns lower runtime reads into (see arithOperand).
+var userTempSeq int
+
+// exprNeedsTemp — does lowering this expression produce a runtime call
+// (memLoad / arrayIndex / fnCall)? The A1 Arith grammar has no Call
+// node (shir_json_in.rs), so such a read cannot sit inside an
+// arithmetic tree — it must be stored into a temp var first.
+func exprNeedsTemp(e *expr) bool {
+	if e == nil {
+		return false
+	}
+	switch e.kind {
+	case "deref", "index", "addr", "call":
+		return true
+	case "bin":
+		return exprNeedsTemp(e.l) || exprNeedsTemp(e.r)
+	}
+	return false
+}
+
+// arithOperand — lower `e` to an A1-arithmetic-safe operand (Num / Var
+// / Str / nested Bin). Runtime reads are stored into a fresh temp var
+// (`t = <read>`, appended to `out`) and the operand becomes Var(t).
+func arithOperand(e *expr, params []string, out *[]any) any {
+	if !exprNeedsTemp(e) {
+		// plain exprs lower through arithNode (Num / Var / Bin) — the
+		// Arith grammar's own shapes, NOT the shell-store getVar calls
+		return arithNode(e)
+	}
+	userTempSeq++
+	tmp := "___t" + strconv.Itoa(userTempSeq)
+	*out = append(*out, map[string]any{
+		"type":    "Assign",
+		"targets": []any{map[string]any{"var": tmp, "indices": []any{}, "sigil": nil}},
+		"expr":    userExprA1(e, params),
+	})
+	return map[string]any{"type": "Var", "name": tmp}
+}
+
 // userStmtsA1 — a user-function body (the uStmt mini-AST) → A1 stmts.
-func userStmtsA1(stmts []*uStmt, params []string) []any {
+// `ptrs` maps pointer param names → element type ("int"/"char"): deref
+// stores and pointer advances only lower for those (a plain var named p
+// stays an ordinary shell variable).
+func userStmtsA1(stmts []*uStmt, params []string, ptrs map[string]string) []any {
 	out := []any{}
 	for _, s := range stmts {
 		switch s.kind {
 		case "skip":
 			continue
 		case "assign":
+			if _, isPtr := ptrs[s.name]; isPtr {
+				if delta, ok := ptrAdvanceDelta(s); ok {
+					// `p = p + 1` / `p += 1` — walk the pointer
+					out = append(out, memAdvanceCall(s.name, delta))
+					continue
+				}
+			}
+			expr := userExprA1(s.e, params)
+			if s.op != "=" {
+				// `total += *s` — a compound assign: load, add, store.
+				// The A1 Arith grammar has no Call node, so a runtime
+				// read on the rhs is lowered into a temp var first.
+				arithOp := strings.TrimSuffix(s.op, "=")
+				expr = map[string]any{
+					"type": "Arith",
+					"ast": map[string]any{
+						"type": "Bin",
+						"op":   arithOp,
+						"lhs":  map[string]any{"type": "Var", "name": s.name},
+						"rhs":  arithOperand(s.e, params, &out),
+					},
+				}
+			}
 			out = append(out, map[string]any{
 				"type":    "Assign",
 				"targets": []any{map[string]any{"var": s.name, "indices": []any{}, "sigil": nil}},
-				"expr":    userExprA1(s.e, params),
+				"expr":    expr,
 			})
+		case "ptrinc":
+			if _, isPtr := ptrs[s.name]; isPtr {
+				delta := 1
+				if s.op == "--" {
+					delta = -1
+				}
+				out = append(out, memAdvanceCall(s.name, delta))
+			}
+		case "derefstore":
+			elem, isPtr := ptrs[s.name]
+			if !isPtr {
+				continue
+			}
+			// `*p = v` — memStore through the handle (writes the shell
+			// var / array element the pointer points at)
+			rhs := userExprA1(s.e, params)
+			if s.op != "=" {
+				// `*p += v` — load the element into a temp, add, store
+				// (the A1 Arith grammar has no Call node)
+				arithOp := strings.TrimSuffix(s.op, "=")
+				userTempSeq++
+				tmp := "___t" + strconv.Itoa(userTempSeq)
+				out = append(out, map[string]any{
+					"type":    "Assign",
+					"targets": []any{map[string]any{"var": tmp, "indices": []any{}, "sigil": nil}},
+					"expr":    call("memLoad", []any{call("getVar", []any{st(s.name)}), st("0"), st(elem)}),
+				})
+				rhs = map[string]any{
+					"type": "Arith",
+					"ast": map[string]any{
+						"type": "Bin",
+						"op":   arithOp,
+						"lhs":  map[string]any{"type": "Var", "name": tmp},
+						"rhs":  arithOperand(s.e, params, &out),
+					},
+				}
+			}
+			out = append(out, map[string]any{
+				"type": "Expr",
+				"expr": call("memStore", []any{
+					call("getVar", []any{st(s.name)}),
+					st("0"), st(elem), rhs,
+				}),
+			})
+			if s.ptrPost {
+				// `*p++ = v` — advance the pointer after the store
+				out = append(out, memAdvanceCall(s.name, 1))
+			}
 		case "while":
 			out = append(out, map[string]any{
 				"type": "While",
 				"cond": userExprA1(s.e, params),
-				"body": userStmtsA1(s.body, params),
+				"body": userStmtsA1(s.body, params, ptrs),
 			})
 		case "ret":
 			out = append(out, map[string]any{
@@ -520,7 +692,7 @@ func buildUserFnA1(name string, fn *userFunc) map[string]any {
 			"expr":    call("getVar", []any{st(strconv.Itoa(i + 1))}),
 		})
 	}
-	body = append(body, userStmtsA1(fn.body, fn.params)...)
+	body = append(body, userStmtsA1(fn.body, fn.params, fn.ptrParams)...)
 	return map[string]any{"type": "Function", "name": name, "body": body}
 }
 
@@ -533,9 +705,11 @@ func buildUserFnA1(name string, fn *userFunc) map[string]any {
 // side effects with stdout) REFUSES. The body is never emitted — only
 // main's body becomes the program.
 type userFunc struct {
-	params  []string
-	varargs bool // `...` in the signature: extra call args feed va_arg
-	body    []*uStmt
+	params     []string
+	paramTypes []string          // parallel to params: "int" | "char"
+	ptrParams  map[string]string // pointer params: name -> element type ("int"/"char")
+	varargs    bool              // `...` in the signature: extra call args feed va_arg
+	body       []*uStmt
 }
 
 var userFuncs = map[string]*userFunc{}
@@ -543,12 +717,13 @@ var userFuncs = map[string]*userFunc{}
 // uStmt — a user-function body statement (the mini-AST the literal-arg
 // fold interprets; see foldUserBody).
 type uStmt struct {
-	kind string // assign | while | ret | skip | exec
-	name string // assign target
-	op   string // "=" | "+=" | "-="
-	e    *expr  // assign rhs / while cond / return expr
-	body []*uStmt
-	a1   any // a raw A1 statement (exec-carrier kind)
+	kind    string // assign | while | ret | skip | exec | derefstore | ptrinc
+	name    string // assign target / deref pointer / ptrinc var
+	op      string // "=" | "+=" | "-="  (ptrinc: "++" | "--")
+	e       *expr  // assign rhs / while cond / return expr / deref rhs
+	body    []*uStmt
+	a1      any // a raw A1 statement (exec-carrier kind)
+	ptrPost bool // derefstore: `*p++ = v` — advance the pointer after the store
 }
 
 // evUExpr — evaluate a body expression with the va_arg stack (a
@@ -687,6 +862,25 @@ func foldConst(e *expr, env map[string]string) (string, bool) {
 			env[e.name] = strconv.FormatInt(n-1, 10)
 		}
 		return v, true
+	case "cond":
+		// cond ? a : b — fold the condition (C numeric truth) then the
+		// taken branch (literal-arg folding for switch-case values and
+		// user-function bodies)
+		c, ok := foldConst(e.l, env)
+		if !ok {
+			return "", false
+		}
+		n, err := strconv.ParseInt(c, 10, 64)
+		if err != nil {
+			return "", false
+		}
+		if n != 0 {
+			return foldConst(e.r, env)
+		}
+		if len(e.args) == 1 {
+			return foldConst(e.args[0], env)
+		}
+		return "", false
 	case "call":
 		return foldCallConst(e, env)
 	case "bin":
@@ -925,6 +1119,35 @@ func lex(src string) ([]tok, error) {
 			}
 			out = append(out, tok{"str", sb.String()})
 			i = j + 1
+		case c == '\'':
+			// char literal `'a'` — decoded like a string but tokenized as
+			// "chr" so primary() can refuse multi-char literals (a C char
+			// literal is an int; the v2 subset models the 1-char string
+			// form — comparisons and %c — only)
+			j := i + 1
+			var sb strings.Builder
+			for j < n && src[j] != '\'' {
+				if src[j] == '\\' && j+1 < n {
+					switch src[j+1] {
+					case 'n':
+						sb.WriteByte('\n')
+					case 't':
+						sb.WriteByte('\t')
+					case '\\':
+						sb.WriteByte('\\')
+					case '\'':
+						sb.WriteByte('\'')
+					default:
+						sb.WriteByte(src[j+1])
+					}
+					j += 2
+					continue
+				}
+				sb.WriteByte(src[j])
+				j++
+			}
+			out = append(out, tok{"chr", sb.String()})
+			i = j + 1
 		case c >= '0' && c <= '9':
 			j := i
 			for j < n && src[j] >= '0' && src[j] <= '9' {
@@ -966,8 +1189,15 @@ func lex(src string) ([]tok, error) {
 				i += 3
 				continue
 			}
+			switch three {
+			case "<<=", ">>=":
+				out = append(out, tok{"op", three})
+				i += 3
+				continue
+			}
 			switch two {
-			case "==", "!=", "<=", ">=", "&&", "||", "+=", "-=", "++", "--":
+			case "==", "!=", "<=", ">=", "&&", "||", "+=", "-=", "++", "--",
+				"<<", ">>", "*=", "/=", "%=", "&=", "|=", "^=":
 				out = append(out, tok{"op", two})
 				i += 2
 				continue
@@ -976,8 +1206,9 @@ func lex(src string) ([]tok, error) {
 			// float itself needs the core Float type; the tokens parse-fail
 			// later and REFUSE, which is the honest gate for t23 until the
 			// estree worker lands IrType::Float). `:` — switch case labels
-			// (and goto labels — those refuse in the parser).
-			if strings.ContainsRune("=+-*/%!<>&;{}()[],.:", rune(c)) {
+			// (and goto labels — those refuse in the parser). `?` — the
+			// ternary operator; `~` `|` `^` — the bitwise ops (v2).
+			if strings.ContainsRune("=+-*/%!<>&|^~?;{}()[],.:", rune(c)) {
 				out = append(out, tok{"op", string(c)})
 				i++
 			} else {
@@ -1166,7 +1397,33 @@ type expr struct {
 	args []*expr // call: the argument expressions
 }
 
-func (p *parser) expr() (*expr, error) { return p.orExpr() }
+func (p *parser) expr() (*expr, error) { return p.ternaryExpr() }
+
+// ternaryExpr — `cond ? a : b` (v2). The loosest operator in an
+// expression; the lowering is the runtime `ternary` call (see
+// valueNode / foldConst — the cond is the test-string grammar).
+func (p *parser) ternaryExpr() (*expr, error) {
+	cond, err := p.orExpr()
+	if err != nil {
+		return nil, err
+	}
+	if !p.isOp("?") {
+		return cond, nil
+	}
+	p.next()
+	a, err := p.expr()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expectOp(":"); err != nil {
+		return nil, err
+	}
+	b, err := p.expr()
+	if err != nil {
+		return nil, err
+	}
+	return &expr{kind: "cond", l: cond, r: a, args: []*expr{b}}, nil
+}
 func (p *parser) orExpr() (*expr, error) {
 	l, err := p.andExpr()
 	if err != nil {
@@ -1183,13 +1440,13 @@ func (p *parser) orExpr() (*expr, error) {
 	return l, nil
 }
 func (p *parser) andExpr() (*expr, error) {
-	l, err := p.cmpExpr()
+	l, err := p.bitorExpr()
 	if err != nil {
 		return nil, err
 	}
 	for p.isOp("&&") {
 		p.next()
-		r, err := p.cmpExpr()
+		r, err := p.bitorExpr()
 		if err != nil {
 			return nil, err
 		}
@@ -1197,26 +1454,88 @@ func (p *parser) andExpr() (*expr, error) {
 	}
 	return l, nil
 }
-func isCmpOp(op string) bool {
-	switch op {
-	case "==", "!=", "<", ">", "<=", ">=":
-		return true
+func (p *parser) bitorExpr() (*expr, error) {
+	l, err := p.bitxorExpr()
+	if err != nil {
+		return nil, err
 	}
-	return false
+	for p.isOp("|") {
+		p.next()
+		r, err := p.bitxorExpr()
+		if err != nil {
+			return nil, err
+		}
+		l = &expr{kind: "bin", op: "|", l: l, r: r}
+	}
+	return l, nil
 }
-
-func (p *parser) cmpExpr() (*expr, error) {
+func (p *parser) bitxorExpr() (*expr, error) {
+	l, err := p.bitandExpr()
+	if err != nil {
+		return nil, err
+	}
+	for p.isOp("^") {
+		p.next()
+		r, err := p.bitandExpr()
+		if err != nil {
+			return nil, err
+		}
+		l = &expr{kind: "bin", op: "^", l: l, r: r}
+	}
+	return l, nil
+}
+func (p *parser) bitandExpr() (*expr, error) {
+	l, err := p.eqExpr()
+	if err != nil {
+		return nil, err
+	}
+	for p.isOp("&") {
+		p.next()
+		r, err := p.eqExpr()
+		if err != nil {
+			return nil, err
+		}
+		l = &expr{kind: "bin", op: "&", l: l, r: r}
+	}
+	return l, nil
+}
+func (p *parser) eqExpr() (*expr, error) {
+	l, err := p.relExpr()
+	if err != nil {
+		return nil, err
+	}
+	for p.isOp("==") || p.isOp("!=") {
+		op := p.next().text
+		r, err := p.relExpr()
+		if err != nil {
+			return nil, err
+		}
+		l = &expr{kind: "bin", op: op, l: l, r: r}
+	}
+	return l, nil
+}
+func (p *parser) relExpr() (*expr, error) {
+	l, err := p.shiftExpr()
+	if err != nil {
+		return nil, err
+	}
+	for p.isOp("<") || p.isOp(">") || p.isOp("<=") || p.isOp(">=") {
+		op := p.next().text
+		r, err := p.shiftExpr()
+		if err != nil {
+			return nil, err
+		}
+		l = &expr{kind: "bin", op: op, l: l, r: r}
+	}
+	return l, nil
+}
+func (p *parser) shiftExpr() (*expr, error) {
 	l, err := p.addExpr()
 	if err != nil {
 		return nil, err
 	}
-	for {
-		t := p.peek()
-		if t == nil || t.kind != "op" || !isCmpOp(t.text) {
-			break
-		}
-		op := t.text
-		p.next()
+	for p.isOp("<<") || p.isOp(">>") {
+		op := p.next().text
 		r, err := p.addExpr()
 		if err != nil {
 			return nil, err
@@ -1280,6 +1599,16 @@ func (p *parser) unaryExpr() (*expr, error) {
 		}
 		return &expr{kind: "addr", l: e}, nil
 	}
+	if p.isOp("~") {
+		p.next()
+		e, err := p.unaryExpr()
+		if err != nil {
+			return nil, err
+		}
+		// ~x → x ^ -1 — two's complement on the 32-bit int domain (JS `^`
+		// operates on int32, matching C's `int` ~)
+		return &expr{kind: "bin", op: "^", l: e, r: &expr{kind: "num", num: "-1"}}, nil
+	}
 	if p.isOp("*") {
 		p.next()
 		e, err := p.unaryExpr()
@@ -1301,6 +1630,12 @@ func (p *parser) primary() (*expr, error) {
 		return &expr{kind: "num", num: t.text}, nil
 	case "str":
 		p.next()
+		return &expr{kind: "str", num: t.text}, nil
+	case "chr":
+		p.next()
+		if len(t.text) != 1 {
+			refuse("multi-char literals are not in the v2 subset (a C char literal is an int; the subset models the 1-char string form)")
+		}
 		return &expr{kind: "str", num: t.text}, nil
 	case "id":
 		p.next()
@@ -1408,6 +1743,14 @@ func arithNode(e *expr) any {
 			refuse("unsupported function call " + e.name + " (non-integer value)")
 		}
 		return map[string]any{"type": "Num", "value": n}
+	case "cond":
+		// a ternary inside arithmetic: fold when the condition is a
+		// compile-time constant, else refuse (the Arith AST has no cond)
+		if s, ok := foldConst(e, nil); ok {
+			n, _ := strconv.Atoi(s)
+			return map[string]any{"type": "Num", "value": n}
+		}
+		refuse("ternary in an arithmetic context (lower it to a temp: int v = c ? a : b)")
 	case "bin":
 		return map[string]any{"type": "Bin", "lhs": arithNode(e.l), "op": e.op, "rhs": arithNode(e.r)}
 	case "index", "deref", "addr":
@@ -1457,6 +1800,21 @@ func valueNode(e *expr) any {
 	case "member":
 		// p.x — a flattened struct member: a plain store read
 		return call("getVar", []any{st(e.name)})
+	case "cond":
+		// cond ? a : b — the runtime ternary (the cond is the frontend's
+		// test-string or arith-truth call, lowered native-first by the
+		// core; the branches are pure values — evaluated eagerly, sound
+		// for the pure-expression subset)
+		var condArg any
+		if condNeedsArith(e.l) {
+			condArg = call("testArith", []any{st(exprToArithString(e.l))})
+		} else {
+			condArg = st(testExpr(e.l))
+		}
+		if len(e.args) == 1 {
+			return call("ternary", []any{condArg, valueNode(e.r), valueNode(e.args[0])})
+		}
+		return call("ternary", []any{condArg, valueNode(e.r), st("")})
 	case "call":
 		return callNode(e)
 	case "addr":
@@ -1531,7 +1889,7 @@ func valueNode(e *expr) any {
 				if k, ok := foldIndex(e.r); ok {
 					return call("memLoad", []any{call("getVar", []any{st(hp.root)}), st(strconv.Itoa(hp.off + k)), st(hp.elem)})
 				}
-				refuse("heap index must be a compile-time constant in the v1 subset")
+				return call("memLoad", []any{call("getVar", []any{st(hp.root)}), indexArith(e.r, hp.off), st(hp.elem)})
 			}
 		}
 		return nil
@@ -1604,7 +1962,12 @@ func exprToArithString(e *expr) string {
 	case "bin":
 		l := exprToArithString(e.l)
 		r := exprToArithString(e.r)
+		if e.op == "!" {
+			return "(!" + l + ")"
+		}
 		return "(" + l + " " + e.op + " " + r + ")"
+	case "cond":
+		refuse("ternary inside arithmetic/index expressions is not in the subset (lower it to a temp)")
 	}
 	return ""
 }
@@ -1640,12 +2003,33 @@ func indexArith(e *expr, base int) any {
 // `testExpr` appends `-ne 0` for top-level ids; `testOperand` (used
 // inside binops) does NOT, so `$i -eq 1` stays that and doesn't turn
 // into `$i -ne 0 -eq 1`.
+// operandIsString — whether a test operand carries a STRING value (a
+// char literal / string literal, or a `char` variable — the store has no
+// int type for chars). Comparisons involving one compare with `=`/`!=`
+// (string equality); pure int comparisons keep `-eq`/`-ne`.
+func operandIsString(e *expr) bool {
+	if e == nil {
+		return false
+	}
+	if e.kind == "str" {
+		return true
+	}
+	if e.kind == "id" && charVars[e.name] {
+		return true
+	}
+	return false
+}
+
 func testOperand(e *expr) string {
 	switch e.kind {
 	case "num":
 		return e.num
 	case "id":
 		return "$" + e.name
+	case "str":
+		return "'" + e.num + "'"
+	case "cond":
+		refuse("ternary in a test condition is not in the subset (lower it to a temp)")
 	case "bin":
 		if e.op == "!" {
 			return "! " + testOperand(e.l)
@@ -1656,9 +2040,50 @@ func testOperand(e *expr) string {
 		if e.op == "||" {
 			return testOperand(e.l) + " -o " + testOperand(e.r)
 		}
+		// char/string comparisons use the STRING test operators (the
+		// store is string-typed; `-eq` would coerce both sides to 0)
+		if (e.op == "==" || e.op == "!=") && (operandIsString(e.l) || operandIsString(e.r)) {
+			op := "="
+			if e.op == "!=" {
+				op = "!="
+			}
+			return testOperand(e.l) + " " + op + " " + testOperand(e.r)
+		}
 		return testOperand(e.l) + " " + cmpOp(e.op) + " " + testOperand(e.r)
 	}
 	return ""
+}
+
+// condNeedsArith — whether `e` contains an ARITHMETIC operator the bash
+// test-string grammar cannot express (bitwise / shift / mod / ... — the
+// test grammar is comparison + -a/-o/! only). Such a condition routes
+// the WHOLE expression to the runtime arith-eval truth test (testArith:
+// bash `$(( ))` semantics — evalArith evaluates arithmetic AND
+// comparisons together).
+func condNeedsArith(e *expr) bool {
+	if e == nil {
+		return false
+	}
+	switch e.kind {
+	case "bin":
+		switch e.op {
+		case "==", "!=", "<", ">", "<=", ">=", "&&", "||", "!":
+			return condNeedsArith(e.l) || condNeedsArith(e.r)
+		}
+		return true // any other bin op is arithmetic
+	case "cond":
+		return true
+	}
+	return false
+}
+
+// condCall — the A1 condition for `if`/`while`/...: the test-string
+// grammar when expressible, else the runtime arith-truth call.
+func condCall(c *expr) map[string]any {
+	if condNeedsArith(c) {
+		return call("testArith", []any{st(exprToArithString(c))})
+	}
+	return testCall(testExpr(c))
 }
 
 func testExpr(e *expr) string {
@@ -1847,10 +2272,50 @@ func (p *parser) stmt() (any, error) {
 		if kw == "char" && isPtr {
 			charPtrVars[name.text] = true
 		}
+		if kw == "char" && !isPtr {
+			charVars[name.text] = true
+		}
 		if isPtr && kw != "char" {
 			// every non-char pointer declaration starts as a heap-pointer
 			// candidate (promoted out by recordPtrTarget / heapAssignRHS)
 			ptrDecls[name.text] = kw
+		}
+		// `int a, b;` / `int a = 1, b = 2;` — multi-declarator (v2). The
+		// pointer-init machinery is per-name and the array path returns
+		// early, so pointers refuse here (the common case is the plain
+		// int/char list).
+		if p.isOp(",") {
+			if isPtr {
+				refuse("multi-declarator pointer declarations are not in the subset")
+			}
+			var out []any
+			decl := name.text
+			for {
+				if p.isOp("=") {
+					p.next()
+					e, err := p.expr()
+					if err != nil {
+						return nil, err
+					}
+					out = append(out, assignStmt(decl, valueNode(e)))
+				}
+				if !p.isOp(",") {
+					break
+				}
+				p.next()
+				nm := p.next()
+				if nm == nil || nm.kind != "id" {
+					return nil, fmt.Errorf("expected identifier in declaration")
+				}
+				decl = nm.text
+			}
+			if err := p.expectOp(";"); err != nil {
+				return nil, err
+			}
+			if len(out) == 0 {
+				return nil, nil
+			}
+			return map[string]any{"body": out, "type": "Block"}, nil
 		}
 		// function signature `int main ( void ) {` — or a USER function
 		// `static int triple ( int n ) { return n * 3; }`. main's body
@@ -1860,6 +2325,8 @@ func (p *parser) stmt() (any, error) {
 		if p.isOp("(") {
 			p.next()
 			var params []string
+			var paramTypes []string
+			var ptrParams map[string]string
 			isVarargs := false
 			if !p.isOp(")") {
 				if p.isId("void") {
@@ -1876,15 +2343,25 @@ func (p *parser) stmt() (any, error) {
 						if t == nil || t.kind != "id" || (t.text != "int" && t.text != "char") {
 							return nil, fmt.Errorf("expected parameter type (int|char) at token %v", t)
 						}
+						ptype := t.text
 						p.next() // int | char
+						isPtr := false
 						for p.isOp("*") {
 							p.next()
+							isPtr = true
 						}
 						pn := p.next()
 						if pn == nil || pn.kind != "id" {
 							return nil, fmt.Errorf("expected parameter name at token %v", pn)
 						}
 						params = append(params, pn.text)
+						paramTypes = append(paramTypes, ptype)
+						if isPtr {
+							if ptrParams == nil {
+								ptrParams = map[string]string{}
+							}
+							ptrParams[pn.text] = ptype
+						}
 						if p.isOp(")") {
 							break
 						}
@@ -1905,7 +2382,7 @@ func (p *parser) stmt() (any, error) {
 			if err != nil {
 				return nil, err
 			}
-			userFuncs[name.text] = &userFunc{params: params, varargs: isVarargs, body: body}
+			userFuncs[name.text] = &userFunc{params: params, paramTypes: paramTypes, ptrParams: ptrParams, varargs: isVarargs, body: body}
 			return nil, nil
 		}
 		if p.isOp("[") {
@@ -1954,6 +2431,34 @@ func (p *parser) stmt() (any, error) {
 			e, err := p.expr()
 			if err != nil {
 				return nil, err
+			}
+			// `int a = 1, b = 2;` — multi-declarator with initializers
+			// (the first declarator already parsed; pointers refuse)
+			if p.isOp(",") {
+				if isPtr {
+					refuse("multi-declarator pointer declarations are not in the subset")
+				}
+				var out []any
+				out = append(out, assignStmt(name.text, valueNode(e)))
+				for p.isOp(",") {
+					p.next()
+					nm := p.next()
+					if nm == nil || nm.kind != "id" {
+						return nil, fmt.Errorf("expected identifier in declaration")
+					}
+					if p.isOp("=") {
+						p.next()
+						e2, err2 := p.expr()
+						if err2 != nil {
+							return nil, err2
+						}
+						out = append(out, assignStmt(nm.text, valueNode(e2)))
+					}
+				}
+				if err := p.expectOp(";"); err != nil {
+					return nil, err
+				}
+				return map[string]any{"body": out, "type": "Block"}, nil
 			}
 			if err := p.expectOp(";"); err != nil {
 				return nil, err
@@ -2020,7 +2525,7 @@ func (p *parser) stmt() (any, error) {
 				}
 			}
 		}
-		return map[string]any{"cond": testCall(testExpr(c)), "then": thenB, "elsifs": []any{}, "else": elseB, "type": "If"}, nil
+		return map[string]any{"cond": condCall(c), "then": thenB, "elsifs": []any{}, "else": elseB, "type": "If"}, nil
 	case p.isId("while"):
 		p.next()
 		if err := p.expectOp("("); err != nil {
@@ -2037,7 +2542,7 @@ func (p *parser) stmt() (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		return map[string]any{"cond": testCall(testExpr(c)), "body": b, "type": "While"}, nil
+		return map[string]any{"cond": condCall(c), "body": b, "type": "While"}, nil
 	case p.isId("for"):
 		// for (init; cond; inc) body → init; while (cond) { body; inc }
 		p.next()
@@ -2097,15 +2602,15 @@ func (p *parser) stmt() (any, error) {
 		if inc != nil {
 			body = append(body, inc)
 		}
-		condStr := "1"
+		condStmt := testCall("1")
 		if cond != nil {
-			condStr = testExpr(cond)
+			condStmt = condCall(cond)
 		}
 		var out []any
 		if init != nil {
 			out = append(out, init)
 		}
-		out = append(out, map[string]any{"cond": testCall(condStr), "body": body, "type": "While"})
+		out = append(out, map[string]any{"cond": condStmt, "body": body, "type": "While"})
 		return map[string]any{"body": out, "type": "Block"}, nil
 	case p.isId("break"), p.isId("continue"):
 		// loop control — the A1 signal calls (the runtime while loop
@@ -2198,7 +2703,7 @@ func (p *parser) stmt() (any, error) {
 		for i := len(cases) - 1; i >= 0; i-- {
 			c := cases[i]
 			cond := &expr{kind: "bin", op: "==", l: disc, r: &expr{kind: "num", num: c.val}}
-			elseB = []any{map[string]any{"cond": testCall(testExpr(cond)), "then": c.body, "elsifs": []any{}, "else": elseB, "type": "If"}}
+			elseB = []any{map[string]any{"cond": condCall(cond), "then": c.body, "elsifs": []any{}, "else": elseB, "type": "If"}}
 		}
 		if len(cases) == 0 {
 			return nil, nil
@@ -2232,7 +2737,7 @@ func (p *parser) stmt() (any, error) {
 		// duplication is the faithful form (the body has no declarations
 		// whose scope the duplication would break in the v1 subset)
 		body := append([]any{}, b...)
-		body = append(body, map[string]any{"cond": testCall(testExpr(c)), "body": append([]any{}, b...), "type": "While"})
+		body = append(body, map[string]any{"cond": condCall(c), "body": append([]any{}, b...), "type": "While"})
 		return map[string]any{"body": body, "type": "Block"}, nil
 	case p.isId("struct"):
 		return p.structDecl()
@@ -2289,6 +2794,19 @@ func (p *parser) forHeaderAssign() (any, error) {
 		p.next()
 		t = p.peek()
 	}
+	// prefix ++i / --i in the for header (v2) — same lowering as postfix
+	if t != nil && (p.isOp("++") || p.isOp("--")) {
+		op := p.next().text
+		nm := p.next()
+		if nm == nil || nm.kind != "id" {
+			return nil, nil
+		}
+		return p.buildAssign(nm.text, "=", &expr{
+			kind: "bin", op: op[:1],
+			l: &expr{kind: "id", name: nm.text},
+			r: &expr{kind: "num", num: "1"},
+		})
+	}
 	if t == nil || t.kind != "id" {
 		return nil, nil
 	}
@@ -2302,7 +2820,7 @@ func (p *parser) forHeaderAssign() (any, error) {
 			r: &expr{kind: "num", num: "1"},
 		})
 	}
-	if p.isOp("=") || p.isOp("+=") || p.isOp("-=") {
+	if p.isAssignOp() {
 		op := p.next().text
 		e, err := p.expr()
 		if err != nil {
@@ -2311,6 +2829,14 @@ func (p *parser) forHeaderAssign() (any, error) {
 		return p.buildAssign(name, op, e)
 	}
 	return nil, nil
+}
+
+// isAssignOp — any assignment operator the v2 subset parses: plain =
+// plus the compound family (+= -= *= /= %= <<= >>= &= |= ^=; buildAssign
+// strips the trailing '=' and lowers the op through the Arith AST).
+func (p *parser) isAssignOp() bool {
+	return p.isOp("=") || p.isOp("+=") || p.isOp("-=") || p.isOp("*=") || p.isOp("/=") || p.isOp("%=") ||
+		p.isOp("<<=") || p.isOp(">>=") || p.isOp("&=") || p.isOp("|=") || p.isOp("^=")
 }
 
 func (p *parser) buildAssign(name, op string, e *expr) (any, error) {
@@ -2331,6 +2857,24 @@ func (p *parser) buildAssign(name, op string, e *expr) (any, error) {
 }
 
 func (p *parser) simpleAssign() (any, error) {
+	if p.isOp("++") || p.isOp("--") {
+		// ++i / --i — prefix increment (v2; statement position discards
+		// the expression value, so the lowering is the same i = i +/- 1
+		// as the postfix statement form)
+		op := p.next().text
+		nm := p.next()
+		if nm == nil || nm.kind != "id" {
+			return nil, fmt.Errorf("expected identifier after prefix " + op)
+		}
+		if err := p.expectOp(";"); err != nil {
+			return nil, err
+		}
+		return p.buildAssign(nm.text, "=", &expr{
+			kind: "bin", op: op[:1],
+			l: &expr{kind: "id", name: nm.text},
+			r: &expr{kind: "num", num: "1"},
+		})
+	}
 	if p.isOp("*") {
 		// *p = v — a store through the handle
 		p.next()
@@ -2338,7 +2882,7 @@ func (p *parser) simpleAssign() (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		if !p.isOp("=") && !p.isOp("+=") && !p.isOp("-=") {
+		if !p.isAssignOp() {
 			return nil, fmt.Errorf("expected assignment after deref")
 		}
 		p.next()
@@ -2395,7 +2939,7 @@ func (p *parser) simpleAssign() (any, error) {
 			return nil, fmt.Errorf("expected member name after '.'")
 		}
 		full := name + "." + mn.text
-		if p.isOp("=") || p.isOp("+=") || p.isOp("-=") {
+		if p.isAssignOp() {
 			op := p.next().text
 			e, err := p.expr()
 			if err != nil {
@@ -2424,7 +2968,7 @@ func (p *parser) simpleAssign() (any, error) {
 		if err := p.expectOp("]"); err != nil {
 			return nil, err
 		}
-		if !p.isOp("=") && !p.isOp("+=") && !p.isOp("-=") {
+		if !p.isAssignOp() {
 			return nil, fmt.Errorf("expected assignment after index")
 		}
 		op := p.next().text
@@ -2438,26 +2982,34 @@ func (p *parser) simpleAssign() (any, error) {
 		if op != "=" {
 			refuse("compound assignment through an index is not in the v1 subset")
 		}
-		// a[i] = v on a heap pointer — the mem arena element store
+		// a[i] = v on a heap pointer — the mem arena element store (the
+		// offset is static, or a runtime arith call for a dynamic index)
 		if hp, ok := heapPtrs[name]; ok {
-			k, ok2 := foldIndex(idx)
-			if !ok2 {
-				refuse("heap index must be a compile-time constant in the v1 subset")
+			var off any
+			if k, ok2 := foldIndex(idx); ok2 {
+				off = st(strconv.Itoa(hp.off + k))
+			} else {
+				off = indexArith(idx, hp.off)
 			}
 			return map[string]any{
 				"type": "Expr",
-				"expr": call("memStore", []any{call("getVar", []any{st(hp.root)}), st(strconv.Itoa(hp.off + k)), st(hp.elem), valueNode(e)}),
+				"expr": call("memStore", []any{call("getVar", []any{st(hp.root)}), off, st(hp.elem), valueNode(e)}),
 			}, nil
 		}
 		// a[i] = v on a C array — the baked-name array write (the core's
 		// arr[1]=x shape; the runtime handles it — same as the ptrTarget
-		// reduction)
+		// reduction). A DYNAMIC index emits the runtime arrayStore call
+		// instead: the baked `a[$i]` target would resolve the subscript
+		// via the STORE (stale for natively-lifted index vars), while the
+		// arith arg here is lowered natively by the core's `arith` arm.
 		if arrayVars[name] {
-			k, ok2 := foldIndex(idx)
-			if !ok2 {
-				refuse("array index must be a compile-time constant in the v1 subset")
+			if k, ok2 := foldIndex(idx); ok2 {
+				return assignStmt(name+"["+strconv.Itoa(k)+"]", valueNode(e)), nil
 			}
-			return assignStmt(name+"["+strconv.Itoa(k)+"]", valueNode(e)), nil
+			return map[string]any{
+				"type": "Expr",
+				"expr": call("arrayStore", []any{st(name), indexArith(idx, 0), valueNode(e)}),
+			}, nil
 		}
 		refuse("indexed assignment to " + name + " (not a heap pointer or array)")
 	}
@@ -2512,7 +3064,7 @@ func (p *parser) simpleAssign() (any, error) {
 		}
 		return nil, nil
 	}
-	if p.isOp("=") || p.isOp("+=") || p.isOp("-=") {
+	if p.isAssignOp() {
 		op := p.next().text
 		e, err := p.expr()
 		if err != nil {
@@ -2844,7 +3396,37 @@ func (p *parser) userStmt() (*uStmt, error) {
 	default:
 		if t.kind == "id" {
 			nm := p.next()
-			if p.isOp("=") || p.isOp("+=") || p.isOp("-=") {
+			if p.isOp("++") || p.isOp("--") {
+				// p++ / p-- — postfix pointer advance (a no-op for
+				// non-pointer vars; the emit only advances ptr params)
+				op := p.next().text
+				if err := p.expectOp(";"); err != nil {
+					return nil, err
+				}
+				return &uStmt{kind: "ptrinc", name: nm.text, op: op}, nil
+			}
+		if p.isAssignOp() {
+			op := p.next().text
+			e, err := p.expr()
+			if err != nil {
+				return nil, err
+			}
+			if err := p.expectOp(";"); err != nil {
+				return nil, err
+			}
+			return &uStmt{kind: "assign", name: nm.text, op: op, e: e}, nil
+		}
+		}
+		if t.kind == "op" && t.text == "*" {
+			// *p = expr — a deref STORE (also *p++ = expr / *p-- = expr:
+			// the target's postfix advances the pointer after the store).
+			p.next() // *
+			target, err := p.expr()
+			if err != nil {
+				return nil, err
+			}
+			if (target.kind == "id" || target.kind == "postinc" || target.kind == "postdec") &&
+				p.isAssignOp() {
 				op := p.next().text
 				e, err := p.expr()
 				if err != nil {
@@ -2853,7 +3435,8 @@ func (p *parser) userStmt() (*uStmt, error) {
 				if err := p.expectOp(";"); err != nil {
 					return nil, err
 				}
-				return &uStmt{kind: "assign", name: nm.text, op: op, e: e}, nil
+				return &uStmt{kind: "derefstore", name: target.name, op: op, e: e,
+					ptrPost: target.kind == "postinc" || target.kind == "postdec"}, nil
 			}
 		}
 		// any other expression statement — consume to ';' (uninterpreted)
@@ -2986,6 +3569,11 @@ func Shir(src string) (out []byte, err error) {
 	}()
 	// pre-scan: address-taken names (&x) keep their storage in the store
 	addrTaken = map[string]bool{}
+	arrayVars = map[string]bool{}
+	scalarAliases = map[string]string{}
+	ptrTargets = map[string]ptrTarget{}
+	charPtrVars = map[string]bool{}
+	userFuncs = map[string]*userFunc{}
 	for _, m := range regexp.MustCompile(`&([A-Za-z_][A-Za-z0-9_]*)`).FindAllStringSubmatch(src, -1) {
 		addrTaken[m[1]] = true
 	}
@@ -2993,6 +3581,7 @@ func Shir(src string) (out []byte, err error) {
 	// worker may exec it repeatedly in-process via wrappers)
 	heapPtrs = map[string]heapPtr{}
 	ptrDecls = map[string]string{}
+	charVars = map[string]bool{}
 	funcPtrs = map[string]string{}
 	structLayouts = map[string][]structMember{}
 	varStruct = map[string]string{}

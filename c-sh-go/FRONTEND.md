@@ -2,6 +2,58 @@
 
 C source -> A1 shIR JSON (the shell-flavored subset of C).
 
+## v2 subset (2026-08-10) — 68/68 gate, beyond the v1 refusal wall
+
+v2 lands the common C idioms v1 refused, each pinned by a testdata
+stdout example (t58–t68):
+
+- **Runtime function calls return VALUES** — `twice(x)` with a
+  non-literal arg lowers to A1 `Call("fnValue", ...)` (the VALUE
+  channel; the old `fnCall` emission SILENTLY yielded 0 — the shell
+  fnCall is status-only — see the runtime fnValue / core ternary
+  arm). Multi-param, multi-statement bodies (`int y = x + 1; return
+  y * 2;`) and nested calls work. A call INSIDE arithmetic still
+  refuses (the A1 Arith AST has no Call node — lower to a temp).
+- **Multi-declarator** `int a, b;` / `int c = 3, d = 4;` (pointers
+  refuse — the pointer-init machinery is per-name).
+- **Compound assignments** `*= /= %= <<= >>= &= |= ^=` (v1 had
+  only `=`/`+=`/`-=`); also in for headers and function bodies.
+- **Prefix `++i` / `--i`** in statements and for headers (statement
+  position discards the value, so the lowering is `i = i +/- 1`;
+  prefix in EXPRESSION position still refuses).
+- **Char literals** `'x'` — a 1-char STRING in the store (multi-char
+  refuses). Char comparisons use the STRING test operators
+  (`=`/`!=` via charVars + operandIsString) — `-eq` would coerce
+  both sides to 0. Char ORDERING (`<`/`>`) still refuses (the test
+  grammar has no string ordering).
+- **Bitwise** `& | ^ ~ << >>` (the structured Arith AST renders
+  native JS int32 ops — C `int` semantics; `~x` lowers to `x ^ -1`)
+  and **bitwise/mod in CONDITIONS** (the test-string grammar is
+  comparison-only, so such conditions route to the runtime
+  `testArith` — bash-arith truth — via condCall; even/odd, flag
+  masks, `n % 2 == 0`).
+- **Ternary** `cond ? a : b` — the runtime `ternary` call; the cond
+  is the test-string (native-first) or a testArith call; branches
+  are pure values (eager evaluation is sound for the subset).
+  Literal conds fold (switch-case values, user bodies). Ternary in
+  an ARITH context refuses (lower to a temp).
+- **Dynamic array writes** `a[i] = v` in a loop — the runtime
+  `arrayStore` call (the baked `a[$i]` target would resolve the
+  subscript via the STORE, stale for lifted index vars; the arith
+  index arg is lowered natively by the core's `arith` arm).
+- **Dynamic heap indices** `p[i]` (read AND write) with a runtime
+  index — the mem-arena offset becomes a runtime arith call (the
+  arena/element-size seam was already runtime-side).
+
+Still refused (honest, refuse > guess): ternary/bitwise/calls inside
+ARITHMETIC or test operands (lower to a temp), dynamic pointer
+ADVANCE (`p = p + n` with a runtime n — mem slice-2 advance),
+multi-return/multi-out-param functions, switch fallthrough,
+multi-char literals, `int a, b;` with pointers, char ordering
+comparisons.
+
+## v1 subset (the refusal wall the v2 idioms crossed)
+
 Yours (in THIS dir): the lexer, parser, emitter, tests. The v1 subset
 (t01–t18, all green): printf, int assignments (+=/-=), binary arith,
 comparisons, if/else, while, for (lowered to the equivalent while — the
