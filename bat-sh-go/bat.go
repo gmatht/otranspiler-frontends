@@ -32,18 +32,111 @@ import (
 
 // Parse parses batch source into an A1 shIR program.
 func Parse(src string) (*shiremit.Program, error) {
-	p := newParser(strings.Split(src, "\n"))
-	stmts, err := p.parseBlock(false)
+	lines := strings.Split(src, "\n")
+	main, subs := splitSections(lines)
+	// main flow (label sections NOT in the called-subroutine set stay
+	// inline — batch falls through labels, so goto-targets must remain)
+	p := newParser(main)
+	mainStmts, err := p.parseBlock(false)
 	if err != nil {
 		return nil, err
 	}
-	return &shiremit.Program{Stmts: stmts}, nil
+	// called subroutines -> A1 Function stmts BEFORE the main flow (the
+	// estree renders them as registrations; the main flow runs after)
+	var fnStmts []map[string]any
+	for _, sub := range subs {
+		name, bodyLines := sub[0], sub[1]
+		sp := newParser(strings.Split(bodyLines, "\n"))
+		sp.inSub = true
+		body, err := sp.parseBlock(false)
+		if err != nil {
+			return nil, fmt.Errorf("subroutine %s: %v", name, err)
+		}
+		fnStmts = append(fnStmts, map[string]any{
+			"type": "Function", "name": name, "body": body,
+		})
+	}
+	return &shiremit.Program{Stmts: append(fnStmts, mainStmts...)}, nil
+}
+
+// splitSections — top-level `:label` lines partition the file into the
+// main flow and subroutine sections. Only labels that are `call :label`
+// targets are extracted (subs); the rest stay inline in main. `^`
+// continuations are joined first; paren depth is tracked so a `:x`
+// inside a `( ... )` block is not a label.
+func splitSections(lines []string) (main []string, subs [][2]string) {
+	// join ^ continuations (mirror the parser: skip empty lines)
+	var joined []string
+	for _, l := range lines {
+		if len(joined) > 0 && strings.HasSuffix(strings.TrimSpace(joined[len(joined)-1]), "^") {
+			joined[len(joined)-1] = strings.TrimSuffix(joined[len(joined)-1], "^") + " " + l
+			continue
+		}
+		joined = append(joined, l)
+	}
+	// label boundaries at paren depth 0, plus the called-label set
+	var bounds []int
+	var names []string
+	called := map[string]bool{}
+	depth := 0
+	for i, l := range joined {
+		ln := strings.TrimSpace(l)
+		if ln != "" && strings.HasPrefix(ln, ":") && !strings.HasPrefix(ln, "::") && depth == 0 {
+			bounds = append(bounds, i)
+			names = append(names, strings.ToLower(strings.TrimSpace(ln[1:])))
+			continue
+		}
+		// scan the line for `call :label` references (the called set)
+		low := strings.ToLower(ln)
+		for {
+			k := strings.Index(low, "call :")
+			if k < 0 {
+				break
+			}
+			j := k + len("call :")
+			e := j
+			for e < len(low) && (isNameChar(low[e]) || low[e] == ':') {
+				e++
+			}
+			if e > j {
+				called[low[j:e]] = true
+			}
+			low = low[e:]
+		}
+		depth += strings.Count(ln, "(") - strings.Count(ln, ")")
+	}
+	// walk the sections: pre-first-label lines + non-called sections
+	// inline; called sections extracted
+	start := 0
+	for bi, b := range bounds {
+		main = append(main, joined[start:b]...)
+		name := names[bi]
+		sectionEnd := len(joined)
+		if bi+1 < len(bounds) {
+			sectionEnd = bounds[bi+1]
+		}
+		bodyLines := joined[b+1 : sectionEnd]
+		if called[name] {
+			subs = append(subs, [2]string{name, strings.Join(bodyLines, "\n")})
+		} else {
+			main = append(main, joined[b])
+			main = append(main, bodyLines...)
+		}
+		start = sectionEnd
+	}
+	if len(bounds) == 0 {
+		main = joined
+	} else {
+		main = append(main, joined[start:]...)
+	}
+	return main, subs
 }
 
 type parser struct {
 	lines   []string
 	idx     int
 	forVars map[string]bool
+	inSub   bool // parsing a called-subroutine body (goto :eof -> Return)
 }
 
 func newParser(lines []string) *parser {
@@ -159,12 +252,38 @@ func (p *parser) parseCommand(s string) ([]map[string]any, string, error) {
 	case "for":
 		return p.parseFor(rest)
 	case "goto":
-		return []map[string]any{{"type": "Goto", "name": strings.TrimSpace(rest)}}, "", nil
+		t := strings.TrimSpace(rest)
+		if strings.EqualFold(t, ":eof") {
+			// goto :eof — end of the current subroutine (Return) or the
+			// whole file at top level (Exit with the current status)
+			if p.inSub {
+				return []map[string]any{{"type": "Return", "value": nil}}, "", nil
+			}
+			return []map[string]any{{"type": "Exit", "value": nil}}, "", nil
+		}
+		return []map[string]any{{"type": "Goto", "name": t}}, "", nil
 	case "exit":
 		return p.parseExit(rest)
 	case "rem":
 		return nil, "", nil
-	case "call", "setlocal", "endlocal", "shift", "pause", "start", "pushd", "popd":
+	case "call":
+		rest = strings.TrimSpace(rest)
+		if strings.HasPrefix(rest, ":") {
+			// call :label [args] — a subroutine call: exec the (sanitized)
+			// function name with the args; the estree runner binds them to
+			// %%1..%%9 via the positional array before running the body.
+			name, args := splitWord(rest[1:])
+			name = strings.ToLower(name)
+			words := []map[string]any{str(name)}
+			if a, err := splitWords(args, p.forVars); err != nil {
+				return nil, "", err
+			} else {
+				words = append(words, a...)
+			}
+			return []map[string]any{execStmt(words, "Emulable")}, "", nil
+		}
+		return nil, "", fmt.Errorf("unsupported: call <file> (v1.1 supports call :label only)")
+	case "setlocal", "endlocal", "shift", "pause", "start", "pushd", "popd":
 		return nil, "", fmt.Errorf("unsupported batch command %q (v1 subset)", strings.ToLower(word))
 	default:
 		// external command: batch builtin -> POSIX name mapping (names +

@@ -33,6 +33,13 @@ Shared (do NOT fork): `frontends/shir-emit-go/` (the A1 JSON emitter),
   unit step only; other steps refuse
 - `^` end-of-line continuation (v1.1) — joins the next non-empty line;
   comments are exempt; inline `^` escapes refuse
+- `call :label [args]` (v1.1) — subroutines: called labels are extracted
+  into A1 `Function` stmts (registered before the main flow; the estree
+  fnCall binds the args to %%1..%%9 via the positional array, the sh
+  renderer emits real `name() { ... return }` functions). `goto :eof` ->
+  Return inside a subroutine / Exit at top level. Distinct from `goto`
+  (jump-with-return vs jump): goto targets stay inline as Goto/Label.
+  `call other.bat` refuses (v1.1: only `call :label`).
 - `exit /b [N]` — the direct IrStmt::Exit statement (all backends render
   it: estree -> process.exit, sh -> exit, perl -> exit; the estree arm
   landed 2026-08-09)
@@ -55,9 +62,10 @@ Shared (do NOT fork): `frontends/shir-emit-go/` (the A1 JSON emitter),
 - `cmd1 & cmd2` statement separators
 
 Deliberately NOT in v1 (refuse loud, documented as worker items):
-- `call`, `setlocal`/`endlocal`, `shift`, `pause`, `start`, `pushd`/`popd`,
-  `set /p`, `for /d /r`, `for /f` with skip=/eol=/usebackq or token sets
-  not starting at 1, `|` pipes, delayed expansion `!var!`, `%cmdline%`
+- `call other.bat`, `setlocal`/`endlocal`, `shift`, `pause`, `start`,
+  `pushd`/`popd`, `set /p`, `for /d /r`, `for /f` with skip=/eol=/usebackq
+  or token sets not starting at 1, `|` pipes, delayed expansion `!var!`,
+  `%cmdline%`
 
 ## Semantics notes
 
