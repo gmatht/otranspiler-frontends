@@ -752,6 +752,17 @@ func exprNeedsTemp(e *expr) bool {
 // / Str / nested Bin). Runtime reads are stored into a fresh temp var
 // (`t = <read>`, appended to `out`) and the operand becomes Var(t).
 func arithOperand(e *expr, params []string, out *[]any) any {
+	if e == nil {
+		return map[string]any{"type": "Num", "value": 0}
+	}
+	if e.kind == "bin" {
+		// recurse into the operands — only the runtime-READ subtrees
+		// become temps (`*x = *x + 1`: the deref is temped, the arith
+		// stays structural)
+		return map[string]any{"type": "Bin", "op": e.op,
+			"lhs": arithOperand(e.l, params, out),
+			"rhs": arithOperand(e.r, params, out)}
+	}
 	if !exprNeedsTemp(e) {
 		// plain exprs lower through arithNode (Num / Var / Bin) — the
 		// Arith grammar's own shapes, NOT the shell-store getVar calls
@@ -832,7 +843,17 @@ func userStmtsA1(stmts []*uStmt, params []string, ptrs map[string]string) []any 
 			}
 			// `*p = v` — memStore through the handle (writes the shell
 			// var / array element the pointer points at)
-			rhs := userExprA1(s.e, params)
+			var rhs any
+			if s.op == "=" && exprNeedsTemp(s.e) {
+				// a plain `*p = <rhs>` whose RHS READS memory
+				// (`*p = *p + 1` — the read+write out-param idiom): the read
+				// goes through a temp (the A1 Arith AST has no Call node —
+				// the memLoad is a runtime call), so the store value is an
+				// Arith over the temp
+				rhs = map[string]any{"type": "Arith", "ast": arithOperand(s.e, params, &out)}
+			} else {
+				rhs = userExprA1(s.e, params)
+			}
 			if s.op != "=" {
 				// `*p += v` — load the element into a temp, add, store
 				// (the A1 Arith grammar has no Call node)
@@ -1088,6 +1109,23 @@ func foldConst(e *expr, env map[string]string) (string, bool) {
 			return foldConst(e.args[0], env)
 		}
 		return "", false
+	case "preinc", "predec":
+		// ++i / --i — the expression's VALUE is the NEW value (prefix)
+		v, ok := env[e.name]
+		if !ok {
+			return "", false
+		}
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return "", false
+		}
+		if e.kind == "preinc" {
+			n++
+		} else {
+			n--
+		}
+		env[e.name] = strconv.FormatInt(n, 10)
+		return env[e.name], true
 	case "call":
 		return foldCallConst(e, env)
 	case "bin":
@@ -1816,6 +1854,26 @@ func (p *parser) unaryExpr() (*expr, error) {
 		// operates on int32, matching C's `int` ~)
 		return &expr{kind: "bin", op: "^", l: e, r: &expr{kind: "num", num: "-1"}}, nil
 	}
+	if p.isOp("++") || p.isOp("--") {
+		// ++i / --i — PREFIX increment/decrement in EXPRESSION position
+		// (the value is the NEW value; hoisted to an increment statement
+		// + the plain var read at the statement level — see
+		// hoistArithCalls / hoistCondReads). Statements and for headers
+		// lower directly (simpleAssign / forHeaderAssign).
+		op := p.next().text
+		e, err := p.unaryExpr()
+		if err != nil {
+			return nil, err
+		}
+		if e == nil || e.kind != "id" {
+			refuse("prefix ++/-- on non-variables is not in the subset")
+		}
+		kind := "preinc"
+		if op == "--" {
+			kind = "predec"
+		}
+		return &expr{kind: kind, name: e.name}, nil
+	}
 	if p.isOp("*") {
 		p.next()
 		e, err := p.unaryExpr()
@@ -1841,7 +1899,13 @@ func (p *parser) primary() (*expr, error) {
 	case "chr":
 		p.next()
 		if len(t.text) != 1 {
-			refuse("multi-char literals are not in the v2 subset (a C char literal is an int; the subset models the 1-char string form)")
+			// multi-char literal: C packs the bytes big-endian into an
+			// int (implementation-defined; GCC: 'ab' = 0x6162)
+			v := 0
+			for i := 0; i < len(t.text); i++ {
+				v = v*256 + int(t.text[i])
+			}
+			return &expr{kind: "num", num: strconv.Itoa(v)}, nil
 		}
 		return &expr{kind: "str", num: t.text}, nil
 	case "id":
@@ -2268,8 +2332,27 @@ func (p *parser) hoistArithCalls(e *expr, out *[]any, top bool) *expr {
 			e.args[0] = p.hoistArithCalls(e.args[0], out, false)
 		}
 		return e
+	case "deref", "index":
+		// a memory read inside arithmetic — hoisted to a temp (the A1
+		// Arith AST has no Call node; the memLoad/arrayIndex is the value)
+		return p.hoistToTemp(e, out)
+	case "preinc", "predec":
+		// ++i / --i — the value is the NEW value: emit the increment
+		// statement, replace with the plain var read
+		op := "+"
+		if e.kind == "predec" {
+			op = "-"
+		}
+		inc := &expr{kind: "bin", op: op, l: &expr{kind: "id", name: e.name}, r: &expr{kind: "num", num: "1"}}
+		*out = append(*out, assignStmt(e.name, valueNode(inc)))
+		return &expr{kind: "id", name: e.name}
 	case "cond":
-		e.l = p.hoistArithCalls(e.l, out, false)
+		// the TEST (e.l) may hold runtime value reads the test-string
+		// grammar cannot express — hoist them via the cond-read walker
+		// first; the branches hoist arith-calls as usual
+		if condValueRead(e.l) {
+			e.l = p.hoistCondReads(e.l, out)
+		}
 		e.r = p.hoistArithCalls(e.r, out, false)
 		if len(e.args) > 0 {
 			e.args[0] = p.hoistArithCalls(e.args[0], out, false)
@@ -2348,6 +2431,117 @@ func condNeedsArith(e *expr) bool {
 		return true
 	}
 	return false
+}
+
+// splitMidBreaks — a case body's `break`s, split against the merged
+// fallthrough tail (`rest`):
+//   - a TRAILING bare break ends the arm — it (and nothing else) drops,
+//     `rest` is NOT merged (no fallthrough);
+//   - a GUARDED mid-arm break (`if (c) break;` — possibly block-wrapped)
+//     keeps the guard with an EMPTY then (a true guard exits the switch
+//     by skipping everything) and wraps the REMAINDER (the rest of this
+//     body + the merged next-arm) in the guard's ELSE (a false guard
+//     falls through — the C fallthrough semantics);
+//   - a BARE mid-arm break makes the rest unreachable (C) — dropped.
+//
+// Nested-loop breaks are inside While stmts and never seen here (they
+// bind to their own loop).
+func splitMidBreaks(body, rest []any) []any {
+	for i, st := range body {
+		m, ok := st.(map[string]any)
+		if !ok {
+			continue
+		}
+		if m["type"] == "Expr" {
+			if e, ok2 := m["expr"].(map[string]any); ok2 && e["func"] == "break" {
+				// trailing or bare mid break: drop it and the rest
+				return body[:i]
+			}
+		}
+		if m["type"] == "If" {
+			then, _ := m["then"].([]any)
+			if len(then) == 1 {
+				if b2, ok2 := then[0].(map[string]any); ok2 {
+					// unwrap a Block wrapper: `if (c) { break; }`
+					if bl, ok3 := b2["body"].([]any); ok3 && b2["type"] == "Block" && len(bl) == 1 {
+						b2 = bl[0].(map[string]any)
+					}
+					if te, ok3 := b2["expr"].(map[string]any); ok3 && b2["type"] == "Expr" && te["func"] == "break" {
+						// guarded break: the else carries the remainder
+						rem := append(append([]any{}, body[i+1:]...), rest...)
+						m["then"] = []any{}
+						m["else"] = splitMidBreaks(rem, []any{})
+						return append(append([]any{}, body[:i]...), m)
+					}
+				}
+			}
+		}
+	}
+	// no breaks: fall through into the merged tail
+	return append(append([]any{}, body...), rest...)
+}
+
+// condValueRead — does a CONDITION expression contain a runtime VALUE
+// read (deref / index / call / prefix-inc) that the test-string and
+// arith-string grammars cannot express? Such reads are hoisted to temps
+// (hoistCondReads) so the remaining condition lowers through condCall.
+func condValueRead(e *expr) bool {
+	if e == nil {
+		return false
+	}
+	switch e.kind {
+	case "deref", "index", "preinc", "predec", "cond":
+		return true
+	case "call":
+		// ANY call in a condition is hoisted (even a foldable one — the
+		// test-string grammar has no call node; the folded constant rides
+		// the temp)
+		return true
+	case "bin", "un":
+		return condValueRead(e.l) || condValueRead(e.r) || (len(e.args) > 0 && condValueRead(e.args[0]))
+	}
+	return false
+}
+
+// hoistCondReads — rewrite a CONDITION expression, replacing every
+// runtime value read with a temp var (the temp assignment appended to
+// `out`); the rewritten condition is expressible in the test/arith
+// grammars (comparisons over the temps). A `cond` (ternary) in a test
+// position is hoisted whole — its value is a runtime call.
+func (p *parser) hoistCondReads(e *expr, out *[]any) *expr {
+	if e == nil {
+		return e
+	}
+	switch e.kind {
+	case "deref", "index":
+		return p.hoistToTemp(e, out)
+	case "preinc", "predec":
+		// ++i in a condition: increment first, test the new value
+		op := "+"
+		if e.kind == "predec" {
+			op = "-"
+		}
+		inc := &expr{kind: "bin", op: op, l: &expr{kind: "id", name: e.name}, r: &expr{kind: "num", num: "1"}}
+		*out = append(*out, assignStmt(e.name, valueNode(inc)))
+		return &expr{kind: "id", name: e.name}
+	case "call":
+		return p.hoistToTemp(e, out)
+	case "cond":
+		e.l = p.hoistCondReads(e.l, out)
+		e.r = p.hoistCondReads(e.r, out)
+		if len(e.args) > 0 {
+			e.args[0] = p.hoistCondReads(e.args[0], out)
+		}
+		return p.hoistToTemp(e, out)
+	case "bin", "un":
+		e.l = p.hoistCondReads(e.l, out)
+		e.r = p.hoistCondReads(e.r, out)
+		if len(e.args) > 0 {
+			e.args[0] = p.hoistCondReads(e.args[0], out)
+		}
+		return e
+	}
+	return e
 }
 
 // condCall — the A1 condition for `if`/`while`/...: the test-string
@@ -2829,7 +3023,18 @@ func (p *parser) stmt() (any, error) {
 				}
 			}
 		}
-		return map[string]any{"cond": condCall(c), "then": thenB, "elsifs": []any{}, "else": elseB, "type": "If"}, nil
+		// runtime value reads in the condition (deref / index / call /
+		// prefix-inc) are hoisted to temps — the test-string grammar
+		// cannot express them (single evaluation — fine for an if)
+		var condTemps []any
+		if condValueRead(c) {
+			c = p.hoistCondReads(c, &condTemps)
+		}
+		ifStmt := map[string]any{"cond": condCall(c), "then": thenB, "elsifs": []any{}, "else": elseB, "type": "If"}
+		if len(condTemps) > 0 {
+			return map[string]any{"body": append(condTemps, ifStmt), "type": "Block"}, nil
+		}
+		return ifStmt, nil
 	case p.isId("while"):
 		p.next()
 		if err := p.expectOp("("); err != nil {
@@ -2845,6 +3050,27 @@ func (p *parser) stmt() (any, error) {
 		b, err := p.stmtOrBlock()
 		if err != nil {
 			return nil, err
+		}
+		if condValueRead(c) {
+			// the condition needs RUNTIME reads: the temps must refresh
+			// every iteration, so the loop becomes
+			//   while (1) { temps; if (!cond) break; body }
+			// — the If's else arm runs the shell BREAK signal the runtime
+			// while loop catches.
+			var condTemps []any
+			c = p.hoistCondReads(c, &condTemps)
+			guard := map[string]any{
+				"body": append(append([]any{}, condTemps...), map[string]any{
+					"cond":   condCall(c),
+					"then":   []any{},
+					"elsifs": []any{},
+					"else":   []any{map[string]any{"type": "Expr", "expr": call("break", []any{})}},
+					"type":   "If",
+				}),
+				"type": "Block",
+			}
+			body := append([]any{guard}, b...)
+			return map[string]any{"cond": testCall("1"), "body": body, "type": "While"}, nil
 		}
 		return map[string]any{"cond": condCall(c), "body": b, "type": "While"}, nil
 	case p.isId("for"):
@@ -2908,7 +3134,26 @@ func (p *parser) stmt() (any, error) {
 		}
 		condStmt := testCall("1")
 		if cond != nil {
-			condStmt = condCall(cond)
+			if condValueRead(cond) {
+				// the cond needs runtime reads — the While gets the
+				// refresh-and-guard structure (the body includes the
+				// update, so the temps refresh before the cond check)
+				var condTemps []any
+				cond = p.hoistCondReads(cond, &condTemps)
+				guard := map[string]any{
+					"body": append(append([]any{}, condTemps...), map[string]any{
+						"cond":   condCall(cond),
+						"then":   []any{},
+						"elsifs": []any{},
+						"else":   []any{map[string]any{"type": "Expr", "expr": call("break", []any{})}},
+						"type":   "If",
+					}),
+					"type": "Block",
+				}
+				body = append([]any{guard}, body...)
+			} else {
+				condStmt = condCall(cond)
+			}
 		}
 		var out []any
 		if init != nil {
@@ -3004,6 +3249,13 @@ func (p *parser) stmt() (any, error) {
 			return nil, fmt.Errorf("expected case/default in switch at token %v", p.peek())
 		}
 		p.next() // }
+		// a runtime-read DISCRIMINANT (`switch (*p)`) is hoisted into a
+		// temp once, before the dispatch chain (the test-string grammar
+		// cannot express the read)
+		var discTemps []any
+		if condValueRead(disc) {
+			disc = p.hoistCondReads(disc, &discTemps)
+		}
 		// lower: the case ARMS are merged for FALLTHROUGH first (C
 		// semantics — a case body that does NOT end with a break runs the
 		// next case's arm too; the shared-body `case 1: case 2: body`
@@ -3014,15 +3266,7 @@ func (p *parser) stmt() (any, error) {
 		arms := make([][]any, len(cases))
 		var nextArm []any = defBody
 		for i := len(cases) - 1; i >= 0; i-- {
-			b := cases[i].body
-			if cases[i].endsWithBreak {
-				arms[i] = b
-			} else {
-				merged := make([]any, 0, len(b)+len(nextArm))
-				merged = append(merged, b...)
-				merged = append(merged, nextArm...)
-				arms[i] = merged
-			}
+			arms[i] = splitMidBreaks(cases[i].body, nextArm)
 			nextArm = arms[i]
 		}
 		elseB := defBody
@@ -3033,6 +3277,9 @@ func (p *parser) stmt() (any, error) {
 		}
 		if len(cases) == 0 {
 			return nil, nil
+		}
+		if len(discTemps) > 0 {
+			return map[string]any{"body": append(discTemps, elseB[0]), "type": "Block"}, nil
 		}
 		return elseB[0], nil
 	case p.isId("do"):
@@ -3061,9 +3308,26 @@ func (p *parser) stmt() (any, error) {
 		// do b while (c) → b; while (c) b — the A1 While is pre-test and
 		// DoWhile has no ESTree lowering in the core, so the body
 		// duplication is the faithful form (the body has no declarations
-		// whose scope the duplication would break in the v1 subset)
+		// whose scope the duplication would break in the v1 subset). A
+		// cond needing runtime reads gets the refresh-and-guard While.
 		body := append([]any{}, b...)
-		body = append(body, map[string]any{"cond": condCall(c), "body": append([]any{}, b...), "type": "While"})
+		if condValueRead(c) {
+			var condTemps []any
+			c = p.hoistCondReads(c, &condTemps)
+			guard := map[string]any{
+				"body": append(append([]any{}, condTemps...), map[string]any{
+					"cond":   condCall(c),
+					"then":   []any{},
+					"elsifs": []any{},
+					"else":   []any{map[string]any{"type": "Expr", "expr": call("break", []any{})}},
+					"type":   "If",
+				}),
+				"type": "Block",
+			}
+			body = append(body, map[string]any{"cond": testCall("1"), "body": append([]any{guard}, append([]any{}, b...)...), "type": "While"})
+		} else {
+			body = append(body, map[string]any{"cond": condCall(c), "body": append([]any{}, b...), "type": "While"})
+		}
 		return map[string]any{"body": body, "type": "Block"}, nil
 	case p.isId("struct"):
 		return p.structDecl()
@@ -3619,10 +3883,13 @@ func (p *parser) stmtOrBlock() ([]any, error) {
 // loop to signal (a break inside a loop INSIDE the case stays — it is
 // not at the case's top level).
 func (p *parser) caseBody() ([]any, bool, error) {
-	// the bool: did the body END with a `break`? (A trailing break is
-	// stripped — the if-chain arm ends there; a body WITHOUT one falls
-	// through to the next case's arm, C semantics — the switch lowering
-	// merges the arms.)
+	// the bool: did the body END with a `break`? A break stays an Expr in
+	// the body — the switch lowering splits it: a trailing one ends the
+	// arm (no fallthrough), a GUARDED mid-arm one (`if (c) break;`) wraps
+	// the remainder in the guard's else (a true guard skips the merged
+	// rest — the C exit-switch semantics the old strip could not
+	// express), and a bare mid one drops the unreachable rest. Nested-
+	// loop breaks bind to their own while — never the switch.
 	var out []any
 	endedWithBreak := false
 	for {
@@ -3656,6 +3923,7 @@ func (p *parser) caseBody() ([]any, bool, error) {
 		}
 		if m, ok := s.(map[string]any); ok && m["type"] == "Expr" {
 			if e, ok := m["expr"].(map[string]any); ok && e["func"] == "break" {
+				out = append(out, s)
 				endedWithBreak = true
 				continue
 			}

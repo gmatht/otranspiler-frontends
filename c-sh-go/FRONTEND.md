@@ -2,6 +2,52 @@
 
 C source -> A1 shIR JSON (the shell-flavored subset of C).
 
+## v4 — the last refused rung (2026-08-10), 79/79
+
+The five documented refusals that remained after v3, each pinned by a
+stdout example (t75–t79):
+
+- **Runtime VALUE reads in CONDITIONS** (deref / index / call / prefix-
+  inc inside `if`/`while`/`for`/`switch` conditions): hoisted to temps.
+  An `if` hoists once (Block[temps, If]); a `while`/`for`/`do-while`
+  whose cond needs reads becomes the refresh-and-guard structure
+  `while (1) { temps; if (!cond) break; body }` — the cond must
+  re-evaluate per iteration, so the temps refresh at the top of each
+  (the while-header cond is emitted before the body). A foldable call
+  (`twice(3)`) is hoisted too — the test-string grammar has no call
+  node. `switch (*p)` hoists the discriminant once. t75: array-max
+  loop, `while (*q < 3)` walk, call in cond.
+- **Prefix `++i` / `--i` in EXPRESSION position**: the value is the NEW
+  value — hoisted to an increment statement + the plain var read at the
+  statement level (printf args, decl inits, compound RHS, and inside
+  conditions). t76: `printf("%d", ++x + 1)`, `int y = ++x;`,
+  `while (++i < 3)`.
+- **Multi-char literals** `'ab'`: C packs the bytes big-endian into an
+  int (GCC 'ab' = 0x6162). Single chars stay the 1-char string form.
+  t77.
+- **Read+write out-params** (`void bump(int *x) { *x = *x + 1; }`): the
+  frontend lowers the RHS memory read through a temp (arithOperand now
+  recurses into bins — only the read subtree temps), and the transform
+  treats a read+write write-param as IN-OUT: it keeps its input
+  position (only write-ONLY params shift later positions), the caller
+  passes the current value, the function's load reads it, and the new
+  value comes back via the echo channel. t78: bump + addout(&v, 5).
+- **Switch mid-arm breaks** (`case 1: if (c) break; rest;`): a guarded
+  mid-arm break keeps its guard with an EMPTY then and wraps the
+  REMAINDER of the merged arm (the rest of this case + the fallthrough
+  tail) in the guard's ELSE — a true guard exits the switch by skipping
+  everything, a false guard falls through (C fallthrough). Trailing
+  breaks still end the arm; bare mid-breaks drop the unreachable rest.
+  (The Goto/Label route was tried first — the shared RestructureGoto
+  pass handles one goto per label and removes it, so multiple
+  break-gotos to one switch-end label panic the renderer.) t79.
+
+Still refused (honest): char ORDERING comparisons (`c < 'b'` — the test
+grammar has no string ordering and char values are strings), pointer
+ADVANCE on array-derived pointers (`q++` where `q = &a[1]` — the
+ptrTarget model is compile-time; heap pointers advance fine),
+`int a, b;` with pointer declarators.
+
 ## v3 — mem-slice-2 + multi-return + the next rung (2026-08-10), 74/74
 
 Three stacked work items, each pinned by a testdata stdout example
@@ -94,12 +140,9 @@ stdout example (t58–t68):
   index — the mem-arena offset becomes a runtime arith call (the
   arena/element-size seam was already runtime-side).
 
-Still refused (honest, refuse > guess): calls/ternary inside TEST
-operands (`*p < 5` — a value read in a condition; lower to a temp),
-prefix ++/-- in EXPRESSION position (`x = ++i` — statements and for
-headers work), multi-char literals, `int a, b;` with pointers,
-multi-return with read+write pointer params, switch mid-arm breaks,
-char ordering comparisons (`c < 'b'`).
+Still refused (honest, refuse > guess): char ordering comparisons
+(`c < 'b'`), pointer advance on array-derived pointers (`q++` where
+`q = &a[1]`), `int a, b;` with pointer declarators.
 
 ## v1 subset (the refusal wall the v2 idioms crossed)
 

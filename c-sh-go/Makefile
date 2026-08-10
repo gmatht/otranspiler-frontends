@@ -26,11 +26,11 @@ $(DEBASHC):
 	cd $(abspath ../../sh2perl) && cargo build --bin debashc
 
 test: build $(DEBASHC)
-	@for f in testdata/*.c; do \
+	@rm -rf $(abspath .gate-tmp) && mkdir -p $(abspath .gate-tmp) && for f in testdata/*.c; do \
 	  bn=$$(basename $$f); \
-	  ./c-sh-go --shir $$f --raw > /tmp/$$bn.mine 2>/dev/null || { echo "FAIL $$bn (frontend emit)"; exit 1; }; \
-	  python3 $(abspath ../../harness/outparam_to_returns.py) < /tmp/$$bn.mine > /tmp/$$bn.out.json 2>/dev/null && mv /tmp/$$bn.out.json /tmp/$$bn.mine; \
-	  if $(DEBASHC) --shir-in-estree /tmp/$$bn.mine > /dev/null 2>&1; then \
+	  ./c-sh-go --shir $$f --raw > $(abspath .gate-tmp)/$$bn.mine 2>/dev/null || { echo "FAIL $$bn (frontend emit)"; exit 1; }; \
+	  python3 $(abspath ../../harness/outparam_to_returns.py) < $(abspath .gate-tmp)/$$bn.mine > $(abspath .gate-tmp)/$$bn.out.json 2>/dev/null && mv $(abspath .gate-tmp)/$$bn.out.json $(abspath .gate-tmp)/$$bn.mine; \
+	  if $(DEBASHC) --shir-in-estree $(abspath .gate-tmp)/$$bn.mine > /dev/null 2>&1; then \
 	    echo "OK $$bn (valid A1 shIR — the core deserializer accepts it)"; \
 	  else \
 	    echo "FAIL $$bn (emit is not valid A1 shIR — the gap the worker fixes)"; \
