@@ -300,6 +300,8 @@ For each language L with an idiomatic source-rendering backend:
    thread) → **C** (cheap grammar) → defer **C++** (very hard) and
    **Perl** (pure-ANTLR infeasible — context-dependent lexing; best
    semantic fit, hand-rolled parser if ever).
+   *C++ is no longer deferred: see `CPP_PLAN.md` (tree-sitter-based
+   C/C++ frontend, separate from the ANTLR fleet).*
 4. Curated behavioral corpora per backend language (layer 4) as backends
    land.
 

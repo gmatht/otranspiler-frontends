@@ -1,4 +1,8 @@
 # Is shIR adequate for C++ and Rust? — an investigation
+#
+# **This verdict is the boundary.** `CPP_PLAN.md` is the *pursuit* plan built
+# on it: parse full C and full C++14+ with tree-sitter, lower the expressible
+# subset (~3/40 features here), refuse the rest cleanly on the AST.
 
 **Verdict: no, not as currently designed.** The IR is a *shell-domain* representation:
 the nodes model shell programs (commands, redirections, expansions, env

@@ -15,11 +15,24 @@ fail_count=0
 while true; do
   bash "$WORKSPACE/setup_backends.sh" --wait >> "$LOG" 2>&1 || true
   echo "[$(date +%FT%T)] c-sh-go: gate run" >> "$LOG"
-  if make test >> "$LOG" 2>&1; then
+  # c-requests first: implement pending cpp-sh-go -> shared-lowering
+  # requests (CPP_PLAN §4). pi runs scoped to this dir; the gate below
+  # validates, and on green the requests move to c-requests/done/.
+  pending=$(ls "$WORKSPACE"/c-requests/*.md 2>/dev/null | grep -v '/done/' || true)
+  if [ -n "$pending" ]; then
+    echo "[$(date +%FT%T)] c-sh-go: implementing c-requests ($(echo "$pending" | wc -l) pending)" >> "$LOG"
+    bash "$WORKSPACE/setup_backends.sh" --pi-fix-c-requests >> "$LOG" 2>&1 || true
+  fi
+  if bash "$WORKSPACE/run-gate.sh" c-sh-go test >> "$LOG" 2>&1; then
     fail_count=0
+    # on green, close implemented requests (the cpp worker re-validates
+    # its own corpus on its next cycle)
+    for r in "$WORKSPACE"/c-requests/*.md; do
+      [ -f "$r" ] && mv "$r" "$WORKSPACE/c-requests/done/" 2>/dev/null || true
+    done
     changes=$(git -C "$WORKSPACE" status --porcelain 2>/dev/null \
               | awk '/^.. /{print $2}' \
-              | awk -v d="$(pwd)" '$0 ~ "^"d || $0 ~ /^harness\// || $0 ~ /^templates\// || $0 ~ /^frontends\/c-sh-go/ || true')
+              | awk -v d="$(pwd)" '$0 ~ "^"d || $0 ~ /^harness\// || $0 ~ /^templates\// || $0 ~ /^frontends\/c-sh-go/ || $0 ~ /^c-requests\// || true')
     if [ -n "$changes" ]; then
       git -C "$WORKSPACE" add $changes 2>/dev/null || true
       git -C "$WORKSPACE" commit -m "frontend c-sh-go: gate green" >> "$LOG" 2>&1 || true

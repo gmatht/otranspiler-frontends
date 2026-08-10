@@ -1,5 +1,13 @@
 # Plan: ANTLR + Go frontends (supersedes the earlier Rust plan)
 
+> **C/C++ exception:** the ANTLR architecture covers every frontend EXCEPT
+> C/C++ — the ANTLR C++ grammar ecosystem is frozen at C++14 (see
+> `CPP_PLAN.md`, which replaces the ANTLR path for C/C++ with a
+> tree-sitter-based frontend: one runtime, tree-sitter-c + tree-sitter-cpp,
+> one shared walker, shipped as a self-contained wasm). The rest of this
+> plan (shir-emit-go, worker scaffolding, `go test` verification) is
+> unchanged.
+
 **Status:** The earlier `plan-antlr-rust.md` proposed Rust frontends
 ("match the core's language"). The user correctly challenged that:
 the frontends don't have to match the core's *language* — they have
