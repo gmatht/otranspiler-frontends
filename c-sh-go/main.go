@@ -892,6 +892,24 @@ func userStmtsA1(stmts []*uStmt, params []string, ptrs map[string]string) []any 
 				"cond": userExprA1(s.e, params),
 				"body": userStmtsA1(s.body, params, ptrs),
 			})
+		case "seq":
+			// a comma-separated declaration list (flattened into assigns)
+			out = append(out, userStmtsA1(s.body, params, ptrs)...)
+		case "for":
+			// for (init; cond; step) body — the init assign, then a While
+			// whose body appends the step at its end
+			if s.init != nil {
+				out = append(out, userStmtsA1([]*uStmt{s.init}, params, ptrs)...)
+			}
+			body := s.body
+			if s.step != nil {
+				body = append(append([]*uStmt{}, s.body...), s.step)
+			}
+			out = append(out, map[string]any{
+				"type": "While",
+				"cond": userExprA1(s.e, params),
+				"body": userStmtsA1(body, params, ptrs),
+			})
 		case "ret":
 			out = append(out, map[string]any{
 				"type":  "Return",
@@ -945,11 +963,13 @@ var userFuncs = map[string]*userFunc{}
 // uStmt — a user-function body statement (the mini-AST the literal-arg
 // fold interprets; see foldUserBody).
 type uStmt struct {
-	kind    string // assign | while | ret | skip | exec | derefstore | ptrinc
+	kind    string // assign | while | if | ret | skip | exec | derefstore | ptrinc | seq | for
 	name    string // assign target / deref pointer / ptrinc var
 	op      string // "=" | "+=" | "-="  (ptrinc: "++" | "--")
-	e       *expr  // assign rhs / while cond / return expr / deref rhs
-	body    []*uStmt
+	e       *expr  // assign rhs / while cond / return expr / deref rhs / for cond
+	body    []*uStmt // while body / if then-arm / for body / seq items
+	init    *uStmt   // for: the loop initializer (an assign)
+	step    *uStmt   // for: the loop step (an assign)
 	a1      any  // a raw A1 statement (exec-carrier kind)
 	ptrPost bool // derefstore: `*p++ = v` — advance the pointer after the store
 }
@@ -4045,30 +4065,48 @@ func (p *parser) userStmt() (*uStmt, error) {
 		}
 		return &uStmt{kind: "ret", e: e}, nil
 	case p.isId("int") || p.isId("char") || p.isId("double") || p.isId("float") || p.isId("va_list"):
-		// a local declaration: `int s = 0;` / `va_list ap;`
+		// a local declaration: `int s = 0;` / `va_list ap;` — and
+		// comma-separated names: `int i, j, t;` (a "seq" of assigns)
 		p.next()
 		for p.isOp("*") {
 			p.next()
 		}
-		nm := p.next()
-		if nm == nil || nm.kind != "id" {
-			return nil, fmt.Errorf("expected identifier in declaration")
-		}
-		if p.isOp("=") {
-			p.next()
-			e, err := p.expr()
-			if err != nil {
-				return nil, err
+		var seq []*uStmt
+		for {
+			nm := p.next()
+			if nm == nil || nm.kind != "id" {
+				return nil, fmt.Errorf("expected identifier in declaration")
 			}
-			if err := p.expectOp(";"); err != nil {
-				return nil, err
+			if p.isOp("=") {
+				p.next()
+				e, err := p.expr()
+				if err != nil {
+					return nil, err
+				}
+				seq = append(seq, &uStmt{kind: "assign", name: nm.text, op: "=", e: e})
+			} else {
+				// uninitialized local — emit `x = ""` so the store owns it
+				// and later reads lower as store reads (a never-written
+				// name would render as "" — the runtime-only writers like
+				// getLine("b") are invisible to the static never-written
+				// analysis).
+				seq = append(seq, &uStmt{kind: "assign", name: nm.text, op: "=", e: &expr{kind: "str", num: ""}})
 			}
-			return &uStmt{kind: "assign", name: nm.text, op: "=", e: e}, nil
+			if !p.isOp(",") {
+				break
+			}
+			p.next() // ,
+			for p.isOp("*") {
+				p.next()
+			}
 		}
 		if err := p.expectOp(";"); err != nil {
 			return nil, err
 		}
-		return &uStmt{kind: "skip"}, nil
+		if len(seq) == 1 {
+			return seq[0], nil
+		}
+		return &uStmt{kind: "seq", body: seq}, nil
 	case p.isId("printf"):
 		// printf(...) in a function body — the same execPrintf lowering
 		// the main body uses, carried as a raw A1 stmt.
@@ -4107,6 +4145,78 @@ func (p *parser) userStmt() (*uStmt, error) {
 		}
 		p.next()
 		return &uStmt{kind: "skip"}, nil
+	case p.isId("for"):
+		// for (init; cond; step) body — a `while` with a pre-assign and
+		// a step appended to the body's end (`i = 0; while (i < n) { …;
+		// i = i + 1; }`). init/step are assignments in the v1 subset.
+		p.next()
+		if err := p.expectOp("("); err != nil {
+			return nil, err
+		}
+		var init *uStmt
+		if !p.isOp(";") {
+			nm := p.next()
+			if nm == nil || nm.kind != "id" {
+				return nil, fmt.Errorf("expected assignment in for-initializer")
+			}
+			if !p.isOp("=") && !p.isOp("+=") && !p.isOp("-=") {
+				return nil, fmt.Errorf("expected assignment in for-initializer")
+			}
+			op := p.next().text
+			e, err := p.expr()
+			if err != nil {
+				return nil, err
+			}
+			init = &uStmt{kind: "assign", name: nm.text, op: op, e: e}
+		}
+		if err := p.expectOp(";"); err != nil {
+			return nil, err
+		}
+		var cond *expr
+		if !p.isOp(";") {
+			var err error
+			cond, err = p.expr()
+			if err != nil {
+				return nil, err
+			}
+		}
+		if err := p.expectOp(";"); err != nil {
+			return nil, err
+		}
+		var step *uStmt
+		if !p.isOp(")") {
+			nm := p.next()
+			if nm == nil || nm.kind != "id" {
+				return nil, fmt.Errorf("expected assignment in for-step")
+			}
+			if !p.isOp("=") && !p.isOp("+=") && !p.isOp("-=") {
+				return nil, fmt.Errorf("expected assignment in for-step")
+			}
+			op := p.next().text
+			e, err := p.expr()
+			if err != nil {
+				return nil, err
+			}
+			step = &uStmt{kind: "assign", name: nm.text, op: op, e: e}
+		}
+		if err := p.expectOp(")"); err != nil {
+			return nil, err
+		}
+		var body []*uStmt
+		if p.isOp("{") {
+			var err error
+			body, err = p.userBlock()
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			one, err := p.userStmt()
+			if err != nil {
+				return nil, err
+			}
+			body = []*uStmt{one}
+		}
+		return &uStmt{kind: "for", e: cond, body: body, init: init, step: step}, nil
 	case p.isId("while"):
 		p.next()
 		if err := p.expectOp("("); err != nil {
