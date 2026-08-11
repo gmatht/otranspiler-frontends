@@ -1,0 +1,12 @@
+# rust-frontend — Rust source -> A1 shIR JSON (the sh2perl frontend contract).
+# syn-based (stable crates.io parser, no nightly/rustc-dev), offline build
+# against the workspace's cached registry.
+[package]
+name = "rust-frontend"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+syn = { version = "=2.0.119", features = ["full"] }
+proc-macro2 = { version = "=1.0.107", features = ["span-locations"] }
+serde_json = "=1.0.151"
