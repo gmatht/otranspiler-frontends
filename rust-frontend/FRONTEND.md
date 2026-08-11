@@ -33,7 +33,8 @@ Expressible (each pinned by a testdata/*.rs stdout example, t01–t12):
   grammar `-eq -ne -lt -le -gt -ge`), `&&`/`||` (-> `-a`/`-o`, binding
   order matches Rust), `!`, parens; operands are variables or integer
   literals
-- bare `return;` (no-op in main) and bare `x;` (no-op) are dropped
+- bare `return;` lowers to the A1 `Exit` statement (it ENDS the program —
+  not a no-op; regression t25) and bare `x;` (no-op) is dropped
 
 Refused loudly (testdata/*_refuse.rs — the emit MUST fail, t13–t23):
 borrows `&x`, user functions, `String::from`/method calls, `match`,
