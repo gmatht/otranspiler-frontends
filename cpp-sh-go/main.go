@@ -5,9 +5,14 @@
 // c-sh-go `clib` package is a Go-module dependency, and this package is
 // the C++-only surface on top of it:
 //
-//   1. a tiny C++ tokenizer (string/char/comment/preprocessor safe)
-//   2. C++-only keyword REFUSAL (REFUSE > GUESS — templates, classes,
-//      std::/::, exceptions, coroutines, concepts, modules, references…)
+//   1. tree-sitter-cpp IS the parser (parser.go): the whole file parses
+//      (GLR error tolerance), and a whitelist walker REFUSES any NAMED
+//      node outside the expressible set — node-level refusal
+//      (REFUSE > GUESS — template_declaration, class_specifier,
+//      qualified_identifier, reference_declarator, placeholder_type_
+//      specifier, try_statement, …) with kind + line, never a lexer choke
+//   2. a tiny C++ tokenizer (string/char/comment/preprocessor safe) —
+//      demoted to C-text reconstruction for clib, no longer the parser
 //   3. a bounded DESUGAR of the expressible C++ surface onto C:
 //        bool / true / false / nullptr → int / 1 / 0 / 0
 //        new T[N] / new T              → malloc(N * sizeof(T)) / malloc(sizeof(T))
@@ -17,11 +22,9 @@
 //      the oracle (CPP_PLAN §5), and the C corpus staying green is the
 //      cpp gate's hard invariant.
 //
-// The hand-rolled tokenizer is the PROVISIONAL parser: CPP_PLAN §1–§2
-// replaces it with tree-sitter (tree-sitter-c / tree-sitter-cpp, one
-// shared walker, shipped as a self-contained wasm) when the full-C/C++
-// grammar work lands. This layer's job is to prove the split, the shared
-// emitter, and the gate today.
+// The wasm packaging (a self-contained tree-sitter wasm binary, CPP_PLAN
+// §2) stays deferred; this is the native Go + cgo tree-sitter adoption
+// (CPP_PLAN Session 1 shape), one walker for CLI and gate.
 package cppshgo
 
 import (
@@ -31,9 +34,10 @@ import (
 	clib "github.com/gmatht/sh2loop/frontends/c-sh-go"
 )
 
-// C++-only keywords that have NO C correspondence — refuse loudly
-// (REFUSE > GUESS), never guess. The value is the reason shown to the
-// user, so a refusal reads as a decision, not a parse failure.
+// C++-only keywords have NO C correspondence. Refusal now happens at
+// the tree-sitter NODE level (parser.go whitelist) — this map is kept
+// as documentation of the refused surface, mirrored by the refuse pins
+// in testdata_cpp/.
 var refuseKeywords = map[string]string{
 	"template":          "templates",
 	"class":             "classes (use struct for data-only)",
@@ -178,23 +182,11 @@ func isIdChar(c byte) bool  { return isIdStart(c) || c >= '0' && c <= '9' }
 
 // ── the C++-only surface: refuse + desugar ──────────────────────
 
-// translate runs the refusal scan and the desugar over the token
-// stream, returning the C-flavored token stream.
+// translate runs the DESUGAR over the token stream (the refusal scan
+// moved to parser.go — tree-sitter owns node-level refusal now),
+// returning the C-flavored token stream.
 func translate(toks []tok) ([]tok, error) {
-	// 1. REFUSE — scan every token; C++-only keywords error loudly.
-	for _, t := range toks {
-		if t.kind == "id" {
-			if why, bad := refuseKeywords[t.text]; bad {
-				return nil, fmt.Errorf("unsupported C++: %s (%s)", t.text, why)
-			}
-		}
-		if t.kind == "op" {
-			if why, bad := refuseKeywords[t.text]; bad {
-				return nil, fmt.Errorf("unsupported C++: %s (%s)", t.text, why)
-			}
-		}
-	}
-	// 2. DESUGAR — the expressible C++ surface, bounded and pinned by
+	// DESUGAR — the expressible C++ surface, bounded and pinned by
 	//    testdata. Every rule below has a testdata_cpp/ example.
 	var out []tok
 	i := 0
@@ -327,6 +319,11 @@ func reassemble(toks []tok) string {
 // exposes): C++ source → A1 shIR JSON bytes. The C++-only surface is
 // applied here; the shared lowering is clib.Shir, untouched.
 func Shir(src string) ([]byte, error) {
+	// tree-sitter is the parser: node-level refusal (REFUSE > GUESS) —
+	// the whole file parses, then unsupported NAMED nodes refuse here.
+	if err := treeCheck(src); err != nil {
+		return nil, err
+	}
 	toks, err := lex(src)
 	if err != nil {
 		return nil, err

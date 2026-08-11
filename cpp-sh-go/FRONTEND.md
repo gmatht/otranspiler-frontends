@@ -9,9 +9,15 @@ harness/* (shared test infra).
 
 ## The split (CPP_PLAN §3)
 
-- `main.go` — the C++-only surface: a provisional tokenizer (the
-  tree-sitter parser replaces it when the full-C/C++ grammar lands), the
-  C++-only keyword REFUSAL table, and a bounded DESUGAR onto C:
+- `parser.go` — **tree-sitter-cpp IS the parser**: the whole file
+  parses (GLR error tolerance), and a whitelist walker REFUSES any
+  NAMED node outside the expressible set (node-level refusal,
+  REFUSE > GUESS — `template_declaration`, `class_specifier`,
+  `qualified_identifier`, `reference_declarator`, `placeholder_type_specifier`,
+  `try_statement`, `->`, syntax errors — with kind + line).
+- `main.go` — the C++-only surface: a tokenizer demoted to C-text
+  reconstruction for clib (string/char/comment/preprocessor-safe), and
+  a bounded DESUGAR onto C:
   - `bool`/`true`/`false`/`nullptr` → `int`/`1`/`0`/`0`
   - `new T[N]`/`new T` → `malloc(N * sizeof(T))`/`malloc(sizeof(T))`
   - `delete[] p`/`delete p` → `free(p)`
@@ -20,6 +26,10 @@ harness/* (shared test infra).
   through `c-requests/` (see the channel at the workspace root).
 - Emit is `clib.Shir` — the A1 JSON is byte-equivalent to the C
   frontend's on the expressible subset (the oracle).
+
+The wasm packaging (CPP_PLAN §2: a self-contained tree-sitter wasm
+binary for browser C/C++ source support) stays deferred; this is the
+native Go + cgo tree-sitter adoption (CPP_PLAN Session 1 shape).
 
 ## v0.1 subset (REFUSE > GUESS)
 
