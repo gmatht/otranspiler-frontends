@@ -34,11 +34,30 @@ Grounding facts (verified 2026-08-10):
 
 ## 2. Parser choice
 
-Hand-rolled tokenizer for v1 (the c-sh-go precedent — `main.go` is a
-hand-rolled lexer/parser). Zig's grammar is small, and the v1 subset is
-smaller. Upgrade path: tree-sitter-zig (like CPP_PLAN §1's tree-sitter-cpp
-argument — error tolerance converts "choked at the token stream" into
-"parsed the file, refused this node"), adopted when the subset needs it.
+**tree-sitter-zig** (`tree-sitter-grammars/tree-sitter-zig` — the official
+org grammar, 41★, 2023–2025). Empirically verified 2026-08-11 by building
+the grammar and parsing the full v1 construct surface: **15/15 parse clean**
+— `std.debug.print`/`.{…}`, fn/arith, if/else-if, while (+`:(update)`), for
+(range + items), defer, pointers (`x.*`, `&x`), slices (`s[0]`, `s.len`),
+switch, comptime consts, `@intCast`, error unions, optionals, comments,
+array literals. (The first probe "failed" 8/14 — those fragments were
+INVALID Zig, not grammar gaps: bare if/while/defer at top level are
+illegal and Zig has no `/* */` comments; valid programs parse clean.)
+
+Fleet unification: tree-sitter-c (386★) + tree-sitter-cpp (445★) +
+tree-sitter-zig all load into ONE parser runtime — the CPP_PLAN "two
+grammars, one runtime" becomes three, one Go binding
+(smacker/go-tree-sitter, cgo), one walker discipline (parse the whole
+file, refuse this node). The one caveat: last push 2025-09 (~11 months
+stale vs zig 0.16.0 installed) — low-risk for the stable C-compatible
+subset; the v1 testdata doubles as the grammar's regression corpus, and
+a grammar update that breaks a pinned construct fails the gate.
+
+The hand-rolled tokenizer (this plan's first draft) is dropped: the
+tokenizer is NOT where Zig's difficulty lives, and the grammar's GLR
+error tolerance converts "choked at the token stream" into "parsed the
+file, refused this node" — the honest discipline the frontends are built
+on (CPP_PLAN §1).
 
 ## 3. The split (mirror CPP_PLAN §3)
 
