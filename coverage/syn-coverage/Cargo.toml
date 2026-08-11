@@ -1,0 +1,8 @@
+# syn-coverage — which syn AST node kinds do our Rust examples exercise?
+[package]
+name = "syn-coverage"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+syn = { version = "=2.0.119", features = ["full", "visit", "extra-traits"] }

@@ -29,6 +29,7 @@ while true; do
       git -C "$WORKSPACE" commit -m "frontend fish-sh-go: gate green" >> "$LOG" 2>&1 || true
     fi
     echo "[$(date +%FT%T)] fish-sh-go: gate GREEN" >> "$LOG"
+    bash "$WORKSPACE/frontends/coverage/worker-coverage-step.sh" fish-sh-go "$LOG" >> "$LOG" 2>&1 || true
   else
     fail_count=$((fail_count+1))
     echo "[$(date +%FT%T)] fish-sh-go: gate FAILED ($fail_count/3) — invoking pi" >> "$LOG"

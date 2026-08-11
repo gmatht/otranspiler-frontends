@@ -1,0 +1,79 @@
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t01_echo.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t01_literal.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t02_assign_str.sh
+ERR /home/llm/sh2loop/frontends/posix-sh-go/testdata/t02_control.sh (2 errors)
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t03_assign_num.sh
+ERR /home/llm/sh2loop/frontends/posix-sh-go/testdata/t03_pipeline.sh (3 errors)
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t04_params.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t04_print_var.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t05_env_read.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t06_two_vars.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t07_reassign.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t08_comment.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t09_quoted_space.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t10_multi_stmt.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t11_external_cmd.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t12_multi_word_echo.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t13_interp.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t14_arith_add.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t15_arith_mul.sh
+ERR /home/llm/sh2loop/frontends/posix-sh-go/testdata/t16_if_cond.sh (3 errors)
+ERR /home/llm/sh2loop/frontends/posix-sh-go/testdata/t17_if_else.sh (4 errors)
+ERR /home/llm/sh2loop/frontends/posix-sh-go/testdata/t18_elif_chain.sh (7 errors)
+ERR /home/llm/sh2loop/frontends/posix-sh-go/testdata/t19_while_loop.sh (2 errors)
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t20_for_list.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t21_array.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t22_func_def.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t23_func_args.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t24_str_cat.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t25_num_cmp.sh
+ERR /home/llm/sh2loop/frontends/posix-sh-go/testdata/t26_str_cmp.sh (3 errors)
+ERR /home/llm/sh2loop/frontends/posix-sh-go/testdata/t27_not_expr.sh (3 errors)
+ERR /home/llm/sh2loop/frontends/posix-sh-go/testdata/t28_and_or.sh (4 errors)
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t29_increment.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t30_ternary.sh
+ERR /home/llm/sh2loop/frontends/posix-sh-go/testdata/t31_case_switch.sh (6 errors)
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t32_redirect.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t33_pipe.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t34_cmdsub.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t35_exit_code.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t36_read_stdin.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t37_substring.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t38_strlen.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t39_arrlen.sh
+ERR /home/llm/sh2loop/frontends/posix-sh-go/testdata/t40_nested_loop.sh (4 errors)
+ERR /home/llm/sh2loop/frontends/posix-sh-go/testdata/t41_local_var.sh (2 errors)
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t42_global_mut.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t43_heredoc.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t44_background.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t45_env_set.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t46_printf.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t47_multi_assign.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t48_accum.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t49_empty_check.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t50_file_test.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t51_arith_loop.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t52_full_prog.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t53_param_default.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t54_str_subst.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t55_array_elem.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t56_array_append.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t57_array_len.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t58_seq_range.sh
+ERR /home/llm/sh2loop/frontends/posix-sh-go/testdata/t59_until.sh (2 errors)
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t60_contains.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t61_while_read.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t62_word_split.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t63_array_split.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t64_prefix_suffix.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t66_array_slice.sh
+ERR /home/llm/sh2loop/frontends/posix-sh-go/testdata/t68_case_glob.sh (10 errors)
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t69_brace.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t70_unset.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t71_true_false.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t72_arith_parens.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t73_str_cond.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t74_file_test.sh
+OK  /home/llm/sh2loop/frontends/posix-sh-go/testdata/t75_arith_compound.sh
+ERR /home/llm/sh2loop/frontends/posix-sh-go/testdata/t76_case_alt.sh (1 errors)
+COVERAGE posix: 63/78 = 80.8%

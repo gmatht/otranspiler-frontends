@@ -1,0 +1,532 @@
+OK  /home/llm/sh2loop/sh2perl/examples/000__02_output_formatting_commands.sh
+OK  /home/llm/sh2loop/sh2perl/examples/000__03_file_manipulation_commands.sh
+ERR /home/llm/sh2loop/sh2perl/examples/000__04a_basic_command_substitution.sh (4 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/000__04b_file_directory_operations.sh
+OK  /home/llm/sh2loop/sh2perl/examples/000__04c_text_processing_commands.sh
+OK  /home/llm/sh2loop/sh2perl/examples/000__04d_system_utilities.sh
+OK  /home/llm/sh2loop/sh2perl/examples/000__04e_file_manipulation.sh
+OK  /home/llm/sh2loop/sh2perl/examples/000__04f_output_formatting.sh
+OK  /home/llm/sh2loop/sh2perl/examples/000__04g_checksum_commands.sh
+ERR /home/llm/sh2loop/sh2perl/examples/000__04h_complex_examples.sh (8 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/000__05_system_utilities.sh
+OK  /home/llm/sh2loop/sh2perl/examples/000__06_text_processing_commands.sh
+OK  /home/llm/sh2loop/sh2perl/examples/000__07_find_path_commands.sh
+ERR /home/llm/sh2loop/sh2perl/examples/001_simple.sh (2 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/002_control_flow.sh (7 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/003_pipeline.sh
+OK  /home/llm/sh2loop/sh2perl/examples/004_test_quoted.sh
+OK  /home/llm/sh2loop/sh2perl/examples/005_args.sh
+OK  /home/llm/sh2loop/sh2perl/examples/006_misc.sh
+OK  /home/llm/sh2loop/sh2perl/examples/007_cat_EOF.sh
+OK  /home/llm/sh2loop/sh2perl/examples/008_simple_backup.sh
+OK  /home/llm/sh2loop/sh2perl/examples/009_arrays.sh
+ERR /home/llm/sh2loop/sh2perl/examples/010_pattern_matching.sh (4 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/011_brace_expansion.sh
+ERR /home/llm/sh2loop/sh2perl/examples/012_process_substitution.sh (17 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/013_parameter_expansion.sh
+OK  /home/llm/sh2loop/sh2perl/examples/014_ansi_quoting.sh
+OK  /home/llm/sh2loop/sh2perl/examples/015_grep_advanced.sh
+OK  /home/llm/sh2loop/sh2perl/examples/016_grep_basic.sh
+OK  /home/llm/sh2loop/sh2perl/examples/017_grep_context.sh
+OK  /home/llm/sh2loop/sh2perl/examples/018_grep_params.sh
+ERR /home/llm/sh2loop/sh2perl/examples/019_grep_regex.sh (2 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/020_ansi_quoting_basic.sh
+OK  /home/llm/sh2loop/sh2perl/examples/021_ansi_quoting_escape.sh
+OK  /home/llm/sh2loop/sh2perl/examples/022_ansi_quoting_unicode.sh
+OK  /home/llm/sh2loop/sh2perl/examples/023_ansi_quoting_practical.sh
+OK  /home/llm/sh2loop/sh2perl/examples/024_parameter_expansion_case.sh
+OK  /home/llm/sh2loop/sh2perl/examples/025_parameter_expansion_advanced.sh
+OK  /home/llm/sh2loop/sh2perl/examples/026_parameter_expansion_more.sh
+OK  /home/llm/sh2loop/sh2perl/examples/027_parameter_expansion_defaults.sh
+OK  /home/llm/sh2loop/sh2perl/examples/028_arrays_indexed.sh
+OK  /home/llm/sh2loop/sh2perl/examples/029_arrays_associative.sh
+OK  /home/llm/sh2loop/sh2perl/examples/030_control_flow_if.sh
+ERR /home/llm/sh2loop/sh2perl/examples/031_control_flow_loops.sh (6 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/032_control_flow_function.sh (3 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/033_brace_expansion_basic.sh
+OK  /home/llm/sh2loop/sh2perl/examples/034_brace_expansion_advanced.sh
+OK  /home/llm/sh2loop/sh2perl/examples/035_brace_expansion_practical.sh
+ERR /home/llm/sh2loop/sh2perl/examples/036_pattern_matching_basic.sh (1 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/037_pattern_matching_extglob.sh (2 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/038_pattern_matching_nocase.sh (1 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/039_process_substitution_here.sh (2 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/040_process_substitution_comm.sh (4 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/041_process_substitution_mapfile.sh (3 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/042_process_substitution_advanced.sh (8 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/043_home.sh
+ERR /home/llm/sh2loop/sh2perl/examples/045_shell_calling_perl.sh (3 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/046_cd..sh
+ERR /home/llm/sh2loop/sh2perl/examples/047_for_arithematic.sh (2 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/048_subprocess.sh (2 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/049_local.sh (2 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/050_test_ls_star_dot_sh.sh
+ERR /home/llm/sh2loop/sh2perl/examples/051_primes.sh (7 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/054_fibonacci.sh (4 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/055_factorize.sh (7 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/056_send_args.sh
+ERR /home/llm/sh2loop/sh2perl/examples/057_case.sh (42 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/058_advanced_bash_idioms.sh (53 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/059_issue3.sh (3 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/060_issue5.sh
+ERR /home/llm/sh2loop/sh2perl/examples/061_test_local_names_preserved.sh (15 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/062_01_ambiguous_operators.sh
+OK  /home/llm/sh2loop/sh2perl/examples/062_02_complex_parameter_expansions.sh
+ERR /home/llm/sh2loop/sh2perl/examples/062_03_complex_heredocs.sh (1 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/062_04_nested_arithmetic.sh
+OK  /home/llm/sh2loop/sh2perl/examples/062_05_nested_command_substitution.sh
+OK  /home/llm/sh2loop/sh2perl/examples/062_06_process_substitution.sh
+OK  /home/llm/sh2loop/sh2perl/examples/062_07_complex_brace_expansion.sh
+ERR /home/llm/sh2loop/sh2perl/examples/062_08_simple_case.sh (5 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/062_09_complex_function.sh (4 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/062_10_simple_pipeline.sh
+OK  /home/llm/sh2loop/sh2perl/examples/062_11_mixed_arithmetic.sh
+OK  /home/llm/sh2loop/sh2perl/examples/062_12_complex_string_interpolation.sh
+OK  /home/llm/sh2loop/sh2perl/examples/062_13_simple_test_expressions.sh
+OK  /home/llm/sh2loop/sh2perl/examples/062_14_complex_array_operations.sh
+ERR /home/llm/sh2loop/sh2perl/examples/062_15_complex_local_variables.sh (4 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/062_hard_to_lex.sh (14 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/063_01_deeply_nested_arithmetic.sh
+OK  /home/llm/sh2loop/sh2perl/examples/063_02_complex_array_assignments.sh
+OK  /home/llm/sh2loop/sh2perl/examples/063_03_nested_command_substitutions.sh
+OK  /home/llm/sh2loop/sh2perl/examples/063_04_complex_parameter_expansion.sh
+ERR /home/llm/sh2loop/sh2perl/examples/063_05_heredoc_with_complex_content.sh (2 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/063_06_complex_pipeline_background.sh (4 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/063_07_nested_if_statements.sh (5 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/063_08_complex_case_statement.sh (11 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/063_09_complex_function_parameter_handling.sh (15 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/063_10_complex_for_loop.sh
+ERR /home/llm/sh2loop/sh2perl/examples/063_11_complex_while_loop.sh (15 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/063_12_complex_eval.sh
+ERR /home/llm/sh2loop/sh2perl/examples/063_13_nested_subshells.sh (5 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/063_14_complex_redirects.sh (4 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/063_15_complex_function_definition.sh (2 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/063_16_complex_test_expressions.sh
+OK  /home/llm/sh2loop/sh2perl/examples/063_17_nested_brace_expansion.sh
+ERR /home/llm/sh2loop/sh2perl/examples/063_18_complex_here_string.sh (3 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/063_19_complex_function_call.sh
+ERR /home/llm/sh2loop/sh2perl/examples/063_20_final_complex_construct.sh (9 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/063_hard_to_parse.sh (87 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/064_01_complex_nested_subshells.sh (6 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/064_02_nested_brace_expansions.sh
+OK  /home/llm/sh2loop/sh2perl/examples/064_03_complex_parameter_expansion.sh
+OK  /home/llm/sh2loop/sh2perl/examples/064_04_extended_glob_patterns.sh
+ERR /home/llm/sh2loop/sh2perl/examples/064_05_complex_case_statement.sh (8 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/064_06_nested_arithmetic_expressions.sh (4 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/064_07_complex_array_operations.sh
+ERR /home/llm/sh2loop/sh2perl/examples/064_08_heredocs_with_variable_interpolation.sh (2 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/064_09_process_substitution_pipeline.sh (4 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/064_10_nested_function_definitions.sh (4 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/064_11_complex_test_expressions.sh (5 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/064_12_brace_expansion_nested_sequences.sh (2 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/064_13_complex_string_manipulation.sh
+OK  /home/llm/sh2loop/sh2perl/examples/064_14_nested_command_substitution_arithmetic.sh
+OK  /home/llm/sh2loop/sh2perl/examples/064_15_complex_pipeline_multiple_redirects.sh
+ERR /home/llm/sh2loop/sh2perl/examples/064_16_function_complex_argument_handling.sh (5 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/064_17_complex_while_loop_nested_conditionals.sh (9 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/064_18_array_slicing_manipulation.sh
+ERR /home/llm/sh2loop/sh2perl/examples/064_19_complex_pattern_matching_extended_globs.sh (9 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/064_20_nested_subshells_environment_variables.sh (4 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/064_21_complex_string_interpolation_multiple_variables.sh
+ERR /home/llm/sh2loop/sh2perl/examples/064_22_function_returning_complex_data_structures.sh (2 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/064_23_complex_error_handling_traps.sh
+OK  /home/llm/sh2loop/sh2perl/examples/064_24_advanced_parameter_expansion.sh
+OK  /home/llm/sh2loop/sh2perl/examples/064_25_complex_command_chaining.sh
+ERR /home/llm/sh2loop/sh2perl/examples/064_hard_to_generate.sh (64 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/065_yes_head_while.sh (2 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/070_cmp_basic.sh (8 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/070_gnuisms_thorough.sh (8 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/071_while_ifs_read.sh
+OK  /home/llm/sh2loop/sh2perl/examples/072_background_fork.sh
+OK  /home/llm/sh2loop/sh2perl/examples/073_trap_signal.sh
+OK  /home/llm/sh2loop/sh2perl/examples/074_shopt.sh
+OK  /home/llm/sh2loop/sh2perl/examples/075_eval_complex.sh
+OK  /home/llm/sh2loop/sh2perl/examples/076_brace_expansion_mixed.sh
+ERR /home/llm/sh2loop/sh2perl/examples/077_backslash_continuation.sh (1 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/078_arithmetic_double_paren.sh (4 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/079_heredoc_interpolation.sh
+OK  /home/llm/sh2loop/sh2perl/examples/080_process_sub_pipeline.sh
+ERR /home/llm/sh2loop/sh2perl/examples/081_nested_functions.sh (2 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/082_sort_locale.sh
+ERR /home/llm/sh2loop/sh2perl/examples/083_process_sub_missing_files.sh (4 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/084_while_pipeline.sh
+OK  /home/llm/sh2loop/sh2perl/examples/086_if_condition_pipe.sh
+ERR /home/llm/sh2loop/sh2perl/examples/087_function_cmd_sub.sh (2 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/088_while_read_ifs_sort.sh
+OK  /home/llm/sh2loop/sh2perl/examples/089_for_in_arith.sh
+ERR /home/llm/sh2loop/sh2perl/examples/090_nested_if_else.sh (7 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/091_while_pipe_var.sh (2 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/092_for_arith_func.sh (7 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/093_case_esac.sh (6 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/094_until_loop.sh (2 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/095_select_menu.sh
+ERR /home/llm/sh2loop/sh2perl/examples/096_head_procsub.sh (3 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/100_pipeline_failure_basic.sh
+OK  /home/llm/sh2loop/sh2perl/examples/101_pipeline_failure_grep.sh
+OK  /home/llm/sh2loop/sh2perl/examples/102_pipeline_failure_sort.sh
+OK  /home/llm/sh2loop/sh2perl/examples/103_pipeline_failure_multi.sh
+OK  /home/llm/sh2loop/sh2perl/examples/104_pipeline_failure_var_capture.sh
+ERR /home/llm/sh2loop/sh2perl/examples/900_if2echo.sh (3 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/999_pwd.sh
+ERR /home/llm/sh2loop/sh2perl/examples/arith-ambiguous-double-paren.sh (3 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/arith-base-notation.sh (1 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/arith-postfix-status.sh
+OK  /home/llm/sh2loop/sh2perl/examples/arithmetic-bracket-old-syntax.sh
+ERR /home/llm/sh2loop/sh2perl/examples/arithmetic-equality.sh (4 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/arithmetic-var-ref.sh
+OK  /home/llm/sh2loop/sh2perl/examples/arithmetic-vs-command-subshell.sh
+ERR /home/llm/sh2loop/sh2perl/examples/array-assignment-variable-subscript.sh (1 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/array-subscript.sh
+ERR /home/llm/sh2loop/sh2perl/examples/assign-in-args.sh (1 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/at-in-test.sh (3 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/at-var-default.sh
+ERR /home/llm/sh2loop/sh2perl/examples/background-chain.sh (1 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/backslash-continuation-dollar-paren.sh
+OK  /home/llm/sh2loop/sh2perl/examples/backslash-continuation-in-dollar-paren.sh
+ERR /home/llm/sh2loop/sh2perl/examples/backslash-dollar-brace.sh (2 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/backslash-gt-test.sh (1 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/backslash-newline-dq.sh
+OK  /home/llm/sh2loop/sh2perl/examples/backtick-echo-single-quote.sh
+OK  /home/llm/sh2loop/sh2perl/examples/backtick-inside-comment.sh
+OK  /home/llm/sh2loop/sh2perl/examples/bash-keyword-arg.sh
+ERR /home/llm/sh2loop/sh2perl/examples/bc-native-capture.sh (2 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/bench-case.sh (2 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/bench-cmp.sh (2 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/bench-count.sh (2 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/bench-cut.sh
+OK  /home/llm/sh2loop/sh2perl/examples/bench-echo.sh
+OK  /home/llm/sh2loop/sh2perl/examples/bench-func.sh
+ERR /home/llm/sh2loop/sh2perl/examples/bench-increment.sh (2 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/bench-strlen.sh
+OK  /home/llm/sh2loop/sh2perl/examples/bench-strremove.sh
+OK  /home/llm/sh2loop/sh2perl/examples/bench-strsubst.sh
+OK  /home/llm/sh2loop/sh2perl/examples/bench-subshell.sh
+OK  /home/llm/sh2loop/sh2perl/examples/bench-substr.sh
+OK  /home/llm/sh2loop/sh2perl/examples/bin-echo-builtin.sh
+ERR /home/llm/sh2loop/sh2perl/examples/brace-close-after-subshell.sh (2 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/brace-expansion-error.sh
+ERR /home/llm/sh2loop/sh2perl/examples/brace-expansion-fail.sh (1 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/brace-inside-cmdsubst.sh
+OK  /home/llm/sh2loop/sh2perl/examples/brace-unbalanced.sh
+OK  /home/llm/sh2loop/sh2perl/examples/builtin-system-open3.sh
+OK  /home/llm/sh2loop/sh2perl/examples/capture-paren-with-eval.sh
+ERR /home/llm/sh2loop/sh2perl/examples/case-arithmetic-body.sh (1 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/case-command-subst-pattern.sh (4 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/case-double-semicolon.sh (1 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/case-nested-esac-semicolon.sh (9 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/case-pattern-dollar-paren.sh (4 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/case-pattern-empty-assign.sh (5 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/case-pattern-paren.sh (10 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/case-pattern-pipe-paren.sh (4 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/case-pattern-star-pipe.sh (4 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/cat-dash-stdin.sh
+ERR /home/llm/sh2loop/sh2perl/examples/cat-heredoc-pipeline.sh (2 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/cd-command-substitution.sh
+OK  /home/llm/sh2loop/sh2perl/examples/cd-in-qx.sh
+OK  /home/llm/sh2loop/sh2perl/examples/check-qx-aa-exec.sh
+OK  /home/llm/sh2loop/sh2perl/examples/check-qx-systemd-path.sh
+OK  /home/llm/sh2loop/sh2perl/examples/checkqx-open3-builtin.sh
+OK  /home/llm/sh2loop/sh2perl/examples/checkqx-qx-var-mv.sh
+OK  /home/llm/sh2loop/sh2perl/examples/checkqx-qx-var-rm.sh
+OK  /home/llm/sh2loop/sh2perl/examples/checkqx-qx-var-which.sh
+OK  /home/llm/sh2loop/sh2perl/examples/chmod-standalone.sh
+OK  /home/llm/sh2loop/sh2perl/examples/chown-standalone.sh
+OK  /home/llm/sh2loop/sh2perl/examples/chown-through-xargs.sh
+OK  /home/llm/sh2loop/sh2perl/examples/comment-like-in-string.sh
+OK  /home/llm/sh2loop/sh2perl/examples/comment-with-single-quotes.sh
+OK  /home/llm/sh2loop/sh2perl/examples/complex-command-substitution.sh
+OK  /home/llm/sh2loop/sh2perl/examples/complex-pipe-subshell.sh
+OK  /home/llm/sh2loop/sh2perl/examples/crlf-line-endings.sh
+OK  /home/llm/sh2loop/sh2perl/examples/declare-let-keyword.sh
+OK  /home/llm/sh2loop/sh2perl/examples/dollar-after-dollar.sh
+OK  /home/llm/sh2loop/sh2perl/examples/dollar-at-default-quoted.sh
+OK  /home/llm/sh2loop/sh2perl/examples/dollar-at-with-default.sh
+OK  /home/llm/sh2loop/sh2perl/examples/dollar-bang.sh
+OK  /home/llm/sh2loop/sh2perl/examples/dollar-followed-by-slash.sh
+OK  /home/llm/sh2loop/sh2perl/examples/dollar-minus.sh
+ERR /home/llm/sh2loop/sh2perl/examples/dollar-positional-arithmetic.sh (1 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/dollar-question-in-bracket.sh (2 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/dollar-question-in-test.sh
+OK  /home/llm/sh2loop/sh2perl/examples/dollar-question.sh
+OK  /home/llm/sh2loop/sh2perl/examples/double-bracket-and-chain.sh
+OK  /home/llm/sh2loop/sh2perl/examples/double-bracket-or-chained.sh
+OK  /home/llm/sh2loop/sh2perl/examples/double-bracket-or.sh
+OK  /home/llm/sh2loop/sh2perl/examples/double-bracket-pipeline.sh
+ERR /home/llm/sh2loop/sh2perl/examples/double-equals-in-test.sh (3 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/double-paren-subshell.sh
+ERR /home/llm/sh2loop/sh2perl/examples/double-quote-with-sed-inside.sh (1 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/dq-hashbang-multiline-assign.sh
+ERR /home/llm/sh2loop/sh2perl/examples/dqs-nested-awk-sed.sh (5 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/dqs-nested-dollar.sh
+OK  /home/llm/sh2loop/sh2perl/examples/echo-complex-pipeline.sh
+ERR /home/llm/sh2loop/sh2perl/examples/echo-hashbang-continuation.sh (1 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/echo-hashbang-in-function.sh (1 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/echo-in-qx.sh
+OK  /home/llm/sh2loop/sh2perl/examples/echo-with-escaped-backtick-and-quotes.sh
+OK  /home/llm/sh2loop/sh2perl/examples/echo-with-escaped-backtick.sh
+OK  /home/llm/sh2loop/sh2perl/examples/egrep-not-native.sh
+ERR /home/llm/sh2loop/sh2perl/examples/eq-string-num-var.sh (4 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/escaped-paren-command-subst.sh
+ERR /home/llm/sh2loop/sh2perl/examples/escaped-quote-midword.sh (1 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/escaped-singlequote-in-doublequote.sh (2 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/exitScript-after-test.sh (3 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/exitScript-function.sh
+OK  /home/llm/sh2loop/sh2perl/examples/for-loop-dollar-at.sh
+OK  /home/llm/sh2loop/sh2perl/examples/func-after-or-assign.sh
+OK  /home/llm/sh2loop/sh2perl/examples/func-after-test-or.sh
+OK  /home/llm/sh2loop/sh2perl/examples/function-space-paren.sh
+OK  /home/llm/sh2loop/sh2perl/examples/generator-system-echo-checkqx.sh
+OK  /home/llm/sh2loop/sh2perl/examples/gunzip_example.sh
+OK  /home/llm/sh2loop/sh2perl/examples/hash-in-var.sh
+OK  /home/llm/sh2loop/sh2perl/examples/heredoc-apostrophe-in-unquoted.sh
+OK  /home/llm/sh2loop/sh2perl/examples/heredoc-apostrophe-span.sh
+OK  /home/llm/sh2loop/sh2perl/examples/heredoc-apostrophe.sh
+ERR /home/llm/sh2loop/sh2perl/examples/heredoc-backtick-quote-span.sh (4 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/heredoc-binary-data.sh (3 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/heredoc-inside-dollar-paren.sh
+OK  /home/llm/sh2loop/sh2perl/examples/heredoc-parse-error.sh
+OK  /home/llm/sh2loop/sh2perl/examples/heredoc-python-fstring.sh
+ERR /home/llm/sh2loop/sh2perl/examples/heredoc-redirects-same-line.sh (1 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/heredoc-singlequote-span.sh (4 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/heredoc-subshell-redirects.sh
+OK  /home/llm/sh2loop/sh2perl/examples/heredoc-tabs.sh
+OK  /home/llm/sh2loop/sh2perl/examples/heredoc-unclosed.sh
+ERR /home/llm/sh2loop/sh2perl/examples/heredoc-with-braces.sh (5 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/heredoc-with-quotes.sh
+ERR /home/llm/sh2loop/sh2perl/examples/heredoc-with-redirect-same-line.sh (1 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/id-cmdsub.sh (6 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/interactive-test-minus-t.sh
+ERR /home/llm/sh2loop/sh2perl/examples/keyword-in-arg.sh (3 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/let-builtin.sh
+OK  /home/llm/sh2loop/sh2perl/examples/let-plusassign.sh
+OK  /home/llm/sh2loop/sh2perl/examples/lex-dot-in-var.sh
+ERR /home/llm/sh2loop/sh2perl/examples/lex-unexpected-qmark.sh (3 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/lexer-char-minus.sh (1 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/ln-symlink.sh
+ERR /home/llm/sh2loop/sh2perl/examples/local-declare-redirect.sh (4 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/longoption-consumes-quote.sh
+OK  /home/llm/sh2loop/sh2perl/examples/mixed-quoting.sh
+ERR /home/llm/sh2loop/sh2perl/examples/mul_xy.sh (2 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/multiline-assign.sh (2 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/multiline-dq-hashbang.sh (1 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/multiline-dq-string.sh
+ERR /home/llm/sh2loop/sh2perl/examples/multiple-awk-in-dqs.sh (7 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/nested-case-esac.sh (18 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/nested-heredoc-in-function.sh (2 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/nested-subshell-paren.sh
+OK  /home/llm/sh2loop/sh2perl/examples/not-negation.sh
+ERR /home/llm/sh2loop/sh2perl/examples/or-continue.sh (2 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/param-expand-default-operator.sh
+ERR /home/llm/sh2loop/sh2perl/examples/param-expand-hash-sameline.sh (4 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/param-expand-hash.sh (4 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/param-expand-hashhash.sh
+ERR /home/llm/sh2loop/sh2perl/examples/param-expand-multiline.sh (4 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/param-expand-question.sh
+ERR /home/llm/sh2loop/sh2perl/examples/parameter-expansion-nested.sh (1 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/parameter-expansion-pattern.sh
+ERR /home/llm/sh2loop/sh2perl/examples/parse-and-or-chain-with-assign.sh (2 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/parse-arithmetic-extra-paren.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-arithmetic-nested-array.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-array-assignment.sh
+ERR /home/llm/sh2loop/sh2perl/examples/parse-array-plusassign.sh (2 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/parse-at-slice-param.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-at-slice.sh
+ERR /home/llm/sh2loop/sh2perl/examples/parse-backslash-continuation.sh (3 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/parse-backslash-newline-in-string.sh
+ERR /home/llm/sh2loop/sh2perl/examples/parse-bare-quote-in-function.sh (4 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/parse-brace-close.sh (2 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/parse-brace-expansion.sh
+ERR /home/llm/sh2loop/sh2perl/examples/parse-brace-in-heredoc.sh (3 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/parse-braceclose-unexpected.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-bracket-chain.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-bracket-subshell-pipe.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-bracket-unexpected.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-break-or.sh
+ERR /home/llm/sh2loop/sh2perl/examples/parse-builtin-keywords-in-case-body.sh (1 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/parse-case-dollarparen-pattern.sh (3 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/parse-case-doublesemicolon.sh (5 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/parse-case-paren-pattern.sh (3 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/parse-case-quoted-pattern.sh (5 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/parse-case-subject-complex.sh (6 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/parse-cd-command-subst.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-command-subst-in-test.sh
+ERR /home/llm/sh2loop/sh2perl/examples/parse-comment-in-brace.sh (8 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/parse-comment-in-dollar-paren.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-complex-pipeline-quotes.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-complex-sed-in-dollarparen.sh
+ERR /home/llm/sh2loop/sh2perl/examples/parse-complex-test-parens.sh (9 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/parse-crlf-shebang.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-db-status-fmt.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-default-value-no-colon.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-default-value-plain-dash.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-dollar-at-default.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-dollar-at-end-of-line.sh
+ERR /home/llm/sh2loop/sh2perl/examples/parse-dollar-brace-hash-hash.sh (3 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/parse-dollar-end-of-string.sh
+ERR /home/llm/sh2loop/sh2perl/examples/parse-dollar-in-arithmetic.sh (2 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/parse-dollar-in-param-expand.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-dollar-keyword-var.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-dollar-paren-or.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-dollar-paren-pipe.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-dollar-single-quote.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-dollars-in-string.sh
+ERR /home/llm/sh2loop/sh2perl/examples/parse-done-unexpected.sh (2 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/parse-dot-after-var.sh
+ERR /home/llm/sh2loop/sh2perl/examples/parse-double-bracket-char-class.sh (3 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/parse-double-bracket-newline.sh (1 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/parse-double-bracket-or-after-heredoc.sh (2 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/parse-double-bracket-or.sh
+ERR /home/llm/sh2loop/sh2perl/examples/parse-double-semicolon-in-case.sh (4 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/parse-double-semicolon.sh (5 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/parse-doublequote-unexpected.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-ef-test-operator.sh
+ERR /home/llm/sh2loop/sh2perl/examples/parse-empty-assign-doublesemicolon.sh (1 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/parse-equals-in-variable.sh
+ERR /home/llm/sh2loop/sh2perl/examples/parse-error-block-in-pipeline.sh (3 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/parse-error-case-bracket.sh (4 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/parse-error-dollar-question-in-regex.sh (2 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/parse-error-doublesemicolon.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-error-escaped-dollar.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-error-export-empty.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-error-regex-lookbehind.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-error-test-semicolon.sh
+ERR /home/llm/sh2loop/sh2perl/examples/parse-escaped-backtick-case.sh (5 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/parse-escaped-quote-in-param-expansion.sh
+ERR /home/llm/sh2loop/sh2perl/examples/parse-eval-multiline.sh (6 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/parse-exit-brace-question.sh (1 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/parse-for-fi-keyword.sh (3 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/parse-function-parentheses-newline.sh (3 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/parse-glob-question-in-arg.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-heredoc-apostrophe.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-heredoc-before-eof.sh
+ERR /home/llm/sh2loop/sh2perl/examples/parse-heredoc-dollar-at.sh (8 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/parse-heredoc-dollar-paren.sh
+ERR /home/llm/sh2loop/sh2perl/examples/parse-heredoc-dqs-backtick-question.sh (4 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/parse-heredoc-eof-unexpected.sh (3 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/parse-heredoc-hash-in-brace.sh
+ERR /home/llm/sh2loop/sh2perl/examples/parse-heredoc-in-if.sh (3 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/parse-heredoc-or-dangling.sh (2 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/parse-heredoc-paren.sh (2 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/parse-heredoc-redirect-chain.sh (1 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/parse-heredoc-tab.sh
+ERR /home/llm/sh2loop/sh2perl/examples/parse-herestring.sh (2 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/parse-hex-number-argument.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-hexnumber-in-arg.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-invalid-redirect.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-lexer-dollar.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-longoption-with-dollar.sh
+ERR /home/llm/sh2loop/sh2perl/examples/parse-multi-command-while-condition.sh (3 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/parse-multiline-single-quote.sh (2 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/parse-multiline-string.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-nested-arithmetic.sh
+ERR /home/llm/sh2loop/sh2perl/examples/parse-or-continuation.sh (3 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/parse-orelse-continuation.sh (1 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/parse-param-pattern-match.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-parameter-expansion-eof.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-parameter-pattern.sh
+ERR /home/llm/sh2loop/sh2perl/examples/parse-paren-after-do.sh (1 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/parse-paren-close.sh
+ERR /home/llm/sh2loop/sh2perl/examples/parse-posix-case-paren.sh (3 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/parse-question-mark.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-quoted-awk-in-subshell.sh
+ERR /home/llm/sh2loop/sh2perl/examples/parse-redirect-clobber.sh (1 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/parse-redirect-in-case-body.sh (4 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/parse-redirect-in-case-pattern.sh (4 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/parse-redirect-samefile.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-return-after-if.sh
+ERR /home/llm/sh2loop/sh2perl/examples/parse-return-and.sh (2 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/parse-return-or.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-return-pipe.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-samefile-operator.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-single-quote-in-arg.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-singlequote-comment.sh
+ERR /home/llm/sh2loop/sh2perl/examples/parse-singlequote-unexpected.sh (1 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/parse-source-in-test.sh (2 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/parse-sq-awk-cmd.sh (4 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/parse-sq-awk-while.sh (5 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/parse-sq-multiline-awk.sh (4 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/parse-sq-with-for.sh (5 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/parse-sq-with-while.sh (5 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/parse-standalone-redirect.sh
+ERR /home/llm/sh2loop/sh2perl/examples/parse-star-case-pattern.sh (1 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/parse-substring-double-colon.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-substring-expansion.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-test-or.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-test-semicolon.sh
+ERR /home/llm/sh2loop/sh2perl/examples/parse-test-with-source.sh (3 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/parse-unexpected-braceclose.sh (1 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/parse-unexpected-end-of-input.sh (1 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/parse-unexpected-parenclose.sh (1 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/parse-unterminated-heredoc.sh
+OK  /home/llm/sh2loop/sh2perl/examples/parse-variable-default-with-quotes.sh
+ERR /home/llm/sh2loop/sh2perl/examples/pid_tempfile.sh (1 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/pipeline-after-subshell.sh
+ERR /home/llm/sh2loop/sh2perl/examples/process-substitution.sh (4 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/ps-system-call.sh
+OK  /home/llm/sh2loop/sh2perl/examples/question-in-singlequote.sh
+OK  /home/llm/sh2loop/sh2perl/examples/question-param-expand.sh
+ERR /home/llm/sh2loop/sh2perl/examples/quoted-case-pattern.sh (1 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/qx-scalar-var-with-builtin.sh
+OK  /home/llm/sh2loop/sh2perl/examples/qx-sed-in-command-var.sh
+OK  /home/llm/sh2loop/sh2perl/examples/qx-uname-in-command-var.sh
+OK  /home/llm/sh2loop/sh2perl/examples/qx-var-builtin-cd.sh
+OK  /home/llm/sh2loop/sh2perl/examples/qx-var-builtin-echo.sh
+OK  /home/llm/sh2loop/sh2perl/examples/qx-var-builtin-sed.sh
+OK  /home/llm/sh2loop/sh2perl/examples/qx-var-builtin-uname.sh
+OK  /home/llm/sh2loop/sh2perl/examples/readlink_example.sh
+OK  /home/llm/sh2loop/sh2perl/examples/readlink_flags.sh
+OK  /home/llm/sh2loop/sh2perl/examples/readlink_relative.sh
+ERR /home/llm/sh2loop/sh2perl/examples/readonly-cmdsub.sh (24 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/realpath-cmdsub.sh (13 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/redirect-all.sh (3 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/redirect-in-arithmetic.sh (1 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/regex-brace-in-test.sh (3 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/regexpattern-eats-close-paren.sh
+ERR /home/llm/sh2loop/sh2perl/examples/return-double-semicolon.sh (6 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/rmdir-standalone.sh
+OK  /home/llm/sh2loop/sh2perl/examples/samefile-operator.sh
+OK  /home/llm/sh2loop/sh2perl/examples/sed-backtick.sh
+OK  /home/llm/sh2loop/sh2perl/examples/sed-redirect-to-qx.sh
+OK  /home/llm/sh2loop/sh2perl/examples/shopt-quiet-flag.sh
+ERR /home/llm/sh2loop/sh2perl/examples/single-quote-embed-escape.sh (2 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/single-quote-escape.sh
+OK  /home/llm/sh2loop/sh2perl/examples/singlequote-escape.sh
+OK  /home/llm/sh2loop/sh2perl/examples/sqs-overlap-multiline-awk.sh
+OK  /home/llm/sh2loop/sh2perl/examples/sqs-overlap-singleline.sh
+ERR /home/llm/sh2loop/sh2perl/examples/subshell-heredoc-close.sh (2 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/subshell-sed-squote-dquote.sh (5 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/system-call-builtin-echo.sh
+OK  /home/llm/sh2loop/sh2perl/examples/tail-standalone.sh
+OK  /home/llm/sh2loop/sh2perl/examples/test-bracket-command-sub.sh
+OK  /home/llm/sh2loop/sh2perl/examples/test-bracket-singlequote.sh
+OK  /home/llm/sh2loop/sh2perl/examples/test-bracket-unclosed.sh
+OK  /home/llm/sh2loop/sh2perl/examples/test-double-bracket.sh
+ERR /home/llm/sh2loop/sh2perl/examples/test-escaped-parens-in-function.sh (5 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/test-expr-backtick.sh (3 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/test-expr-colon.sh (3 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/test-expr-dollar-paren.sh (3 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/test-expr-float.sh (3 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/test-expr-long-option.sh (3 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/test-expr-pipe.sh
+ERR /home/llm/sh2loop/sh2perl/examples/test-expr-true.sh (3 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/test-expression-backslash-continuation.sh (5 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/test-operator-S.sh
+OK  /home/llm/sh2loop/sh2perl/examples/test-operator-missing.sh
+OK  /home/llm/sh2loop/sh2perl/examples/test_find.sh
+OK  /home/llm/sh2loop/sh2perl/examples/test_grep.sh
+OK  /home/llm/sh2loop/sh2perl/examples/test_perl_critic.sh
+ERR /home/llm/sh2loop/sh2perl/examples/test_simple_function.sh (2 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/test_system_builtin.sh
+ERR /home/llm/sh2loop/sh2perl/examples/tty-cmdsub.sh (27 errors)
+ERR /home/llm/sh2loop/sh2perl/examples/typeset-cmdsub.sh (2 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/uname-in-qx.sh
+OK  /home/llm/sh2loop/sh2perl/examples/unclosed-param-expansion.sh
+OK  /home/llm/sh2loop/sh2perl/examples/unicode-in-string.sh
+OK  /home/llm/sh2loop/sh2perl/examples/unmatched-brace.sh
+OK  /home/llm/sh2loop/sh2perl/examples/var-hash-pattern.sh
+OK  /home/llm/sh2loop/sh2perl/examples/variable-apostrophe-concat.sh
+OK  /home/llm/sh2loop/sh2perl/examples/variable-assignment-concatenated-string.sh
+OK  /home/llm/sh2loop/sh2perl/examples/variable-default-with-hash.sh
+OK  /home/llm/sh2loop/sh2perl/examples/variable-plus-operator.sh
+ERR /home/llm/sh2loop/sh2perl/examples/zsh-style-eval-redirect.sh (2 errors)
+OK  /home/llm/sh2loop/sh2perl/examples/zstd_example.sh
+COVERAGE posix: 314/531 = 59.1%

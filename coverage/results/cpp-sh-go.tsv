@@ -1,0 +1,13 @@
+EMIT	t01_hello.cc
+EMIT	t02_bool.cc
+EMIT	t03_new_delete.cc
+EMIT	t04_comment.cc
+EMIT	t05_arith_loop.cc
+EMIT	t06_struct.cc
+REFUSE	t07_template_refuse.cc
+REFUSE	t08_class_refuse.cc
+REFUSE	t09_std_refuse.cc
+PARSE-ERR	t10_ref_refuse.cc
+REFUSE	t11_auto_refuse.cc
+REFUSE	t12_exception_refuse.cc
+REFUSE	t13_newvar_refuse.cc

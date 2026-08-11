@@ -16,9 +16,12 @@ while true; do
             | awk -v d="$PWD" '$0 ~ "^"d || $0 ~ /^harness\//' || true)
   if [ -n "$changes" ]; then
     bash "$WORKSPACE/setup_backends.sh" --wait 2>>"$LOG" || true
-    make build >> "$LOG" 2>&1 && make test >> "$LOG" 2>&1
-    git -C "$WORKSPACE" add $changes 2>>"$LOG" || true
-    git -C "$WORKSPACE" commit -m "frontend bat-sh-go: build/fix" 2>>"$LOG" || true
+    if make build >> "$LOG" 2>&1 && make test >> "$LOG" 2>&1; then
+      git -C "$WORKSPACE" add $changes 2>>"$LOG" || true
+      git -C "$WORKSPACE" commit -m "frontend bat-sh-go: build/fix" 2>>"$LOG" || true
+      # parser-node coverage mode: green gate + uncovered nodes -> new example
+      bash "$WORKSPACE/frontends/coverage/worker-coverage-step.sh" bat-sh-go "$LOG" >> "$LOG" 2>&1 || true
+    fi
   fi
   sleep 300
 done
