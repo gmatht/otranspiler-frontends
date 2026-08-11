@@ -2,15 +2,15 @@
 // Mirrors shir.rs analyze_var_types (numeric_lift_vars / string_lift_vars)
 // and shir_json.rs program_json/expr_json/stmt_json.
 
-package main
+package zshlib
 
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 const contractVersion = 1
@@ -2206,6 +2206,410 @@ func analyzeVarLifetimes(stmts []Stmt) []VarLifetimeOut {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// var_bash_env (mirror analyze_var_bash_env): bash/zsh-identity variables
+// the program REFERENCES that the shell sets ITSELF at startup (never
+// inherited): HOSTNAME, BASH_VERSION, BASH_VERSINFO, ZSH_VERSION.
+// Detected from getVar("NAME") / param(op, NAME, …) calls in the lowered
+// IR. Sorted by name; serialized as the A1 `var_bash_env` list.
+// ─────────────────────────────────────────────────────────────────────
+
+func analyzeVarBashEnv(stmts []Stmt) []string {
+	found := map[string]bool{}
+	walkBashEnvStmts(stmts, found)
+	names := make([]string, 0, len(found))
+	for n := range found {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func isBashIdentity(name string) bool {
+	switch name {
+	case "HOSTNAME", "BASH_VERSION", "BASH_VERSINFO", "ZSH_VERSION":
+		return true
+	}
+	return false
+}
+
+func walkBashEnvStmts(stmts []Stmt, found map[string]bool) {
+	for _, st := range stmts {
+		switch t := st.(type) {
+		case *ExprS:
+			walkBashEnvExpr(t.Expr, found)
+		case *IfS:
+			walkBashEnvExpr(t.Cond, found)
+			walkBashEnvStmts(t.Then, found)
+			for _, e := range t.Elsifs {
+				if c, ok := e[0].(Expr); ok {
+					walkBashEnvExpr(c, found)
+				}
+				if b, ok := e[1].([]Stmt); ok {
+					walkBashEnvStmts(b, found)
+				}
+			}
+			walkBashEnvStmts(t.Else, found)
+		case *WhileS:
+			walkBashEnvExpr(t.Cond, found)
+			walkBashEnvStmts(t.Body, found)
+		case *ForS:
+			walkBashEnvExpr(t.Iter, found)
+			walkBashEnvStmts(t.Body, found)
+		case *CaseS:
+			walkBashEnvExpr(t.Disc, found)
+			for _, cl := range t.Clauses {
+				walkBashEnvStmts(cl.Body, found)
+			}
+		case *AssignS:
+			walkBashEnvExpr(t.Expr, found)
+		case *RedirectS:
+			walkBashEnvStmts(t.Inner, found)
+			for _, r := range t.Redirects {
+				walkBashEnvExpr(r.Target, found)
+			}
+		case *BlockS:
+			walkBashEnvStmts(t.Body, found)
+		case *SubshellS:
+			walkBashEnvStmts(t.Body, found)
+		case *BackgroundS:
+			walkBashEnvStmts(t.Body, found)
+		case *FunctionS:
+			walkBashEnvStmts(t.Body, found)
+		case *ReturnS:
+			if t.Value != nil {
+				walkBashEnvExpr(t.Value, found)
+			}
+		case *PipelineS:
+			for _, stage := range t.Stages {
+				walkBashEnvStmts(stage, found)
+			}
+		}
+	}
+}
+
+func walkBashEnvExpr(e Expr, found map[string]bool) {
+	switch t := e.(type) {
+	case *CallE:
+		if t.Func == "getVar" {
+			// getVar("NAME") — a $NAME read
+			if len(t.Args) > 0 {
+				if n, ok := t.Args[0].(*StrE); ok && isBashIdentity(n.Value) {
+					found[n.Value] = true
+				}
+			}
+		}
+		if t.Func == "param" {
+			// param(op, VAR, …) — the variable is the SECOND arg
+			if len(t.Args) > 1 {
+				if n, ok := t.Args[1].(*StrE); ok && isBashIdentity(n.Value) {
+					found[n.Value] = true
+				}
+			}
+		}
+		for _, a := range t.Args {
+			walkBashEnvExpr(a, found)
+		}
+	case *ArrowE:
+		walkBashEnvStmts(t.Body, found)
+	case *ArrayE:
+		for _, el := range t.Elems {
+			walkBashEnvExpr(el, found)
+		}
+	case *ObjectE:
+		for _, p := range t.Props {
+			walkBashEnvExpr(p.Val, found)
+		}
+	case *BinOpE:
+		walkBashEnvExpr(t.Lhs, found)
+		walkBashEnvExpr(t.Rhs, found)
+	case *InterpE:
+		for _, p := range t.Parts {
+			if !p.IsLit {
+				walkBashEnvExpr(p.Expr, found)
+			}
+		}
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// var_nospace (mirror analyze_var_nospace): a variable is tagged nospace
+// when EVERY assignment site is provably free of IFS whitespace (space,
+// tab, newline) — spaceless literals, numeric results (literals, $(( )),
+// numeric binops), copies of already-spaceless values, ${x} reads of
+// spaceless vars, and `$(tr -d <ifs-set> …)` captures. Fixed point over
+// the assignment sites (monotone — converges); only provably-spaceless
+// vars appear in the verdict list. Sorted by name.
+// ─────────────────────────────────────────────────────────────────────
+
+type VarNospaceOut struct {
+	Name    string
+	Nospace bool
+}
+
+type nospaceAssign struct {
+	name string
+	rhs  Expr
+}
+
+func analyzeVarNospace(stmts []Stmt) []VarNospaceOut {
+	var assigns []nospaceAssign
+	walkNospaceAssigns(stmts, &assigns)
+	// fixed point: start everything untagged; a var becomes tagged when
+	// EVERY assignment RHS is provably spaceless (monotone — converges)
+	verdicts := map[string]bool{}
+	changed := true
+	for guard := 0; changed && guard < 64; guard++ {
+		changed = false
+		for _, a := range assigns {
+			ok := nospaceExpr(a.rhs, verdicts)
+			cur := verdicts[a.name]
+			if ok != cur {
+				verdicts[a.name] = ok
+				changed = true
+			}
+		}
+	}
+	names := make([]string, 0, len(verdicts))
+	for n := range verdicts {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	out := make([]VarNospaceOut, 0, len(names))
+	for _, n := range names {
+		out = append(out, VarNospaceOut{Name: n, Nospace: verdicts[n]})
+	}
+	return out
+}
+
+// collect the assignment sites (mirror the core's walk: Assign targets
+// without indices; recurse into If/loop/block/subshell/background/case
+// bodies — function and pipeline bodies are NOT visited)
+func walkNospaceAssigns(stmts []Stmt, assigns *[]nospaceAssign) {
+	for _, st := range stmts {
+		switch t := st.(type) {
+		case *AssignS:
+			// scalar targets only (our lowering never emits index targets)
+			*assigns = append(*assigns, nospaceAssign{name: t.Var, rhs: t.Expr})
+		case *IfS:
+			walkNospaceAssigns(t.Then, assigns)
+			for _, e := range t.Elsifs {
+				if b, ok := e[1].([]Stmt); ok {
+					walkNospaceAssigns(b, assigns)
+				}
+			}
+			walkNospaceAssigns(t.Else, assigns)
+		case *ForS:
+			walkNospaceAssigns(t.Body, assigns)
+		case *WhileS:
+			walkNospaceAssigns(t.Body, assigns)
+		case *BlockS:
+			walkNospaceAssigns(t.Body, assigns)
+		case *SubshellS:
+			walkNospaceAssigns(t.Body, assigns)
+		case *BackgroundS:
+			walkNospaceAssigns(t.Body, assigns)
+		case *CaseS:
+			for _, cl := range t.Clauses {
+				walkNospaceAssigns(cl.Body, assigns)
+			}
+		}
+	}
+}
+
+func whitespaceFree(s string) bool {
+	for _, r := range s {
+		if unicode.IsSpace(r) {
+			return false
+		}
+	}
+	return true
+}
+
+func nospaceExpr(e Expr, verdicts map[string]bool) bool {
+	switch t := e.(type) {
+	case *IntE:
+		return true
+	case *StrE:
+		return whitespaceFree(t.Value)
+	case *ArithE:
+		return true // numeric result
+	case *BinOpE:
+		return true // numeric binary op
+	case *VarE:
+		return verdicts[t.Name]
+	case *InterpE:
+		for _, p := range t.Parts {
+			if p.IsLit {
+				if !whitespaceFree(p.Lit) {
+					return false
+				}
+			} else if !nospaceExpr(p.Expr, verdicts) {
+				return false
+			}
+		}
+		return true
+	case *CallE:
+		switch t.Func {
+		case "getVar":
+			if len(t.Args) > 0 {
+				if n, ok := t.Args[0].(*StrE); ok {
+					return verdicts[n.Value]
+				}
+			}
+			return false
+		case "arith":
+			return true // the numeric result
+		case "capture":
+			// command substitution: provably whitespace-free output
+			if len(t.Args) > 0 {
+				if a, ok := t.Args[0].(*ArrowE); ok {
+					return lastStageTrDeletesIFS(a.Body)
+				}
+			}
+			return false
+		case "param":
+			// ${x}, ${x:-d}, … — the result is built from the var value
+			// and the literal/default parts; tag only the pure-read forms
+			return paramNospace(t.Args, verdicts)
+		}
+		return false
+	}
+	return false // Array/Object/Arrow/… — conservative
+}
+
+// param(op, VAR, …) — ${x} / ${#x} (the var value itself: its verdict)
+// and ${x:-d}-family (var value OR default: both must be spaceless).
+func paramNospace(args []Expr, verdicts map[string]bool) bool {
+	if len(args) == 0 {
+		return false
+	}
+	op, ok := args[0].(*StrE)
+	if !ok {
+		return false
+	}
+	switch op.Value {
+	case "", "len":
+		if len(args) > 1 {
+			if n, ok := args[1].(*StrE); ok && !strings.HasPrefix(n.Value, "#") {
+				return verdicts[n.Value]
+			}
+		}
+		return false
+	case ":=", ":-", ":+", ":?", "=", "+", "?":
+		varOk := false
+		if len(args) > 1 {
+			if n, ok := args[1].(*StrE); ok {
+				varOk = verdicts[n.Value]
+			}
+		}
+		defOk := false
+		if len(args) > 2 {
+			defOk = nospaceExpr(args[2], verdicts)
+		}
+		return varOk && defOk
+	}
+	return false
+}
+
+// The command text of a `tr -d <set>` delete set; the set arg is usually
+// an Interpolate of literal text (quoted "\t\n " stays a literal
+// backslash-t — handle the common POSIX-class + literal-set forms
+// conservatively).
+func trDeleteSet(arg Expr) (string, bool) {
+	switch t := arg.(type) {
+	case *StrE:
+		return t.Value, true
+	case *InterpE:
+		var out strings.Builder
+		for _, p := range t.Parts {
+			if p.IsLit {
+				out.WriteString(p.Lit)
+			} else {
+				return "", false // dynamic set — no
+			}
+		}
+		return out.String(), true
+	}
+	return "", false
+}
+
+// A delete set that provably removes the whole IFS whitespace set.
+func coversIFSWhitespace(set string) bool {
+	if strings.Contains(set, "[:space:]") {
+		return true // the POSIX class — all whitespace
+	}
+	// literal set: must contain the space char, a tab and a newline
+	// (accept both the real control chars and the backslash spellings)
+	hasSpace := strings.Contains(set, " ") || strings.Contains(set, "\\ ")
+	hasTab := strings.Contains(set, "\t") || strings.Contains(set, "\\t")
+	hasNL := strings.Contains(set, "\n") || strings.Contains(set, "\\n")
+	return hasSpace && hasTab && hasNL
+}
+
+// Is the capture's command a whitespace-removing `tr -d`? The capture's
+// arrow body is `Expr(pipeline([Arrow(…), …, Arrow(last)]))` or a single
+// `Expr(exec tr -d <set> …)`. The output of `tr -d <ifs-set>` is
+// whitespace-free whatever the input.
+func lastStageTrDeletesIFS(stmts []Stmt) bool {
+	return execIsTrDeletes(stmts)
+}
+
+func execIsTrDeletes(stmts []Stmt) bool {
+	if len(stmts) == 0 {
+		return false
+	}
+	es, ok := stmts[len(stmts)-1].(*ExprS)
+	if !ok {
+		return false
+	}
+	call, ok := es.Expr.(*CallE)
+	if !ok {
+		return false
+	}
+	switch call.Func {
+	case "exec":
+		// exec args: [cmd, Array([arg1, arg2, …])]
+		if len(call.Args) < 2 {
+			return false
+		}
+		cmd, ok := call.Args[0].(*StrE)
+		if !ok || cmd.Value != "tr" {
+			return false
+		}
+		argv, ok := call.Args[1].(*ArrayE)
+		if !ok {
+			return false
+		}
+		if len(argv.Elems) < 2 {
+			return false
+		}
+		fl, ok := argv.Elems[0].(*StrE)
+		if !ok || fl.Value != "-d" {
+			return false
+		}
+		if set, ok := trDeleteSet(argv.Elems[1]); ok {
+			return coversIFSWhitespace(set)
+		}
+		return false
+	case "pipeline":
+		// the pipeline's last stage: Arrow(body) → exec check on it
+		if len(call.Args) < 1 {
+			return false
+		}
+		stages, ok := call.Args[0].(*ArrayE)
+		if !ok || len(stages.Elems) == 0 {
+			return false
+		}
+		lastStage, ok := stages.Elems[len(stages.Elems)-1].(*ArrowE)
+		if !ok {
+			return false
+		}
+		return execIsTrDeletes(lastStage.Body)
+	}
+	return false
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // optimize (mirror optimize_stmts: arith-const fold; self-assign removal
 // is a no-op for our node shapes — IrExpr::Var is never produced)
 // ─────────────────────────────────────────────────────────────────────
@@ -2389,6 +2793,7 @@ func stmtJSON(s Stmt) map[string]interface{} {
 			"type": "While",
 			"cond": exprJSON(t.Cond),
 			"body": stmtsJSON(t.Body),
+			"runs": provablyRunningLoops[s],
 		}
 	case *ForS:
 		return map[string]interface{}{
@@ -2396,6 +2801,7 @@ func stmtJSON(s Stmt) map[string]interface{} {
 			"var":  t.Var,
 			"iter": exprJSON(t.Iter),
 			"body": stmtsJSON(t.Body),
+			"runs": provablyRunningLoops[s],
 		}
 	case *RedirectS:
 		return map[string]interface{}{
@@ -2460,7 +2866,7 @@ func redirectsJSON(rs []RedirectIR) []interface{} {
 }
 
 // programJSON — the A1 program with stmt_lines.
-func programJSON(stmts []Stmt, varTypes []VarTypeOut, varLengths []VarLenOut, varConst []VarConstOut, varLifetimes []VarLifetimeOut) []byte {
+func programJSON(stmts []Stmt, varTypes []VarTypeOut, varLengths []VarLenOut, varConst []VarConstOut, varLifetimes []VarLifetimeOut, varNospace []VarNospaceOut, varBashEnv []string) []byte {
 	prog := map[string]interface{}{
 		"type":             "Program",
 		"contract_version": contractVersion,
@@ -2471,6 +2877,8 @@ func programJSON(stmts []Stmt, varTypes []VarTypeOut, varLengths []VarLenOut, va
 		"var_lengths":      varLengthsJSON(varLengths),
 		"var_const":        varConstJSON(varConst),
 		"var_lifetimes":    varLifetimesJSON(varLifetimes),
+		"var_nospace":      varNospaceJSON(varNospace),
+		"var_bash_env":     varBashEnv,
 		"subs":             []interface{}{},
 		"stmts":            stmtsJSON(stmts),
 	}
@@ -2525,6 +2933,14 @@ func varLifetimesJSON(vls []VarLifetimeOut) []interface{} {
 	return out
 }
 
+func varNospaceJSON(vns []VarNospaceOut) []interface{} {
+	out := make([]interface{}, len(vns))
+	for i, v := range vns {
+		out[i] = map[string]interface{}{"name": v.Name, "nospace": v.Nospace}
+	}
+	return out
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // driver: file → A1 JSON
 // ─────────────────────────────────────────────────────────────────────
@@ -2542,45 +2958,20 @@ func shirForSource(src string) ([]byte, error) {
 		}
 	}
 	stmts = optimizeStmts(stmts)
-	applyTransforms(stmts) // mirror ast_to_ir: worker-submitted transforms (seq-range-for)
+	applyTransforms(stmts) // mirror ast_to_ir: worker-submitted transforms (seq-range-for, arith-forms)
+	setProvablyRunningLoops(stmts) // mirror shir_to_shir_json: the "runs" markup
 	vt := analyzeVarTypes(stmts)
 	vl := analyzeStringLengths(stmts)
 	vc := analyzeVarConst(stmts)
 	vlif := analyzeVarLifetimes(stmts)
-	return programJSON(stmts, vt, vl, vc, vlif), nil
+	vns := analyzeVarNospace(stmts)
+	vbe := analyzeVarBashEnv(stmts)
+	return programJSON(stmts, vt, vl, vc, vlif, vns, vbe), nil
 }
 
-func main() {
-	args := os.Args[1:]
-	raw := false
-	var filtered []string
-	for _, a := range args {
-		if a == "--raw" {
-			raw = true
-		} else {
-			filtered = append(filtered, a)
-		}
-	}
-	if len(filtered) != 2 || filtered[0] != "--shir" {
-		fmt.Fprintln(os.Stderr, "usage: zsh-sh-go --shir <file.zsh> [--raw]")
-		os.Exit(2)
-	}
-	inp := filtered[1]
-	src := inp
-	if strings.Contains(inp, ".sh") || !strings.ContainsAny(inp, " \t\n") {
-		if b, err := os.ReadFile(inp); err == nil {
-			src = string(b)
-		}
-	}
-	out, err := shirForSource(src)
-	if err != nil {
-		// the core's export_shir prints the error and returns normally:
-		// empty stdout, exit 0
-		fmt.Fprintln(os.Stderr, "Parse error: "+err.Error())
-		return
-	}
-	os.Stdout.Write(out)
-	if !raw {
-		os.Stdout.Write([]byte{'\n'})
-	}
+// Shir — zsh-sh-go as a library: zsh source -> A1 shIR JSON bytes (no
+// trailing newline). Both the CLI (cmd/zsh-sh-go) and the combined
+// busybox dispatch through this single entry point.
+func Shir(src string) ([]byte, error) {
+	return shirForSource(src)
 }

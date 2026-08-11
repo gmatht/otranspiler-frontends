@@ -6,7 +6,7 @@
 // The emitted JSON must be BYTE-IDENTICAL to `debashc --shir FILE --raw`
 // (optimized lowering + A2 annotations, no trailing newline). The core is
 // the source of truth: every rule below mirrors a specific core function.
-package main
+package zshlib
 
 import (
 	"fmt"
@@ -127,7 +127,8 @@ type Command struct {
 	// redirect-wrapped
 	Inner *Command
 	// test
-	TestExpr string
+	TestExpr   string
+	TestDouble bool // [[ ]] — carries the core's trailing "[[" tag
 	// ((...))
 	ArithRaw string
 	// return value word
@@ -2257,11 +2258,11 @@ func (p *Parser) parseBracketTest(dbl bool) (*Command, error) {
 	for !p.eof() {
 		if dbl && p.starts("]]") {
 			p.pos += 2
-			return &Command{Kind: "test", TestExpr: sb.String()}, nil
+			return &Command{Kind: "test", TestExpr: sb.String(), TestDouble: true}, nil
 		}
 		if !dbl && p.peek() == ']' {
 			p.pos++
-			return &Command{Kind: "test", TestExpr: sb.String()}, nil
+			return &Command{Kind: "test", TestExpr: sb.String(), TestDouble: false}, nil
 		}
 		c := p.peek()
 		if isWS(c) || isNL(c) {

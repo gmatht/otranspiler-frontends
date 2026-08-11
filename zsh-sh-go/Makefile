@@ -28,7 +28,7 @@ build:
 	# a non-object file) makes `go build -o` refuse to overwrite it and the
 	# gate wedges. Drop it first; the fresh binary is always rebuilt.
 	rm -f zsh-sh-go
-	$(GO) build -o zsh-sh-go .
+	$(GO) build -o zsh-sh-go ./cmd/zsh-sh-go
 
 # PLAN v12: zsh arrays are 1-based but the A1 contract is canonical
 # 0-based — the frontend normalizes subscripts at emit, which the core's
