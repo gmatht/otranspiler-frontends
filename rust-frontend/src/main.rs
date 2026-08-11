@@ -21,7 +21,8 @@
 //!     literal `%` escapes to `%%`; `{{`/`}}` unescape)
 //!   - conditions: comparisons == != < <= > >= (-> -eq -ne -lt -le -gt
 //!     -ge), `&&`/`||` (-> `-a`/`-o`), `!`, parens
-//!   - bare `return;` (no-op) and bare `x;` (no-op) statements are dropped
+//!   - bare `return;` (-> the A1 Exit statement — control flow, not a
+//!     no-op) and bare `x;` (no-op) statements
 //!
 //! Everything else refuses loudly with a line number — borrows, String
 //! methods, match, loops other than while/for-range, indexing, vec!/dbg!/
@@ -221,7 +222,10 @@ fn lower_expr_stmt(e: &syn::Expr) -> Option<Value> {
             if r.expr.is_some() {
                 refuse("`return` with a value", r.span());
             }
-            None // bare `return;` in main is a no-op
+            // `return;` in main ENDS the program — native rustc stops there.
+            // Not a no-op (the coverage gate caught this: dropping it ran
+            // the rest of main). Lower to the A1 Exit statement.
+            Some(json!({"type": "Exit", "value": null}))
         }
         syn::Expr::Path(p) => {
             // bare `x;` — evaluates the variable, no side effect (c-sh-go
