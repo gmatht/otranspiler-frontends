@@ -2424,6 +2424,25 @@ func testOperand(e *expr) string {
 		refuse("ternary in a test condition is not in the subset (lower it to a temp)")
 	case "bin":
 		if e.op == "!" {
+			// bare `!` on a NUMERIC operand (a plain int var, or an int
+			// literal): the test grammar's `! $x` negates "is the string
+			// non-empty", NOT C's "is the value zero" — `test ! 0` is
+			// FALSE (a set variable "0" is a non-empty string), so the
+			// branch of `if (!no)` with no == 0 is silently dropped in
+			// the estree run. C truth `!x` is exactly `x == 0`, so the
+			// negation folds into the comparison: `$x -eq 0` (the test
+			// grammar's `!` binds to the WHOLE rest, so `! $x -eq 0`
+			// would mean x != 0 — the mirror image). STRING-valued
+			// operands (char vars, char* vars, literals) keep the bare
+			// negation — `! $c` is "is the string empty", the faithful
+			// model of a char's zero/non-zero truth in the string store
+			// (`-eq` would coerce the char to 0).
+			if e.l != nil && e.l.kind == "id" && !charVars[e.l.name] && !charPtrVars[e.l.name] {
+				return testOperand(e.l) + " -eq 0"
+			}
+			if e.l != nil && e.l.kind == "num" {
+				return testOperand(e.l) + " -eq 0"
+			}
 			return "! " + testOperand(e.l)
 		}
 		if e.op == "&&" {

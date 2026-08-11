@@ -4,6 +4,23 @@ C source -> A1 shIR JSON (the shell-flavored subset of C).
 
 ## v4 — the last refused rung (2026-08-10), 79/79
 
+## v4.1 — bare `!` on a numeric operand (c-request cpp-20260810-054745)
+
+`if (!no)` was silently DROPPING the branch in the estree run: the test
+string `! $no` negates the test grammar's "is the string non-empty"
+(a set variable `"0"` is a non-empty string → `! 0` is FALSE), not C's
+"is the value zero". The lowering now folds the negation into the
+comparison — C truth `!x` is exactly `x == 0`, so a bare `!` on an int
+var / int literal renders `$x -eq 0` (the grammar's `!` binds to the
+WHOLE rest, so `! $x -eq 0` would be the mirror image). STRING-valued
+operands (char vars, char* vars, literals) keep the bare `! $c` — the
+faithful "is the string empty" model (an `-eq` would coerce the char
+to 0). The proven `!(a == 1)` → `! $a -eq 1` shape is unchanged. The
+bare-int-operand truthiness of `&&`/`||` (`$x` directly under `-a`/
+`-o` — string-truth, documented deliberate) is a SEPARATE pre-existing
+gap, untouched.
+
+
 The five documented refusals that remained after v3, each pinned by a
 stdout example (t75–t79):
 
