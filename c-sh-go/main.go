@@ -25,6 +25,22 @@ func call(f string, args []any) map[string]any {
 	return map[string]any{"args": args, "func": f, "purity": "Emulable", "type": "Call"}
 }
 
+// isBreakStmt — a break statement (the first-class `{"type":"Break"}`
+// node OR the legacy `Expr(Call(func:"break"))` form the switch lowering
+// used to emit). Both render to the same runtime signal.
+func isBreakStmt(m map[string]any) bool {
+	if m["type"] == "Break" {
+		return true
+	}
+	if m["type"] == "Expr" {
+		if e, ok := m["expr"].(map[string]any); ok && e["func"] == "break" {
+			return true
+		}
+	}
+	return false
+}
+
+
 // addrTaken — names whose address is taken (&x): their storage must live
 // in the sh2 store (the emitter would otherwise lift them to native JS
 // bindings, and the mem.* seam reads/writes the store — divergence).
@@ -2472,8 +2488,8 @@ func splitMidBreaks(body, rest []any) []any {
 		if !ok {
 			continue
 		}
-		if m["type"] == "Expr" {
-			if e, ok2 := m["expr"].(map[string]any); ok2 && e["func"] == "break" {
+		if m["type"] == "Break" || m["type"] == "Expr" {
+			if isBreakStmt(m) {
 				// trailing or bare mid break: drop it and the rest
 				return body[:i]
 			}
@@ -2486,7 +2502,7 @@ func splitMidBreaks(body, rest []any) []any {
 					if bl, ok3 := b2["body"].([]any); ok3 && b2["type"] == "Block" && len(bl) == 1 {
 						b2 = bl[0].(map[string]any)
 					}
-					if te, ok3 := b2["expr"].(map[string]any); ok3 && b2["type"] == "Expr" && te["func"] == "break" {
+					if isBreakStmt(b2) {
 						// guarded break: the else carries the remainder
 						rem := append(append([]any{}, body[i+1:]...), rest...)
 						m["then"] = []any{}
@@ -3134,30 +3150,20 @@ func (p *parser) stmt() (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		// C's `for (i; c; u) { ... continue; }` jumps to the UPDATE then
-		// re-tests the condition. The naive A1 lowering `while (c) {
-		// body; u }` puts the update at the END of the body, so a shell
-		// `continue` would skip the trailing update → infinite loop on
-		// the second iteration (i never advances past the continue
-		// site). Fix: wrap each top-level `continue` in the body with
-		// the update so the update runs BEFORE the shell-continue skip.
-		// Recurse into If/Block (where continues can also appear) but
-		// NOT into While/For/Function (their `continue` binds to
-		// themselves, not the outer for).
-		if inc != nil {
-			b = wrapForContinues(b, inc)
-		}
+		// C's `for (i; c; u) { ... continue; }` — emit the RICH ForInit
+		// node; the core's strip_cfor pass lowers it to
+		// `init; while(c){ body-with-step-before-continues; step }` for
+		// the shell-flavored renderers (the continue/step interaction
+		// is the strip's job now, not this frontend's).
 		var body []any
 		body = append(body, b...)
-		if inc != nil {
-			body = append(body, inc)
-		}
 		condStmt := testCall("1")
 		if cond != nil {
 			if condValueRead(cond) {
-				// the cond needs runtime reads — the While gets the
-				// refresh-and-guard structure (the body includes the
-				// update, so the temps refresh before the cond check)
+				// the cond needs runtime reads — the body gets the
+				// refresh-and-guard structure (the strip's While has the
+				// step at the body end, so the temps refresh before the
+				// cond check — same structure as before)
 				var condTemps []any
 				cond = p.hoistCondReads(cond, &condTemps)
 				guard := map[string]any{
@@ -3165,7 +3171,7 @@ func (p *parser) stmt() (any, error) {
 						"cond":   condCall(cond),
 						"then":   []any{},
 						"elsifs": []any{},
-						"else":   []any{map[string]any{"type": "Expr", "expr": call("break", []any{})}},
+						"else":   []any{map[string]any{"type": "Break"}},
 						"type":   "If",
 					}),
 					"type": "Block",
@@ -3175,12 +3181,20 @@ func (p *parser) stmt() (any, error) {
 				condStmt = condCall(cond)
 			}
 		}
-		var out []any
-		if init != nil {
-			out = append(out, init)
+		forInit := map[string]any{
+			"type": "ForInit",
+			"init": []any{},
+			"cond": condStmt,
+			"step": []any{},
+			"body": body,
 		}
-		out = append(out, map[string]any{"cond": condStmt, "body": body, "type": "While"})
-		return map[string]any{"body": out, "type": "Block"}, nil
+		if init != nil {
+			forInit["init"] = []any{init}
+		}
+		if inc != nil {
+			forInit["step"] = []any{inc}
+		}
+		return forInit, nil
 	case p.isId("break"), p.isId("continue"):
 		// loop control — the A1 signal calls (the runtime while loop
 		// catches BREAK/CONTINUE). In switch-case bodies the switch
@@ -3190,7 +3204,9 @@ func (p *parser) stmt() (any, error) {
 		if err := p.expectOp(";"); err != nil {
 			return nil, err
 		}
-		return map[string]any{"type": "Expr", "expr": call(kw, []any{})}, nil
+		// first-class loop-control statements (the A1 contract nodes;
+		// the renderers map them to the runtime's break/continue)
+		return map[string]any{"type": strings.ToUpper(kw[:1]) + kw[1:]}, nil
 	case p.isId("goto"):
 		// goto IDENT; — emit a Label/Goto IR pair. The shared
 		// `RestructureGoto` pass in shir_passes rewrites these into
@@ -3941,8 +3957,8 @@ func (p *parser) caseBody() ([]any, bool, error) {
 		if s == nil {
 			continue
 		}
-		if m, ok := s.(map[string]any); ok && m["type"] == "Expr" {
-			if e, ok := m["expr"].(map[string]any); ok && e["func"] == "break" {
+		if m, ok := s.(map[string]any); ok && (m["type"] == "Break" || m["type"] == "Expr") {
+			if isBreakStmt(m) {
 				out = append(out, s)
 				endedWithBreak = true
 				continue
