@@ -50,6 +50,13 @@ the A1->ESTree->JS run, normalized stdout match. Native compile with the
 real toolchain is the source of truth — the frontend only ever sees
 valid Rust (invalid input is rejected before the oracle runs).
 
+Load hardening: the worker's `make test` holds the workspace
+`.gate.lock` flock (same serialization backend workers use — commit
+7edd76e) so the gate never races another worker's cargo build, and the
+harness's rust native path retries a starved/OOM'd `rustc` compile
+(2026-08-12 14:49: t01's native side came back empty on a concurrent
+build, transpiled side correct, rest green).
+
 ## Worker
 
 Not yet registered (prototype). The fleet pattern is failure-driven
