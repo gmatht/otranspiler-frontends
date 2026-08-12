@@ -76,7 +76,10 @@ are lookahead-based (type-keyword checks) and parse 78/79 of the corpus —
 
 Full findings: **PARSER_GAPS.md** (workspace root). The Perl check is
 `ppi-coverage.pl` (PPI is the external source of truth — grammars-v4 has no
-Perl grammar).
+Perl grammar). The worker loop is wired to these: `worker-coverage-step.sh`
+asks pi for one example per **`rules-gap.sh`** gap first (external grammar,
+ledger- and noise-filtered), falling back to the A1-node proxy where no
+external grammar exists.
 
 Requires java/javac + the antlr4 jar (downloaded on demand to
 `.antlr4.jar`, gitignored). Java parser generated into `.work/`
