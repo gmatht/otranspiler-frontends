@@ -41,6 +41,22 @@ echo "$TS coverage[$lang]: gate green but parser construct '$gap' uncovered — 
 # untracked testdata dir)
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 ls "$ROOT/frontends/$lang"/testdata 2>/dev/null | sort > "$T/before.txt"
+ls "$ROOT/core-requests"/*.md 2>/dev/null | sort > "$T/core_before.txt" || true
+# prune core-pending entries whose request was completed (moved to
+# core-requests/done/ or deleted by the estree worker) — the gap is then
+# retried (the contract now has what the construct needed).
+if [ -f "$ROOT/frontends/coverage/core-pending-$lang.txt" ]; then
+  : > "$T/pending.new"
+  while IFS=$'\t' read -r g req; do
+    [ -n "$g" ] || continue
+    if [ -f "$ROOT/core-requests/$req" ]; then
+      printf '%s\t%s\n' "$g" "$req" >> "$T/pending.new"
+    else
+      echo "$TS coverage[$lang]: core-request $req completed — gap '$g' retried" >> "$LOG"
+    fi
+  done < "$ROOT/frontends/coverage/core-pending-$lang.txt"
+  mv "$T/pending.new" "$ROOT/frontends/coverage/core-pending-$lang.txt"
+fi
 
 # pi creates ONE example in frontends/<lang>/testdata/ (scoped prompt).
 # rc==0 + no new file = pi deliberately refused (per the prompt: "if the
@@ -57,12 +73,21 @@ if (cd "$ROOT/frontends/$lang" && make test > "$T/gate.log" 2>&1); then
   ls "$ROOT/frontends/$lang"/testdata 2>/dev/null | sort > "$T/after.txt"
   newfiles=$(comm -13 "$T/before.txt" "$T/after.txt")
   if [ -z "$newfiles" ]; then
-    # pi created nothing. rc==0 = deliberate refusal (the prompt told pi
-    # to exit 0 when the construct is not expressible) — ledger it so the
-    # next cycle moves to the NEXT gap; rc!=0 = pi failure — retry next.
+    # pi created nothing. rc==0 is either a by-design refusal or a
+    # core-request escalation (the prompt tells pi which — a new
+    # core-requests/<lang>-*.md request); rc!=0 = pi failure — retry next.
     if [ "$pi_rc" -eq 0 ]; then
-      printf '%s\n' "$gap" >> "$ROOT/frontends/coverage/refused-$lang.txt"
-      echo "$TS coverage[$lang]: no example for '$gap' (pi judged it not expressible) — marked known-refused" >> "$LOG"
+      ls "$ROOT/core-requests"/*.md 2>/dev/null | sort > "$T/core_after.txt" || true
+      newreq=$(comm -13 "$T/core_before.txt" "$T/core_after.txt")
+      if [ -n "$newreq" ]; then
+        for req in $newreq; do
+          printf '%s\t%s\n' "$gap" "$(basename "$req")" >> "$ROOT/frontends/coverage/core-pending-$lang.txt"
+        done
+        echo "$TS coverage[$lang]: '$gap' is an A1-contract gap — escalated to core-requests ($(echo $newreq | xargs -n1 basename | tr '\n' ' ')) — skipped while pending" >> "$LOG"
+      else
+        printf '%s\n' "$gap" >> "$ROOT/frontends/coverage/refused-$lang.txt"
+        echo "$TS coverage[$lang]: no example for '$gap' (pi judged it not expressible) — marked known-refused" >> "$LOG"
+      fi
     else
       echo "$TS coverage[$lang]: no example for '$gap' (pi rc=$pi_rc) — will retry next cycle" >> "$LOG"
     fi
@@ -99,13 +124,23 @@ else
       echo "$TS coverage[$lang]: example for '$gap' FAILED THE ORACLE — a frontend LOWERING BUG, recorded in bugs-$lang.txt" >> "$LOG"
     fi
   else
-    # no new file was created. If pi exited 0 it followed the prompt's
-    # refusal path (the construct is not expressible) — record it so the
-    # next cycle moves to the NEXT gap instead of retrying this one
-    # forever. A nonzero rc is a pi failure, not a judgment — retry.
+    # no new file was created. If pi exited 0 it either followed the
+    # prompt's refusal path (not expressible — record so the next cycle
+    # moves on) or escalated an A1-contract gap to core-requests (a new
+    # <lang>-*.md request — pending, not refused). A nonzero rc is a pi
+    # failure, not a judgment — retry.
     if [ "$pi_rc" -eq 0 ]; then
-      printf '%s\n' "$gap" >> "$ROOT/frontends/coverage/refused-$lang.txt"
-      echo "$TS coverage[$lang]: no example for '$gap' (pi judged it not expressible) — marked known-refused" >> "$LOG"
+      ls "$ROOT/core-requests"/*.md 2>/dev/null | sort > "$T/core_after.txt" || true
+      newreq=$(comm -13 "$T/core_before.txt" "$T/core_after.txt")
+      if [ -n "$newreq" ]; then
+        for req in $newreq; do
+          printf '%s\t%s\n' "$gap" "$(basename "$req")" >> "$ROOT/frontends/coverage/core-pending-$lang.txt"
+        done
+        echo "$TS coverage[$lang]: '$gap' is an A1-contract gap — escalated to core-requests — skipped while pending" >> "$LOG"
+      else
+        printf '%s\n' "$gap" >> "$ROOT/frontends/coverage/refused-$lang.txt"
+        echo "$TS coverage[$lang]: no example for '$gap' (pi judged it not expressible) — marked known-refused" >> "$LOG"
+      fi
     else
       echo "$TS coverage[$lang]: no example for '$gap' (pi rc=$pi_rc) — will retry next cycle" >> "$LOG"
     fi

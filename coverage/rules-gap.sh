@@ -33,6 +33,16 @@ exclude() {
       grep -vF "$pat" "$tmp" > "$tmp.2" && mv "$tmp.2" "$tmp"
     done < "$e"
   done
+  # escalated contract gaps: skipped while the core-request is pending
+  # (worker-coverage-step.sh prunes the ledger when the estree worker
+  # completes the request, so the gap is retried once the contract has it)
+  if [ -f "$DIR/core-pending-$lang.txt" ]; then
+    cut -f1 "$DIR/core-pending-$lang.txt" | grep -vE '^$' > "$tmp.pats" 2>/dev/null || true
+    if [ -s "$tmp.pats" ]; then
+      grep -vFf "$tmp.pats" "$tmp" > "$tmp.2" && mv "$tmp.2" "$tmp"
+    fi
+    rm -f "$tmp.pats"
+  fi
   cat "$tmp"; rm -f "$tmp"
 }
 

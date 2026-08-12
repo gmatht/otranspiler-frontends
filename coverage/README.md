@@ -85,6 +85,21 @@ ledger- and noise-filtered; powershell's tree-sitter-powershell is now such a
 grammar), falling back to the A1-node proxy where no external grammar exists
 (zig included — the A1 proxy is its only signal until tree-sitter-zig lands).
 
+Each gap gets ONE of three dispositions (the prompt tells pi which):
+
+1. **expressible** → pi creates a testdata example; the gate validates and
+the hook commits it.
+2. **by-design refusal** (the subset deliberately excludes the construct) →
+pi creates nothing; the hook ledgers the gap in `refused-<lang>.txt` and
+stops retrying it.
+3. **A1-contract gap** (the construct needs a shIR node/field the contract
+lacks — not a subset refusal) → pi creates nothing and appends a structured
+request to `core-requests/<lang>-<ts>.md`; the hook records the gap in
+`core-pending-<lang>.txt` (skipped by both gap detectors while pending) and
+the estree worker implements the request. When the request is completed
+(moved to `core-requests/done/`), the hook prunes the pending entry and the
+gap is retried.
+
 Requires java/javac + the antlr4 jar (downloaded on demand to
 `.antlr4.jar`, gitignored). Java parser generated into `.work/`
 (gitignored). Per-file results: `results/antlr-*.tsv`.

@@ -36,6 +36,11 @@ exclude() {  # read stdin, drop lines matching the exclusion files
   for e in $excl; do
     [ -f "$e" ] && pat="$pat$(tr '\n' '|' < "$e" | sed 's/|$//')"
   done
+  # escalated contract gaps: skipped while the core-request is pending
+  # (worker-coverage-step.sh prunes the ledger on completion)
+  if [ -f "$DIR/core-pending-$lang.txt" ]; then
+    pat="$pat$(cut -f1 "$DIR/core-pending-$lang.txt" | tr '\n' '|' | sed 's/|$//')"
+  fi
   pat=$(printf '%s' "$pat" | sed 's/|$//')
   if [ -n "$pat" ]; then grep -vE "$pat"; else cat; fi
 }
