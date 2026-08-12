@@ -50,6 +50,97 @@ fi
   && mkdir -p out \
   && javac -cp "$JAR" *.java -d out) || { echo "ANTLR build failed"; exit 1; }
 
+# ── official grammars-v4 grammars for the Go/C frontends (the external
+#    source of truth; the frontends' own parsers are hand-rolled, so the
+#    official grammars enumerate the language's grammar rules instead) ──
+fetch() { [ -f "$2" ] || curl -sL -o "$2" "$1"; }
+fetch "https://raw.githubusercontent.com/antlr/grammars-v4/master/golang/GoLexer.g4" "$W/GoLexer.g4"
+fetch "https://raw.githubusercontent.com/antlr/grammars-v4/master/golang/GoParser.g4" "$W/GoParser.g4"
+fetch "https://raw.githubusercontent.com/antlr/grammars-v4/master/golang/Java/GoParserBase.java" "$W/GoParserBase.java"
+fetch "https://raw.githubusercontent.com/antlr/grammars-v4/master/c/CLexer.g4" "$W/CLexer.g4"
+fetch "https://raw.githubusercontent.com/antlr/grammars-v4/master/c/CParser.g4" "$W/CParser.g4"
+# stub base classes: the official grammars' gcc-preprocess/symbol-table
+# hooks are skipped (coverage measurement, not semantic analysis). The
+# C predicates return conservative values that resolve the testdata's
+# ambiguities (no typedefs/casts in the subset; sizeof(type) used).
+cat > "$W/SymbolTable.java" <<'EOF'
+// minimal stub — the official C grammar's semantic symbol table (unused for coverage)
+public class SymbolTable { }
+EOF
+cat > "$W/CLexerBase.java" <<'EOF'
+import org.antlr.v4.runtime.*;
+// minimal stub — the official C grammar's preprocessor hook (gcc invocation) skipped
+public abstract class CLexerBase extends Lexer {
+    public CLexerBase(CharStream input) { super(input); }
+}
+EOF
+cat > "$W/CParserBase.java" <<'EOF'
+import org.antlr.v4.runtime.*;
+// minimal stub — conservative predicates for the official C grammar's
+// ambiguity resolution (coverage measurement, not semantic analysis)
+public abstract class CParserBase extends Parser {
+    public CParserBase(TokenStream input) { super(input); }
+    private SymbolTable _st = new SymbolTable();
+    // '(' followed by a type keyword = a cast; else a paren-expr
+    public boolean IsCast() {
+        int t = _input.LT(2).getType();
+        switch (t) {
+            case CLexer.Int: case CLexer.Char: case CLexer.Float:
+            case CLexer.Double: case CLexer.Void: case CLexer.Struct:
+            case CLexer.Union: case CLexer.Enum: case CLexer.Signed:
+            case CLexer.Unsigned: case CLexer.Short: case CLexer.Long:
+            case CLexer.Bool: case CLexer.BitInt: case CLexer.Typedef:
+                return true;
+            default:
+                return false;
+        }
+    }
+    public boolean IsDeclaration() { return true; }
+    public boolean IsDeclarationSpecifier() { return true; }
+    public boolean IsInitDeclaratorList() { return true; }
+    public boolean IsNullStructDeclarationListExtension() { return false; }
+    // sizeof( TYPE ) vs sizeof expr — true iff a type keyword follows '('
+    public boolean IsSomethingOfTypeName() {
+        int t = _input.LT(3).getType();
+        switch (t) {
+            case CLexer.Int: case CLexer.Char: case CLexer.Float:
+            case CLexer.Double: case CLexer.Void: case CLexer.Struct:
+            case CLexer.Union: case CLexer.Enum: case CLexer.Signed:
+            case CLexer.Unsigned: case CLexer.Short: case CLexer.Long:
+            case CLexer.Bool: case CLexer.BitInt:
+                return true;
+            default:
+                return false;
+        }
+    }
+    public boolean IsStatement() { return true; }
+    public boolean IsTypeSpecifierQualifier() { return true; }
+    public boolean IsTypedefName() { return false; }
+    public void LookupSymbol() { }
+    public void EnterDeclaration() { }
+    public void EnterScope() { }
+    public void ExitScope() { }
+    public void OutputSymbolTable() { }
+}
+EOF
+cp "$DIR/antlr-sh/Rules.java" "$W/"
+(cd "$W" \
+  && java -jar "$JAR" -o . GoLexer.g4 GoParser.g4 >/dev/null 2>&1 \
+  && java -jar "$JAR" -o . CLexer.g4 CParser.g4 >/dev/null 2>&1 \
+  && javac -cp "$JAR" *.java -d out) || { echo "ANTLR rules build failed"; exit 1; }
+
+run_rules() {  # <mode> <label> <files...>
+  local mode=$1 label=$2; shift 2
+  local out; out=$(java -cp "$W/out:$JAR" Rules "$mode" "$@" 2>/dev/null)
+  local def exe clean
+  def=$(echo "$out" | grep '^RULES-DEFINED' | cut -d' ' -f2)
+  exe=$(echo "$out" | grep '^RULES-EXERCISED' | cut -d' ' -f2)
+  clean=$(echo "$out" | grep '^RULES-EXERCISED' | grep -o 'by [0-9]*/[0-9]* parse-clean')
+  echo "  $label: $exe/$def grammar rules exercised $clean"
+  local gaps; gaps=$(echo "$out" | grep '^RULE-UNEXERCISED' | cut -f2 | tr '\n' ' ')
+  [ -n "$gaps" ] && echo "    unexercised rules: $gaps" || echo "    unexercised rules: none"
+}
+
 run_cov() {  # <mode> <label> <files...>
   local mode=$1 label=$2; shift 2
   local tsv="$DIR/results/antlr-$label.tsv"
@@ -80,3 +171,29 @@ run_cov py py-python3-corpus $(find "$ROOT" -maxdepth 2 -name '*.py' -not -path 
 
 echo
 echo " per-file: $DIR/results/antlr-*.tsv"
+
+echo
+echo "══════════════════════════════════════════════════════════════"
+echo " 3. per-example rule coverage vs the official grammars"
+echo "══════════════════════════════════════════════════════════════"
+echo "  (a rule no example enters = a language construct the examples"
+echo "   don't cover; judge expressibility against the frontend subset"
+echo "   + gate — see GOOD_EXAMPLES.md. posix uses the custom subset"
+echo "   grammar (grammars-v4 has no POSIX grammar); go/c use the"
+echo "   official grammars-v4 grammars.)"
+echo "  posix (custom POSIX subset) × posix-sh-go/testdata:"
+run_rules posix sh-posix "$FE"/posix-sh-go/testdata/*.sh
+echo "  py (official grammars-v4 Python3) × py-sh-go/testdata:"
+run_rules py py "$FE"/py-sh-go/testdata/*.py
+# go-sh examples omit package/import/func-main boilerplate — wrap them
+# like the executed-stdout oracle does (frontend-stdout.sh)
+T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+for f in "$FE"/go-sh/testdata/*.go; do
+  if grep -q 'func main()' "$f"; then cp "$f" "$T/$(basename "$f")";
+  else { echo "package main"; echo "func main() {"; cat "$f"; echo "}"; } > "$T/$(basename "$f")"; fi
+done
+echo "  go (official grammars-v4 golang) × go-sh/testdata (oracle-wrapped):"
+run_rules go go "$T"/*.go
+echo "  c (official grammars-v4 c) × c-sh-go/testdata:"
+run_rules c c "$FE"/c-sh-go/testdata/*.c
+rm -rf "$T"

@@ -74,7 +74,7 @@ NEWLINE: '\r'? '\n' [ \t]*;
 COMMENT: '#' ~[\r\n]* -> skip;
 
 SQUOTE: '\'' ~['\r\n]* '\'';
-DQUOTE: '"' ( ~["`\\\r\n] | '\\' . )* '"';
+DQUOTE: '"' ( ~["\\\r\n] | '\\' . )* '"';
 CMDSUB: '$(' CMDSUB_INNER ')';
 fragment CMDSUB_INNER: ( ~[()] | '(' CMDSUB_INNER ')' )*;
 PARAM: '${' PARAM_INNER '}';
@@ -106,19 +106,21 @@ command:
   | brace_group
   ;
 
-simple_command: (assignment | WORD | SQUOTE | DQUOTE | CMDSUB | BTICK | redirect)+;
+simple_command: (assignment | WORD | SQUOTE | DQUOTE | CMDSUB | BTICK | PARAM | ASSIGN | BANG | redirect)+;
 
 assignment: WORD ASSIGN (WORD | SQUOTE | DQUOTE | CMDSUB | BTICK | PARAM)*;
 
-redirect: (GREAT | DGREAT | LESS | DLESS | LESSAND | GREATAND | DLESSDASH) WORD;
+redirect: (GREAT | DGREAT | LESS | DLESS | LESSAND | GREATAND | DLESSDASH) word;
 
 if_command: IF compound_list THEN compound_list (ELIF compound_list THEN compound_list)* (ELSE compound_list)? FI;
 while_command: WHILE compound_list DO compound_list DONE;
 until_command: UNTIL compound_list DO compound_list DONE;
 for_command: FOR WORD (IN word_list)? separator* DO compound_list DONE;
-case_command: CASE WORD IN case_item* ESAC;
+case_command: CASE word IN separator* case_item+ ESAC;
 case_item: LPAREN? pattern RPAREN compound_list? (SEMI SEMI | SEMI AMP | SEMI SEMI AMP)?;
-pattern: (WORD | SQUOTE | DQUOTE) (PIPE (WORD | SQUOTE | DQUOTE))*;
+pattern: word (PIPE word)*;
+
+word: WORD | SQUOTE | DQUOTE | PARAM | CMDSUB | BTICK | ASSIGN | BANG;
 
 function_definition:
     WORD LPAREN RPAREN separator* brace_group
@@ -128,5 +130,5 @@ function_definition:
 subshell: LPAREN compound_list RPAREN;
 brace_group: LBRACE compound_list RBRACE;
 
-compound_list: separator* and_or separator*;
+compound_list: separator* and_or (separator and_or)* separator*;
 word_list: (WORD | SQUOTE | DQUOTE | CMDSUB | BTICK | PARAM)+;
