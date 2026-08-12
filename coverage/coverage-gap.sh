@@ -19,18 +19,24 @@
 #       are expressible (the gate is the final arbiter).
 #
 # Exclusions: one construct per line in frontends/coverage/refused-<lang>.txt
-# (appended by the worker when a proposed example for that gap was rejected
-# by the gate — the construct refuses by design; stop retrying it).
+# (worker-appended when a proposed example for that gap was refused by the
+# frontend — by design; stop retrying it) and bugs-<lang>.txt (worker-appended
+# when the example failed the ORACLE — a frontend lowering bug, recorded for
+# the worker to fix).
 set -u
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 FE="$ROOT/frontends"
 DIR="$FE/coverage"
 lang="$1"
 
-# known-refused exclusions (worker-appended)
-excl="$DIR/refused-$lang.txt"
-exclude() {  # read stdin, drop lines matching the exclusion file
-  local pat=""; [ -f "$excl" ] && pat=$(tr '\n' '|' < "$excl" | sed 's/|$//')
+# known-refused/known-bug exclusions (worker-appended)
+excl="$DIR/refused-$lang.txt $DIR/bugs-$lang.txt"
+exclude() {  # read stdin, drop lines matching the exclusion files
+  local pat=""
+  for e in $excl; do
+    [ -f "$e" ] && pat="$pat$(tr '\n' '|' < "$e" | sed 's/|$//')"
+  done
+  pat=$(printf '%s' "$pat" | sed 's/|$//')
   if [ -n "$pat" ]; then grep -vE "$pat"; else cat; fi
 }
 
@@ -74,24 +80,28 @@ for line in out.splitlines():
 PY
     ;;
   *)
-    # per-frontend binary + testdata extension
+    # per-frontend binary + testdata extension (+ dir override: cpp's
+    # examples live in testdata_cpp/, not testdata/)
+    td="testdata"
     case "$lang" in
       posix-sh-go) bin="$FE/posix-sh-go/posix-sh-go"; ext=sh ;;
       c-sh-go)     bin="$FE/c-sh-go/c-sh-go";         ext=c ;;
-      cpp-sh-go)   bin="$FE/cpp-sh-go/cpp-sh-go";     ext=cc ;;
+      cpp-sh-go)   bin="$FE/cpp-sh-go/cpp-sh-go";     ext=cc ; td=testdata_cpp ;;
       go-sh)       bin="$FE/go-sh/go-sh";             ext=go ;;
       py-sh-go)    bin="$FE/py-sh-go/py-sh-go";       ext=py ;;
       perl-sh-go)  bin="$FE/perl-sh-go/perl-sh-go";   ext=pl ;;
       fish-sh-go)  bin="$FE/fish-sh-go/fish-sh-go";   ext=fish ;;
       zsh-sh-go)   bin="$FE/zsh-sh-go/zsh-sh-go";     ext=zsh ;;
       bat-sh-go)   bin="$FE/bat-sh-go/bat-sh-go";     ext=bat ;;
+      zig-sh-go)   bin="$FE/zig-sh-go/zig-sh-go";     ext=zig ;;
+      powershell-sh-go) bin="$FE/powershell-sh-go/powershell-sh-go"; ext=ps1 ;;
       *) exit 0 ;;  # unknown frontend: no inventory
     esac
     [ -x "$bin" ] || exit 0
     # collect every node type the testdata emit produces
     T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
     : > "$T/types.txt"
-    for f in "$FE/$lang"/testdata/*."$ext"; do
+    for f in "$FE/$lang"/$td/*."$ext"; do
       [ -f "$f" ] || continue
       case "$(basename "$f")" in *_refuse*|*_gap*) continue ;; esac
       timeout 30 "$bin" --shir "$f" --raw > "$T/o" 2>/dev/null || continue

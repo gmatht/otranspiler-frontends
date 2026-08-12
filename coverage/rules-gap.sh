@@ -90,7 +90,23 @@ case "$lang" in
     perl -MPPI -e 'exit 0' 2>/dev/null || exit 0
     perl "$DIR/ppi-coverage.pl" "$FE/$lang"/testdata/*.pl 2>/dev/null \
       | grep '^RULE-UNEXERCISED' | cut -f2 | noise ppi | exclude ;;
-  *) exit 0 ;;  # no external grammar (zsh/fish/bat/zig/powershell/cpp/rust) —
-                # the A1 proxy (or syn for rust) in coverage-gap.sh stays the source
+  powershell-sh-go)
+    # tree-sitter-powershell (vendored under grammars/) is the official
+    # parser — report its NAMED node types that no testdata example
+    # exercises (ts-coverage, a Go tool in the frontend module using the
+    # same smacker/go-tree-sitter + cgo bindings the frontend uses).
+    command -v go >/dev/null || exit 0
+    mkdir -p "$W"
+    tsb="$W/ts-coverage-powershell"
+    if [ ! -x "$tsb" ] || find "$FE/powershell-sh-go/cmd/ts-coverage" -newer "$tsb" 2>/dev/null | grep -q .; then
+      (cd "$FE/powershell-sh-go" && CGO_ENABLED=1 go build -o "$tsb" ./cmd/ts-coverage) >/dev/null 2>&1 || exit 0
+    fi
+    "$tsb" "$FE/powershell-sh-go/testdata" \
+      "$FE/powershell-sh-go/grammars/tree-sitter-powershell/src/node-types.json" 2>/dev/null \
+      | exclude ;;
+  *) exit 0 ;;  # no external grammar (zsh/fish/bat/zig/cpp/rust) — zig's
+                # tokenizer is hand-rolled (tree-sitter-zig is planned,
+                # PLAN_ZIG_F §2); the A1 proxy (or syn for rust) in
+                # coverage-gap.sh stays the source
 esac
 exit 0
