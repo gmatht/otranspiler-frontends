@@ -134,6 +134,75 @@ func cTypeSize(t string) (int, bool) {
 	return 0, false
 }
 
+// cTypeKind — the IrType kind for a C type-specifier word sequence
+// (the c-sh-go model: int = 4 bytes, long/long long = 8 bytes on the
+// x86-64 target). Emitted as {"kind": "Int32"} etc. in var_types and
+// Cast/Sizeof nodes.
+func cTypeKind(words ...string) string {
+	// char/float/double/void have no sized-int IR kind (the frontend
+	// keeps the legacy widthless handling for them)
+	for _, w := range words {
+		if w == "char" || w == "float" || w == "double" || w == "void" {
+			return ""
+		}
+	}
+	uns := false
+	for _, w := range words {
+		if w == "unsigned" {
+			uns = true
+		}
+	}
+	long := false
+	for _, w := range words {
+		if w == "long" {
+			long = true
+		}
+	}
+	if uns {
+		if long {
+			return "UInt64"
+		}
+		return "UInt32"
+	}
+	if long {
+		return "Int64"
+	}
+	return "Int32"
+}
+
+// isTypeKw — a C type-specifier keyword (used to spot `(TYPE) expr`
+// casts and `sizeof(TYPE)` in expression position).
+func isTypeKw(w string) bool {
+	switch w {
+	case "int", "char", "long", "unsigned", "signed", "short", "double", "float", "void":
+		return true
+	}
+	return false
+}
+
+// scanTypeSpec — consume a C type-specifier sequence starting at the
+// current token (e.g. `unsigned long long`), stopping before the first
+// non-type keyword; returns the words and the IrType kind ("" when the
+// next token is not a type keyword).
+func (p *parser) scanTypeSpec() (words []string, kind string) {
+	for p.peek() != nil && p.peek().kind == "id" && isTypeKw(p.peek().text) {
+		w := p.next().text
+		words = append(words, w)
+		// a second `long` (`long long`) or `unsigned int` — keep
+		// consuming while the sequence is still a type specifier; stop
+		// at `int`/`char`/`float`/`double`/`void` when followed by a
+		// declarator (the next word would be a NAME — can't know yet,
+		// so accept a trailing base keyword conservatively)
+		if w == "int" || w == "char" || w == "float" || w == "double" || w == "void" {
+			break
+		}
+	}
+	if len(words) == 0 {
+		return nil, ""
+	}
+	return words, cTypeKind(words...)
+}
+
 // structSize — the flattened sizeof of a declared struct type.
 func structSize(tag string) (int, bool) {
 	total := 0
@@ -487,12 +556,52 @@ var charVars = map[string]bool{}
 // The pointer IS the string; the seam is bypassed entirely.
 var charPtrVars = map[string]bool{}
 
+// varTypes — the declared C type of each scalar/array variable
+// (name -> IrType kind string "Int32"/"Int64"/"UInt32"/"UInt64";
+// absent for char/float/struct/pointers). Emitted in the A1
+// `var_types` field so the C-executed ESTree path can lower i32 vs
+// i64 arithmetic (`| 0` vs BigInt/BigInt64Array).
+var varTypes = map[string]string{}
+
 func assignStmt(name string, expr any) map[string]any {
 	return map[string]any{
 		"expr":    expr,
 		"targets": []any{map[string]any{"indices": []any{}, "sigil": nil, "var": name}},
 		"type":    "Assign",
 	}
+}
+
+// valueNodeTyped — valueNode with the C 64-bit lowering: a 64-bit-
+// typed expression renders as the structured Arith node (BigInt in the
+// ESTree path) so printf %d/%lld args and assignments keep exact 64-bit
+// semantics (a bare getVar read of a BigInt binding would throw in
+// parseInt and a Number read would round past 2^53).
+func valueNodeTyped(e *expr) any {
+	if is64(exprType(e)) {
+		return map[string]any{"type": "Arith", "ast": arithNode(e)}
+	}
+	return valueNode(e)
+}
+
+// declInitValue — a declaration initializer for the declared C type:
+// 64-bit vars initialize via the typed Arith node (BigInt), others via
+// the legacy valueNode path.
+func declInitValue(e *expr, kind string) any {
+	if is64(kind) {
+		return map[string]any{"type": "Arith", "ast": castNode(kind, arithNode(e))}
+	}
+	return valueNode(e)
+}
+
+// sortedVarTypes — the declared-type map keys, deterministically
+// ordered (the A1 contract is byte-deterministic).
+func sortedVarTypes() []string {
+	names := make([]string, 0, len(varTypes))
+	for n := range varTypes {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names
 }
 func testCall(s string) map[string]any { return call("test", []any{st(s)}) }
 func execPrintf(args []any) map[string]any {
@@ -1164,6 +1273,34 @@ func foldConst(e *expr, env map[string]string) (string, bool) {
 		return env[e.name], true
 	case "call":
 		return foldCallConst(e, env)
+	case "sizeof":
+		// sizeof(T) — the typed node (ctype carries the IrType kind; the
+		// ABI size follows the c-sh-go model: int/uint = 4, long long /
+		// unsigned long long = 8). Also handles sizeof(structvar) via the
+		// flattened layout and sizeof(typed-scalar) via varTypes.
+		if e.ctype != "" {
+			switch e.ctype {
+			case "Int32", "UInt32":
+				return "4", true
+			case "Int64", "UInt64":
+				return "8", true
+			}
+		}
+		if e.l != nil && e.l.kind == "id" {
+			if tag, ok := varStruct[e.l.name]; ok {
+				if sz, ok := structSize(tag); ok {
+					return strconv.Itoa(sz), true
+				}
+			}
+			if k := varTypes[e.l.name]; k != "" {
+				switch k {
+				case "Int32", "UInt32":
+					return "4", true
+				case "Int64", "UInt64":
+					return "8", true
+				}
+			}
+		}
 	case "bin":
 		switch e.op {
 		case "+", "-", "*", "/", "%":
@@ -1309,17 +1446,30 @@ func foldCallConst(e *expr, env map[string]string) (string, bool) {
 			}
 		}
 	case "sizeof":
-		if len(e.args) == 1 {
-			a := e.args[0]
-			if a.kind == "id" {
-				if sz, ok := cTypeSize(a.name); ok {
+		// sizeof(T) — the typed node shape (ctype carries the IrType
+		// kind; the ABI size follows the c-sh-go model)
+		if e.ctype != "" {
+			switch e.ctype {
+			case "Int32", "UInt32":
+				return "4", true
+			case "Int64", "UInt64":
+				return "8", true
+			}
+		}
+		// sizeof(expr) — a struct-typed variable uses the flattened
+		// layout; a typed scalar uses its declared type's size
+		if e.l != nil && e.l.kind == "id" {
+			if tag, ok := varStruct[e.l.name]; ok {
+				if sz, ok := structSize(tag); ok {
 					return strconv.Itoa(sz), true
 				}
-				// sizeof(p) on a struct-typed variable -> the layout size
-				if tag, ok := varStruct[a.name]; ok {
-					if sz, ok := structSize(tag); ok {
-						return strconv.Itoa(sz), true
-					}
+			}
+			if k := varTypes[e.l.name]; k != "" {
+				switch k {
+				case "Int32", "UInt32":
+					return "4", true
+				case "Int64", "UInt64":
+					return "8", true
 				}
 			}
 		}
@@ -1445,8 +1595,17 @@ func lex(src string) ([]tok, error) {
 					j++
 				}
 			}
+			// C integer suffixes: strip `LL` / `ULL` / `l` / `u` (and
+			// case variants) so `5000000000LL` lexes as the plain
+			// decimal literal (the frontend's int model is 64-bit
+			// signed — the suffix only changes the C type, which the
+			// surrounding declaration's var_types already carries).
+			k := j // token text ends at j (digits + optional float part)
+			for k < n && (src[k] == 'l' || src[k] == 'L' || src[k] == 'u' || src[k] == 'U') {
+				k++
+			}
 			out = append(out, tok{"num", src[i:j]})
-			i = j
+			i = k
 		case isIdent(c):
 			j := i
 			for j < n && (isIdent(src[j]) || (src[j] >= '0' && src[j] <= '9')) {
@@ -1676,6 +1835,9 @@ type expr struct {
 	op   string
 	l, r *expr
 	args []*expr // call: the argument expressions
+	// ctype — the resolved C type kind ("Int32"/"Int64"/"UInt32"/"UInt64")
+	// for cast/sizeof expression nodes (empty = widthless/unknown).
+	ctype string
 }
 
 func (p *parser) expr() (*expr, error) { return p.ternaryExpr() }
@@ -1946,6 +2108,52 @@ func (p *parser) primary() (*expr, error) {
 		return &expr{kind: "str", num: t.text}, nil
 	case "id":
 		p.next()
+		if t.text == "sizeof" {
+			// sizeof(T) / sizeof(expr) — a compile-time constant carried as
+			// a typed node; the core folds it to 4/8 per the type. Must be
+			// checked BEFORE the generic call handling (`sizeof(...)`
+			// lexes as an id followed by parens).
+			if err := p.expectOp("("); err != nil {
+				return nil, err
+			}
+			if p.peek() != nil && p.peek().kind == "id" && isTypeKw(p.peek().text) {
+				words, ck := p.scanTypeSpec()
+				if len(words) == 0 {
+					return nil, fmt.Errorf("sizeof: empty type specifier")
+				}
+				if err := p.expectOp(")"); err != nil {
+					return nil, err
+				}
+				// the sized int kinds keep the typed Sizeof node (the core
+				// folds it to 4/8); char/float/double/void have no IR type
+				// — fold to the ABI size constant here
+				if ck == "Int32" || ck == "UInt32" || ck == "Int64" || ck == "UInt64" {
+					return &expr{kind: "sizeof", ctype: ck}, nil
+				}
+				if sz, ok := cTypeSize(words[len(words)-1]); ok {
+					return &expr{kind: "num", num: strconv.Itoa(sz)}, nil
+				}
+				return nil, fmt.Errorf("sizeof: unsupported type")
+			}
+			// sizeof(expr) — the operand's C type; a typed operand keeps the
+			// typed Sizeof node (the core folds it to 4/8), an untyped one
+			// (struct vars) folds to the layout constant here
+			se, err := p.expr()
+			if err != nil {
+				return nil, err
+			}
+			if err := p.expectOp(")"); err != nil {
+				return nil, err
+			}
+			sf := &expr{kind: "sizeof", ctype: exprType(se), l: se}
+			if sf.ctype == "" {
+				if s, ok := foldConst(sf, nil); ok {
+					return &expr{kind: "num", num: s}, nil
+				}
+				return nil, fmt.Errorf("sizeof: unsupported operand type")
+			}
+			return sf, nil
+		}
 		if p.isOp("[") {
 			// id[expr] — indexing (pointer-to-string lowering: a 1-char slice)
 			p.next()
@@ -2003,16 +2211,22 @@ func (p *parser) primary() (*expr, error) {
 		return &expr{kind: "id", name: t.text}, nil
 	case "op":
 		if t.text == "(" {
-			// `(int) e` / `(char) e` — a C type cast (identity in the v1
-			// subset: every value is a string in the shell store)
-			if p.p+2 < len(p.ts) {
-				n1, n2 := p.ts[p.p+1], p.ts[p.p+2]
-				if n1.kind == "id" && (n1.text == "int" || n1.text == "char") && n2.kind == "op" && n2.text == ")" {
-					p.next()
-					p.next()
-					p.next()
-					return p.unaryExpr()
+			// `(T) e` — a C type cast. Multi-word specifiers (long long /
+			// unsigned long long) are supported; int/char casts keep the
+			// widthless identity, 64-bit casts render the typed node.
+			if p.p+1 < len(p.ts) && p.ts[p.p+1].kind == "id" && isTypeKw(p.ts[p.p+1].text) {
+				save := p.p
+				p.next() // (
+				_, ck := p.scanTypeSpec()
+				if p.isOp(")") {
+					p.next() // )
+					e, err := p.unaryExpr()
+					if err != nil {
+						return nil, err
+					}
+					return &expr{kind: "cast", ctype: ck, l: e}, nil
 				}
+				p.p = save // not a cast (e.g. `(x)` paren expr) — rewind
 			}
 			p.next()
 			e, err := p.expr()
@@ -2029,7 +2243,95 @@ func (p *parser) primary() (*expr, error) {
 }
 
 // ── statement lowering → A1 ──────────────────────────────────────────
+// exprType — the C type kind of an expression ("Int32"/"Int64"/… or
+// "" for char/float/pointers/unknown). Drives the Int64/UInt64 BigInt
+// wrapping in arithNode: a 64-bit C expression must render as pure
+// BigInt arithmetic in the ESTree path.
+func exprType(e *expr) string {
+	switch e.kind {
+	case "num":
+		return "Int32" // integer literals are int (no LL/U suffix support)
+	case "id":
+		return varTypes[e.name]
+	case "cast":
+		return e.ctype
+	case "sizeof":
+		return "Int64" // size_t on the x86-64 target (8 bytes)
+	case "preinc", "predec", "postinc", "postdec":
+		return varTypes[e.name]
+	case "bin":
+		// usual arithmetic conversions (subset): 64-bit wins, unsigned
+		// propagates, otherwise int
+		lt, rt := exprType(e.l), exprType(e.r)
+		if is64(lt) || is64(rt) {
+			if lt == "UInt64" || rt == "UInt64" {
+				return "UInt64"
+			}
+			if is64(lt) {
+				return lt
+			}
+			return rt
+		}
+		if lt == "UInt32" || rt == "UInt32" {
+			return "UInt32"
+		}
+		return "Int32"
+	}
+	return ""
+}
+
+func is64(k string) bool { return k == "Int64" || k == "UInt64" }
+
+func castNode(ty string, arg any) map[string]any {
+	return map[string]any{"type": "Cast", "ty": map[string]any{"kind": ty}, "arg": arg}
+}
+
+// ensure64 — wrap every Num/Var leaf AND the root of an arith node in
+// Cast(ty, …) so a 64-bit C expression renders as pure BigInt
+// arithmetic in JS (a mixed BigInt/Number binary op would throw).
+func ensure64(ty string, n any) any {
+	if m, ok := n.(map[string]any); ok {
+		switch m["type"] {
+		case "Num", "Var":
+			return castNode(ty, m)
+		case "Bin":
+			m["lhs"] = ensure64(ty, m["lhs"])
+			m["rhs"] = ensure64(ty, m["rhs"])
+			return castNode(ty, m)
+		case "Un":
+			m["arg"] = ensure64(ty, m["arg"])
+			return castNode(ty, m)
+		case "Cond":
+			m["test"] = ensure64(ty, m["test"])
+			m["then"] = ensure64(ty, m["then"])
+			m["else"] = ensure64(ty, m["else"])
+			return castNode(ty, m)
+		case "Assign":
+			m["rhs"] = ensure64(ty, m["rhs"])
+			return castNode(ty, m)
+		case "IncDec":
+			return castNode(ty, m)
+		case "Cast":
+			return m // already typed
+		case "Sizeof":
+			return castNode(ty, m)
+		}
+	}
+	return castNode(ty, n)
+}
+
+// arithNode — the A1 Arith AST for an expression, with the C type
+// lowering: Int64/UInt64-typed expressions wrap every leaf and the
+// root in Cast(ty, …) (the ESTree path renders BigInt arithmetic).
 func arithNode(e *expr) any {
+	n := arithNodeInner(e)
+	if t := exprType(e); is64(t) {
+		n = ensure64(t, n)
+	}
+	return n
+}
+
+func arithNodeInner(e *expr) any {
 	switch e.kind {
 	case "num":
 		n, _ := strconv.Atoi(e.num)
@@ -2060,6 +2362,22 @@ func arithNode(e *expr) any {
 		refuse("ternary in an arithmetic context (lower it to a temp: int v = c ? a : b)")
 	case "bin":
 		return map[string]any{"type": "Bin", "lhs": arithNode(e.l), "op": e.op, "rhs": arithNode(e.r)}
+	case "cast":
+		// (T)x — a C cast: the typed node (the ESTree path renders | 0 /
+		// >>> 0 / BigInt per the target type); a widthless cast (char,
+		// void) is identity.
+		inner := arithNode(e.l)
+		if e.ctype == "" {
+			return inner
+		}
+		return map[string]any{"type": "Cast", "ty": map[string]any{"kind": e.ctype}, "arg": inner}
+	case "sizeof":
+		// sizeof(T) — a compile-time constant carried as a typed node
+		// (the core folds it to 4/8 before any backend renders it)
+		if e.ctype != "" {
+			return map[string]any{"type": "Sizeof", "ty": map[string]any{"kind": e.ctype}}
+		}
+		refuse("sizeof of a non-typed operand is not in the subset")
 	case "index", "deref", "addr":
 		// an array element / pointer deref inside arithmetic — the A1
 		// Arith grammar has no Call node, so a runtime array read cannot
@@ -2130,6 +2448,31 @@ func valueNode(e *expr) any {
 			return call("addrOf", []any{st(e.l.name)})
 		}
 		return call("addrOf", []any{valueNode(e.l)})
+	case "cast":
+		// (T)x in a value position: casts of VALUE-machinery expressions
+		// (calls, derefs, indexes, ternaries) recurse into the value
+		// lowering (`(int)strlen(s)` -> the ${#s} length read); casts of
+		// pure arithmetic render the structured node so the width
+		// conversion applies in JS (`(int)ll` on a BigInt binding must
+		// emit `Number(x) | 0`, not a raw getVar that parseInt would
+		// throw on). char/void casts stay identity.
+		if e.l != nil {
+			switch e.l.kind {
+			case "call", "deref", "index", "member", "cond", "addr", "str":
+				return valueNode(e.l)
+			}
+		}
+		if e.ctype != "" {
+			return map[string]any{"type": "Arith", "ast": arithNode(e)}
+		}
+		return valueNode(e.l)
+	case "sizeof":
+		// sizeof(T) — a compile-time constant as a typed Arith node
+		// (the core folds it to 4/8)
+		if e.ctype != "" {
+			return map[string]any{"type": "Arith", "ast": map[string]any{"type": "Sizeof", "ty": map[string]any{"kind": e.ctype}}}
+		}
+		refuse("sizeof of a non-typed operand is not in the subset")
 	case "deref":
 		// *p on a statically-aliased scalar — the alias folding: direct
 		// read, chasing the chain (`**pp` where pp->p->x reads x)
@@ -2366,6 +2709,13 @@ func (p *parser) hoistArithCalls(e *expr, out *[]any, top bool) *expr {
 		e.r = p.hoistArithCalls(e.r, out, false)
 		if len(e.args) > 0 {
 			e.args[0] = p.hoistArithCalls(e.args[0], out, false)
+		}
+		return e
+	case "cast":
+		// (T)x — hoist a call nested inside the operand (the Arith AST
+		// has no Call node) so `1 + (int)strlen(s)` lowers to a temp
+		if e.l != nil {
+			e.l = p.hoistArithCalls(e.l, out, false)
 		}
 		return e
 	case "deref", "index":
@@ -2712,9 +3062,9 @@ func (p *parser) stmt() (any, error) {
 		// fall through to the type-keyword handling
 		p.next()
 		return p.stmt()
-	case p.isId("int") || p.isId("char") || p.isId("double") || p.isId("float") || p.isId("void") || p.isId("return"):
-		kw := p.next().text
-		if kw == "return" {
+	case p.isId("return"):
+		p.next()
+		{
 			var e *expr
 			if !p.isOp(";") {
 				var err error
@@ -2729,7 +3079,20 @@ func (p *parser) stmt() (any, error) {
 			p.retExpr = e   // captured for user-function constant folding
 			return nil, nil // return: no stdout effect in the v1 subset
 		}
-		// [int|char] [*]* NAME ( = expr )? ;  — pointers: `int *p` / `char *s`
+	case p.isId("int") || p.isId("char") || p.isId("double") || p.isId("float") || p.isId("void") || p.isId("long") || p.isId("unsigned") || p.isId("signed") || p.isId("short"):
+		// [signed|unsigned] [long [long]] [int|char|...] [*]* NAME
+		// — the full type-specifier sequence (long long / unsigned /
+		// unsigned long long) resolves to an IrType kind; char/float/
+		// struct keep the legacy widthless handling.
+		words, _ := p.scanTypeSpec()
+		kw := words[0]
+		kind := ""
+		if kw == "char" || kw == "double" || kw == "float" || kw == "void" {
+			kind = ""
+		} else {
+			kind = cTypeKind(words...)
+		}
+		// [int|char|...] [*]* NAME ( = expr )? ;  — pointers: `int *p` / `char *s`
 		isPtr := false
 		for p.isOp("*") {
 			p.next()
@@ -2796,6 +3159,9 @@ func (p *parser) stmt() (any, error) {
 		if name.kind != "id" {
 			return nil, fmt.Errorf("expected identifier after type")
 		}
+		if kind != "" && !p.isOp("(") {
+			varTypes[name.text] = kind
+		}
 		if kw == "char" && isPtr {
 			charPtrVars[name.text] = true
 		}
@@ -2803,6 +3169,11 @@ func (p *parser) stmt() (any, error) {
 			charVars[name.text] = true
 		}
 		if isPtr && kw != "char" {
+			// typed (non-int/char) pointers are outside the subset's
+			// element-size model (int = 4, char = 1)
+			if kind != "" && kw != "int" {
+				refuse("typed (non-int/char) pointer declarations are not in the subset")
+			}
 			// every non-char pointer declaration starts as a heap-pointer
 			// candidate (promoted out by recordPtrTarget / heapAssignRHS)
 			ptrDecls[name.text] = kw
@@ -2833,6 +3204,9 @@ func (p *parser) stmt() (any, error) {
 				nm := p.next()
 				if nm == nil || nm.kind != "id" {
 					return nil, fmt.Errorf("expected identifier in declaration")
+				}
+				if kind != "" {
+					varTypes[nm.text] = kind
 				}
 				decl = nm.text
 			}
@@ -2922,6 +3296,9 @@ func (p *parser) stmt() (any, error) {
 				return nil, err
 			}
 			arrayVars[name.text] = true
+			if kind != "" {
+				varTypes[name.text] = kind
+			}
 			if p.isOp("=") {
 				p.next()
 				if err := p.expectOp("{"); err != nil {
@@ -3024,7 +3401,7 @@ func (p *parser) stmt() (any, error) {
 			// hoisted to temps (the A1 Arith AST has no Call/Cond node)
 			var temps []any
 			e = p.hoistArithCalls(e, &temps, true)
-			init := assignStmt(name.text, valueNode(e))
+			init := assignStmt(name.text, declInitValue(e, kind))
 			if len(temps) > 0 {
 				return map[string]any{"body": append(temps, init), "type": "Block"}, nil
 			}
@@ -3427,7 +3804,7 @@ func (p *parser) stmt() (any, error) {
 		args := []any{st(fmtStr)}
 		for _, e := range valueExprs {
 			e = p.hoistArithCalls(e, &temps, true)
-			args = append(args, valueNode(e))
+			args = append(args, valueNodeTyped(e))
 		}
 		if len(temps) > 0 {
 			return map[string]any{"body": append(temps, execPrintf(args)), "type": "Block"}, nil
@@ -4459,6 +4836,7 @@ func Shir(src string) (out []byte, err error) {
 	ptrTargets = map[string]ptrTarget{}
 	charPtrVars = map[string]bool{}
 	userFuncs = map[string]*userFunc{}
+	varTypes = map[string]string{}
 	for _, m := range regexp.MustCompile(`&([A-Za-z_][A-Za-z0-9_]*)`).FindAllStringSubmatch(src, -1) {
 		addrTaken[m[1]] = true
 	}
@@ -4498,6 +4876,13 @@ func Shir(src string) (out []byte, err error) {
 		return userDefs[i].(map[string]any)["name"].(string) < userDefs[j].(map[string]any)["name"].(string)
 	})
 	stmts = append(userDefs, stmts...)
+	// the declared C types (int/long long/unsigned…) — the C-executed
+	// ESTree path lowers Int32/UInt32 with |0/>>>0/Math.imul and
+	// Int64/UInt64 with BigInt per these annotations
+	typeVars := []any{}
+	for _, n := range sortedVarTypes() {
+		typeVars = append(typeVars, map[string]any{"name": n, "type": map[string]any{"kind": varTypes[n]}})
+	}
 	prog := map[string]any{
 		"type":             "Program",
 		"contract_version": 1,
@@ -4509,7 +4894,7 @@ func Shir(src string) (out []byte, err error) {
 		"var_const":        []any{},
 		"var_lengths":      []any{},
 		"var_lifetimes":    []any{},
-		"var_types":        []any{},
+		"var_types":        typeVars,
 	}
 	return json.Marshal(prog)
 }

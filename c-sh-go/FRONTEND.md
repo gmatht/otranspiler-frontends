@@ -2,6 +2,53 @@
 
 C source -> A1 shIR JSON (the shell-flavored subset of C).
 
+## v5 — typed integers: int / long long / unsigned / sizeof (2026-08-12), 80/80
+
+C's integer types no longer collapse into the widthless `Int`: the frontend
+now carries the declared type per variable (A1 `var_types`, `{"kind":
+"Int32"}` etc.) and the typed arithmetic nodes (`Cast`/`Sizeof` in the Arith
+AST), and the C-executed ESTree path lowers them per the BinInt64
+benchmarks (`benchmarks/i64/BinInt64.md`):
+
+| C type | IrType kind | ESTree lowering |
+|---|---|---|
+| `int` / `signed` | `Int32` | native numbers, `| 0` wrap, `Math.imul` |
+| `unsigned [int]` | `UInt32` | native numbers, `>>> 0`, `(a>>>0)<(b>>>0)` cmp |
+| `long` / `long long` | `Int64` | BigInt (`BigInt("N")` literals, `BigInt.asIntN(64, …)`) |
+| `unsigned long long` | `UInt64` | BigInt (`BigInt.asUintN(64, …)`) |
+
+- **Declarations**: the full type-specifier sequence is parsed
+  (`long long`, `unsigned`, `unsigned long long`, `signed`); typed vars are
+  recorded in `var_types` (the core keeps frontend-supplied types — it only
+  backfills its own analysis when the field is empty). Integer literal
+  suffixes (`LL`/`ULL`/`u`/`l`) are stripped at the lexer.
+- **Casts** `(T)x` — emitted as `ArithAst::Cast`; the ESTree path renders
+  `Number(x) | 0` (Int32), `Number(x) >>> 0` (UInt32), `BigInt.asIntN(64,
+  BigInt(x))` (Int64), `BigInt.asUintN(64, BigInt(x))` (UInt64).
+  `(int)strlen(s)`-style casts of VALUE-machinery calls recurse into the
+  value lowering.
+- **sizeof(T)** — emitted as `ArithAst::Sizeof(ty)`; the core folds it to
+  4/8 (int/unsigned = 4, long long = 8; `sizeof(char)` = 1, `sizeof(double)`
+  = 8 fold at the frontend — no IR type for them). `sizeof(structvar)`
+  folds to the flattened layout size. malloc/calloc sizes keep folding.
+- **64-bit arithmetic**: every Int64/UInt64-typed expression wraps its
+  leaves AND root in `Cast(ty, …)` so the ESTree path renders pure BigInt
+  arithmetic (a mixed BigInt/Number binary op would throw). `printf` args
+  of 64-bit type render the typed Arith node, and `%lld`/`%llu`/`%ld` are
+  supported by the core's native printf fold (BigInt args bypass
+  `parseInt` — the template stringifies them exactly).
+- Signed vs unsigned at 64 bits: `BigUint64Array` would be 2–10× slower
+  than `BigInt64Array` on V8 (BinInt64.md §6), so the JS lowering keeps
+  u64 as BigInt values with `asUintN` wrap — exact, no rounding past 2^53.
+
+Verified end-to-end (gcc vs A1→ESTree→JS): t31_types.c (sizeof int/ll,
+`%lld` beyond 2^32, `%u`/`%llu`, `(int)` narrowing — 705032704 =
+5000000000 mod 2^32). Gate 80/80 (79 pre-existing + t31).
+
+Still refused (honest): typed (non-int/char) POINTERS, i64 in conditions
+(the test-string lowering is untyped), `unsigned` arithmetic beyond the
+four declarator forms.
+
 ## v4 — the last refused rung (2026-08-10), 79/79
 
 ## v4.1 — bare `!` on a numeric operand (c-request cpp-20260810-054745)
