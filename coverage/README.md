@@ -66,12 +66,17 @@ GOOD_EXAMPLES.md for the expressible ones.
 | py-sh-go | official grammars-v4 Python3 (vendored) | 45/119 rules, 71/71 parse-clean; unexercised = classdef/try/lambda/break/continue/from-import/extended-slice/match… — all probed by-design refusals |
 | go-sh | official grammars-v4 golang (fetched) | 67/106 rules, 78/78 parse-clean; import + fixed-array covered by t76/t77; rest = const/struct/method/pointer/break/concurrency — by-design |
 | c-sh-go | official grammars-v4 c (fetched; stub base classes) | 60/117 rules, 78/79 parse-clean (t26 varargs needs the preprocessor); const/enum/typedef/volatile/__LINE__ parse but their inits are silently dropped (lowering bugs), designated-init/asm/attributes/_Generic refuse |
-| zsh/fish/bat/perl | none exists in grammars-v4 | no external truth — the A1-node proxy (coverage-gap.sh) is the only signal |
+| perl-sh-go | PPI node classes (`ppi-coverage.pl`) | 26/76 classes, 68/68 parse-clean; single-quote gap closed by t70; number/q()/$#/single-quote-$ lowerings broken (bugs-perl-sh-go.txt); use/package/qw/pod/BEGIN refuse |
+| zsh/fish/bat | none exists in grammars-v4 | no external truth — the A1-node proxy (coverage-gap.sh) is the only signal |
 
 Caveat: the c grammar's semantic superclasses (`CLexerBase`/`CParserBase`)
 are stubbed (the real ones run gcc + a symbol table); the stub predicates
 are lookahead-based (type-keyword checks) and parse 78/79 of the corpus —
 `sizeof(type)`/`(int)` casts resolve, `va_list` (stdarg.h) does not.
+
+Full findings: **PARSER_GAPS.md** (workspace root). The Perl check is
+`ppi-coverage.pl` (PPI is the external source of truth — grammars-v4 has no
+Perl grammar).
 
 Requires java/javac + the antlr4 jar (downloaded on demand to
 `.antlr4.jar`, gitignored). Java parser generated into `.work/`

@@ -1,0 +1,7 @@
+single-quoted string containing '$' interpolates it (should be literal) — t70 probe, print 'raw $x not interpolated'
+float literal 1.5 lowers as concat '1'.'5' — print 1.5 prints 15
+hex literal 0x1F lowers to 0 (hex prefix dropped)
+octal literal 077 lowers to 77 (decimal, not 63)
+exp literal 1e3 lowers to 1 (the e3 suffix dropped) — print 1e3 prints 1
+q() quote operator lowers as a function CALL to "q" — print q(foo) fails
+$#array lowers to a bogus Call("a", [elements...]) — the last-index idiom broken
