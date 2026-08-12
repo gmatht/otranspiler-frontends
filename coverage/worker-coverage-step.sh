@@ -56,7 +56,7 @@ if (cd "$ROOT/frontends/$lang" && make test > "$T/gate.log" 2>&1); then
   cat "$T/gate.log" >> "$LOG"
   changes=$(git -C "$ROOT" status --porcelain 2>/dev/null \
             | awk '/^.. /{print $2}' \
-            | awk -v d="$ROOT/frontends/$lang" '$0 ~ "^"d || $0 ~ /^harness\//' || true)
+            | awk -v d="frontends/$lang" '$2 ~ "^"d || $2 ~ /^harness\//' || true)
   if [ -n "$changes" ]; then
     git -C "$ROOT" add $changes 2>/dev/null || true
     git -C "$ROOT" commit -m "frontend $lang: coverage example for '$gap'" >> "$LOG" 2>&1 || true
