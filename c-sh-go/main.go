@@ -2280,6 +2280,9 @@ func (p *parser) primary() (*expr, error) {
 // wrapping in arithNode: a 64-bit C expression must render as pure
 // BigInt arithmetic in the ESTree path.
 func exprType(e *expr) string {
+	if e == nil {
+		return ""
+	}
 	switch e.kind {
 	case "num":
 		// C literal typing: int when it fits, else long long (LP64). The
@@ -2402,6 +2405,11 @@ func arithNodeInner(e *expr) any {
 		}
 		refuse("ternary in an arithmetic context (lower it to a temp: int v = c ? a : b)")
 	case "bin":
+		if e.r == nil {
+			// the unary-`!` shape (`!ll` in a condition): the Arith Un
+			// node (a nil RHS would crash the Bin lowering)
+			return map[string]any{"type": "Un", "op": e.op, "arg": arithNode(e.l)}
+		}
 		return map[string]any{"type": "Bin", "lhs": arithNode(e.l), "op": e.op, "rhs": arithNode(e.r)}
 	case "cast":
 		// (T)x — a C cast: the typed node (the ESTree path renders | 0 /
@@ -2731,8 +2739,33 @@ func operandIsString(e *expr) bool {
 func (p *parser) hoistToTemp(e *expr, out *[]any) *expr {
 	userTempSeq++
 	tmp := "___t" + strconv.Itoa(userTempSeq)
+	// a 64-bit-elem pointer read hoisted out of arithmetic: the temp is
+	// typed so the arith lowering wraps it in BigInt (Number would round
+	// the memLoad string past 2^53)
+	if elem64Kind(e) != "" {
+		varTypes[tmp] = elem64Kind(e)
+	}
 	*out = append(*out, assignStmt(tmp, valueNode(e)))
 	return &expr{kind: "id", name: tmp}
+}
+
+// elem64Kind — the IrType kind of a 64-bit-elem pointer read ("Int64" /
+// "UInt64"/""), for temp typing.
+func elem64Kind(e *expr) string {
+	if e == nil || e.l == nil || e.l.kind != "id" {
+		return ""
+	}
+	elem, ok := ptrDecls[e.l.name]
+	if !ok {
+		return ""
+	}
+	switch elem {
+	case "long long", "long":
+		return "Int64"
+	case "unsigned long long", "unsigned long":
+		return "UInt64"
+	}
+	return ""
 }
 
 // hoistArithCalls — rewrite `e` so no runtime call or ternary remains
@@ -2997,6 +3030,14 @@ func condCall(c *expr) map[string]any {
 	// test-string grammar cannot compare handles) — slice 2
 	if mc, ok := heapCompareCall(c); ok {
 		return mc
+	}
+	if is64(exprType(c)) {
+		// a 64-bit-typed condition: the structured Arith renders native
+		// BigInt comparisons — exact past 2^53 (the testArith string
+		// form's parseInt would round, and a BigInt test string would
+		// mix types). Leaves are wrapped; the root comparison stays
+		// unwrapped (asIntN of a boolean would throw).
+		return map[string]any{"type": "Arith", "ast": arithNodeInner(c)}
 	}
 	if condNeedsArith(c) {
 		return call("testArith", []any{st(exprToArithString(c))})
@@ -3984,9 +4025,17 @@ func (p *parser) buildAssign(name, op string, e *expr) (any, error) {
 		// same seam as the valueNode fallback.
 		return assignStmt(name, call("fparith", []any{st("($" + name + " " + arithOp + " " + exprToArithString(e) + ")")})), nil
 	}
-	return assignStmt(name, map[string]any{"ast": map[string]any{
+	n := map[string]any{
 		"type": "Bin", "lhs": map[string]any{"type": "Var", "name": name},
-		"op": arithOp, "rhs": arithNode(e)}, "type": "Arith"}), nil
+		"op": arithOp, "rhs": arithNode(e),
+	}
+	// a 64-bit target's compound is a 64-bit expression: wrap leaves and
+	// root so the ESTree path renders pure BigInt arithmetic (a mixed
+	// BigInt/Number `y + <read>` would throw)
+	if k := varTypes[name]; is64(k) {
+		n = ensure64(k, n).(map[string]any)
+	}
+	return assignStmt(name, map[string]any{"ast": n, "type": "Arith"}), nil
 }
 
 func (p *parser) simpleAssign() (any, error) {

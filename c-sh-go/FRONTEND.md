@@ -47,15 +47,16 @@ Verified end-to-end (gcc vs A1→ESTree→JS): t31_types.c (sizeof int/ll,
 comparisons AND arithmetic — `ll % 2 == 0`, `ll + 1 > 5000000000LL`,
 `u / 3 > 100`, `!ll`), t42_typed_pointers.c (`long long *`,
 `unsigned long long *`, `unsigned int *` heap pointers with malloc,
-element-scaled offsets, pointer advance, exact u64 values past 2^53).
-Gate 82/82 (79 pre-existing + t31/t41/t42).
+element-scaled offsets, pointer advance, exact u64 values past 2^53),
+t43_64ptr_arith.c (64-bit pointer reads INSIDE arithmetic — `x =
+a[0] + 1`, `y += a[0]`, `a[0] + 2` — exact past 2^53, 2^64 wrap
+included), t44_huge_cond.c (i64 bitwise/mod conditions on
+9223372036854775807 — `ll % 2`, `ll & 1`, `ll >> 62` — exact past
+2^53). Gate 85/85.
 
-Still refused (honest): 64-bit-elem pointer reads INSIDE arithmetic
-(`b[0] + 1` — the A1 Arith AST has no Call node; lower to a temp),
-`testArith` conditions with 64-bit values past 2^53 (`ll % 2` where
-ll ≥ 2^53 — the shell-arith evaluator's parseInt limit; comparisons
-and +-*-/ conditions render natively and are exact), and untyped
-char-order comparisons.
+Still refused (honest): char ORDERING comparisons (`c < 'b'` — the
+untyped test-string grammar has no string ordering), and i64 in
+`switch` discriminants (untyped case-value comparison).
 
 ## v4 — the last refused rung (2026-08-10), 79/79
 
