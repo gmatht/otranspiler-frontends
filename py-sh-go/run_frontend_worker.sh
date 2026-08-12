@@ -20,10 +20,13 @@ while true; do
   echo "[$(date +%FT%T)] py-sh-go: gate run" >> "$LOG"
   if make test >> "$LOG" 2>&1; then
     fail_count=0
-    # commit any scoped changes the fix may have made (this dir + harness/*)
+    # commit any scoped changes the fix may have made (this dir + harness/*).
+    # `git status` paths are repo-relative, so match the frontend dir as a
+    # RELATIVE prefix (the old absolute-path match never fired — fixes
+    # piled up uncommitted until a stray `git stash` wiped them).
     changes=$(git -C "$WORKSPACE" status --porcelain 2>/dev/null \
               | awk '/^.. /{print $2}' \
-              | awk -v d="$(pwd)" '$0 ~ "^"d || $0 ~ /^harness\//' || true)
+              | awk -v d="${pwd#$WORKSPACE/}" '$0 ~ "^"d"/" || $0 ~ /^harness\//' || true)
     if [ -n "$changes" ]; then
       git -C "$WORKSPACE" add $changes 2>/dev/null || true
       git -C "$WORKSPACE" commit -m "frontend py-sh-go: gate green" >> "$LOG" 2>&1 || true
