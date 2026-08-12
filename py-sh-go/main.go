@@ -21,12 +21,11 @@
 // are emitted (Expr/Assign/If/While/For/Function/... — the Perl-only
 // Output/Warn nodes panic the ESTree backend, so they are never
 // emitted here).
-package main
+package pylib
 
 import (
 	"bytes"
 	"fmt"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -65,6 +64,10 @@ type BoolE struct {
 }
 type TernaryE struct{ Cond, Then, Else Expr }
 type ListE struct{ Elems []Expr }
+type DictE struct {
+	Keys   []Expr // string-literal keys in the v1 subset
+	Values []Expr
+}
 type SubscriptE struct {
 	Obj        Expr
 	Index      Expr // a[i] form
@@ -129,10 +132,10 @@ type FuncS struct {
 type ReturnS struct{ Value Expr }
 type ExprS struct{ Expr Expr }
 type WithS struct {
-	Path     string
-	Mode     string
-	FhVar    string
-	Body     []Stmt
+	Path  string
+	Mode  string
+	FhVar string
+	Body  []Stmt
 }
 type ImportS struct{}
 type GlobalS struct{}
@@ -258,7 +261,7 @@ func lexLine(src string) []tok {
 			continue
 		}
 		switch c {
-		case '(', ')', '[', ']', ',', ':', '.', '+', '-', '*', '/', '%', '<', '>', '=':
+		case '(', ')', '[', ']', '{', '}', ',', ':', '.', '+', '-', '*', '/', '%', '<', '>', '=':
 			toks = append(toks, tok{tOp, string(c), i})
 			i++
 			continue
@@ -790,10 +793,12 @@ func parseRHS(toks []tok) (Expr, error) {
 			continue
 		}
 		switch t.text {
-		case "(", "[":
+		case "(", "[", "{":
 			depth++
-		case ")", "]":
-			depth--
+		case ")", "]", "}":
+			if depth > 0 {
+				depth--
+			}
 		case ",":
 			if depth == 0 {
 				parts = append(parts, toks[start:i])
@@ -913,10 +918,10 @@ func parseExprUntil(toks []tok, stops ...string) (Expr, []tok, error) {
 			continue
 		}
 		switch t.text {
-		case "(", "[":
+		case "(", "[", "{":
 			depth++
 			continue
-		case ")", "]":
+		case ")", "]", "}":
 			if depth > 0 {
 				depth--
 				continue
@@ -1357,6 +1362,41 @@ func (e *exprParser) parsePrimary() (Expr, error) {
 			}
 			return &ListE{Elems: elems}, nil
 		}
+		if t.text == "{" {
+			// dict literal {k: v, ...}
+			var keys, vals []Expr
+			if e.isOp("}") {
+				e.next()
+				return &DictE{}, nil
+			}
+			for {
+				k, err := e.parseTernary()
+				if err != nil {
+					return nil, err
+				}
+				if err := e.expectOp(":"); err != nil {
+					return nil, err
+				}
+				v, err := e.parseTernary()
+				if err != nil {
+					return nil, err
+				}
+				keys = append(keys, k)
+				vals = append(vals, v)
+				if e.isOp(",") {
+					e.next()
+					if e.isOp("}") {
+						break
+					}
+					continue
+				}
+				break
+			}
+			if err := e.expectOp("}"); err != nil {
+				return nil, err
+			}
+			return &DictE{Keys: keys, Values: vals}, nil
+		}
 	}
 	return nil, fmt.Errorf("unexpected token %q", t.text)
 }
@@ -1583,6 +1623,8 @@ func (l *lowerer) typeOf(e Expr) string {
 		return "int"
 	case *ListE:
 		return "list"
+	case *DictE:
+		return "dict"
 	case *SubscriptE:
 		if t.Index != nil {
 			return "str"
@@ -1739,13 +1781,13 @@ func backgroundStmt(body []map[string]any) map[string]any {
 
 func redirectStmt(inner []map[string]any, fd int, mode, target string) map[string]any {
 	return map[string]any{
-		"type": "Redirect",
+		"type":  "Redirect",
 		"inner": toAnyStmts(inner),
 		"redirects": []any{map[string]any{
-			"fd":           fd,
-			"mode":         mode,
-			"target":       st(target),
-			"interpolate":  true,
+			"fd":          fd,
+			"mode":        mode,
+			"target":      st(target),
+			"interpolate": true,
 		}},
 	}
 }
@@ -1961,6 +2003,31 @@ func (l *lowerer) subscriptIR(t *SubscriptE) (map[string]any, error) {
 			}
 		}
 		return nil, fmt.Errorf("rsplit subscript: expected var.rsplit(str, 1)[1]")
+	}
+	// s.split()[0] — the first whitespace-separated word; s.split(sep)[0]
+	// — the part before the FIRST sep occurrence. Both lower to ${s%%P*}:
+	// strip the longest suffix that starts at the first space/sep (bash
+	// param expansion; the core's param lift lowers it natively for a
+	// literal core like " " or ","). No-arg split() on a string with
+	// LEADING whitespace differs (python skips the whitespace run, the
+	// glob keeps it) — out of the corpus idiom's scope.
+	if mc, ok := t.Obj.(*MethodCallE); ok && mc.Name == "split" {
+		if one, ok := t.Index.(*LitInt); ok && one.Text == "0" {
+			if n, ok := mc.Obj.(*NameE); ok {
+				sep := " "
+				if len(mc.Args) == 1 {
+					pa, ok := mc.Args[0].(*LitStr)
+					if !ok {
+						return nil, fmt.Errorf("split subscript: expected var.split(str)[0]")
+					}
+					sep = pa.Value
+				} else if len(mc.Args) > 1 {
+					return nil, fmt.Errorf("split subscript: expected var.split([str])[0]")
+				}
+				return call("param", []any{st("%%"), st(n.Name), st(sep + "*")}), nil
+			}
+		}
+		return nil, fmt.Errorf("split subscript: expected var.split()[0]")
 	}
 	name, ok := t.Obj.(*NameE)
 	if !ok {
@@ -2219,6 +2286,27 @@ func (l *lowerer) methodIR(t *MethodCallE) (map[string]any, error) {
 			}
 		}
 		return nil, fmt.Errorf("replace: expected var.replace(str, str)")
+	case "upper":
+		// s.upper() — ${s^^} (uppercase all): the core's param lift maps
+		// "^^" to the runtime/native toUpperCase.
+		if n, ok := t.Obj.(*NameE); ok {
+			return call("param", []any{st("^^"), st(n.Name)}), nil
+		}
+		return nil, fmt.Errorf("upper: expected var.upper()")
+	case "get":
+		// d.get(k) — dict lookup: the runtime's assocGet (${d[k]}). A
+		// missing key yields "" (the subset has no None; Python's None
+		// default arg is out of scope).
+		if len(t.Args) == 1 {
+			if n, ok := t.Obj.(*NameE); ok {
+				key, err := l.argIR(t.Args[0])
+				if err != nil {
+					return nil, err
+				}
+				return call("arrayIndex", []any{st(n.Name), key}), nil
+			}
+		}
+		return nil, fmt.Errorf("get: expected var.get(key)")
 	case "write":
 		// fh.write("...") — handled at statement level (with-block)
 		return nil, fmt.Errorf("write handled at statement level")
@@ -2604,6 +2692,32 @@ func (l *lowerer) assignOne(target, op string, val Expr) ([]map[string]any, erro
 		}
 		return []map[string]any{backgroundStmt([]map[string]any{exprStmt(ir)})}, nil
 	}
+	// dict literal → declare -A + setArray ([k]=v elements): the exact
+	// shape the core frontend emits for `declare -A d; d=([a]=1 [b]=2)`
+	// (the estree runtime registers the name via the declare builtin and
+	// stores key=value pairs; reads dispatch through arrayIndex).
+	if dt, ok := val.(*DictE); ok {
+		var elems []any
+		for i, k := range dt.Keys {
+			ks, ok := k.(*LitStr)
+			if !ok {
+				return nil, fmt.Errorf("dict: keys must be string literals")
+			}
+			switch v := dt.Values[i].(type) {
+			case *LitStr:
+				elems = append(elems, st("["+ks.Value+"]="+v.Value))
+			case *LitInt:
+				elems = append(elems, st("["+ks.Value+"]="+v.Text))
+			default:
+				return nil, fmt.Errorf("dict: value for %q must be a literal", ks.Value)
+			}
+		}
+		l.setType(target, "dict")
+		return []map[string]any{
+			exprStmt(execCall("declare", []any{st("-A"), st(target)})),
+			assignStmt(target, call("setArray", []any{st(target), array(elems)})),
+		}, nil
+	}
 	// list literal → setArray / setArrayAppend (arr += (...))
 	if lst, ok := val.(*ListE); ok {
 		var elems []any
@@ -2817,6 +2931,21 @@ func (l *lowerer) exprStmtIR(e Expr) ([]map[string]any, error) {
 		if t.Name == "wait" {
 			return []map[string]any{exprStmt(execCall("wait", []any{}))}, nil
 		}
+		if t.Name == "append" {
+			// l.append(x) — list append → arr+=(x): the same
+			// Assign(setArrayAppend) shape `a += [x]` lowers to (t56).
+			if len(t.Args) == 1 {
+				if n, ok := t.Obj.(*NameE); ok {
+					ir, err := l.argIR(t.Args[0])
+					if err != nil {
+						return nil, err
+					}
+					l.setType(n.Name, "list")
+					return []map[string]any{assignStmt(n.Name, call("setArrayAppend", []any{st(n.Name), array([]any{ir})}))}, nil
+				}
+			}
+			return nil, fmt.Errorf("append: expected var.append(value)")
+		}
 		if t.Name == "write" {
 			// fh.write("...") — handled inside with-blocks
 			return nil, fmt.Errorf("write outside with-block")
@@ -2897,59 +3026,32 @@ func buildProgram(stmts []Stmt) (*shiremit.Program, error) {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// main
+// Shir — py-sh-go as a library: Python source -> A1 shIR JSON bytes
+// (no trailing newline). Both the CLI (cmd/py-sh-go) and the combined
+// busybox dispatch through this single entry point.
 // ─────────────────────────────────────────────────────────────────────
 
-func main() {
-	args := os.Args[1:]
-	raw := false
-	filtered := []string{}
-	for _, a := range args {
-		if a == "--raw" {
-			raw = true
-		} else {
-			filtered = append(filtered, a)
-		}
-	}
-	if len(filtered) != 2 || filtered[0] != "--shir" {
-		fmt.Fprintln(os.Stderr, "usage: py-sh-go --shir <file.py> [--raw]")
-		os.Exit(2)
-	}
-	inp := filtered[1]
-	src := inp
-	if strings.Contains(inp, ".py") || !strings.ContainsAny(inp, " \t\n") {
-		if b, err := os.ReadFile(inp); err == nil {
-			src = string(b)
-		}
-	}
+func Shir(src string) ([]byte, error) {
 	// Strip shebang.
 	if i := strings.IndexByte(src, '\n'); i > 0 && strings.HasPrefix(src, "#!") {
 		src = src[i+1:]
 	}
 	stmts, err := parseProgram(src)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "parse: "+err.Error())
-		os.Exit(2)
+		return nil, fmt.Errorf("parse: %w", err)
 	}
 	prog, err := buildProgram(stmts)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "lower: "+err.Error())
-		os.Exit(2)
+		return nil, fmt.Errorf("lower: %w", err)
 	}
 	out, err := shiremit.Emit(prog)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "emit: "+err.Error())
-		os.Exit(1)
+		return nil, fmt.Errorf("emit: %w", err)
 	}
 	// The shared emitter predates the stmt_lines contract field; the
 	// core's program JSON always carries it (empty here — no line
 	// mappings for the v1 subset). Insert after "requires" — exactly
 	// where serde_json's BTreeMap ordering places it.
 	out = bytes.Replace(out, []byte(`"requires":[]`), []byte(`"requires":[],"stmt_lines":[]`), 1)
-	if raw {
-		os.Stdout.Write(out)
-	} else {
-		os.Stdout.Write(out)
-		os.Stdout.Write([]byte{'\n'})
-	}
+	return out, nil
 }
