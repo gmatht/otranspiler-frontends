@@ -54,14 +54,28 @@ pi_rc=$?
 if (cd "$ROOT/frontends/$lang" && make test > "$T/gate.log" 2>&1); then
   # the new example keeps the gate green — commit it
   cat "$T/gate.log" >> "$LOG"
-  changes=$(git -C "$ROOT" status --porcelain 2>/dev/null \
-            | awk '/^.. /{print $2}' \
-            | awk -v d="frontends/$lang" '$2 ~ "^"d || $2 ~ /^harness\//' || true)
-  if [ -n "$changes" ]; then
-    git -C "$ROOT" add $changes 2>/dev/null || true
-    git -C "$ROOT" commit -m "frontend $lang: coverage example for '$gap'" >> "$LOG" 2>&1 || true
+  ls "$ROOT/frontends/$lang"/testdata 2>/dev/null | sort > "$T/after.txt"
+  newfiles=$(comm -13 "$T/before.txt" "$T/after.txt")
+  if [ -z "$newfiles" ]; then
+    # pi created nothing. rc==0 = deliberate refusal (the prompt told pi
+    # to exit 0 when the construct is not expressible) — ledger it so the
+    # next cycle moves to the NEXT gap; rc!=0 = pi failure — retry next.
+    if [ "$pi_rc" -eq 0 ]; then
+      printf '%s\n' "$gap" >> "$ROOT/frontends/coverage/refused-$lang.txt"
+      echo "$TS coverage[$lang]: no example for '$gap' (pi judged it not expressible) — marked known-refused" >> "$LOG"
+    else
+      echo "$TS coverage[$lang]: no example for '$gap' (pi rc=$pi_rc) — will retry next cycle" >> "$LOG"
+    fi
+  else
+    changes=$(git -C "$ROOT" status --porcelain 2>/dev/null \
+              | awk '/^.. /{print $2}' \
+              | awk -v d="frontends/$lang" '$1 ~ "^"d || $1 ~ /^harness\//' || true)
+    if [ -n "$changes" ]; then
+      git -C "$ROOT" add $changes 2>/dev/null || true
+      git -C "$ROOT" commit -m "frontend $lang: coverage example for '$gap'" >> "$LOG" 2>&1 || true
+    fi
+    echo "$TS coverage[$lang]: coverage example for '$gap' committed (gate green)" >> "$LOG"
   fi
-  echo "$TS coverage[$lang]: coverage example for '$gap' committed (gate green)" >> "$LOG"
 else
   cat "$T/gate.log" >> "$LOG"
   # Discard ONLY what pi added (files not present before), revert tracked
