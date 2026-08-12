@@ -11,6 +11,18 @@
 ANTLR4 ?= antlr4
 DEBASHC ?= $(abspath ../../sh2perl/target/debug/debashc)
 GO ?= /snap/go/current/bin/go
+# Per-gate oracle snapshot (see harness/snapshot-debashc.sh): concurrent
+# workers rebuild target/debug/debashc mid-gate (estree worker core
+# changes; other gates' self-heal rules), and a torn binary wedges ONE
+# test with a misleading FAIL (t71_var_name_mods, 2026-08-12 20:55:24).
+# The byte-equality phase and the stdout harness both run the stable
+# verified copy below, never the shared binary.
+GATE_TMP := $(shell mktemp -d /tmp/zsh-sh-go-gate.XXXXXX)
+GATE_DEBASHC := $(GATE_TMP)/debashc
+
+$(GATE_DEBASHC): $(DEBASHC)
+	@bash "$(abspath ../../harness/snapshot-debashc.sh)" $(DEBASHC) $@ \
+	  || { echo "FAIL: no verified debashc snapshot (concurrent rebuild?)"; exit 1; }
 
 .PHONY: all gen build test worker clean
 
@@ -42,11 +54,11 @@ build:
 $(DEBASHC):
 	cd $(abspath ../../sh2perl) && cargo build --bin debashc
 
-test: build $(DEBASHC)
+test: build $(GATE_DEBASHC)
 	@for f in testdata/*.zsh; do \
 	  bn=$$(basename $$f); \
 	  ./zsh-sh-go --shir $$f --raw > /tmp/$$bn.mine 2>/dev/null || { echo "FAIL $$bn (frontend)"; exit 1; }; \
-	  $(DEBASHC) --shir $$f --raw > /tmp/$$bn.core 2>/dev/null || { echo "FAIL $$bn (core)"; exit 1; }; \
+	  $(GATE_DEBASHC) --shir $$f --raw > /tmp/$$bn.core 2>/dev/null || { echo "FAIL $$bn (core)"; exit 1; }; \
 	  if grep -qEf "$(abspath ../../harness/zsh-subscript.ere)" "$$f"; then \
 	    echo "OK $$bn (array-subscript file — byte-equality waived; stdout oracle only)"; \
 	  elif diff -q /tmp/$$bn.mine /tmp/$$bn.core > /dev/null; then \
@@ -58,10 +70,11 @@ test: build $(DEBASHC)
 	  fi; \
 	done
 	@echo "--- executed-stdout comparison (native vs JS/ESTree) ---"
-	@bash "$(abspath ../../harness/frontend-stdout.sh)" zsh ./zsh-sh-go testdata "$(DEBASHC)" || exit 1
+	@bash "$(abspath ../../harness/frontend-stdout.sh)" zsh ./zsh-sh-go testdata "$(GATE_DEBASHC)" || exit 1
 
 worker: test
 	@echo "zsh-sh-go worker gate: ingress acceptance + executed-stdout passed"
 
 clean:
 	rm -f zsh-sh-go /tmp/*.mine /tmp/*.core
+	rm -rf $(GATE_TMP)

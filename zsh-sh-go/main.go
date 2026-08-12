@@ -421,7 +421,10 @@ func (p *Parser) parseWord() (*Word, error) {
 			if p.isVarRefNext() {
 				break
 			}
-			if p.peekAt(1) == '{' || p.peekAt(1) == '(' {
+			// `$$` (DollarDollar, the pid special var) breaks out like a
+			// var ref — the merge loop parses it as an expansion part
+			// (mirror: the core lexes DollarDollar in word context).
+			if p.peekAt(1) == '{' || p.peekAt(1) == '(' || p.peekAt(1) == '$' {
 				break
 			}
 			sb.WriteByte('$')
@@ -525,7 +528,7 @@ func (p *Parser) mergeFragments(w *Word) {
 			// backtick becomes a new word (consumed, content dropped)
 			return
 		case c == '$':
-			if p.isVarRefNext() || p.peekAt(1) == '{' || p.peekAt(1) == '(' {
+			if p.isVarRefNext() || p.peekAt(1) == '{' || p.peekAt(1) == '(' || p.peekAt(1) == '$' {
 				exp, err := p.parseDollarExpansion()
 				if err != nil {
 					return
