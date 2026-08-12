@@ -21,6 +21,11 @@ while true; do
     sleep 300; continue
   fi
   bash "$WORKSPACE/setup_backends.sh" --wait >> "$LOG" 2>&1 || true
+  # SELF-HEAL: a stale root-owned cpp-sh-go-latest.txt (left by a
+  # pre-single-owner gate run) makes run-gate.sh's report write fail
+  # with "Permission denied" even when make test is green. Remove it
+  # (and a stale running.txt from a crashed run) before each gate.
+  rm -f "$WORKSPACE/gate-reports/cpp-sh-go-latest.txt" "$WORKSPACE/gate-reports/running.txt" 2>/dev/null || true
   echo "[$(date +%FT%T)] cpp-sh-go: gate run" >> "$LOG"
   if bash "$WORKSPACE/run-gate.sh" cpp-sh-go test >> "$LOG" 2>&1; then
     fail_count=0
