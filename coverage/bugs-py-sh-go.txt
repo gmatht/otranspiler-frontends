@@ -1,0 +1,1 @@
+True/False literals lower to Str "1"/"0" — native prints True/False (stdout mismatch)
