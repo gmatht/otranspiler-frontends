@@ -43,11 +43,19 @@ benchmarks (`benchmarks/i64/BinInt64.md`):
 
 Verified end-to-end (gcc vs A1→ESTree→JS): t31_types.c (sizeof int/ll,
 `%lld` beyond 2^32, `%u`/`%llu`, `(int)` narrowing — 705032704 =
-5000000000 mod 2^32). Gate 80/80 (79 pre-existing + t31).
+5000000000 mod 2^32), t41_typed_conditions.c (i64/u32 in if conditions:
+comparisons AND arithmetic — `ll % 2 == 0`, `ll + 1 > 5000000000LL`,
+`u / 3 > 100`, `!ll`), t42_typed_pointers.c (`long long *`,
+`unsigned long long *`, `unsigned int *` heap pointers with malloc,
+element-scaled offsets, pointer advance, exact u64 values past 2^53).
+Gate 82/82 (79 pre-existing + t31/t41/t42).
 
-Still refused (honest): typed (non-int/char) POINTERS, i64 in conditions
-(the test-string lowering is untyped), `unsigned` arithmetic beyond the
-four declarator forms.
+Still refused (honest): 64-bit-elem pointer reads INSIDE arithmetic
+(`b[0] + 1` — the A1 Arith AST has no Call node; lower to a temp),
+`testArith` conditions with 64-bit values past 2^53 (`ll % 2` where
+ll ≥ 2^53 — the shell-arith evaluator's parseInt limit; comparisons
+and +-*-/ conditions render natively and are exact), and untyped
+char-order comparisons.
 
 ## v4 — the last refused rung (2026-08-10), 79/79
 

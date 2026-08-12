@@ -11,6 +11,7 @@ package clib
 // Emit shapes mirror the py-sh-go frontend so the estree runner executes
 // them identically. Unsupported constructs fail loud (refuse > guess).
 import (
+	"math"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -214,6 +215,23 @@ func structSize(tag string) (int, bool) {
 		total += sz
 	}
 	return total, true
+}
+
+// kindToElem — the C element-type NAME the runtime mem.* seam scales by
+// (the memElemSize table): the four sized int kinds map to their canonical
+// C names; everything else keeps the declarator word.
+func kindToElem(kind string) string {
+	switch kind {
+	case "Int32":
+		return "int"
+	case "UInt32":
+		return "unsigned int"
+	case "Int64":
+		return "long long"
+	case "UInt64":
+		return "unsigned long long"
+	}
+	return ""
 }
 
 // storeAssignStmt — a store write (Expr(setVar(...))): for names the
@@ -591,6 +609,20 @@ func declInitValue(e *expr, kind string) any {
 		return map[string]any{"type": "Arith", "ast": castNode(kind, arithNode(e))}
 	}
 	return valueNode(e)
+}
+
+// is64ElemPtrRead — a deref/index whose pointer's element type is
+// 64-bit (the mem.* seam scales by the elem size; the read value is a
+// store string that parseInt would round past 2^53).
+func is64ElemPtrRead(e *expr) bool {
+	if e == nil || e.l == nil || e.l.kind != "id" {
+		return false
+	}
+	elem, ok := ptrDecls[e.l.name]
+	if !ok {
+		return false
+	}
+	return elem == "long long" || elem == "unsigned long long" || elem == "long" || elem == "unsigned long"
 }
 
 // sortedVarTypes — the declared-type map keys, deterministically
@@ -2250,7 +2282,16 @@ func (p *parser) primary() (*expr, error) {
 func exprType(e *expr) string {
 	switch e.kind {
 	case "num":
-		return "Int32" // integer literals are int (no LL/U suffix support)
+		// C literal typing: int when it fits, else long long (LP64). The
+		// value, not the (stripped) suffix, decides — a literal beyond
+		// 2^31 must not render as rounded Number arithmetic.
+		if n, err := strconv.ParseInt(e.num, 10, 64); err == nil {
+			if n >= math.MinInt32 && n <= math.MaxInt32 {
+				return "Int32"
+			}
+			return "Int64"
+		}
+		return "Int32"
 	case "id":
 		return varTypes[e.name]
 	case "cast":
@@ -3169,14 +3210,16 @@ func (p *parser) stmt() (any, error) {
 			charVars[name.text] = true
 		}
 		if isPtr && kw != "char" {
-			// typed (non-int/char) pointers are outside the subset's
-			// element-size model (int = 4, char = 1)
-			if kind != "" && kw != "int" {
-				refuse("typed (non-int/char) pointer declarations are not in the subset")
-			}
 			// every non-char pointer declaration starts as a heap-pointer
-			// candidate (promoted out by recordPtrTarget / heapAssignRHS)
-			ptrDecls[name.text] = kw
+			// candidate (promoted out by recordPtrTarget / heapAssignRHS).
+			// The element type name scales the mem.* arena offsets — typed
+			// ints (long long / unsigned …) map to their canonical C names
+			// (the runtime memElemSize table).
+			elem := kw
+			if kind != "" {
+				elem = kindToElem(kind)
+			}
+			ptrDecls[name.text] = elem
 		}
 		// `int a, b;` / `int a = 1, b = 2;` — multi-declarator (v2). The
 		// pointer-init machinery is per-name and the array path returns
@@ -3374,7 +3417,7 @@ func (p *parser) stmt() (any, error) {
 			}
 			// heap pointer initializer (malloc / pointer copy / p = q + n)
 			if isPtr && kw != "char" {
-				if hp, isRoot, ok := heapAssignRHS(name.text, e, kw); ok {
+				if hp, isRoot, ok := heapAssignRHS(name.text, e, ptrDecls[name.text]); ok {
 					if isRoot {
 						// p itself holds the memAlloc handle — the store
 						// write (setVar: the mem seam reads the store)
@@ -3413,7 +3456,7 @@ func (p *parser) stmt() (any, error) {
 			// so a later `*p = v` / `p = q + n` resolves even if the first
 			// assignment is not the declaration; a pointer whose later
 			// uses advance/compute its position goes runtime from the start
-			hp := heapPtr{root: name.text, elem: kw, off: 0}
+			hp := heapPtr{root: name.text, elem: ptrDecls[name.text], off: 0}
 			if ptrNeedsDyn(name.text, p.ts[p.p:]) {
 				hp.dyn = true
 				hp.hv = "___hp_" + name.text
@@ -3799,11 +3842,18 @@ func (p *parser) stmt() (any, error) {
 			return nil, err
 		}
 		// calls/ternaries nested inside arithmetic args are hoisted to
-		// temps (the A1 Arith AST has no Call/Cond node)
+		// temps (the A1 Arith AST has no Call/Cond node). EXCEPT pure
+		// 64-bit-elem pointer reads: the memLoad call is a legal exec
+		// arg, and hoisting it to a temp would break the core's printf
+		// BigInt detection (the temp's value must render without
+		// parseInt — a parseInt of the exact string would round past
+		// 2^53).
 		var temps []any
 		args := []any{st(fmtStr)}
 		for _, e := range valueExprs {
-			e = p.hoistArithCalls(e, &temps, true)
+			if !is64ElemPtrRead(e) {
+				e = p.hoistArithCalls(e, &temps, true)
+			}
 			args = append(args, valueNodeTyped(e))
 		}
 		if len(temps) > 0 {
