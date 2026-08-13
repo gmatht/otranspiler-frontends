@@ -1,10 +1,30 @@
 # PLAN_POWERSHELL_F — a PowerShell frontend on the bat precedent
 
-**Status: IN PROGRESS — t11 landed (gate green).** The
+**Status: IN PROGRESS — t12 landed (gate green).** The
 proposal is implemented as described; revision history below.
 
 ## 0. Revision history
 
+- 2026-08-14 (t12_for_condition, gate green): the for_statement node's
+  for_condition field lands — `for (; $c; ) { B }`, the CONDITION-ONLY
+  clause combination (the grammar admits ANY subset of the three
+  clauses), lowers EXACTLY to the A1 While statement `while ($c) { B }`
+  (with empty init/iter clauses a for loop IS a while loop; the same
+  whileStmt shape the t06 do-while duplication emits, byte-identical
+  to the core's While). The for_condition node has the same
+  single-pipeline shape as while_condition, so it lowers through the
+  same lowerCondition / lowerCondPipeline — the t06/t07 condition
+  subset (a bare variable read, pinned for an UNSET variable: pwsh
+  $null FALSY vs A1 "" FALSY, the consistent condition-position null
+  edge; the body never runs on either side and the executed-stdout
+  oracle matches live pwsh by construction). The other clause
+  combinations REFUSE, pinned testdata_refuse/t12_for_init_iter.ps1
+  (for_initializer / for_iterator — the assignment/`++`/comparison
+  machinery of the plan's full for row "the C frontend's for-lowering
+  (init/cond/update → while)", which lands with the assignment rung)
+  and t12_for_conditionless.ps1 (`for (;;)` is an infinite loop — pwsh
+  truthy vs no pinned A1 true-literal condition; the t06 `$true`
+  divergence precedent: refuse > guess).
 - 2026-08-13 (t11_exit, gate green): the flow_control_statement node's
   `exit` form lands — `exit 5` lowers to the A1 Exit statement with a
   bare Int code, `exit` bare to Exit with value null (lastExit), the

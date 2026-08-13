@@ -35,6 +35,8 @@ import (
 //	      `while` / `until` keyword, `(` while_condition `)`
 //	        while_condition → pipeline → pipeline_chain → variable
 //	    if_statement (t07 — then + optional else_clause; elseif_clauses REFUSES)
+//	    for_statement (t12 — the condition-only `for (; $c; )` form → While;
+//	      for_initializer / for_iterator / conditionless REFUSE)
 //	    empty_statement                 (t08 — a lone `;`, a NO-OP: dropped,
 //	                                      emitting ZERO statements)
 //	    assignment_expression / …          (REFUSE until pinned)
@@ -101,6 +103,8 @@ func lowerStatement(n *sitter.Node, src []byte) (any, error) {
 		// means a new call site appeared — refuse loudly rather than
 		// box the multi-statement slice as one element.
 		return nil, refuse(n, src, "do_statement outside a statement_list")
+	case "for_statement":
+		return lowerForStatement(n, src)
 	case "empty_statement":
 		// the lone `;` — the _statement rule's empty_statement
 		// alternative; this grammar parses EVERY standalone `;` as
@@ -372,6 +376,67 @@ func lowerBlock(n *sitter.Node, src []byte) ([]any, error) {
 		return lowerStatementList(bl, src)
 	}
 	return []any{}, nil
+}
+
+// lowerForStatement — the for_statement node: `for` `(` [for_initializer]
+// `;` [for_condition] `;` [for_iterator] `)` statement_block (the
+// grammar admits ANY subset of the three clauses; the `for` keyword is
+// a non-named alias token). The t12 rung pins the CONDITION-ONLY form
+// `for (; $c; ) { B }`, which lowers EXACTLY to the A1 While statement
+// `while ($c) { B }` — with empty init/iter clauses a for loop IS a
+// while loop, and the emission is byte-identical to the t06 do-while
+// duplication's While shape (the same whileStmt; the for_condition
+// node has the SAME single-pipeline shape as while_condition —
+// verified against node-types.json — so it lowers through the same
+// lowerCondition / lowerCondPipeline, the t06/t07 condition subset: a
+// bare variable read). Live pwsh 7.6.4: with $c unset the condition
+// reads $null (FALSY) and the body NEVER runs — CONSISTENT with the
+// A1 getVar read "" (the t06/t07 condition-position null edge) — so
+// the executed-stdout oracle matches by construction (both print the
+// statement after the loop, never the body).
+//
+// The OTHER clause combinations REFUSE (refuse > guess): a
+// for_initializer / for_iterator is the assignment / `++` /
+// comparison machinery — the plan's full row "the C frontend's
+// for-lowering (init/cond/update → while)" (PLAN_POWERSHELL_F.md §1)
+// lands with the assignment rung; a CONDITIONLESS for (`for (;;)`) is
+// an infinite loop — pwsh runs forever while the A1 would need a
+// true-literal condition the subset doesn't pin (the t06 `$true`
+// divergence precedent). Pinned testdata_refuse/t12_for_init_iter.ps1
+// + t12_for_conditionless.ps1.
+func lowerForStatement(n *sitter.Node, src []byte) (any, error) {
+	var body []any
+	var cond any
+	for i := 0; i < int(n.NamedChildCount()); i++ {
+		ch := n.NamedChild(i)
+		switch ch.Type() {
+		case "statement_block":
+			// the body lowers through the same statement_list path as
+			// top-level statements (the t06/t07 bodies)
+			b, err := lowerBlock(ch, src)
+			if err != nil {
+				return nil, err
+			}
+			body = b
+		case "for_condition":
+			c, err := lowerCondition(ch, src)
+			if err != nil {
+				return nil, err
+			}
+			cond = c
+		case "for_initializer", "for_iterator":
+			clause := strings.TrimPrefix(ch.Type(), "for_")
+			return nil, refuse(ch, src, "for %s (the t12 pin is the condition-only `for (; $c; )` form; the %s clause is the assignment/`++`/comparison machinery of the plan's full for-lowering row — outside the v1 subset)", clause, clause)
+		default:
+			return nil, refuse(ch, src, "for_statement part %q", ch.Type())
+		}
+	}
+	if cond == nil {
+		return nil, refuse(n, src, "conditionless for (`for (;;)` is an infinite loop — pwsh runs forever while the A1 has no pinned true-literal condition; the t06 `$true` divergence precedent: refuse > guess)")
+	}
+	// `for (; C; ) { B }` ≡ `while (C) { B }` — the A1 While statement
+	// (the same shape the t06 do-while duplication emits).
+	return whileStmt(cond, body), nil
 }
 
 // lowerIfStatement — the if_statement node: `if` `(` condition `)`

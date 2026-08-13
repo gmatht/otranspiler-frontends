@@ -4,7 +4,7 @@ PowerShell (.ps1) source -> A1 shIR JSON — **the bat sibling**
 (workspace-side dir; no git worktree; the object pipeline is a stated
 TEXT approximation for v1; see PLAN_POWERSHELL_F.md).
 
-**Status: WORKER-IMPLEMENTED, t11 landed (gate green).** The parser is
+**Status: WORKER-IMPLEMENTED, t12 landed (gate green).** The parser is
 wharflab/tree-sitter-powershell (vendored under
 `grammars/tree-sitter-powershell/`, loaded via smacker/go-tree-sitter
 cgo) — the plan's choice, empirically verified. The emitter produces A1
@@ -171,6 +171,27 @@ line) — now the worker's fixes, not records):
   (the while/for rungs host them); return is the function rung's
   value channel (functions refuse in v1); throw is the exception
   model (the A1 has no exceptions).
+- t12_for_condition: the for_statement node's for_condition field —
+  `for (; $c; ) { B }` — the CONDITION-ONLY clause combination (the
+  grammar admits ANY subset of the three clauses). With empty
+  init/iter clauses a for loop IS a while loop, so the lowering is
+  exactly that: `for (; $c; ) { B }` → the A1 While statement
+  `while ($c) { B }`, byte-identical to the t06 do-while
+  duplication's While shape (the same whileStmt). The for_condition
+  node has the SAME single-pipeline shape as while_condition
+  (verified against node-types.json), so it lowers through the same
+  lowerCondition / lowerCondPipeline — the t06/t07 condition subset:
+  a bare variable read. Pinned for an UNSET variable (pwsh $null
+  FALSY vs A1 "" FALSY — the consistent condition-position null
+  edge): the body NEVER runs on either side, the statement after the
+  loop prints on both (the body echo is structural — a wrongly-run
+  body would DIFF). The other clause combinations REFUSE, pinned
+  `testdata_refuse/t12_for_init_iter.ps1` (the initializer/iterator
+  clauses are the assignment/`++`/comparison machinery of the plan's
+  full for-lowering row, PLAN_POWERSHELL_F.md §1 — lands with the
+  assignment rung) and `t12_for_conditionless.ps1` (`for (;;)` is an
+  infinite loop — pwsh truthy vs no pinned A1 true-literal condition;
+  the t06 `$true` divergence precedent: refuse > guess).
 - Comments, comment-only files (empty Program), and the REFUSE table
   (refuse.go): anything outside the subset errors loudly — including
   .NET member access (`$x.Length`), assignment, `|` pipelines, unknown
