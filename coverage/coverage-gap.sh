@@ -129,6 +129,17 @@ walk(d)
 PY
     done
     sort -u "$T/types.txt" > "$T/used.txt"
+    # A torn binary (a concurrent `go build -o <bin>` from another gate or
+    # pi session — the same race the gates guard against via GATE_DEBASHC
+    # snapshots) makes EVERY emit fail: used.txt stays empty and the first
+    # A1-vocab node alphabetically (e.g. 'A1 node Arith') is fabricated as
+    # a gap, spawning a phantom coverage-pi escalation (zsh-sh-go
+    # 2026-08-13 20:08). The gate was just GREEN — the frontend parsed the
+    # whole corpus, so an empty emit set is the torn-binary signature:
+    # report no gaps; the next cycle retries on a healthy binary.
+    if [ ! -s "$T/used.txt" ]; then
+      exit 0
+    fi
     # A1 vocabulary (frontends/shir-contract/schema.json)
     python3 - "$T/used.txt" <<'PY' | exclude
 import json, sys
