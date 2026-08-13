@@ -32,16 +32,24 @@ lang="$1"
 # known-refused/known-bug exclusions (worker-appended)
 excl="$DIR/refused-$lang.txt $DIR/bugs-$lang.txt"
 exclude() {  # read stdin, drop lines matching the exclusion files
-  local pat=""
+  # join every source's pattern with '|' — the old plain concatenation
+  # glued the refused-ledger's last entry to the core-pending ledger's
+  # first (e.g. "A1 node RawExprA1 node Int"), a dead alternation branch
+  # that silently un-refused the boundary construct and re-issued it as a
+  # phantom gap every cycle (zig-sh-go RawExpr, ledgered 2026-08-13)
+  local pat="" p=""
   for e in $excl; do
-    [ -f "$e" ] && pat="$pat$(tr '\n' '|' < "$e" | sed 's/|$//')"
+    if [ -f "$e" ]; then
+      p=$(tr '\n' '|' < "$e" | sed 's/|$//')
+      [ -n "$p" ] && pat="${pat:+$pat|}$p"
+    fi
   done
   # escalated contract gaps: skipped while the core-request is pending
   # (worker-coverage-step.sh prunes the ledger on completion)
   if [ -f "$DIR/core-pending-$lang.txt" ]; then
-    pat="$pat$(cut -f1 "$DIR/core-pending-$lang.txt" | tr '\n' '|' | sed 's/|$//')"
+    p=$(cut -f1 "$DIR/core-pending-$lang.txt" | tr '\n' '|' | sed 's/|$//')
+    [ -n "$p" ] && pat="${pat:+$pat|}$p"
   fi
-  pat=$(printf '%s' "$pat" | sed 's/|$//')
   if [ -n "$pat" ]; then grep -vE "$pat"; else cat; fi
 }
 
