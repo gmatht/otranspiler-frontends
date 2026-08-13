@@ -14,7 +14,18 @@ DEBASHC ?= $(abspath ../../sh2perl/target/debug/debashc)
 all: build
 
 build:
-	$(GO) build -o bat-sh-go ./cmd/bat-sh-go
+	# Atomic publish: build to a temp file, then rename over the target, so a
+	# CONCURRENT gate run (the worker loop and the coverage step both run
+	# `make test` in this dir and they can overlap) never observes the binary
+	# missing or half-written mid-gate (posix-sh-go t08-t11, 2026-08-13 15:17
+	# — "frontend emit: ./posix-sh-go: No such file or directory" while the
+	# byte-equal phase of the same run had passed). The old in-place
+	# `go build -o` write left a window with NO/PARTIAL binary; mv(1) is
+	# atomic: any concurrent exec sees either the previous complete binary
+	# or the new one.
+	rm -f .bat-sh-go.tmp
+	$(GO) build -o .bat-sh-go.tmp ./cmd/bat-sh-go
+	mv -f .bat-sh-go.tmp bat-sh-go
 
 test: build
 	@for f in testdata/*.bat; do \
@@ -46,4 +57,4 @@ worker: test
 	@echo "bat-sh-go worker gate: ingress acceptance + executed-stdout passed"
 
 clean:
-	rm -f bat-sh-go /tmp/*.mine
+	rm -f bat-sh-go .bat-sh-go.tmp /tmp/*.mine
