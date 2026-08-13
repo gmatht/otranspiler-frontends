@@ -15,9 +15,14 @@ core's purity verdicts (echo → Emulable).
 
 Landed surface (each construct lands with a pinned `testdata/` example,
 validated by `make test` = refusals + ingress acceptance +
-executed-stdout vs the RECORDED expectations — pwsh is not installed on
-the fleet boxes, so the native oracle is `native_limits_powershell` in
-harness/frontend-stdout.sh, the bat precedent):
+executed-stdout vs LIVE `pwsh` (7.6.4, direct snap binary — the
+harness prefers /snap/powershell/current/opt/powershell/pwsh over the
+snap-confine wrapper, mirroring go/zig); the old hand-authored
+`native_limits_powershell` records were removed 2026-08-13 when pwsh
+was installed — the live oracle is the reference, and the first gate
+immediately exposed two wrong records (t03 [string] cast prints the
+type name; Write-Output of an unset var prints nothing, not an empty
+line) — now the worker's fixes, not records):
 
 - t01_echo: `Write-Output "…"` / `Write-Host "…"` / `echo …` → the
   core's exec-echo Call; string args lower exactly like the core's

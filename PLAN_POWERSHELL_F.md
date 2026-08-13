@@ -1,18 +1,35 @@
 # PLAN_POWERSHELL_F — a PowerShell frontend on the bat precedent
 
-**Status: PROPOSAL (no code yet).** This document proposes
-`frontends/powershell-sh-go` — a PowerShell (.ps1) source -> A1 shIR JSON
-frontend, architected as the sibling of `frontends/bat-sh-go` (Windows
-scripting; workspace-side dir, no git worktree, hand-rolled Go lexer/parser,
-the recorded-expectations native gate).
+**Status: IN PROGRESS — t01 landed (gate green, 2026-08-12).** The
+proposal is implemented as described; revision history below.
+
+## 0. Revision history
+
+- 2026-08-12 (t01_echo landed): the frontend dir went live — vendored
+  wharflab/tree-sitter-powershell (`grammars/`, commit 21b365b) loaded
+  via smacker/go-tree-sitter (cgo), the byte-identical A1 emitter
+  (emit.go: full 13-field program, sorted keys, no HTML escaping, no
+  trailing newline, core purity verdicts), the CST lowering (lower.go),
+  and the REFUSE table (refuse.go). `Write-Output`/`Write-Host`/`echo`
+  with string args emit the core's exec-echo Call byte-for-byte
+  (verified vs `debashc --shir --raw`); `make test` is green (refusal
+  pin + ingress acceptance + recorded stdout via
+  `native_limits_powershell`). Also fixed in harness/frontend-stdout.sh:
+  the `native[0]` unbound-variable bug for the powershell (recorded-
+  expectations) case.
+  NOTE (vendored-runtime quirk, recorded for the t02 rung): the smacker
+  runtime does not materialize the interior text tokens of
+  expandable_string_literal as children; lower.go reconstructs the
+  Interpolate lit-parts from byte spans between the variable children
+  (verified byte-identical for the no-variable case).
 
 Grounding facts (verified 2026-08-10):
 
-- `pwsh` (PowerShell Core) is **NOT installed** on this box — the native
+- `pwsh` (PowerShell Core 7.6.4) **IS installed** (2026-08-13) — the native
   executed-stdout side uses the bat precedent: `native_limits_bat`-style
   RECORDED expectations (`harness/frontend-stdout.sh` gains a
   `native_limits_powershell` list of `name.ps1|expected-stdout` entries; the
-  transpiled run is compared against the record). Installing pwsh later
+  transpiled run is compared against the record). Live-oracle wiring
   flips the gate to live native, unchanged discipline.
 - `frontends/bat-sh-go` is the proven template: `bat.go` hand-rolled
   lexer/parser/emitter, `frontends/shir-emit-go/` shared A1 emitter,
