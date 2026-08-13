@@ -26,6 +26,12 @@ zsh-specific coverage beyond the POSIX-shaped core of the corpus:
 
 - `[[ ... ]]` / `(( ... ))` conditions (test/let lowering)
 - `(( expr ))` statements (`exec let`)
+- C-style `for (( init; cond; step )); do …; done` → the rich A1 `ForInit`
+  node (byte-identical to the core's CStyleFor lowering: ';'-split
+  trimmed header, let-able Assign/IncDec init/step → structured
+  `Assign{Arith}` stmts, cond → `exec let` (or `Int(1)` for `((;;))`),
+  `runs:false`; a non-let-able part keeps the whole construct on the
+  opaque `cstyleFor` call with the raw header text, spacing preserved)
 - bare `$a[2]` array indexes (→ `arrayIndex`) and `${s[2,3]}` / `$#a`
 - `f() {` function bodies (whitespace before the brace)
 - heredocs (`cat <<EOF`, `<<-`, `<<<`, quoted delimiters)
