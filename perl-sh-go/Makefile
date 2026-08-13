@@ -30,7 +30,7 @@ gen:
 	@exit 1
 
 build:
-	$(GO) build -o perl-sh-go .
+	$(GO) build -o perl-sh-go ./cmd/perl-sh-go
 
 test: build $(DEBASHC)
 	@for f in testdata/*.pl; do \

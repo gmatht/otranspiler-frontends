@@ -31,11 +31,10 @@
 //   - `my $l = <STDIN>` → the `read` builtin (REPLY at EOF) + assign.
 //   - heredocs, qx backticks, subroutines (`Function` stmts — the ESTree
 //     backend consumes functions from stmts, not the `subs` field).
-package main
+package pllib
 
 import (
 	"fmt"
-	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -48,24 +47,24 @@ import (
 type tokKind string
 
 const (
-	tIdent  tokKind = "ident"
-	tVar    tokKind = "var" // $name / @name (sigil in text)
-	tEnv    tokKind = "env" // $ENV{NAME}
-	tStr    tokKind = "str" // "..." or '...' (raw inner, quoted flag)
-	tNum    tokKind = "num"
-	tOp     tokKind = "op" // == != < > <= >= eq ne lt gt le ge && || ! + - * / % . ? : << >> ++ -- += -= *= /= = or and
-	tQx     tokKind = "qx" // `cmd`
-	tRd     tokKind = "rd" // <STDIN> / <$ph>
-	tPunct  tokKind = "punct"
-	tEOF    tokKind = "eof"
+	tIdent tokKind = "ident"
+	tVar   tokKind = "var" // $name / @name (sigil in text)
+	tEnv   tokKind = "env" // $ENV{NAME}
+	tStr   tokKind = "str" // "..." or '...' (raw inner, quoted flag)
+	tNum   tokKind = "num"
+	tOp    tokKind = "op" // == != < > <= >= eq ne lt gt le ge && || ! + - * / % . ? : << >> ++ -- += -= *= /= = or and
+	tQx    tokKind = "qx" // `cmd`
+	tRd    tokKind = "rd" // <STDIN> / <$ph>
+	tPunct tokKind = "punct"
+	tEOF   tokKind = "eof"
 )
 
 type token struct {
-	kind   tokKind
-	text   string
-	raw    string // string inner (undecoded) / qx text / readline inner
-	dq     bool   // str was double-quoted
-	line   int    // 0-based source line
+	kind tokKind
+	text string
+	raw  string // string inner (undecoded) / qx text / readline inner
+	dq   bool   // str was double-quoted
+	line int    // 0-based source line
 }
 
 // ── expression AST ───────────────────────────────────────────────────
@@ -812,9 +811,9 @@ func (p *parser) printStmts(exprs []*node) []map[string]any {
 			copy(elseArgs, exprs)
 			elseArgs[i] = e.kids[2]
 			return []map[string]any{map[string]any{
-				"type": "If",
-				"cond": p.testCond(e.kids[0], false),
-				"then": stmtsToAny([]map[string]any{printfStmt(p.lowerValues(thenArgs))}),
+				"type":   "If",
+				"cond":   p.testCond(e.kids[0], false),
+				"then":   stmtsToAny([]map[string]any{printfStmt(p.lowerValues(thenArgs))}),
 				"elsifs": []any{},
 				"else":   stmtsToAny([]map[string]any{printfStmt(p.lowerValues(elseArgs))}),
 			}}
@@ -888,9 +887,9 @@ func (p *parser) heredocLines(term string, termLine int) string {
 func (p *parser) assignOrCond(name string, rhs *node) []map[string]any {
 	if rhs.kind == "tern" {
 		return []map[string]any{map[string]any{
-			"type": "If",
-			"cond": p.testCond(rhs.kids[0], false),
-			"then": stmtsToAny([]map[string]any{assignStmt(name, p.lowerValue(rhs.kids[1]))}),
+			"type":   "If",
+			"cond":   p.testCond(rhs.kids[0], false),
+			"then":   stmtsToAny([]map[string]any{assignStmt(name, p.lowerValue(rhs.kids[1]))}),
 			"elsifs": []any{},
 			"else":   stmtsToAny([]map[string]any{assignStmt(name, p.lowerValue(rhs.kids[2]))}),
 		}}
@@ -2177,41 +2176,15 @@ func min(a, b int) int {
 	return b
 }
 
-// ── main ─────────────────────────────────────────────────────────────
+// ── Shir — perl-sh-go as a library: Perl source -> A1 shIR JSON bytes
+// (no trailing newline). Both the CLI (cmd/perl-sh-go) and the combined
+// busybox dispatch through this single entry point. ───────────────────
 
-func main() {
-	args := os.Args[1:]
-	raw := false
-	filtered := []string{}
-	for _, a := range args {
-		if a == "--raw" {
-			raw = true
-		} else {
-			filtered = append(filtered, a)
-		}
-	}
-	if len(filtered) != 2 || filtered[0] != "--shir" {
-		fmt.Fprintln(os.Stderr, "usage: perl-sh-go --shir <file.pl> [--raw]")
-		os.Exit(2)
-	}
-	inp := filtered[1]
-	src := inp
-	if b, err := os.ReadFile(inp); err == nil {
-		src = string(b)
-	}
+func Shir(src string) ([]byte, error) {
 	stmts, err := parseProgram(src)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "perl-sh-go: "+err.Error())
-		os.Exit(2)
+		return nil, err
 	}
 	prog := &shiremit.Program{Stmts: stmts}
-	out, err := shiremit.Emit(prog)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "emit: "+err.Error())
-		os.Exit(1)
-	}
-	os.Stdout.Write(out)
-	if !raw {
-		os.Stdout.Write([]byte{'\n'})
-	}
+	return shiremit.Emit(prog)
 }
