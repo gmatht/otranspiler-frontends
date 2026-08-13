@@ -16,7 +16,8 @@ Shared (do NOT fork): `frontends/shir-emit-go/` (the A1 JSON emitter),
 - `echo [text]`, bare `echo`, `echo.` / `echo:` (blank line), `echo off/on`
   (echo-control directive — no-op in the transpiled output)
 - `set VAR=value`, `set "VAR=value"`, `set VAR=` (empty)
-- `set /a VAR=expr` — integers, `+ - * / %`, parens, `%var%` operands
+- `set /a VAR=expr` — integers, `+ - * / %`, parens, unary minus
+  (`-5`, `-(1+2)`), `%var%` operands, `%%` literal (modulo)
 - `%var%` expansion (case-insensitive), `%%` literal, `%1`..`%9`, `%*`,
   `%errorlevel%` -> `$?` (getVar("?"))
 - `if [not] A==B (cmd) [else (cmd)]` — else only with the parenthesized
@@ -47,23 +48,41 @@ Shared (do NOT fork): `frontends/shir-emit-go/` (the A1 JSON emitter),
 - `exit /b [N]` — the direct IrStmt::Exit statement (all backends render
   it: estree -> process.exit, sh -> exit, perl -> exit; the estree arm
   landed 2026-08-09)
-- `for /f ["delims=X tokens=1[,N...]"] %%v in (FILE | literal words | 'cmd') do …`
+- `for /f ["delims=X tokens=1[,N...]"] %%v in (FILE | "literal line" | literal words | 'cmd') do …`
   (v1.1) — line iteration with field tokens (read-builtin lowering; the
   single-token case adds a discard var since read's last var gets the
-  remainder). `skip=`/`eol=`/`usebackq` and token sets not starting at 1
+  remainder). `in ("string")` is cmd's quoted-literal form — the WHOLE
+  string is one line, tokenized by delims (bare `(word word)` is the
+  frontend's literal-words extension; real cmd treats those as
+  filenames). `skip=`/`eol=`/`usebackq` and token sets not starting at 1
   refuse. NOTE: the estree runtime caches read buffers per source, so two
   for /f loops over the SAME file in one program see the second as empty
   (runtime gap — use distinct files).
 - `> file` / `>> file` / `N>` / `N>>` redirects (v1.1) — the word-list
-  scan wraps the exec in a Redirect stmt.
+  scan wraps the exec in a Redirect stmt. The glued cmd forms (`>file`,
+  `echo text>file` — cmd ECHOES the space before a spaced `>`, so the
+  no-space form is the portable one) are handled, batch `\` path
+  separators normalize to `/` for the POSIX targets, and the `nul` device
+  maps to `/dev/null` (how batch silences `copy`/`move` status lines).
 - batch builtin -> POSIX command mapping (v1.1): copy->cp, del/erase->rm,
   type->cat, move/ren/rename->mv, rd->rmdir, md->mkdir, dir->ls, where->
   which, xcopy->cp, ver->uname, find->grep -F, cls/title->no-op; common
-  flags translated (dir /b->-1, del /q->-f, /y->-f, ...). Batch `ren OLD
+  flags translated (dir /b->-1, del /q->-f, /y->-f, ...). `robocopy SRC
+  DST /S|/E` -> `rsync -a SRC/ DST`; `/MIR|/PURGE` -> `rsync -a
+  --delete SRC/ DST`; no recursion flag -> `rsync -a --exclude='*/'
+  --include='*' SRC/ DST` (top-level files only); `/MOV|/MOVE` ->
+  `rsync -a --remove-source-files` (/MOVE leaves the emptied source
+  dirs); `/L` -> `rsync -an`; file filters -> rsync --include/
+  --exclude sets; `/XD dirs` / `/XF files` -> `--exclude=...`;
+  `/LOG:file` -> `--log-file=file` (log format differs). robocopy's
+  verbose status output is silenced with `>nul`; retry/wait/thread and
+  output-quiet flags are dropped; unknown options refuse. Batch `ren OLD
   newname` resolves the bare destination into OLD's dir. NOTE: the estree
   runner's exec allowlist derives from the SOURCE text — scripts using
   mapped commands should mention the posix names in a comment.
-- `cmd1 & cmd2` statement separators
+- `cmd1 & cmd2` statement separators — split on the first top-level `&`
+  (outside double quotes); cmd ECHOES the trailing space before a spaced
+  `&`, so `echo a&echo b` is the portable form
 
 Deliberately NOT in v1 (refuse loud, documented as worker items):
 - `call other.bat`, `setlocal`/`endlocal`, `shift`, `pause`, `start`,
