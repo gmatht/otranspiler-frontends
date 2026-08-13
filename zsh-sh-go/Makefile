@@ -55,7 +55,13 @@ $(DEBASHC):
 	cd $(abspath ../../sh2perl) && cargo build --bin debashc
 
 test: build $(GATE_DEBASHC)
-	@for f in testdata/*.zsh; do \
+	# GATE_TMP is a per-invocation mktemp dir; without a trap the worker's
+	# 5-min gate loop leaks one ~20MB debashc snapshot per run (~5.8GB/day
+	# when /tmp fills, mktemp fails and the gate wedges with a spurious
+	# FAIL). Clean it on exit (success or failure) from ONE shell covering
+	# both phases.
+	@trap 'rm -rf $(GATE_TMP)' EXIT; \
+	for f in testdata/*.zsh; do \
 	  bn=$$(basename $$f); \
 	  ./zsh-sh-go --shir $$f --raw > /tmp/$$bn.mine 2>/dev/null || { echo "FAIL $$bn (frontend)"; exit 1; }; \
 	  $(GATE_DEBASHC) --shir $$f --raw > /tmp/$$bn.core 2>/dev/null || { echo "FAIL $$bn (core)"; exit 1; }; \
@@ -68,9 +74,9 @@ test: build $(GATE_DEBASHC)
 	    diff /tmp/$$bn.mine /tmp/$$bn.core | head -5; \
 	    exit 1; \
 	  fi; \
-	done
-	@echo "--- executed-stdout comparison (native vs JS/ESTree) ---"
-	@bash "$(abspath ../../harness/frontend-stdout.sh)" zsh ./zsh-sh-go testdata "$(GATE_DEBASHC)" || exit 1
+	done; \
+	echo "--- executed-stdout comparison (native vs JS/ESTree) ---"; \
+	bash "$(abspath ../../harness/frontend-stdout.sh)" zsh ./zsh-sh-go testdata "$(GATE_DEBASHC)"
 
 worker: test
 	@echo "zsh-sh-go worker gate: ingress acceptance + executed-stdout passed"
