@@ -30,13 +30,21 @@ line) — now the worker's fixes, not records):
   and barewords → Str DoubleQuoted).
 - t02_braced_variable: `${name}` — the braced spelling of a variable
   read; braces are pure spelling, both forms lower to the same
-  getVar slot.
-- t03_cast: `[type] operand` (cast_expression) → the plan's IDENTITY
-  mapping (the C `(int)` precedent): the type_literal is dropped and
-  the operand lowers exactly as if the cast were absent —
-  byte-identical to the uncast spelling. The unary-operator forms of
-  expression_with_unary_operator (`-not` / `!` / `++` / `--`) and
-  object-shaped operands (member access, `@()` arrays) still REFUSE.
+  getVar slot. Pinned in the exact interpolation context ("a ${foo} b"
+  → "a  b"): a BARE `Write-Output ${foo}` of an unset var prints
+  NOTHING in pwsh ($null is filtered from the pipeline) while the A1
+  echo of an empty store value prints a blank line — that null
+  semantic stays outside the v1 text-closed subset (refuse > guess).
+- t03_cast: `[type] operand` (cast_expression) in COMMAND-ARGUMENT
+  position lowers as an expandable string: lit type text (`[string]`)
+  + the operand — pwsh argument mode does NOT evaluate a leading type
+  literal, so `Write-Output [string]"cast value"` prints
+  `[string]cast value` (live pwsh 7.6.4; the original identity pin was
+  written against a guessed record and is superseded — identity would
+  only hold in expression position, unreachable in v1). The
+  unary-operator forms of expression_with_unary_operator (`-not` /
+  `!` / `++` / `--`) and object-shaped operands (member access, `@()`
+  arrays) still REFUSE.
 - Comments, comment-only files (empty Program), and the REFUSE table
   (refuse.go): anything outside the subset errors loudly — including
   .NET member access (`$x.Length`), assignment, `|` pipelines, unknown

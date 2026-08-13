@@ -5,6 +5,21 @@ proposal is implemented as described; revision history below.
 
 ## 0. Revision history
 
+- 2026-08-13 (live pwsh oracle + t02/t03 fixes, gate green): pwsh
+  7.6.4 is installed and the harness flips powershell to a LIVE native
+  oracle (`native_limits_powershell` emptied; direct snap binary
+  preferred over the snap-confine wrapper, mirroring go/zig — commit
+  3fad6b99). The live oracle exposed two wrong records (both had been
+  written to match the frontend's emission, not real pwsh): (1) t02 —
+  `Write-Output` of an UNSET var prints NOTHING in pwsh ($null is
+  filtered from the pipeline) vs the A1 echo's blank line; the bare
+  read is dropped from the example (the null semantic stays outside
+  the text-closed subset) and the braced spelling is pinned in the
+  exact interpolation context. (2) t03 — `[string]"cast value"` in
+  argument position prints `[string]cast value`: argument mode does
+  NOT evaluate a leading type literal, so lowerCast lowers the
+  argument as an expandable string (lit type text + operand) instead
+  of the original identity pin (superseded — see §1 table).
 - 2026-08-12 (t01_echo landed): the frontend dir went live — vendored
   wharflab/tree-sitter-powershell (`grammars/`, commit 21b365b) loaded
   via smacker/go-tree-sitter (cgo), the byte-identical A1 emitter
@@ -78,7 +93,7 @@ The new semantics to map (each a deliberate choice, refuse > guess):
 | `cmd.exe args` (external) | exec (the allowlist gate) |
 | `a | b` pipeline | bash pipe (TEXT — see §1 note) |
 | `-f` format operator `"{0} {1}" -f a, b` | printf-style |
-| `[int]x` cast | identity (the C `(int)` precedent) |
+| `[int]x` cast (argument position) | literal text — argument mode does NOT evaluate a leading type literal (pwsh 7.6.4: `Write-Output [int]5` prints `[int]5`, `[string]"x"` prints `[string]x`); the argument lowers as an expandable string (lit type text + operand). Identity holds only in EXPRESSION position, unreachable in v1 (assignment refuses) |
 
 ### Pinned refusals (testdata_ps1/*_refuse.ps1 — the emit must FAIL)
 

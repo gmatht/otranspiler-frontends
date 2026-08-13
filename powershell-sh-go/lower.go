@@ -191,20 +191,32 @@ func lowerExpr(n *sitter.Node, src []byte) (any, error) {
 	}
 }
 
-// lowerCast — `[type] operand` — the plan's IDENTITY mapping
-// (PLAN_POWERSHELL_F.md §1: "`[int]x` cast → identity (the C `(int)`
-// precedent)"): the A1 is text-typed, so the type_literal is dropped
-// and the operand lowers exactly as if the cast were absent —
-// byte-identical to the uncast spelling (verified against the core).
+// lowerCast — `[type] operand` in COMMAND-ARGUMENT position. Verified
+// against live pwsh 7.6.4 (2026-08-13 live-oracle flip): argument mode
+// does NOT evaluate a leading type literal as a cast — `Write-Output
+// [string]"cast value"` prints `[string]cast value`, `Write-Output
+// [int]5` prints `[int]5`, and `[string]$foo` prints `[string]` followed
+// by foo's value. The v1 subset reaches casts ONLY in argument position
+// (expression position needs assignment, which refuses), so the whole
+// argument lowers as an expandable string: the type_literal text is a
+// lit part and the operand expands per argument-mode rules. (The plan's
+// original pin — "identity, the C `(int)` precedent" — held only for
+// expression position and was written against a guessed record, not
+// real pwsh; superseded here.)
 func lowerCast(n *sitter.Node, src []byte) (any, error) {
 	// named children: type_literal + the operand (unary_expression)
 	if n.NamedChildCount() != 2 {
 		return nil, refuse(n, src, "cast_expression with %d children", n.NamedChildCount())
 	}
-	if tl := n.NamedChild(0); tl.Type() != "type_literal" {
+	tl := n.NamedChild(0)
+	if tl.Type() != "type_literal" {
 		return nil, refuse(tl, src, "cast head %q", tl.Type())
 	}
-	return lowerUnary(n.NamedChild(1), src)
+	op, err := lowerUnary(n.NamedChild(1), src)
+	if err != nil {
+		return nil, err
+	}
+	return interpExpr([]any{litPart(tl.Content(src)), exprPart(op)}), nil
 }
 
 // lowerStringLiteral — 'single-quoted' or "double-quoted".
