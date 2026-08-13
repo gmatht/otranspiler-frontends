@@ -98,6 +98,17 @@ line) — now the worker's fixes, not records):
   Pinned for an UNSET variable condition: pwsh $null (FALSY) and A1
   "" (FALSY) both take the else branch — the executed-stdout oracle
   compares the transpiled run against live pwsh (both print "no").
+- t08_empty_statement: the empty_statement node — a lone `;` where
+  the _statement rule expects a statement (the grammar parses EVERY
+  standalone `;` as this node, including a trailing `;` after a
+  pipeline). Live pwsh 7.6.4 accepts it as a NO-OP (verified:
+  `Write-Output "a"; ; Write-Output "b"` prints a then b, exit 0).
+  Lowering: ZERO statements — the node is dropped exactly like
+  comments (the plan's `#`-comments row; the A1 has no no-op node and
+  needs none), so the emitted program is byte-identical to the same
+  program without the `;` and the executed-stdout oracle matches live
+  pwsh by construction. The nil return is skipped by lowerStatementList
+  and covers block bodies too (lowerBlock shares the path).
 - Comments, comment-only files (empty Program), and the REFUSE table
   (refuse.go): anything outside the subset errors loudly — including
   .NET member access (`$x.Length`), assignment, `|` pipelines, unknown

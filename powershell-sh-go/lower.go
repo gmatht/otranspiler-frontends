@@ -32,6 +32,8 @@ import (
 //	      `while` / `until` keyword, `(` while_condition `)`
 //	        while_condition → pipeline → pipeline_chain → variable
 //	    if_statement (t07 — then + optional else_clause; elseif_clauses REFUSES)
+//	    empty_statement                 (t08 — a lone `;`, a NO-OP: dropped,
+//	                                      emitting ZERO statements)
 //	    assignment_expression / …          (REFUSE until pinned)
 
 // lowerProgram — walk the CST root and lower the v1 subset to A1
@@ -96,6 +98,22 @@ func lowerStatement(n *sitter.Node, src []byte) (any, error) {
 		// means a new call site appeared — refuse loudly rather than
 		// box the multi-statement slice as one element.
 		return nil, refuse(n, src, "do_statement outside a statement_list")
+	case "empty_statement":
+		// the lone `;` — the _statement rule's empty_statement
+		// alternative; this grammar parses EVERY standalone `;` as
+		// this node, including a trailing `;` after a pipeline (the
+		// t08 pin's `Write-Output "a"; ; Write-Output "b"` has TWO
+		// empty_statement children). Live pwsh 7.6.4 accepts it as a
+		// NO-OP (verified: the oracle run prints "a" then "b", exit
+		// 0). Lowering: ZERO statements — the node is dropped exactly
+		// like comments (the plan's `#`-comments row, PLAN_POWERSHELL_F.md
+		// §1; the A1 has no no-op node and needs none), so the emitted
+		// program is byte-identical to the same program without the
+		// `;` and the executed-stdout oracle matches live pwsh by
+		// construction. The nil return is skipped by lowerStatementList
+		// (and covers block bodies via lowerBlock, which shares this
+		// path).
+		return nil, nil
 	default:
 		return nil, refuse(n, src, "statement type %q", n.Type())
 	}
