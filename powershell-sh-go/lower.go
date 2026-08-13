@@ -1,6 +1,7 @@
 package ps1lib
 
 import (
+	"fmt"
 	"strings"
 
 	sitter "github.com/smacker/go-tree-sitter"
@@ -24,6 +25,7 @@ import (
 //	                                 → cast_expression  (type_literal + operand)
 //	            generic_token                     (bareword)
 //	            variable
+//	            concatenated_command_argument     (adjacent pieces — t05)
 //	      pipeline_chain_tail*    (REFUSE: `|` pipe — t08 rung)
 //	    assignment_expression / if_statement / …  (REFUSE until pinned)
 
@@ -153,9 +155,139 @@ func lowerCommandElement(n *sitter.Node, src []byte) (any, error) {
 		return strExpr(n.Content(src), "DoubleQuoted"), nil
 	case "variable":
 		return getVarCall(variableName(n, src)), nil
+	case "concatenated_command_argument":
+		return lowerConcatArg(n, src)
 	default:
 		return nil, refuse(n, src, "argument form %q", n.Type())
 	}
+}
+
+// lowerConcatArg — the concatenated_command_argument node: adjacent
+// quoted / bareword / variable pieces with NO whitespace between them
+// (`pre"mid"post`, `$x"b"`, `2"a"`). Live pwsh 7.6.4 argument-mode
+// tokenization (verified 2026-08-13 with a 4-param argument counter):
+//
+//   - an argument with an UNQUOTED head (bareword / variable / number)
+//     absorbs every following piece: `pre"mid"post` is ONE argument
+//     "premidpost", `$x"b"` is one argument, `2"a"` is "2a";
+//   - an argument that STARTS with a quoted string terminates there:
+//     `Write-Output "a"b` passes TWO arguments ("a", "b") — pwsh
+//     writes one pipeline OBJECT per argument, and the v1 echo mapping
+//     is single-object, so the multi-object form REFUSES (the t02
+//     null-edge precedent: refuse > guess) instead of joining the two
+//     objects with a space like the core's `echo "a" b` would;
+//   - `"a""b"` is NOT a concatenation — the doubled quote is an
+//     ESCAPED quote inside one double-quoted string (parsed as a single
+//     string_literal, so it never reaches this node).
+//
+// The pieces lower exactly like the core's equivalent bash word:
+// adjacent literal text merges into one lit part, a variable adds an
+// expr part, an all-literal tail lowers to a Str (the core's `echo
+// pre"mid"post` → Str "premidpost"). Pieces outside the v1 subset
+// (backtick escape_character, `$(…)` sub_expression, object-shaped
+// array_literal_expression) REFUSE.
+func lowerConcatArg(n *sitter.Node, src []byte) (any, error) {
+	head := n.NamedChild(0)
+	if head == nil {
+		return nil, refuse(n, src, "empty concatenated argument")
+	}
+	switch head.Type() {
+	case "string_literal", "expandable_string_literal":
+		// pwsh writes one pipeline OBJECT per leading quoted string
+		// (`Write-Output "a"b` prints "a" then "b" on separate lines)
+		// — multi-object output, outside the single-object echo mapping.
+		return nil, refuse(head, src, "quoted head of a concatenated argument (pwsh emits one object per leading quoted string; the multi-object output is outside the v1 single-object echo mapping)")
+	case "generic_token", "variable", "unary_expression":
+		// unquoted head — the pieces merge into ONE argument
+	default:
+		return nil, refuse(head, src, "head %q of a concatenated argument", head.Type())
+	}
+	parts, err := concatParts(n, src, 0)
+	if err != nil {
+		return nil, err
+	}
+	return mergeConcatParts(parts)
+}
+
+// concatParts — the pieces of the unquoted-headed tail as Interpolate
+// parts: quoted strings contribute their interior parts, barewords
+// contribute lit text, variables contribute expr parts.
+func concatParts(n *sitter.Node, src []byte, start int) ([]any, error) {
+	var parts []any
+	for i := start; i < int(n.NamedChildCount()); i++ {
+		ch := n.NamedChild(i)
+		switch ch.Type() {
+		case "string_literal":
+			ps, err := stringLiteralParts(ch, src)
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, ps...)
+		case "expandable_string_literal":
+			ps, err := lowerExpandableStringParts(ch, src)
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, ps...)
+		case "generic_token":
+			// bareword piece (`pre` in `pre"mid"post`)
+			parts = append(parts, litPart(ch.Content(src)))
+		case "variable":
+			parts = append(parts, exprPart(getVarCall(variableName(ch, src))))
+		case "unary_expression":
+			// number-headed (`2"a"`) / variable-headed (`$x"b"`) piece
+			if ch.NamedChildCount() != 1 {
+				return nil, refuse(ch, src, "unary_expression with %d children", ch.NamedChildCount())
+			}
+			op := ch.NamedChild(0)
+			switch op.Type() {
+			case "variable":
+				parts = append(parts, exprPart(getVarCall(variableName(op, src))))
+			case "integer_literal":
+				parts = append(parts, litPart(op.Content(src)))
+			default:
+				return nil, refuse(op, src, "%q inside a concatenated argument", op.Type())
+			}
+		default:
+			return nil, refuse(ch, src, "piece %q inside a concatenated argument", ch.Type())
+		}
+	}
+	return parts, nil
+}
+
+// mergeConcatParts — fold the pieces into one argument expression the
+// way the core folds an adjacent bash word: adjacent lit parts merge
+// into one; a variable anywhere makes it an Interpolate; an all-literal
+// tail is a Str (the core's `echo pre"mid"post` → Str "premidpost").
+func mergeConcatParts(parts []any) (any, error) {
+	var merged []any
+	for _, p := range parts {
+		pm := p.(map[string]any)
+		if pm["kind"] == "lit" && len(merged) > 0 {
+			if last, ok := merged[len(merged)-1].(map[string]any); ok && last["kind"] == "lit" {
+				last["text"] = last["text"].(string) + pm["text"].(string)
+				continue
+			}
+		}
+		merged = append(merged, p)
+	}
+	if len(merged) == 0 {
+		return nil, fmt.Errorf("REFUSE: empty concatenated argument (PLAN_POWERSHELL_F.md v1 subset — refuse > guess)")
+	}
+	hasExpr := false
+	var text strings.Builder
+	for _, p := range merged {
+		pm := p.(map[string]any)
+		if pm["kind"] == "expr" {
+			hasExpr = true
+		} else {
+			text.WriteString(pm["text"].(string))
+		}
+	}
+	if hasExpr {
+		return interpExpr(merged), nil
+	}
+	return strExpr(text.String(), "DoubleQuoted"), nil
 }
 
 // lowerUnary — unary_expression wraps its single operand.
@@ -237,6 +369,24 @@ func lowerStringLiteral(n *sitter.Node, src []byte) (any, error) {
 	}
 }
 
+// stringLiteralParts — the interior of a string_literal as Interpolate
+// parts: double-quoted → the expandable interior's parts (lit/expr);
+// single-quoted → ONE lit part (verbatim text, no interpolation).
+func stringLiteralParts(n *sitter.Node, src []byte) ([]any, error) {
+	if n.NamedChildCount() != 1 {
+		return nil, refuse(n, src, "string_literal without a body")
+	}
+	inner := n.NamedChild(0)
+	switch inner.Type() {
+	case "expandable_string_literal":
+		return lowerExpandableStringParts(inner, src)
+	case "verbatim_string_characters":
+		return []any{litPart(innerText(inner.Content(src)))}, nil
+	default:
+		return nil, refuse(inner, src, "string body %q", inner.Type())
+	}
+}
+
 // lowerExpandableString — `"…"` with optional $var interpolation. The
 // core lowers double-quoted strings to Interpolate with lit/expr parts.
 //
@@ -247,6 +397,23 @@ func lowerStringLiteral(n *sitter.Node, src []byte) (any, error) {
 // spans between the named children (verified against the core for the
 // no-variable case: a single lit part).
 func lowerExpandableString(n *sitter.Node, src []byte) (any, error) {
+	parts, err := lowerExpandableStringParts(n, src)
+	if err != nil {
+		return nil, err
+	}
+	return interpExpr(parts), nil
+}
+
+// lowerExpandableStringParts — the interior of a "…" string as
+// Interpolate parts (lit text + getVar exprs).
+//
+// NOTE (vendored-runtime quirk): with the smacker runtime the interior
+// text tokens of expandable_string_literal are not materialized as
+// children — only the interpolated variables (and the closing quote)
+// are. The literal text parts are therefore reconstructed from the byte
+// spans between the named children (verified against the core for the
+// no-variable case: a single lit part).
+func lowerExpandableStringParts(n *sitter.Node, src []byte) ([]any, error) {
 	var parts []any
 	pos := n.StartByte() + 1 // skip the opening quote
 	for i := 0; i < int(n.NamedChildCount()); i++ {
@@ -269,7 +436,7 @@ func lowerExpandableString(n *sitter.Node, src []byte) (any, error) {
 	if txt := string(src[pos:end]); txt != "" {
 		parts = append(parts, litPart(txt))
 	}
-	return interpExpr(parts), nil
+	return parts, nil
 }
 
 // variableName — `$x` → "x" and `${x}` → "x": the braces are pure

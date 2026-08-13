@@ -45,13 +45,34 @@ line) — now the worker's fixes, not records):
   unary-operator forms of expression_with_unary_operator (`-not` /
   `!` / `++` / `--`) and object-shaped operands (member access, `@()`
   arrays) still REFUSE.
+- t04_invocation_operator: `&` / `.` before a whitelisted command
+  name (command_invocation_operator + command_name_expr): the
+  operator lowers away (pure invocation spelling, the ${}-brace
+  precedent of t02; the emit is byte-identical to the un-prefixed
+  form) — verified against live pwsh 7.6.4. `& $cmd` / `. ./file.ps1`
+  REFUSE (the command_name_expr text is not in the whitelist).
+- t05_concatenated_argument: the concatenated_command_argument node —
+  adjacent quoted/bareword/variable pieces with no whitespace
+  (`pre"mid"post`, `$x"b"`, `2"a"`). Live pwsh 7.6.4 argument-mode
+  tokenization: an UNQUOTED head absorbs every following piece (ONE
+  argument), so the pieces merge exactly like the core's
+  adjacent-word folding (adjacent lits merge; a variable →
+  Interpolate; all-literal → Str — byte-identical to the core's `echo
+  pre"mid"post` / `echo $x"b"`). A QUOTED head REFUSES: pwsh
+  terminates the argument there and writes one pipeline OBJECT per
+  leading quoted string (`Write-Output "a"b` prints "a" then "b"
+  on separate lines), and the multi-object output is outside the v1
+  single-object echo mapping (the t02 null-edge precedent: refuse >
+  guess). `"a""b"` is NOT this node (the doubled quote is an
+  escaped quote inside ONE string); backtick escape_character and
+  `$(…)` pieces inside a concatenated argument still REFUSE.
 - Comments, comment-only files (empty Program), and the REFUSE table
   (refuse.go): anything outside the subset errors loudly — including
   .NET member access (`$x.Length`), assignment, `|` pipelines, unknown
   commands, named parameters (all pinned in `testdata_refuse/`).
 
 The v1 subset and the refusal table are PLAN_POWERSHELL_F.md. The next
-construct (t04_var: assignment + `$var` interpolation) lands on the
+construct (t06_var: assignment + `$var` interpolation) lands on the
 next RED pin; the string-interpolation machinery it needs is already
 in place (lower.go reconstructs string parts from byte spans — the
 smacker runtime does not materialize the interior text tokens of
