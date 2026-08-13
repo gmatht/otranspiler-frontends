@@ -23,13 +23,22 @@ harness/frontend-stdout.sh, the bat precedent):
   core's exec-echo Call; string args lower exactly like the core's
   double-quoted strings (Interpolate with lit/expr parts, single-quoted
   and barewords → Str DoubleQuoted).
+- t02_braced_variable: `${name}` — the braced spelling of a variable
+  read; braces are pure spelling, both forms lower to the same
+  getVar slot.
+- t03_cast: `[type] operand` (cast_expression) → the plan's IDENTITY
+  mapping (the C `(int)` precedent): the type_literal is dropped and
+  the operand lowers exactly as if the cast were absent —
+  byte-identical to the uncast spelling. The unary-operator forms of
+  expression_with_unary_operator (`-not` / `!` / `++` / `--`) and
+  object-shaped operands (member access, `@()` arrays) still REFUSE.
 - Comments, comment-only files (empty Program), and the REFUSE table
   (refuse.go): anything outside the subset errors loudly — including
   .NET member access (`$x.Length`), assignment, `|` pipelines, unknown
   commands, named parameters (all pinned in `testdata_refuse/`).
 
 The v1 subset and the refusal table are PLAN_POWERSHELL_F.md. The next
-construct (t02_var: assignment + `$var` interpolation) lands on the
+construct (t04_var: assignment + `$var` interpolation) lands on the
 next RED pin; the string-interpolation machinery it needs is already
 in place (lower.go reconstructs string parts from byte spans — the
 smacker runtime does not materialize the interior text tokens of

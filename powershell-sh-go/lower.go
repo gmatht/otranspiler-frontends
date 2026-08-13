@@ -20,6 +20,8 @@ import (
 //	            unary_expression → string_literal → expandable_string_literal
 //	                                            → verbatim_string_characters
 //	                             → variable / integer_literal / …
+//	                             → expression_with_unary_operator
+//	                                 → cast_expression  (type_literal + operand)
 //	            generic_token                     (bareword)
 //	            variable
 //	      pipeline_chain_tail*    (REFUSE: `|` pipe — t08 rung)
@@ -174,9 +176,35 @@ func lowerExpr(n *sitter.Node, src []byte) (any, error) {
 	case "integer_literal":
 		// `Write-Output 5` — the core's `echo 5` emits a Str.
 		return strExpr(n.Content(src), "DoubleQuoted"), nil
+	case "expression_with_unary_operator":
+		// PowerShell wraps a leading cast (or -not / ! / ++ / --) in this
+		// node; the v1 subset admits ONLY the cast form — the unary-
+		// operator forms hit the default refuse below.
+		if n.NamedChildCount() != 1 {
+			return nil, refuse(n, src, "expression_with_unary_operator with %d children", n.NamedChildCount())
+		}
+		return lowerExpr(n.NamedChild(0), src)
+	case "cast_expression":
+		return lowerCast(n, src)
 	default:
 		return nil, refuse(n, src, "expression %q", n.Type())
 	}
+}
+
+// lowerCast — `[type] operand` — the plan's IDENTITY mapping
+// (PLAN_POWERSHELL_F.md §1: "`[int]x` cast → identity (the C `(int)`
+// precedent)"): the A1 is text-typed, so the type_literal is dropped
+// and the operand lowers exactly as if the cast were absent —
+// byte-identical to the uncast spelling (verified against the core).
+func lowerCast(n *sitter.Node, src []byte) (any, error) {
+	// named children: type_literal + the operand (unary_expression)
+	if n.NamedChildCount() != 2 {
+		return nil, refuse(n, src, "cast_expression with %d children", n.NamedChildCount())
+	}
+	if tl := n.NamedChild(0); tl.Type() != "type_literal" {
+		return nil, refuse(tl, src, "cast head %q", tl.Type())
+	}
+	return lowerUnary(n.NamedChild(1), src)
 }
 
 // lowerStringLiteral — 'single-quoted' or "double-quoted".
