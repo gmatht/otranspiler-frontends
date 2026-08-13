@@ -8,6 +8,9 @@ set -euo pipefail
 cd "$(dirname "$0")"
 WORKSPACE="$(cd ../.. && pwd)"
 LOG="$WORKSPACE/loop-frontend-rust-frontend.log"
+# Worker cgroup enrollment (harness/WorkerPool.pm): this frontend worker
+# runs inside sh2workers; best-effort (unprivileged WSL -> cooperative).
+perl "$WORKSPACE/harness/WorkerPool.pm" --enter-worker $$ >> "$LOG" 2>&1 || true
 # HARD-SERIALIZE the heavy build+test phase against every other worker
 # on this box. Backend workers already flock $WORKSPACE/.gate.lock
 # around --backend-gate (commit 7edd76e: N concurrent cargo builds
@@ -28,7 +31,7 @@ while true; do
     fail_count=0
     changes=$(git -C "$WORKSPACE" status --porcelain 2>/dev/null \
               | awk '/^.. /{print $2}' \
-              | awk -v d="${pwd#$WORKSPACE/}" '$0 ~ "^"d"/" || $0 ~ /^harness\//' || true)
+              | awk -v d="${PWD#$WORKSPACE/}" '$0 ~ "^"d"/" || $0 ~ /^harness\//' || true)
     if [ -n "$changes" ]; then
       git -C "$WORKSPACE" add $changes 2>/dev/null || true
       git -C "$WORKSPACE" commit -m "frontend rust-frontend: gate green" >> "$LOG" 2>&1 || true

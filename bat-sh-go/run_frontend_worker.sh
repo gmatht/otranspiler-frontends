@@ -5,6 +5,9 @@ set -euo pipefail
 cd "$(dirname "$0")"
 WORKSPACE="/home/llm/sh2loop"
 LOG="$WORKSPACE/loop-frontend-bat-sh-go.log"
+# Worker cgroup enrollment (harness/WorkerPool.pm): this frontend worker
+# runs inside sh2workers; best-effort (unprivileged WSL -> cooperative).
+perl "$WORKSPACE/harness/WorkerPool.pm" --enter-worker $$ >> "$LOG" 2>&1 || true
 echo "[$(date +%FT%T)] frontend bat-sh-go worker started (pid=$$)" >> "$LOG"
 while true; do
   if [ -f "$WORKSPACE/.leases/bat-sh-go" ]; then

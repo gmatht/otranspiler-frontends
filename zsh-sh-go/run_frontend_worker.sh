@@ -13,6 +13,9 @@ set -euo pipefail
 cd "$(dirname "$0")"
 WORKSPACE="$(cd ../.. && pwd)"
 LOG="$WORKSPACE/loop-frontend-zsh-sh-go.log"
+# Worker cgroup enrollment (harness/WorkerPool.pm): this frontend worker
+# runs inside sh2workers; best-effort (unprivileged WSL -> cooperative).
+perl "$WORKSPACE/harness/WorkerPool.pm" --enter-worker $$ >> "$LOG" 2>&1 || true
 echo "[$(date +%FT%T)] frontend zsh-sh-go worker started (pid=$$)" >> "$LOG"
 fail_count=0
 while true; do
@@ -23,7 +26,7 @@ while true; do
     # commit any scoped changes the fix may have made (this dir + harness/*)
     changes=$(git -C "$WORKSPACE" status --porcelain 2>/dev/null \
               | awk '/^.. /{print $2}' \
-              | awk -v d="${pwd#$WORKSPACE/}" '$0 ~ "^"d"/" || $0 ~ /^harness\//' || true)
+              | awk -v d="${PWD#$WORKSPACE/}" '$0 ~ "^"d"/" || $0 ~ /^harness\//' || true)
     if [ -n "$changes" ]; then
       git -C "$WORKSPACE" add $changes 2>/dev/null || true
       git -C "$WORKSPACE" commit -m "frontend zsh-sh-go: gate green" >> "$LOG" 2>&1 || true
