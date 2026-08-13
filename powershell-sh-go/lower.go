@@ -848,6 +848,91 @@ func lowerFormatArg(n *sitter.Node, list *sitter.Node, start int, src []byte) (a
 	return strExpr(folded, "DoubleQuoted"), i, nil
 }
 
+// lowerFormatExpr — the format_expression node: `LHS -f RHS` in
+// EXPRESSION position — the t17 rung, the general-expression twin of
+// the t14 format_argument_expression (which the grammar reaches ONLY
+// inside an argument_list; the parenthesized `Write-Output ("{0}" -f
+// "a")` reaches THIS node). Live pwsh 7.6.4 (verified 2026-08-14):
+// the parens evaluate the format to ONE object — `Write-Output
+// ("{0}" -f "a")` prints `a`, `Write-Output ("{1} {0}" -f "x","y")`
+// prints `y x` — and in the paren the grammar parses the comma-list
+// RHS as ONE array_literal_expression (the t14 argument_list split
+// does not apply here), so the lowering collects the array's
+// unary_expression elements as the format's argument list, the pwsh
+// semantics. The t17 subset pins the SAME all-literal fold as t14:
+// the format string and every argument are literal strings / decimal
+// integers, so `LHS -f args` folds to ONE compile-time A1 Str via the
+// shared foldFormat (a variable anywhere, a nested format, a range
+// RHS and an alignment/format-specifier or count mismatch REFUSE
+// exactly like t14 — the runtime printf-style rung is a later
+// milestone; refuse > guess).
+func lowerFormatExpr(n *sitter.Node, src []byte) (any, error) {
+	var lhs, rhs *sitter.Node
+	for i := 0; i < int(n.NamedChildCount()); i++ {
+		ch := n.NamedChild(i)
+		switch ch.Type() {
+		case "unary_expression":
+			if lhs == nil {
+				lhs = ch
+			} else if rhs == nil {
+				rhs = ch
+			} else {
+				return nil, refuse(ch, src, "format_expression with more than two operands")
+			}
+		case "array_literal_expression":
+			// the comma-list RHS (`"{0} {1}" -f "a","b"`) — the pwsh
+			// argument-array form; can only be the RHS (a format string
+			// LHS is always a literal).
+			if rhs != nil {
+				return nil, refuse(ch, src, "format_expression with more than two operands")
+			}
+			rhs = ch
+		case "format_operator", "-f":
+			// the operator itself — structure only
+		default:
+			return nil, refuse(ch, src, "format_expression part %q (the t17 subset pins `LHS -f args` with literal operands)", ch.Type())
+		}
+	}
+	if lhs == nil || rhs == nil {
+		return nil, refuse(n, src, "format_expression without a format string or arguments")
+	}
+	fmtText, err := literalStringText(lhs, src)
+	if err != nil {
+		return nil, err
+	}
+	// the format's arguments: a single RHS or the array_literal_expression
+	// comma-list (the pwsh argument-array semantics — the parenthesized
+	// twin of lowerFormatArg's [RHS] + following-elements collection).
+	var argNodes []*sitter.Node
+	switch rhs.Type() {
+	case "array_literal_expression":
+		for i := 0; i < int(rhs.NamedChildCount()); i++ {
+			c := rhs.NamedChild(i)
+			if c.Type() != "unary_expression" {
+				return nil, refuse(c, src, "format argument %q (the t17 subset pins literal format arguments)", c.Type())
+			}
+			argNodes = append(argNodes, c)
+		}
+	case "unary_expression":
+		argNodes = append(argNodes, rhs)
+	default:
+		return nil, refuse(rhs, src, "format RHS %q (the t17 subset pins literal format arguments)", rhs.Type())
+	}
+	vals := make([]string, len(argNodes))
+	for j, a := range argNodes {
+		v, err := literalArgText(a, src)
+		if err != nil {
+			return nil, err
+		}
+		vals[j] = v
+	}
+	folded, err := foldFormat(fmtText, vals)
+	if err != nil {
+		return nil, err
+	}
+	return strExpr(folded, "DoubleQuoted"), nil
+}
+
 // literalStringText — a string_literal node whose interior is EXACTLY
 // one literal text part (no interpolation): the t14 format string.
 func literalStringText(n *sitter.Node, src []byte) (string, error) {
@@ -1150,6 +1235,8 @@ func lowerUnary(n *sitter.Node, src []byte) (any, error) {
 // lowerExpr — an argument/operand expression.
 func lowerExpr(n *sitter.Node, src []byte) (any, error) {
 	switch n.Type() {
+	case "parenthesized_expression":
+		return lowerParenthesized(n, src)
 	case "string_literal":
 		return lowerStringLiteral(n, src)
 	case "variable":
@@ -1170,6 +1257,58 @@ func lowerExpr(n *sitter.Node, src []byte) (any, error) {
 	default:
 		return nil, refuse(n, src, "expression %q", n.Type())
 	}
+}
+
+// lowerParenthesized — the parenthesized_expression node: `( expr )` in
+// COMMAND-ARGUMENT position. Live pwsh 7.6.4 (verified 2026-08-14):
+// the parens evaluate the inner pipeline to ONE object, and the
+// argument passes that single object on (`Write-Output ("{0}" -f "a")`
+// prints `a`) — the standard v1 single-object echo mapping. The t17
+// subset pins the parens ONLY as the format_expression host (the
+// grammar reaches the format_expression node exactly here and in a
+// bare statement position — both the t14 twin `-f` rung; the
+// statement form stays a loud REFUSE): the inner pipeline must be
+// exactly ONE pipeline_chain containing ONE format_expression. Any
+// other parenthesized content (`Write-Output ("a")` / `($x)` — a
+// different expression rung) REFUSES (refuse > guess), matching the
+// t14 plain-literal-list refusal.
+func lowerParenthesized(n *sitter.Node, src []byte) (any, error) {
+	var pl *sitter.Node
+	for i := 0; i < int(n.NamedChildCount()); i++ {
+		ch := n.NamedChild(i)
+		if ch.Type() != "pipeline" {
+			return nil, refuse(ch, src, "parenthesized_expression part %q", ch.Type())
+		}
+		if pl != nil {
+			return nil, refuse(ch, src, "parenthesized_expression with multiple pipelines")
+		}
+		pl = ch
+	}
+	if pl == nil {
+		return nil, refuse(n, src, "parenthesized_expression without a pipeline")
+	}
+	var chain *sitter.Node
+	for i := 0; i < int(pl.NamedChildCount()); i++ {
+		ch := pl.NamedChild(i)
+		switch ch.Type() {
+		case "pipeline_chain":
+			if chain != nil {
+				return nil, refuse(ch, src, "parenthesized pipeline with multiple chains")
+			}
+			chain = ch
+		case "pipeline_chain_tail":
+			return nil, refuse(ch, src, "pipeline `|` in a parenthesized expression (the t08 text-pipe rung)")
+		default:
+			return nil, refuse(ch, src, "parenthesized pipeline part %q", ch.Type())
+		}
+	}
+	if chain == nil {
+		return nil, refuse(n, src, "parenthesized_expression without a pipeline_chain")
+	}
+	if chain.NamedChildCount() != 1 || chain.NamedChild(0).Type() != "format_expression" {
+		return nil, refuse(n, src, "parenthesized expression %q (the t17 subset pins the `-f` format_expression host; other parenthesized expressions are unpinned)", n.Content(src))
+	}
+	return lowerFormatExpr(chain.NamedChild(0), src)
 }
 
 // lowerCast — `[type] operand` in COMMAND-ARGUMENT position. Verified

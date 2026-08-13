@@ -4,7 +4,7 @@ PowerShell (.ps1) source -> A1 shIR JSON — **the bat sibling**
 (workspace-side dir; no git worktree; the object pipeline is a stated
 TEXT approximation for v1; see PLAN_POWERSHELL_F.md).
 
-**Status: WORKER-IMPLEMENTED, t14 landed (gate green).** The parser is
+**Status: WORKER-IMPLEMENTED, t17 landed (gate green).** The parser is
 wharflab/tree-sitter-powershell (vendored under
 `grammars/tree-sitter-powershell/`, loaded via smacker/go-tree-sitter
 cgo) — the plan's choice, empirically verified. The emitter produces A1
@@ -214,8 +214,8 @@ line) — now the worker's fixes, not records):
   composite-format operator inside an argument_list
   (`foo("{0} {1}" -f "a","b")`; the grammar reaches this node ONLY
   there — a parenthesized `Write-Output ("{0}" -f "a")` is the
-  DIFFERENT format_expression node and a bare `-f` in argument
-  position is a command_parameter, both still refused). Live pwsh
+  DIFFERENT format_expression node, landed as t17, and a bare `-f` in
+  argument position is a command_parameter, still refused). Live pwsh
   7.6.4 (verified 2026-08-13): the head argument and the
   parenthesized value(s) are SEPARATE pipeline objects (`Write-Output
   foo("{0} {1}" -f "a","b")` prints `foo` then `a b` on two lines),
@@ -238,6 +238,31 @@ line) — now the worker's fixes, not records):
   count mismatch, a plain literal argument list (`foo("x")`), an
   empty `foo()` and an argument after the parens all REFUSE (refuse >
   guess).
+- t17_format_expression: the format_expression node — the SAME `-f`
+  .NET composite-format operator in EXPRESSION position, the
+  parenthesized twin of t14 (`Write-Output ("{0}" -f "a")`; the
+  grammar reaches this node in a parenthesized command argument — the
+  t14 note's "DIFFERENT format_expression node" — and in a bare
+  `"{0}" -f "a"` statement, which stays REFUSED: statement-level
+  expressions are the command-only rung). Live pwsh 7.6.4 (verified
+  2026-08-14): the parens evaluate the format to ONE object —
+  `Write-Output ("{0}" -f "a")` prints `a`, `Write-Output ("{1} {0}" -f
+  "x","y")` prints `y x` — the standard v1 single-object echo
+  mapping, so the argument lowers to ONE echo of the folded value
+  (the t14 object-per-argument split does NOT apply: the paren is a
+  single argument, not an argument list). The t17 subset pins the
+  SAME all-literal fold as t14 via the shared fold machinery: the
+  format string and every argument are literal strings / decimal
+  integers → ONE compile-time A1 Str. In the paren the grammar parses
+  the comma-list RHS as ONE array_literal_expression (the t14
+  list-split workaround does not apply) — the lowering collects its
+  elements as the format's argument array, the pwsh semantics; `{N}`
+  placeholders substitute the N-th argument, `{1} {0}` pins
+  reordering. A variable anywhere (`"{0}" -f $x`), a nested
+  paren/format, escaped braces, alignment/format specifiers
+  (`{0:D2}`), a placeholder/argument count mismatch and any NON-format
+  parenthesized expression (`("a")` / `($x)`) all REFUSE (the runtime
+  printf-style rung is a later milestone; refuse > guess).
 - Comments, comment-only files (empty Program), and the REFUSE table
   (refuse.go): anything outside the subset errors loudly — including
   .NET member access (`$x.Length`), assignment, `|` pipelines, unknown
