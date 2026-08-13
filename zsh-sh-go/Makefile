@@ -17,7 +17,14 @@ GO ?= /snap/go/current/bin/go
 # test with a misleading FAIL (t71_var_name_mods, 2026-08-12 20:55:24).
 # The byte-equality phase and the stdout harness both run the stable
 # verified copy below, never the shared binary.
-GATE_TMP := $(shell mktemp -d /tmp/zsh-sh-go-gate.XXXXXX)
+# GATE_TMP is created LAZILY — only the test/worker goals need the oracle
+# snapshot. An eager `$(shell mktemp -d …)` at parse time made EVERY make
+# invocation (build/all/clean/gen) leak one ~20MB dir; the worker only
+# runs `make test` (trap-cleaned below), but a manual `make build` leaked
+# one dir per run. $(if) expands only the taken branch, so a non-test
+# goal never runs mktemp. (GATE_DEBASHC is a `:=` after this, so the
+# value is fixed at parse for test/worker runs.)
+GATE_TMP := $(if $(filter test worker,$(MAKECMDGOALS)),$(shell mktemp -d /tmp/zsh-sh-go-gate.XXXXXX),/nonexistent-gate-tmp)
 GATE_DEBASHC := $(GATE_TMP)/debashc
 
 $(GATE_DEBASHC): $(DEBASHC)
