@@ -37,6 +37,8 @@ import (
 //	    if_statement (t07 — then + optional else_clause; elseif_clauses REFUSES)
 //	    for_statement (t12 — the condition-only `for (; $c; )` form → While;
 //	      for_initializer / for_iterator / conditionless REFUSE)
+//	    foreach_statement (t13 — `foreach ($x in $list) { B }` → the A1 For;
+//	      the `-parallel` foreach_parameter REFUSES)
 //	    empty_statement                 (t08 — a lone `;`, a NO-OP: dropped,
 //	                                      emitting ZERO statements)
 //	    assignment_expression / …          (REFUSE until pinned)
@@ -105,6 +107,8 @@ func lowerStatement(n *sitter.Node, src []byte) (any, error) {
 		return nil, refuse(n, src, "do_statement outside a statement_list")
 	case "for_statement":
 		return lowerForStatement(n, src)
+	case "foreach_statement":
+		return lowerForEachStatement(n, src)
 	case "empty_statement":
 		// the lone `;` — the _statement rule's empty_statement
 		// alternative; this grammar parses EVERY standalone `;` as
@@ -437,6 +441,91 @@ func lowerForStatement(n *sitter.Node, src []byte) (any, error) {
 	// `for (; C; ) { B }` ≡ `while (C) { B }` — the A1 While statement
 	// (the same shape the t06 do-while duplication emits).
 	return whileStmt(cond, body), nil
+}
+
+// lowerForEachStatement — the foreach_statement node: `foreach` `(`
+// [foreach_parameter] variable `in` pipeline `)` statement_block (the
+// `foreach` keyword, the parens and the `in` keyword are anonymous
+// alias tokens; the named children are the optional foreach_parameter,
+// the loop variable, the `in` pipeline and the body). The t13 rung
+// lands the plan's "For over the A1 array" row (PLAN_POWERSHELL_F.md
+// §1): `foreach ($x in $list) { B }` lowers to the A1 For statement
+// `{var: x, iter: Array [ split [ getVar "list" ] ], body: B}` — the
+// CORE's exact shape for bash `for i in $list; do …; done` (verified
+// byte-identical against `debashc file --shir`), because the iter
+// pipeline has the SAME single-pipeline shape as the t06/t07
+// conditions (verified against node-types.json), so the `in` collection
+// lowers through the same lowerCondPipeline subset: a bare variable
+// read. The split wrapper is the bash word-splitting the A1 For's
+// iter semantics implement (the estree renderer emits `[].concat(…)`
+// and the runtime splits the item list); WITHOUT it a bare getVar
+// would render as `[].concat("")` → ONE empty item → the body would
+// run once — a miscompile. Pinned for an UNSET variable: live pwsh
+// 7.6.4 reads $null and iterates ZERO times; the A1 side reads "" and
+// split("") is the EMPTY list — the same zero iterations, so the
+// executed-stdout oracle matches by construction (the body never runs
+// on either side and the statement after the loop prints on both; the
+// body echo is structural — a wrongly-run body would DIFF). The
+// foreach_parameter (`foreach -parallel (…)`) REFUSES: parallel foreach
+// is a different execution model (iterations run concurrently — the
+// plan's `&`-parallelism machinery, unpinned; refuse > guess).
+func lowerForEachStatement(n *sitter.Node, src []byte) (any, error) {
+	var varName string
+	var iter any
+	var body []any
+	gotVar, gotIter, gotBody := false, false, false
+	for i := 0; i < int(n.NamedChildCount()); i++ {
+		ch := n.NamedChild(i)
+		switch ch.Type() {
+		case "foreach_parameter":
+			return nil, refuse(ch, src, "foreach -parallel (the parallel foreach runs the iterations concurrently — a different execution model, outside the v1 subset)")
+		case "variable":
+			if gotVar {
+				return nil, refuse(ch, src, "foreach_statement with multiple loop variables")
+			}
+			varName = variableName(ch, src)
+			gotVar = true
+		case "pipeline":
+			if gotIter {
+				return nil, refuse(ch, src, "foreach_statement with multiple `in` collections")
+			}
+			// the `in` collection: the SAME single-pipeline subset as the
+			// t06/t07 conditions — a bare variable read (lowerCondPipeline
+			// shares the shape check, including the `$true` automatic
+			// refusal: iterating a truthy automatic would run the body on
+			// one side only).
+			v, err := lowerCondPipeline(ch, src)
+			if err != nil {
+				return nil, err
+			}
+			// the split wrapper — the core's `for i in $list` iter shape
+			// (byte-identical; see the function comment).
+			iter = arrayExpr([]any{splitCall(v)})
+			gotIter = true
+		case "statement_block":
+			if gotBody {
+				return nil, refuse(ch, src, "foreach_statement with multiple bodies")
+			}
+			b, err := lowerBlock(ch, src)
+			if err != nil {
+				return nil, err
+			}
+			body = b
+			gotBody = true
+		default:
+			return nil, refuse(ch, src, "foreach_statement part %q", ch.Type())
+		}
+	}
+	if !gotVar {
+		return nil, refuse(n, src, "foreach_statement without a loop variable")
+	}
+	if !gotIter {
+		return nil, refuse(n, src, "foreach_statement without an `in` collection")
+	}
+	if !gotBody {
+		return nil, refuse(n, src, "foreach_statement without a body")
+	}
+	return forStmt(varName, iter, body), nil
 }
 
 // lowerIfStatement — the if_statement node: `if` `(` condition `)`

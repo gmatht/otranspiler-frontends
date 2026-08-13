@@ -4,7 +4,7 @@ PowerShell (.ps1) source -> A1 shIR JSON — **the bat sibling**
 (workspace-side dir; no git worktree; the object pipeline is a stated
 TEXT approximation for v1; see PLAN_POWERSHELL_F.md).
 
-**Status: WORKER-IMPLEMENTED, t12 landed (gate green).** The parser is
+**Status: WORKER-IMPLEMENTED, t13 landed (gate green).** The parser is
 wharflab/tree-sitter-powershell (vendored under
 `grammars/tree-sitter-powershell/`, loaded via smacker/go-tree-sitter
 cgo) — the plan's choice, empirically verified. The emitter produces A1
@@ -192,6 +192,24 @@ line) — now the worker's fixes, not records):
   assignment rung) and `t12_for_conditionless.ps1` (`for (;;)` is an
   infinite loop — pwsh truthy vs no pinned A1 true-literal condition;
   the t06 `$true` divergence precedent: refuse > guess).
+- t13_foreach: the foreach_statement node — `foreach ($x in $list) {
+  B }` → the A1 For statement (the plan's "For over the A1 array"
+  row): `{var: x, iter: Array [ split [ getVar "list" ] ], body: B}`,
+  byte-identical to the core's `for i in $list; do …; done` emission
+  (the iter pipeline has the SAME single-pipeline shape as the t06/t07
+  conditions, so the `in` collection lowers through the same
+  lowerCondPipeline subset: a bare variable read; the split wrapper is
+  the word-splitting the A1 For's iter semantics implement — WITHOUT
+  it a bare getVar would render as `[].concat("")` → one empty item,
+  a miscompile). Pinned for an UNSET variable: pwsh iterates $null
+  ZERO times and split("") is the empty list — the executed-stdout
+  oracle matches live pwsh by construction (the body echo is
+  structural, a wrongly-run body would DIFF; the interpolation is the
+  t09/t10 consistent edge). The foreach_parameter form (`foreach
+  -parallel (…)`) REFUSES — concurrent iterations, a different
+  execution model — pinned `testdata_refuse/t13_foreach_parallel.ps1`.
+  (`invocation_foreach_expression` — `ForEach-Object`/the method form
+  — is the `$_` pipeline-variable machinery, a separate rung.)
 - Comments, comment-only files (empty Program), and the REFUSE table
   (refuse.go): anything outside the subset errors loudly — including
   .NET member access (`$x.Length`), assignment, `|` pipelines, unknown

@@ -106,6 +106,33 @@ func ifStmt(cond any, then, els []any) any {
 	}
 }
 
+// splitCall — the core's word-splitting wrapper for an UNQUOTED $var in
+// a for-list (`for i in $list` → iter Array [ split [ getVar "list" ] ],
+// the t13 foreach iter's byte-identical shape): the A1 split call with
+// the core's purity verdict (PureCpu — not a runtime builtin).
+func splitCall(e any) any {
+	return map[string]any{"type": "Call", "func": "split", "args": []any{e}, "purity": "PureCpu"}
+}
+
+// forStmt — the A1 For statement (the t13 rung: `foreach ($x in $list)`
+// — the plan's "For over the A1 array" row). Shape mirrors shir_json.rs
+// exactly: type/var/iter/body + the runs verdict. runs matches the
+// core's stmt_provably_runs for this lowering (an Array iter with a
+// non-empty item list is provably running → true — the same true the
+// core emits for `for i in a b c` and `for i in $list`).
+func forStmt(v string, iter any, body []any) any {
+	if body == nil {
+		body = []any{}
+	}
+	return map[string]any{
+		"type": "For",
+		"var":  v,
+		"iter": iter,
+		"body": body,
+		"runs": true,
+	}
+}
+
 // whileStmt — the A1 While statement (the t06 do-while duplication:
 // `do { B } while (C)` → `B; while (C) { B }`). "runs" mirrors the
 // core's stmt_provably_runs verdict: false unless the cond is provably

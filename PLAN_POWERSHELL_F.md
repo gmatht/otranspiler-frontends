@@ -1,9 +1,31 @@
 # PLAN_POWERSHELL_F — a PowerShell frontend on the bat precedent
 
-**Status: IN PROGRESS — t12 landed (gate green).** The
+**Status: IN PROGRESS — t13 landed (gate green).** The
 proposal is implemented as described; revision history below.
 
 ## 0. Revision history
+
+- 2026-08-14 (t13_foreach, gate green): the foreach_statement node
+  lands — `foreach ($x in $list) { B }` lowers to the A1 For statement
+  `{var: x, iter: Array [ split [ getVar "list" ] ], body: B}` — the
+  plan's "For over the A1 array" row, byte-identical to the core's
+  `for i in $list; do …; done` emission (verified against `debashc
+  file --shir`). The `in` collection is the SAME single-pipeline shape
+  as the t06/t07 conditions, so it lowers through the shared
+  lowerCondPipeline subset (a bare variable read; the `$true`
+  automatic refusal carries over); the split wrapper is the
+  word-splitting the A1 For's iter semantics implement (the estree
+  renderer emits `[].concat(…)` — a bare getVar would render as
+  `[].concat("")` → ONE empty item → the body would run once, a
+  miscompile). Pinned for an UNSET variable: pwsh reads $null and
+  iterates ZERO times; split("") is the empty list — the
+  executed-stdout oracle matches live pwsh by construction (both
+  print the statement after the loop, never the body; the body echo
+  is structural). The foreach_parameter form (`foreach -parallel
+  (…)` — concurrent iterations, the `&`-parallelism machinery)
+  REFUSES, pinned testdata_refuse/t13_foreach_parallel.ps1; the
+  `invocation_foreach_expression` node (ForEach-Object / the `$_`
+  pipeline variable) remains the `$_` rung.
 
 - 2026-08-14 (t12_for_condition, gate green): the for_statement node's
   for_condition field lands — `for (; $c; ) { B }`, the CONDITION-ONLY
