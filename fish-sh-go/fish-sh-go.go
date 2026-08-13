@@ -743,6 +743,23 @@ func (p *parser) parseCondCmd() (map[string]any, error) {
 			return e, nil
 		}
 	}
+	// fish `string match -rq PAT STR` — regex matching, lowered to the
+	// A1 `Regex` expr node (core request fish-sh-go-20260813-192709): a
+	// quiet ERE match over one value becomes
+	// `Call(regexMatch, [Regex{pattern, flags}, value])`, which the
+	// ESTree renderer prints as `sh2.regexMatch(/pattern/flags, value)`
+	// — the runtime consumes the rendered regex literal (a native
+	// RegExp) and records the status. Only the QUIET condition form
+	// lowers (fish prints matches otherwise; the print form has no A1
+	// shape); any other `string match` shape falls through to the
+	// generic exec emission below.
+	if name == "string" && len(args) >= 4 {
+		if sub, err := p.plainWord(args[1], "string subcommand"); err == nil && sub == "match" {
+			if e, ok := p.stringMatchCond(args[2:]); ok {
+				return e, nil
+			}
+		}
+	}
 	elems := make([]any, 0, len(args)-1)
 	for _, run := range mergeRuns(args[1:]) {
 		e, err := p.runValue(run)
@@ -1558,6 +1575,91 @@ func stringSubFromIR(e map[string]any, start, length string) (map[string]any, bo
 		return strExpr(s[lo:hi]), true
 	}
 	return nil, false
+}
+
+// stringMatchCond lowers the `string match` CONDITION form
+// `string match [-r] [-q] [-i] PAT STR` (exactly one STR operand) to
+// the A1 regex-test call `Call(regexMatch, [Regex{pattern, flags},
+// value])`. Only the quiet (-q) regex (-r) form lowers — fish prints
+// the match otherwise, and the print form has no A1 shape. Flags
+// accept fish's bundled shorts (`-rq`, `-qi`) and long forms
+// (--regex/--quiet/--ignore-case); any other shape returns ok=false
+// and the caller falls back to the generic exec emission.
+func (p *parser) stringMatchCond(args []token) (map[string]any, bool) {
+	regex := false
+	quiet := false
+	flags := ""
+	i := 0
+	for i < len(args) {
+		f, err := p.plainWord(args[i], "string match flag")
+		if err != nil || !strings.HasPrefix(f, "-") || f == "-" {
+			break
+		}
+		body := strings.TrimPrefix(f, "-")
+		if body == "" { // `--` ends option parsing
+			i++
+			break
+		}
+		switch body {
+		case "r", "regex":
+			regex = true
+		case "q", "quiet":
+			quiet = true
+		case "i", "ignore-case":
+			flags += "i"
+		default:
+			// bundled short flags (`-rq`): every char must be r/q/i
+			ok := true
+			for _, c := range body {
+				switch c {
+				case 'r':
+					regex = true
+				case 'q':
+					quiet = true
+				case 'i':
+					flags += "i"
+				default:
+					ok = false
+				}
+			}
+			if !ok {
+				return nil, false
+			}
+		}
+		i++
+	}
+	if !regex || !quiet || i >= len(args) {
+		return nil, false
+	}
+	// the pattern: a bare word (no expansions) or a single-quoted
+	// literal (fish's standard `'[0-9]+'` — quotes are literal text)
+	pat := ""
+	if args[i].kind == tWord {
+		var err error
+		pat, err = p.plainWord(args[i], "string match pattern")
+		if err != nil {
+			return nil, false
+		}
+	} else if args[i].kind == tSQuote {
+		pat = args[i].text
+	} else {
+		return nil, false
+	}
+	if i+2 != len(args) { // exactly one STR operand
+		return nil, false
+	}
+	runs := mergeRuns(args[i+1:])
+	if len(runs) != 1 {
+		return nil, false
+	}
+	value, err := p.runValue(runs[0])
+	if err != nil {
+		return nil, false
+	}
+	return callExpr("regexMatch", []any{
+		map[string]any{"type": "Regex", "pattern": pat, "flags": flags},
+		value,
+	}), true
 }
 
 // builtinCaptureValue detects a command substitution whose body is a
