@@ -21,6 +21,13 @@ harness/* (shared test infra).
   - `bool`/`true`/`false`/`nullptr` → `int`/`1`/`0`/`0`
   - `new T[N]`/`new T` → `malloc(N * sizeof(T))`/`malloc(sizeof(T))`
   - `delete[] p`/`delete p` → `free(p)`
+  - `stripSwitchDefaultBreak` — a switch's default arm trailing
+    `break` is dropped from the token stream before clib sees it: the
+    shared switch lowering keeps it (only case-arm breaks are
+    stripped), and an A1 Break outside a loop is an uncaught BREAK
+    signal in the ESTree runtime (t15_switch DIFF). Redundant in the
+    if-chain the switch lowers to; stripped at the token level so only
+    breaks that bind to the switch are touched.
 - The shared lowering is **c-sh-go's `clib` package, imported as a Go
   module — never modified here.** Extensions to C-owned behavior go
   through `c-requests/` (see the channel at the workspace root).

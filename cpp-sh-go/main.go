@@ -303,6 +303,165 @@ func desugarDelete(toks []tok, i int) ([]tok, int, error) {
 	return out, j + 1, nil
 }
 
+// stripSwitchDefaultBreak — C++-surface normalization for the shared
+// switch lowering. clib lowers `switch` to an if-chain and strips every
+// CASE arm's trailing `break` (splitMidBreaks), but the DEFAULT arm's
+// body is used as-is: a trailing `break` there survives into the A1 shIR
+// as a top-level Break, which the ESTree runtime renders as an UNCAUGHT
+// BREAK signal (sh2.break throws; only loop bodies catch it). The
+// transpiled program dies mid-switch and its buffered stdout is lost
+// (t15_switch DIFF: empty output vs native "two\nother\n"). In the
+// if-chain the switch lowers to, the default arm's trailing break is
+// redundant — the chain ends there — exactly like every case arm's, so
+// drop the final `break ;` of the default arm HERE, at the token level,
+// before clib sees the C text.
+//
+// Token-level is what makes the strip safe: only a break that BINDS TO
+// THE SWITCH is touched (a user `break` inside an if/else within a loop
+// must survive — it is the loop's control flow, and it never sits in a
+// switch default arm). Only a break that is the LAST statement of the
+// default arm qualifies: a mid-arm break still guards real C fallthrough
+// semantics (the statements after it are dead) and is left alone, like
+// clib's case-arm handling (splitMidBreaks).
+func stripSwitchDefaultBreak(toks []tok) []tok {
+	// indices of the `break ;` pairs to drop (removals are collected
+	// first, then applied in one rebuild — indices stay stable)
+	drop := map[int]bool{}
+	for i := 0; i < len(toks); i++ {
+		if toks[i].kind != "id" || toks[i].text != "switch" {
+			continue
+		}
+		// `switch ( disc ) { body }` — skip the discriminant; braces
+		// inside its parens (initializer lists) must not count
+		j := i + 1
+		if j >= len(toks) || toks[j].text != "(" {
+			continue
+		}
+		for paren := 0; j < len(toks); j++ {
+			switch toks[j].text {
+			case "(":
+				paren++
+			case ")":
+				paren--
+			}
+			if paren == 0 {
+				break
+			}
+		}
+		j++ // past ')'
+		if j >= len(toks) || toks[j].text != "{" {
+			continue
+		}
+		// scan the body: brace depth (parens shield inner braces —
+		// `foo({1,2})` inside an arm), and the default arm's span
+		// [defStart, defEnd) — from just past the default's ':' to the
+		// next depth-1 case/default keyword or the closing '}'
+		depth, paren := 0, 0
+		defStart, defEnd := -1, -1
+		foundDefault := false // stays set once a default arm is seen
+	scanBody:
+		for k := j; k < len(toks); k++ {
+			t := toks[k]
+			if t.kind == "op" {
+				switch t.text {
+				case "(":
+					paren++
+				case ")":
+					if paren > 0 {
+						paren--
+					}
+				case "{":
+					if paren == 0 {
+						depth++
+					}
+				case "}":
+					if paren == 0 && depth > 0 {
+						depth--
+						if depth == 0 {
+							if foundDefault {
+								defEnd = k // body closed
+							}
+							// this switch's body is done (the linear loop
+							// still sees any nested switch itself); a plain
+							// break here would exit the t.text switch, NOT
+							// the scan — the label is load-bearing
+							break scanBody
+						}
+					}
+				}
+			}
+			if depth == 1 && paren == 0 && t.kind == "id" &&
+				(t.text == "case" || t.text == "default") {
+				if foundDefault {
+					defEnd = k // a later arm closed the default arm
+				}
+				if t.text == "default" {
+					// the arm body starts just past the ':' (default
+					// carries no constant expression)
+					for m := k + 1; m < len(toks); m++ {
+						if toks[m].kind == "op" && toks[m].text == ":" {
+							defStart, foundDefault = m+1, true
+							break
+						}
+					}
+				}
+			}
+		}
+		if !foundDefault || defStart < 0 || defEnd < defStart {
+			continue
+		}
+		// find the last DIRECT statement of the default arm (depth 1,
+		// outside parens) and its last `break` — the strip applies only
+		// when the break IS that final statement
+		depth, paren = 1, 0
+		lastDirect, lastBreak := -1, -1
+		for k := defStart; k < defEnd; k++ {
+			t := toks[k]
+			if t.kind == "op" {
+				switch t.text {
+				case "(":
+					paren++
+				case ")":
+					if paren > 0 {
+						paren--
+					}
+				case "{":
+					if paren == 0 {
+						depth++
+					}
+				case "}":
+					if paren == 0 && depth > 1 {
+						depth--
+					}
+				}
+			}
+			if depth == 1 && paren == 0 {
+				if t.text != ";" {
+					lastDirect = k
+				}
+				if t.kind == "id" && t.text == "break" {
+					lastBreak = k
+				}
+			}
+		}
+		if lastBreak >= 0 && lastBreak == lastDirect &&
+			lastBreak+1 < len(toks) && toks[lastBreak+1].text == ";" {
+			drop[lastBreak] = true
+			drop[lastBreak+1] = true
+		}
+	}
+	if len(drop) == 0 {
+		return toks
+	}
+	out := make([]tok, 0, len(toks))
+	for i, t := range toks {
+		if !drop[i] {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
 // reassemble joins the C-flavored token stream back into source text
 // for clib. Whitespace-insensitive (clib re-lexes), but strings/chars
 // are emitted as single tokens so they survive intact.
@@ -332,5 +491,10 @@ func Shir(src string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	// C++-surface normalization (see stripSwitchDefaultBreak): the
+	// shared switch lowering keeps the default arm's trailing `break`,
+	// which the ESTree runtime cannot execute outside a loop — drop it
+	// here, where the break's switch-binding is still visible.
+	c = stripSwitchDefaultBreak(c)
 	return clib.Shir(reassemble(c))
 }
