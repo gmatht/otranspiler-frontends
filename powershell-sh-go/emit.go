@@ -106,6 +106,41 @@ func ifStmt(cond any, then, els []any) any {
 	}
 }
 
+// redirectStmt — the A1 Redirect statement (the t19 rung: the pwsh
+// merging redirection `Write-Output "hi" 2>&1` → `{"type":"Redirect",
+// "inner":[…],"redirects":[…]}`). Shape mirrors shir_json.rs exactly:
+// type/inner/redirects, sorted keys (inner < redirects < type), no runs
+// field — byte-identical to the core's `echo hi 2>&1` emission.
+func redirectStmt(inner, redirects []any) any {
+	if inner == nil {
+		inner = []any{}
+	}
+	if redirects == nil {
+		redirects = []any{}
+	}
+	return map[string]any{
+		"type":      "Redirect",
+		"inner":     inner,
+		"redirects": redirects,
+	}
+}
+
+// redirectSpec — one A1 redirect spec, the core's redirect_json shape:
+// `{"fd":N,"mode":"w","target":{"type":"Str","value":"&1",…},
+// "interpolate":true}` (sorted keys — fd < interpolate < mode < target).
+// The "&N" target is the fd-dup marker the ESTree renderer passes to
+// the runtime (redirect_spec_to_estree) and the runtime installs as a
+// shared-fd duplicate (sh2-namespace.mjs _applyRedirectSpecs) — the
+// byte-identical twin of the core's `echo hi N>&1` redirect spec.
+func redirectSpec(fd int, target string) any {
+	return map[string]any{
+		"fd":          fd,
+		"mode":        "w",
+		"target":      strExpr(target, "DoubleQuoted"),
+		"interpolate": true,
+	}
+}
+
 // splitCall — the core's word-splitting wrapper for an UNQUOTED $var in
 // a for-list (`for i in $list` → iter Array [ split [ getVar "list" ] ],
 // the t13 foreach iter's byte-identical shape): the A1 split call with

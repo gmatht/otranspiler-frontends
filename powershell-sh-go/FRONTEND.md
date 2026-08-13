@@ -4,7 +4,7 @@ PowerShell (.ps1) source -> A1 shIR JSON — **the bat sibling**
 (workspace-side dir; no git worktree; the object pipeline is a stated
 TEXT approximation for v1; see PLAN_POWERSHELL_F.md).
 
-**Status: WORKER-IMPLEMENTED, t18 landed (gate green).** The parser is
+**Status: WORKER-IMPLEMENTED, t19 landed (gate green).** The parser is
 wharflab/tree-sitter-powershell (vendored under
 `grammars/tree-sitter-powershell/`, loaded via smacker/go-tree-sitter
 cgo) — the plan's choice, empirically verified. The emitter produces A1
@@ -280,6 +280,33 @@ line) — now the worker's fixes, not records):
   (`label_expression` in flow_control_statement — `break :label`) is
   a separate construct and still REFUSES (lowerFlowControl's labeled
   break/continue refusal).
+- t19_merging_redirection: the merging_redirection_operator node —
+  the pwsh stream-merge `N>&1` (stream N into the SUCCESS stream; the
+  grammar's redirection rule is a CHOICE of this operator and the file
+  form, file_redirection_operator — the ledger-refused `> file` — and
+  the node appears as a _command_element of command_elements,
+  verified against the CST). Live pwsh 7.6.4 (verified 2026-08-14):
+  `Write-Output "hi" 2>&1` prints hi, exit 0 — nothing in the v1
+  subset writes to streams 2-6, so the merge never changes the
+  observable output (the pin guards the EMIT, the oracle guards that
+  the redirect installs without breaking the run — the t04
+  invocation-operator precedent). Lowering: the A1 Redirect statement
+  `{"type":"Redirect","inner":[…],"redirects":[{"fd":2,"mode":"w",
+  "target":Str "&1","interpolate":true}]}` — byte-identical to the
+  core's `echo "hi" 2>&1` emission (verified against `debashc --shir
+  --raw`): the "&N" target is the fd-dup the A1→ESTree renderer
+  lowers to `sh2.redirectSync(body, [{fd:2,mode:"w",target:"&1"}])`
+  and the runtime installs as a shared-fd duplicate (sh2-namespace.mjs
+  _applyRedirectSpecs), so the transpiled run prints the same "hi".
+  The other operator forms REFUSE (testdata_refuse/): `*>&1` — the
+  all-streams merge has no numeric fd and the A1 IrRedirect.fd is an
+  int (the contract lacks the "all streams" fd; a core request would
+  be needed to express it); every `X>&2` form — pwsh 7.6.4 rejects
+  them at parse time ("The 'N>&2' operator is reserved for future
+  use") while the vendored grammar over-accepts (refuse > guess).
+  The `redirections` (plural) pipeline_chain wrapper stays a gap:
+  it wraps only non-command statement expressions, which
+  lowerPipeline refuses anyway.
 - Comments, comment-only files (empty Program), and the REFUSE table
   (refuse.go): anything outside the subset errors loudly — including
   .NET member access (`$x.Length`), assignment, `|` pipelines, unknown

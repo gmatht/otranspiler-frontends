@@ -704,6 +704,7 @@ func lowerCommand(n *sitter.Node, src []byte) ([]any, error) {
 	}
 	var argExprs []any
 	var stmts []any
+	var redirects []any
 	seenList := false
 	if elems := n.ChildByFieldName("command_elements"); elems != nil {
 		for i := 0; i < int(elems.NamedChildCount()); i++ {
@@ -713,6 +714,9 @@ func lowerCommand(n *sitter.Node, src []byte) ([]any, error) {
 				// pipeline object each — the t14 subset pins a single
 				// head argument (the `foo(fmt -f args)` shape); flush it
 				// as its own echo before the list's echoes.
+				if len(redirects) > 0 {
+					return nil, refuse(e, src, "argument_list combined with a redirection (the t19 subset pins merging redirections on a plain command)")
+				}
 				if len(argExprs) != 1 {
 					return nil, refuse(e, src, "argument_list with %d preceding arguments (the t14 subset pins exactly ONE head argument — the `head(fmt -f args)` shape)", len(argExprs))
 				}
@@ -735,6 +739,19 @@ func lowerCommand(n *sitter.Node, src []byte) ([]any, error) {
 				}
 				return nil, refuse(e, src, "argument after an argument_list (the t14 subset pins the `head(fmt -f args)` shape with nothing after the parens)")
 			}
+			if e.Type() == "redirection" {
+				// the t19 rung: the pwsh merging redirection (stream N
+				// into the SUCCESS stream) applies to the WHOLE command —
+				// collect the specs and wrap the command's statements in
+				// one A1 Redirect at the end (the core's `echo hi 2>&1`
+				// shape).
+				spec, err := lowerRedirection(e, src)
+				if err != nil {
+					return nil, err
+				}
+				redirects = append(redirects, spec)
+				continue
+			}
 			a, err := lowerCommandElement(e, src)
 			if err != nil {
 				return nil, err
@@ -748,6 +765,13 @@ func lowerCommand(n *sitter.Node, src []byte) ([]any, error) {
 		// no argument_list — the plain command, ONE echo (byte-identical
 		// to the pre-t14 emission).
 		stmts = append(stmts, exprStmt(execCall("echo", argExprs)))
+	}
+	if len(redirects) > 0 {
+		// the command's statements (the t14 split may have produced
+		// several) run inside ONE A1 Redirect — the pwsh merge applies
+		// to the whole command. Byte-identical to the core's
+		// `echo hi 2>&1` Redirect emission.
+		return []any{redirectStmt(stmts, redirects)}, nil
 	}
 	return stmts, nil
 }
@@ -1052,6 +1076,51 @@ func foldFormat(fmtText string, vals []string) (string, error) {
 		return "", fmt.Errorf("REFUSE: %d placeholders vs %d format arguments (pwsh format-errors on missing args and silently ignores extras — both unpinned; refuse > guess)", placeholders, len(vals))
 	}
 	return b.String(), nil
+}
+
+// lowerRedirection — the redirection node in command_elements: the
+// grammar's `redirection` rule is a CHOICE of the merging operator
+// (merging_redirection_operator — `2>&1` / `3>&1` / …) and the file
+// form (file_redirection_operator + redirected_file_name — `> file`;
+// on the by-design refused ledger, refused-powershell-sh-go.txt). The
+// t19 rung lands the MERGING form — the pwsh stream-merge `N>&1`
+// (stream N into the SUCCESS stream): the A1 Redirect spec
+// `{"fd":N,"mode":"w","target":Str "&1","interpolate":true}`,
+// byte-identical to the core's `echo hi N>&1` emission (the "&N"
+// target is the fd-dup the ESTree renderer/runtime install as a
+// shared-fd duplicate). Live pwsh 7.6.4 (verified 2026-08-14):
+// `Write-Output "hi" 2>&1` prints hi, exit 0 — nothing in the v1
+// subset writes to streams 2-6, so the merge never changes the
+// observable output (the pin guards the EMIT; the oracle guards that
+// the redirect installs without breaking the run).
+//
+// The other operator forms REFUSE (refuse > guess):
+//   - `*>&1` — pwsh's all-streams merge has NO numeric fd, and the A1
+//     IrRedirect.fd is an int — the contract lacks the "all streams"
+//     fd (a core request would be needed to express it);
+//   - every `X>&2` form (`1>&2`, `2>&2`, `3>&2`…`6>&2`, `*>&2`) — live
+//     pwsh 7.6.4 REJECTS them at parse time ("The 'N>&2' operator is
+//     reserved for future use", verified 2026-08-14) while the
+//     vendored grammar over-accepts — a real pwsh program can never
+//     contain them (the t04 command whitelist precedent).
+func lowerRedirection(n *sitter.Node, src []byte) (any, error) {
+	if n.NamedChildCount() == 0 {
+		return nil, refuse(n, src, "redirection without an operator")
+	}
+	op := n.NamedChild(0)
+	if op.Type() != "merging_redirection_operator" {
+		return nil, refuse(op, src, "redirection form %q (the file form is on the by-design refused ledger)", op.Type())
+	}
+	text := op.Content(src)
+	// `N>&1` (N = 2..6 — the grammar's member list): the pwsh
+	// stream-merge into the SUCCESS stream.
+	if len(text) != 4 || text[1:] != ">&1" || text[0] < '2' || text[0] > '6' {
+		if text == "*>&1" {
+			return nil, refuse(op, src, "merging operator %q (the A1 fd is a number — the all-streams merge needs a contract extension; refuse > guess)", text)
+		}
+		return nil, refuse(op, src, "merging operator %q (pwsh 7.6.4 rejects every `X>&2` form at parse time — \"reserved for future use\"; the grammar over-accepts)", text)
+	}
+	return redirectSpec(int(text[0]-'0'), "&1"), nil
 }
 
 // lowerCommandElement — one argument of a command invocation.
