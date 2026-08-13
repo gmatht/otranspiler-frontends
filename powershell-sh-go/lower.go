@@ -81,24 +81,33 @@ func lowerStatementList(n *sitter.Node, src []byte) ([]any, error) {
 			stmts = append(stmts, ds...)
 			continue
 		}
-		s, err := lowerStatement(ch, src)
+		ss, err := lowerStatement(ch, src)
 		if err != nil {
 			return nil, err
 		}
-		if s != nil {
-			stmts = append(stmts, s)
-		}
+		// a statement expands to one or more A1 statements: the t06
+		// do-while duplication and the t14 head+argument_list echo
+		// split both emit SEVERAL statements (the nil empty_statement
+		// return is an empty slice — a no-op append).
+		stmts = append(stmts, ss...)
 	}
 	return stmts, nil
 }
 
-// lowerStatement — one top-level statement.
-func lowerStatement(n *sitter.Node, src []byte) (any, error) {
+// lowerStatement — one top-level statement, as the A1 statements it
+// lowers to (the t06 do-while duplication and the t14 argument_list
+// echo split expand to SEVERAL; everything else is a one-element
+// slice).
+func lowerStatement(n *sitter.Node, src []byte) ([]any, error) {
 	switch n.Type() {
 	case "pipeline":
 		return lowerPipeline(n, src)
 	case "if_statement":
-		return lowerIfStatement(n, src)
+		s, err := lowerIfStatement(n, src)
+		if err != nil {
+			return nil, err
+		}
+		return []any{s}, nil
 	case "do_statement":
 		// NOTE: handled in lowerStatementList (it expands to several
 		// statements — the do-while duplication); reaching this switch
@@ -106,9 +115,17 @@ func lowerStatement(n *sitter.Node, src []byte) (any, error) {
 		// box the multi-statement slice as one element.
 		return nil, refuse(n, src, "do_statement outside a statement_list")
 	case "for_statement":
-		return lowerForStatement(n, src)
+		s, err := lowerForStatement(n, src)
+		if err != nil {
+			return nil, err
+		}
+		return []any{s}, nil
 	case "foreach_statement":
-		return lowerForEachStatement(n, src)
+		s, err := lowerForEachStatement(n, src)
+		if err != nil {
+			return nil, err
+		}
+		return []any{s}, nil
 	case "empty_statement":
 		// the lone `;` — the _statement rule's empty_statement
 		// alternative; this grammar parses EVERY standalone `;` as
@@ -121,12 +138,16 @@ func lowerStatement(n *sitter.Node, src []byte) (any, error) {
 		// §1; the A1 has no no-op node and needs none), so the emitted
 		// program is byte-identical to the same program without the
 		// `;` and the executed-stdout oracle matches live pwsh by
-		// construction. The nil return is skipped by lowerStatementList
-		// (and covers block bodies via lowerBlock, which shares this
-		// path).
+		// construction. The nil return (an empty slice) is skipped by
+		// lowerStatementList (and covers block bodies via lowerBlock,
+		// which shares this path).
 		return nil, nil
 	case "flow_control_statement":
-		return lowerFlowControl(n, src)
+		s, err := lowerFlowControl(n, src)
+		if err != nil {
+			return nil, err
+		}
+		return []any{s}, nil
 	default:
 		return nil, refuse(n, src, "statement type %q", n.Type())
 	}
@@ -604,8 +625,10 @@ func lowerIfStatement(n *sitter.Node, src []byte) (any, error) {
 }
 
 // lowerPipeline — a single statement; `|` pipelines refuse until the
-// t08 rung (the plan's text-pipe approximation).
-func lowerPipeline(n *sitter.Node, src []byte) (any, error) {
+// t08 rung (the plan's text-pipe approximation). Returns the command's
+// A1 statements — normally one, but the t14 argument_list echo split
+// can emit several.
+func lowerPipeline(n *sitter.Node, src []byte) ([]any, error) {
 	var chain *sitter.Node
 	for i := 0; i < int(n.NamedChildCount()); i++ {
 		ch := n.NamedChild(i)
@@ -638,7 +661,16 @@ func lowerPipeline(n *sitter.Node, src []byte) (any, error) {
 // lowerCommand — `Write-Output "…"` / `Write-Host "…"` / `echo …` lower
 // to the core's exec-echo Call (byte-identical to the core frontend's
 // `echo …` lowering). Every other command name REFUSES.
-func lowerCommand(n *sitter.Node, src []byte) (any, error) {
+//
+// A command element may be an argument_list (`foo(…)` — the t14 rung):
+// live pwsh 7.6.4 writes ONE pipeline OBJECT per command argument — the
+// head argument is its own object and the parenthesized list's value(s)
+// follow as further objects — so the command lowers to one echo
+// statement PER OBJECT (the A1 echo joins its own args with spaces on
+// one line, which would miscompile the object-per-argument reality).
+// The t14 subset pins EXACTLY ONE head argument before the list and
+// the list itself must be the `-f` format form; anything else REFUSES.
+func lowerCommand(n *sitter.Node, src []byte) ([]any, error) {
 	nameNode := n.ChildByFieldName("command_name")
 	if nameNode == nil {
 		return nil, refuse(n, src, "command without a name")
@@ -652,18 +684,270 @@ func lowerCommand(n *sitter.Node, src []byte) (any, error) {
 		return nil, refuse(nameNode, src, "command %q (outside the v1 subset)", name)
 	}
 	var argExprs []any
+	var stmts []any
+	seenList := false
 	if elems := n.ChildByFieldName("command_elements"); elems != nil {
 		for i := 0; i < int(elems.NamedChildCount()); i++ {
-			e, err := lowerCommandElement(elems.NamedChild(i), src)
+			e := elems.NamedChild(i)
+			if e.Type() == "argument_list" {
+				// the head argument(s) accumulated so far form ONE
+				// pipeline object each — the t14 subset pins a single
+				// head argument (the `foo(fmt -f args)` shape); flush it
+				// as its own echo before the list's echoes.
+				if len(argExprs) != 1 {
+					return nil, refuse(e, src, "argument_list with %d preceding arguments (the t14 subset pins exactly ONE head argument — the `head(fmt -f args)` shape)", len(argExprs))
+				}
+				stmts = append(stmts, exprStmt(execCall("echo", argExprs)))
+				argExprs = nil
+				ls, err := lowerArgumentList(e, src)
+				if err != nil {
+					return nil, err
+				}
+				stmts = append(stmts, ls...)
+				seenList = true
+				continue
+			}
+			if seenList {
+				// a separator after the parens is whitespace — skip it;
+				// any real argument after the argument_list would be
+				// another pipeline object — unpinned (refuse > guess).
+				if e.Type() == "command_argument_sep" {
+					continue
+				}
+				return nil, refuse(e, src, "argument after an argument_list (the t14 subset pins the `head(fmt -f args)` shape with nothing after the parens)")
+			}
+			a, err := lowerCommandElement(e, src)
 			if err != nil {
 				return nil, err
 			}
-			if e != nil {
-				argExprs = append(argExprs, e)
+			if a != nil {
+				argExprs = append(argExprs, a)
 			}
 		}
 	}
-	return exprStmt(execCall("echo", argExprs)), nil
+	if len(stmts) == 0 {
+		// no argument_list — the plain command, ONE echo (byte-identical
+		// to the pre-t14 emission).
+		stmts = append(stmts, exprStmt(execCall("echo", argExprs)))
+	}
+	return stmts, nil
+}
+
+// lowerArgumentList — the argument_list node: `(` argument_expression_list
+// `)` attached to a command argument (`foo(…)`). Live pwsh 7.6.4: the
+// parens evaluate and the resulting objects are passed as further
+// arguments after the head — so each list value is its own echo
+// statement (the one-object-per-argument rule of lowerCommand). The
+// t14 subset pins the `-f` FORMAT form: the first argument_expression
+// must be a format_argument_expression (which consumes the RHS AND
+// every following list element as its arguments — the comma-list is
+// the format operator's argument array in pwsh; see lowerFormatArg);
+// a plain literal list (`foo("x")`) is a different rung and REFUSES.
+func lowerArgumentList(n *sitter.Node, src []byte) ([]any, error) {
+	list := n.ChildByFieldName("argument_expression_list")
+	if list == nil {
+		return nil, refuse(n, src, "empty argument_list (the t14 subset pins `head(fmt -f args)`; `foo()` is unpinned)")
+	}
+	var out []any
+	for i := 0; i < int(list.NamedChildCount()); i++ {
+		ae := list.NamedChild(i)
+		if ae.Type() != "argument_expression" || ae.NamedChildCount() != 1 {
+			return nil, refuse(ae, src, "argument_list part %q (the t14 subset pins the `-f` format operator in an argument list)", ae.Type())
+		}
+		c := ae.NamedChild(0)
+		switch c.Type() {
+		case "format_argument_expression":
+			v, consumed, err := lowerFormatArg(c, list, i, src)
+			if err != nil {
+				return nil, err
+			}
+			// the folded format value is ONE pipeline object — its own
+			// echo statement (the one-object-per-argument rule).
+			out = append(out, exprStmt(execCall("echo", []any{v})))
+			i = consumed
+		default:
+			return nil, refuse(c, src, "%q in an argument list (the t14 subset pins the `-f` format operator; a plain argument list is unpinned)", c.Type())
+		}
+	}
+	return out, nil
+}
+
+// lowerFormatArg — the format_argument_expression node: `LHS -f RHS`
+// (unary_expression + the named format_operator + unary_expression) —
+// the .NET composite-format operator, `"{0} {1}" -f "a","b"`. The
+// grammar parses the comma-list RHS as the format's single RHS
+// expression plus FOLLOWING argument_expression elements of the
+// enclosing argument_expression_list (verified against the CST), while
+// pwsh takes the whole comma-list as the -f argument ARRAY — so the
+// lowering collects [RHS] + the following list elements as the format's
+// arguments and returns the index past the last consumed element.
+//
+// The t14 subset pins an ALL-LITERAL format — the format string and
+// every argument are literal strings / decimal integers — so the
+// formatted result is a COMPILE-TIME constant and the whole `LHS -f
+// args` folds to ONE A1 Str (the executed-stdout oracle then matches
+// live pwsh by construction). A variable anywhere (`"{0}" -f $x`),
+// a non-literal RHS, escaped braces (`{{`), alignment/format
+// specifiers (`{0:D2}`) and a placeholder/argument count mismatch all
+// REFUSE (the runtime printf-style rung is a later milestone; refuse
+// > guess).
+func lowerFormatArg(n *sitter.Node, list *sitter.Node, start int, src []byte) (any, int, error) {
+	var lhs, rhs *sitter.Node
+	for i := 0; i < int(n.ChildCount()); i++ {
+		ch := n.Child(i)
+		switch ch.Type() {
+		case "unary_expression":
+			if lhs == nil {
+				lhs = ch
+			} else if rhs == nil {
+				rhs = ch
+			} else {
+				return nil, start, refuse(ch, src, "format_argument_expression with more than two operands")
+			}
+		case "format_operator", "-f":
+			// the operator itself — structure only
+		default:
+			return nil, start, refuse(ch, src, "format_argument_expression part %q", ch.Type())
+		}
+	}
+	if lhs == nil || rhs == nil {
+		return nil, start, refuse(n, src, "format_argument_expression without a format string or arguments")
+	}
+	fmtText, err := literalStringText(lhs, src)
+	if err != nil {
+		return nil, start, err
+	}
+	// the format's arguments: the RHS plus every following list element
+	// (the pwsh comma-array semantics; a nested format / a non-literal
+	// following element is unpinned and REFUSES).
+	args := []*sitter.Node{rhs}
+	i := start + 1
+	for ; i < int(list.NamedChildCount()); i++ {
+		ae := list.NamedChild(i)
+		if ae.Type() != "argument_expression" || ae.NamedChildCount() != 1 {
+			return nil, start, refuse(ae, src, "argument_list part after a format operator (the t14 subset pins literal arguments)")
+		}
+		c := ae.NamedChild(0)
+		if c.Type() != "unary_expression" {
+			return nil, start, refuse(c, src, "%q after a format operator (the t14 subset pins literal format arguments)", c.Type())
+		}
+		args = append(args, c)
+	}
+	vals := make([]string, len(args))
+	for j, a := range args {
+		v, err := literalArgText(a, src)
+		if err != nil {
+			return nil, start, err
+		}
+		vals[j] = v
+	}
+	folded, err := foldFormat(fmtText, vals)
+	if err != nil {
+		return nil, start, err
+	}
+	return strExpr(folded, "DoubleQuoted"), i, nil
+}
+
+// literalStringText — a string_literal node whose interior is EXACTLY
+// one literal text part (no interpolation): the t14 format string.
+func literalStringText(n *sitter.Node, src []byte) (string, error) {
+	if n.Type() != "unary_expression" || n.NamedChildCount() != 1 {
+		return "", refuse(n, src, "format string %q (the t14 subset pins a literal string)", n.Type())
+	}
+	op := n.NamedChild(0)
+	if op.Type() != "string_literal" {
+		return "", refuse(op, src, "format string %q (the t14 subset pins a literal string)", op.Type())
+	}
+	parts, err := stringLiteralParts(op, src)
+	if err != nil {
+		return "", err
+	}
+	if len(parts) != 1 {
+		return "", refuse(op, src, "format string with %d parts (the t14 subset pins a literal string — no $var interpolation)", len(parts))
+	}
+	pm := parts[0].(map[string]any)
+	if pm["kind"] != "lit" {
+		return "", refuse(op, src, "format string with an interpolated variable (the runtime printf-style rung is a later milestone)")
+	}
+	return pm["text"].(string), nil
+}
+
+// literalArgText — one format argument: a literal string or a bare
+// decimal integer (the t14 all-literal subset).
+func literalArgText(n *sitter.Node, src []byte) (string, error) {
+	if n.Type() != "unary_expression" || n.NamedChildCount() != 1 {
+		return "", refuse(n, src, "format argument %q (the t14 subset pins literal strings / integers)", n.Type())
+	}
+	op := n.NamedChild(0)
+	switch op.Type() {
+	case "string_literal":
+		parts, err := stringLiteralParts(op, src)
+		if err != nil {
+			return "", err
+		}
+		if len(parts) != 1 {
+			return "", refuse(op, src, "format argument with %d parts (the t14 subset pins literal strings — no $var interpolation)", len(parts))
+		}
+		pm := parts[0].(map[string]any)
+		if pm["kind"] != "lit" {
+			return "", refuse(op, src, "format argument with an interpolated variable (the runtime printf-style rung is a later milestone)")
+		}
+		return pm["text"].(string), nil
+	case "integer_literal":
+		return op.Content(src), nil
+	default:
+		return "", refuse(op, src, "format argument %q (the t14 subset pins literal strings / integers)", op.Type())
+	}
+}
+
+// foldFormat — constant-fold a .NET composite format string with its
+// literal arguments: `{N}` placeholders substitute the N-th argument.
+// The t14 subset pins BARE `{N}` placeholders with an EXACT
+// placeholder/argument match: escaped braces (`{{` / `}}`),
+// alignment/format specifiers (`{0,5}` / `{0:D2}`) and out-of-range or
+// mismatched counts REFUSE (pwsh would format-error or silently ignore
+// extras — both unpinned; refuse > guess).
+func foldFormat(fmtText string, vals []string) (string, error) {
+	var b strings.Builder
+	placeholders := 0
+	for i := 0; i < len(fmtText); {
+		c := fmtText[i]
+		switch {
+		case c == '{':
+			if i+1 < len(fmtText) && fmtText[i+1] == '{' {
+				return "", fmt.Errorf("REFUSE: escaped brace `{{` in a format string (the t14 subset pins bare `{N}` placeholders; refuse > guess)")
+			}
+			j := i + 1
+			for j < len(fmtText) && fmtText[j] >= '0' && fmtText[j] <= '9' {
+				j++
+			}
+			if j == i+1 {
+				return "", fmt.Errorf("REFUSE: non-numeric placeholder in a format string near %q (the t14 subset pins bare `{N}` placeholders)", fmtText[i:])
+			}
+			idx, err := strconv.Atoi(fmtText[i+1 : j])
+			if err != nil || idx >= len(vals) {
+				return "", fmt.Errorf("REFUSE: placeholder {%d} out of range for %d format arguments (pwsh throws a FormatException there; refuse > guess)", idx, len(vals))
+			}
+			if j < len(fmtText) && (fmtText[j] == ':' || fmtText[j] == ',') {
+				return "", fmt.Errorf("REFUSE: alignment/format specifier %q in a format string (the t14 subset pins bare `{N}` placeholders)", fmtText[i:j+1])
+			}
+			if j >= len(fmtText) || fmtText[j] != '}' {
+				return "", fmt.Errorf("REFUSE: unterminated placeholder in a format string near %q", fmtText[i:])
+			}
+			b.WriteString(vals[idx])
+			i = j + 1
+			placeholders++
+		case c == '}':
+			return "", fmt.Errorf("REFUSE: lone `}` in a format string near %q (the t14 subset pins bare `{N}` placeholders)", fmtText[i:])
+		default:
+			b.WriteByte(c)
+			i++
+		}
+	}
+	if placeholders != len(vals) {
+		return "", fmt.Errorf("REFUSE: %d placeholders vs %d format arguments (pwsh format-errors on missing args and silently ignores extras — both unpinned; refuse > guess)", placeholders, len(vals))
+	}
+	return b.String(), nil
 }
 
 // lowerCommandElement — one argument of a command invocation.

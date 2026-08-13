@@ -4,7 +4,7 @@ PowerShell (.ps1) source -> A1 shIR JSON — **the bat sibling**
 (workspace-side dir; no git worktree; the object pipeline is a stated
 TEXT approximation for v1; see PLAN_POWERSHELL_F.md).
 
-**Status: WORKER-IMPLEMENTED, t13 landed (gate green).** The parser is
+**Status: WORKER-IMPLEMENTED, t14 landed (gate green).** The parser is
 wharflab/tree-sitter-powershell (vendored under
 `grammars/tree-sitter-powershell/`, loaded via smacker/go-tree-sitter
 cgo) — the plan's choice, empirically verified. The emitter produces A1
@@ -210,17 +210,46 @@ line) — now the worker's fixes, not records):
   execution model — pinned `testdata_refuse/t13_foreach_parallel.ps1`.
   (`invocation_foreach_expression` — `ForEach-Object`/the method form
   — is the `$_` pipeline-variable machinery, a separate rung.)
+- t14_format: the format_argument_expression node — the `-f` .NET
+  composite-format operator inside an argument_list
+  (`foo("{0} {1}" -f "a","b")`; the grammar reaches this node ONLY
+  there — a parenthesized `Write-Output ("{0}" -f "a")` is the
+  DIFFERENT format_expression node and a bare `-f` in argument
+  position is a command_parameter, both still refused). Live pwsh
+  7.6.4 (verified 2026-08-13): the head argument and the
+  parenthesized value(s) are SEPARATE pipeline objects (`Write-Output
+  foo("{0} {1}" -f "a","b")` prints `foo` then `a b` on two lines),
+  so the command lowers to ONE echo statement PER OBJECT — the A1
+  echo joins its own args with spaces on one line, which would
+  miscompile the object-per-argument reality (the t05 quoted-head
+  refusal stays: that multi-object shape is a tokenizer artifact,
+  this one is the explicit parens). The t14 subset pins an
+  ALL-LITERAL format: the format string and every argument are
+  literal strings / decimal integers, so `LHS -f args` folds to ONE
+  compile-time A1 Str — the grammar parses the comma-list RHS as the
+  format's RHS plus following argument_expression elements of the
+  enclosing list, while pwsh takes the whole comma-list as the -f
+  argument ARRAY, so the lowering collects [RHS] + the following
+  elements (the pwsh semantics); bare `{N}` placeholders substitute
+  the N-th argument, `{1} {0}` pins reordering. A variable anywhere
+  (`"{0}" -f $x` — pinned `testdata_refuse/t14_format_var.ps1`; the
+  runtime printf-style rung is a later milestone), escaped braces,
+  alignment/format specifiers (`{0:D2}`), a placeholder/argument
+  count mismatch, a plain literal argument list (`foo("x")`), an
+  empty `foo()` and an argument after the parens all REFUSE (refuse >
+  guess).
 - Comments, comment-only files (empty Program), and the REFUSE table
   (refuse.go): anything outside the subset errors loudly — including
   .NET member access (`$x.Length`), assignment, `|` pipelines, unknown
   commands, named parameters (all pinned in `testdata_refuse/`).
 
 The v1 subset and the refusal table are PLAN_POWERSHELL_F.md. The next
-construct (assignment + `$var` interpolation, the elseif chain) lands
-on the next RED pin; the string-interpolation machinery it needs is
-already in place (lower.go reconstructs string parts from byte spans —
-the smacker runtime does not materialize the interior text tokens of
-expandable_string_literal as children, verified against the core).
+construct (assignment + `$var` interpolation, the elseif chain, the
+runtime printf-style `-f` rung) lands on the next RED pin; the
+string-interpolation machinery it needs is already in place (lower.go
+reconstructs string parts from byte spans — the smacker runtime does
+not materialize the interior text tokens of expandable_string_literal
+as children, verified against the core).
 
 Scope: this dir + harness/* (shared test infra). Shared core
 (sh2perl/src/*, parser/) is the estree worker's — a change there goes
