@@ -17,7 +17,13 @@
 // strings.ReplaceAll (${s//o/n}) + strings.Contains (grep idiom),
 // string-concat + arithmetic exprs, len(), slicing, indexing, array
 // literals + range-for, if/else if/else, for cond, for init;cond;post
-// (→ seq Range when numeric), switch/case/default, func literals
+// (→ seq Range when numeric), switch/case/default, TYPE SWITCH
+// (`switch [v :=] x.(type) { case T: ... default: ... }` — lowered to the
+// Case node with discriminant Call{func:"typeof", args:[x]} (sh2.typeOf:
+// store strings -> "string", lifted numbers -> "int"/"float", bools ->
+// "bool", arrays -> "array"), type-name clause patterns ("*" = default),
+// guard var v bound to getVar x in every arm; case labels must be plain
+// type names — core request go-sh-20260813-154009), func literals
 // (params -> $1.., fresh vars -> `local`), go-func background,
 // raw-string heredocs, comments, shebang.
 //
@@ -364,6 +370,11 @@ type parser struct {
 	fnParamOrd []string           // ordered param names -> $1..
 	fnLocals   map[string]bool
 	inFunc     bool
+	// type-switch guard aliases: `switch v := x.(type)` binds v to x in
+	// every arm (core request go-sh-20260813-154009) — reads of the guard
+	// var resolve to the guarded var (getVar x), matching the contract's
+	// "v binds to getVar(\"x\")" lowering.
+	varAlias map[string]string
 }
 
 type arrayInfo struct {
@@ -818,7 +829,9 @@ func (p *parser) parseVarDecl() []map[string]any {
 			}
 			continue
 		}
-		if t.kind == tIdent && p.toks[p.pos+1].kind != tPunct {
+		// plain type ident — `var x int = 5` / `var x any = "hi"`: a type
+		// name may be followed by `=` (the initializer) or end the line.
+		if t.kind == tIdent && (p.toks[p.pos+1].kind != tPunct || p.toks[p.pos+1].text == "=") {
 			p.pos++ // plain type ident
 			continue
 		}
@@ -1104,6 +1117,11 @@ func (p *parser) parseAssignStmt() []map[string]any {
 		} else {
 			targets = append(targets, p.expect(tIdent, "").text)
 		}
+	}
+	// a type-switch guard var is bound to the guarded value — writing to
+	// it would need a shadow (Refuse > guess; reads alias via resolveVar)
+	if _, ok := p.varAlias[targets[0]]; ok {
+		p.failf("cannot assign to type-switch guard %q (v2)", targets[0])
 	}
 	// indexed assign: a[1] = "X" → target var "a[1]" (the `arr[1]=X` shape)
 	if p.atPunct("[") {
@@ -1657,6 +1675,59 @@ func (p *parser) parseFor() []map[string]any {
 func (p *parser) parseSwitch() []map[string]any {
 	p.expect(tIdent, "switch")
 	p.skipNL()
+	// type switch: `switch [v :=] x.(type) {` — runtime type dispatch
+	// (core request go-sh-20260813-154009, now implemented in the A1):
+	// lowered to the EXISTING Case node with discriminant
+	// Call{func:"typeof", args:[getVar x]} (the renderer maps the
+	// `typeof` callee to sh2.typeOf) and type-name clause patterns
+	// ("*" for default). The guard var v binds to getVar x in every arm
+	// (reads resolve through p.varAlias), so a store-backed x dispatches
+	// on its text and a lifted x on its runtime value — faithfully.
+	if gv, x, ok := p.peekTypeSwitch(); ok {
+		p.skipNL()
+		p.expect(tPunct, "{")
+		var clauses []any
+		for {
+			p.skipNL()
+			if p.atPunct("}") {
+				p.pos++
+				break
+			}
+			if p.atIdent("default") {
+				p.pos++
+				p.expect(tPunct, ":")
+				clauses = append(clauses, map[string]any{
+					"patterns": []any{"*"},
+				"body":     p.parseTypeSwitchBody(gv, x),
+			})
+			} else if p.atIdent("case") {
+				p.pos++
+				var pats []any
+				pats = append(pats, p.typePattern())
+				for p.acceptPunct(",") {
+					p.skipNL()
+					pats = append(pats, p.typePattern())
+				}
+				p.expect(tPunct, ":")
+				clauses = append(clauses, map[string]any{
+					"patterns": pats,
+					"body":     p.parseTypeSwitchBody(gv, x),
+				})
+			} else {
+				p.failf("expected case/default in type switch, got %q", p.tok().text)
+			}
+		}
+		return []map[string]any{{
+			"type":         "Case",
+			"discriminant": map[string]any{
+				"type": "Call", "func": "typeof",
+				"args":   []any{getVarExpr(x)},
+				"purity": "PureCpu",
+			},
+			"clauses": clauses,
+		}}
+	}
+	// value switch (existing path)
 	disc := p.parseExpr()
 	p.skipNL()
 	p.expect(tPunct, "{")
@@ -1696,6 +1767,67 @@ func (p *parser) parseSwitch() []map[string]any {
 		"discriminant": p.exprToWord(disc),
 		"clauses":      clauses,
 	}}
+}
+
+// peekTypeSwitch detects `switch [v :=] x.(type) {` and consumes the
+// guard tokens. Returns (guardVar, guardedVar, true) for a type switch
+// (guardVar "" for the bare `switch x.(type)` form); anything else
+// leaves the token stream untouched and reports false — the value-switch
+// path parses the discriminant as an expression.
+func (p *parser) peekTypeSwitch() (string, string, bool) {
+	i := p.pos
+	t := p.toks
+	gv := ""
+	if i+1 < len(t) && t[i].kind == tIdent && t[i+1].kind == tOp && t[i+1].text == ":=" {
+		gv = t[i].text
+		i += 2
+	}
+	if i+4 < len(t) &&
+		t[i].kind == tIdent &&
+		t[i+1].kind == tPunct && t[i+1].text == "." &&
+		t[i+2].kind == tPunct && t[i+2].text == "(" &&
+		t[i+3].kind == tIdent && t[i+3].text == "type" &&
+		t[i+4].kind == tPunct && t[i+4].text == ")" {
+		x := t[i].text
+		p.pos = i + 5
+		return gv, x, true
+	}
+	return "", "", false
+}
+
+// typePattern: a type-switch case label — a plain type NAME (int,
+// string, ...). Composite type lists ([]byte, *T, ...) stay refused
+// (Refuse > guess: the Case pattern vocabulary is the type-name string).
+func (p *parser) typePattern() string {
+	p.skipNL()
+	t := p.expect(tIdent, "")
+	return t.text
+}
+
+// parseTypeSwitchBody parses one arm with the guard var v aliased to the
+// guarded var x, so reads of v lower to getVar x (the contract binding).
+func (p *parser) parseTypeSwitchBody(gv, x string) []map[string]any {
+	if gv != "" {
+		old, had := p.varAlias[gv]
+		p.varAlias[gv] = x
+		defer func() {
+			if had {
+				p.varAlias[gv] = old
+			} else {
+				delete(p.varAlias, gv)
+			}
+		}()
+	}
+	return p.parseSwitchBody()
+}
+
+// resolveVar: reads of a type-switch guard var resolve to the guarded
+// var (the v -> x binding); all other names pass through.
+func (p *parser) resolveVar(name string) string {
+	if t, ok := p.varAlias[name]; ok {
+		return t
+	}
+	return name
 }
 
 func (p *parser) parseSwitchBody() []map[string]any {
@@ -1827,10 +1959,11 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 		if e.name == "nil" {
 			return strExpr("")
 		}
-		if n, ok := p.paramNumber(e.name); ok {
+		name := p.resolveVar(e.name)
+		if n, ok := p.paramNumber(name); ok {
 			return getVarExpr(strconv.Itoa(n))
 		}
-		return getVarExpr(e.name)
+		return getVarExpr(name)
 	case "member":
 		// c.Args on a stored exec.Command → the Go-style bracketed argv
 		// ("[echo hi]"). exec.Command args are string literals by the
@@ -2169,7 +2302,7 @@ func (p *parser) addHasString(e *expr) bool {
 	case "str", "rawstr":
 		return true
 	case "var":
-		return e.name == "nil" || p.varTypes[e.name] == "Str"
+		return e.name == "nil" || p.varTypes[p.resolveVar(e.name)] == "Str"
 	}
 	return false
 }
@@ -2208,7 +2341,7 @@ func (p *parser) operandKind(e *expr) string {
 		if e.name == "nil" {
 			return "str"
 		}
-		switch p.varTypes[e.name] {
+		switch p.varTypes[p.resolveVar(e.name)] {
 		case "Str":
 			return "str"
 		case "Int":
@@ -2227,10 +2360,11 @@ func (p *parser) exprToArith(e *expr) map[string]any {
 		}
 		p.failf("non-integer numeric literal %q (v2)", e.text)
 	case "var":
-		if n, ok := p.paramNumber(e.name); ok {
+		name := p.resolveVar(e.name)
+		if n, ok := p.paramNumber(name); ok {
 			return arithVar(strconv.Itoa(n))
 		}
-		return arithVar(e.name)
+		return arithVar(name)
 	case "add", "mul":
 		return arithBin(p.exprToArith(e.lhs), e.op, p.exprToArith(e.rhs))
 	case "neg":
@@ -2369,7 +2503,7 @@ func (p *parser) condTestString(c *expr) string {
 func (p *parser) condOperandQ(e *expr) string {
 	switch e.kind {
 	case "var":
-		return `"$` + e.name + `"`
+		return `"$` + p.resolveVar(e.name) + `"`
 	case "str":
 		return `"` + e.text + `"`
 	case "num":
@@ -2383,7 +2517,7 @@ func (p *parser) condOperandQ(e *expr) string {
 func (p *parser) condOperandArg(e *expr) string {
 	switch e.kind {
 	case "var":
-		return `"$` + e.name + `"`
+		return `"$` + p.resolveVar(e.name) + `"`
 	case "str":
 		return `"` + e.text + `"`
 	case "num":
@@ -2414,6 +2548,7 @@ func Shir(src string) ([]byte, error) {
 		stdinRdr: map[string]bool{},
 		fnNames:  map[string]bool{},
 		outer:    map[string]bool{},
+		varAlias: map[string]string{},
 	}
 	stmts, err := p.run()
 	if err != nil {
