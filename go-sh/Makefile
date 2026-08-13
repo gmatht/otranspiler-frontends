@@ -22,7 +22,7 @@ gen:
 	@exit 1
 
 build:
-	$(GO) build -o go-sh .
+	$(GO) build -o go-sh ./cmd/go-sh
 
 test: build
 	@for f in testdata/*.go; do \

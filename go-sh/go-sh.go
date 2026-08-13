@@ -23,11 +23,11 @@
 //
 // Refuse > guess: anything outside the subset is a hard error (the gate
 // reports FAIL), never a silent mis-lowering.
-package main
+package golib
 
 import (
 	"fmt"
-	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -352,8 +352,10 @@ type parser struct {
 	toks []token
 	pos  int
 	// semantic side-state (the Go subset's shell-shaped meanings)
-	varTypes   map[string]string // name -> "Int" | "Str" | "Array"
+	varTypes   map[string]string // name -> "Int" | "Str" | "Array" | "Map"
 	arrays     map[string]arrayInfo
+	maps       map[string]bool    // m := map[K]V{...} — assoc-array name
+	bufs       map[string]string  // b := bytes.Buffer — accumulated contents
 	cmds       map[string][]*expr // cmd := exec.Command(...) -> args
 	stdinRdr   map[string]bool    // r := bufio.NewReader(os.Stdin)
 	fnNames    map[string]bool    // f := func(...){...} — callable subs
@@ -718,7 +720,35 @@ func (p *parser) parseTopLevel() []map[string]any {
 		switch {
 		case p.atPunct("{") || p.atPunct("}"):
 			p.pos++ // func main's braces / bare blocks
-		case p.atIdent("package") || p.atIdent("import") || p.atIdent("func"):
+		case p.atIdent("package"):
+			p.pos++
+			p.skipToLineEnd()
+		case p.atIdent("import"):
+			// import "fmt" / import ( "fmt" \n "strings" ) — skip the
+			// whole clause, parenthesized block included (t71).
+			p.pos++
+			p.skipNL()
+			if p.atPunct("(") {
+				depth := 0
+				for {
+					t := p.next()
+					if t.kind == tEOF {
+						break
+					}
+					if t.kind == tPunct && t.text == "(" {
+						depth++
+					}
+					if t.kind == tPunct && t.text == ")" {
+						depth--
+						if depth == 0 {
+							break
+						}
+					}
+				}
+			} else {
+				p.skipToLineEnd()
+			}
+		case p.atIdent("func"):
 			p.pos++
 			p.skipToLineEnd()
 		default:
@@ -751,6 +781,8 @@ func (p *parser) parseStmt() []map[string]any {
 		return []map[string]any{p.returnToStmt(p.parseExpr())}
 	case "go":
 		return p.parseGo()
+	case "var":
+		return p.parseVarDecl()
 	case "case", "default":
 		p.failf("'%s' outside switch", t.text)
 	}
@@ -758,6 +790,71 @@ func (p *parser) parseStmt() []map[string]any {
 		return p.parseDottedStmt()
 	}
 	return p.parseAssignStmt()
+}
+
+// parseVarDecl: `var a, b [type] [= init]` — bare declarations register
+// the names (""), bytes.Buffer registers a buffer accumulator (t56).
+func (p *parser) parseVarDecl() []map[string]any {
+	p.expect(tIdent, "var")
+	var names []string
+	for {
+		p.skipNL()
+		names = append(names, p.expect(tIdent, "").text)
+		if !p.acceptPunct(",") {
+			break
+		}
+	}
+	// optional type: pkg.Ident (bytes.Buffer) | plain ident | []T | *T
+	p.skipNL()
+	isBuf := false
+	for {
+		t := p.tok()
+		if t.kind == tIdent && p.toks[p.pos+1].kind == tPunct && p.toks[p.pos+1].text == "." {
+			pkg := p.next().text
+			p.next() // .
+			typ := p.expect(tIdent, "").text
+			if pkg == "bytes" && typ == "Buffer" {
+				isBuf = true
+			}
+			continue
+		}
+		if t.kind == tIdent && p.toks[p.pos+1].kind != tPunct {
+			p.pos++ // plain type ident
+			continue
+		}
+		if t.kind == tPunct && (t.text == "[" || t.text == "*") {
+			p.pos++
+			p.skipNL()
+			for p.tok().kind == tIdent {
+				p.next()
+			}
+			p.skipNL()
+			continue
+		}
+		break
+	}
+	var out []map[string]any
+	for _, n := range names {
+		p.registerVar(n, "Str")
+		if isBuf {
+			p.bufs[n] = ""
+		}
+		out = append(out, assignStmt(n, strExpr("")))
+	}
+	// optional initializer: var b = expr
+	p.skipNL()
+	if p.atPunct("=") {
+		p.pos++
+		p.skipNL()
+		rhs := p.parseExpr()
+		if len(names) != 1 {
+			p.failf("var decl initializer with multiple targets (v2)")
+		}
+		w := p.exprToWord(rhs)
+		p.registerVar(names[0], p.wordType(w))
+		return []map[string]any{assignStmt(names[0], w)}
+	}
+	return out
 }
 
 func (p *parser) parseBlockStmts() []map[string]any {
@@ -791,6 +888,24 @@ func (p *parser) parseDottedStmt() []map[string]any {
 		return p.writeFileStmt()
 	case "os.Setenv":
 		return p.setenvStmt()
+	}
+	// b.WriteString(...) on a bytes.Buffer → append to the accumulator
+	// (the literal-only contract keeps the contents statically known).
+	if _, ok := p.bufs[first]; ok {
+		switch method {
+		case "WriteString", "Write":
+			p.expect(tPunct, "(")
+			p.skipNL()
+			a := p.parseExpr()
+			p.skipNL()
+			p.expect(tPunct, ")")
+			if a.kind != "str" && a.kind != "num" && a.kind != "rawstr" {
+				p.failf("bytes.Buffer.%s needs a literal (v2)", method)
+			}
+			p.bufs[first] += a.text
+			return nil
+		}
+		p.failf("unsupported bytes.Buffer.%s (v2)", method)
 	}
 	// cmd := exec.Command(...) handles: Start → (…) & , Wait → wait
 	// (t44: the deterministic background idiom, mirroring the posix
@@ -1059,6 +1174,58 @@ func (p *parser) parseAssignStmt() []map[string]any {
 				"purity": "Emulable",
 			})}
 	}
+	// map literal: name := map[K]V{ k: v, ... } → one assocSet per pair
+	// (the runtime's by-name associative-array store; t54).
+	if p.atIdent("map") {
+		p.pos++
+		p.expect(tPunct, "[")
+		for p.tok().kind == tIdent {
+			p.next()
+		}
+		p.expect(tPunct, "]")
+		for p.tok().kind == tIdent {
+			p.next()
+		}
+		p.skipNL()
+		p.expect(tPunct, "{")
+		if len(targets) > 1 {
+			p.failf("map literal with multiple targets (v2)")
+		}
+		p.maps[targets[0]] = true
+		p.registerVar(targets[0], "Map")
+		var body []map[string]any
+		for {
+			p.skipNL()
+			if p.atPunct("}") {
+				p.pos++
+				break
+			}
+			key := p.parseExpr()
+			if key.kind != "str" && key.kind != "num" && key.kind != "rawstr" {
+				p.failf("map keys must be literals (v2)")
+			}
+			p.expect(tPunct, ":")
+			p.skipNL()
+			val := p.parseExpr()
+			if val.kind != "str" && val.kind != "num" && val.kind != "rawstr" {
+				p.failf("map values must be literals (v2)")
+			}
+			body = append(body, map[string]any{
+				"type": "Expr",
+				"expr": map[string]any{
+					"type": "Call", "func": "assocSet",
+					"args":   []any{strExpr(targets[0]), strExpr(key.text), strExpr(val.text)},
+					"purity": "Emulable",
+				},
+			})
+			if !p.acceptPunct(",") {
+				p.skipNL()
+				p.expect(tPunct, "}")
+				break
+			}
+		}
+		return []map[string]any{{"type": "Block", "body": body}}
+	}
 	// cmd := exec.Command(a, b) [.Output()|.Run()]  /  x, _ := ....Output()
 	if p.atIdent("exec") {
 		p.next()
@@ -1120,6 +1287,37 @@ func (p *parser) parseAssignStmt() []map[string]any {
 		}
 		return []map[string]any{execStmt("read",
 			[]map[string]any{strExpr("-r"), strExpr(readVar)}, "Emulable")}
+	}
+
+	// n, _ := strconv.Atoi("42") → n = "42" — the error return is
+	// dropped, and Atoi over a literal folds at emit time (t72).
+	if p.atIdent("strconv") {
+		p.next()
+		p.expect(tPunct, ".")
+		p.expect(tIdent, "Atoi")
+		p.expect(tPunct, "(")
+		p.skipNL()
+		arg := p.parseExpr()
+		p.skipNL()
+		p.expect(tPunct, ")")
+		if arg.kind != "str" && arg.kind != "num" {
+			p.failf("strconv.Atoi needs a literal (v2)")
+		}
+		name := ""
+		for _, tg := range targets {
+			if tg == "_" {
+				continue
+			}
+			if name != "" {
+				p.failf("strconv.Atoi returns (int, error) — one target (v2)")
+			}
+			name = tg
+		}
+		if name == "" {
+			p.failf("strconv.Atoi needs a target var (v2)")
+		}
+		p.registerVar(name, "Int")
+		return []map[string]any{assignStmt(name, strExpr(arg.text))}
 	}
 
 	// generic RHS
@@ -1315,6 +1513,29 @@ func (p *parser) parseIf() []map[string]any {
 func (p *parser) parseFor() []map[string]any {
 	p.expect(tIdent, "for")
 	p.skipNL()
+	// for i := range N { — Go's range-over-int (i = 0..N-1, exclusive
+	// end) → the core For Range shape (t73).
+	if p.tok().kind == tIdent && p.toks[p.pos+1].text == ":=" &&
+		p.pos+2 < len(p.toks) && p.toks[p.pos+2].kind == tIdent && p.toks[p.pos+2].text == "range" {
+		v := p.next().text
+		p.pos++ // :=
+		p.skipNL()
+		p.next() // range
+		p.skipNL()
+		n := p.expect(tNum, "").text
+		end, err := strconv.Atoi(n)
+		if err != nil || end < 0 {
+			p.failf("range over int needs a non-negative literal (v2)")
+		}
+		body := p.parseBlockStmts()
+		p.registerVar(v, "Int")
+		return []map[string]any{{
+			"type": "For",
+			"var":  v,
+			"iter": map[string]any{"type": "Range", "start": 0, "end": end - 1},
+			"body": body,
+		}}
+	}
 	// range forms
 	if p.atIdent("_") || p.atIdent("range") {
 		var v string
@@ -1611,10 +1832,48 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 		}
 		return getVarExpr(e.name)
 	case "member":
+		// c.Args on a stored exec.Command → the Go-style bracketed argv
+		// ("[echo hi]"). exec.Command args are string literals by the
+		// frontend contract, so the argv is statically known (t53).
+		if i := strings.LastIndex(e.name, "."); i > 0 {
+			base, field := e.name[:i], e.name[i+1:]
+			if field == "Args" {
+				if args, ok := p.cmds[base]; ok {
+					var b strings.Builder
+					b.WriteByte('[')
+					for j, a := range args {
+						if j > 0 {
+							b.WriteByte(' ')
+						}
+						b.WriteString(a.text)
+					}
+					b.WriteByte(']')
+					return strExpr(b.String())
+				}
+			}
+		}
 		p.failf("bare member %q (v2)", e.name)
 	case "add", "mul", "neg":
 		return p.arithOrConcat(e)
 	case "index":
+		// m["key"] on a map var → assocGet (the runtime's by-name
+		// associative-array read; t54).
+		if e.target != nil && e.target.kind == "var" && p.maps[e.target.name] {
+			key := ""
+			if e.idx1e != nil {
+				if e.idx1e.kind != "str" && e.idx1e.kind != "num" {
+					p.failf("map key must be a literal (v2)")
+				}
+				key = e.idx1e.text
+			} else {
+				key = e.idx1
+			}
+			return map[string]any{
+				"type": "Call", "func": "assocGet",
+				"args":   []any{strExpr(e.target.name), strExpr(key)},
+				"purity": "Emulable",
+			}
+		}
 		if e.idx1e != nil {
 			p.failf("index key must be a number literal (v2)")
 		}
@@ -1630,6 +1889,11 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 	case "strlen":
 		if e.target != nil && e.target.kind == "var" {
 			return paramCall("len", e.target.name)
+		}
+		// len("lit") — folded at emit time with Go's byte-length
+		// semantics, matching the native run exactly (t75).
+		if e.target != nil && (e.target.kind == "str" || e.target.kind == "rawstr") {
+			return strExpr(strconv.Itoa(len(e.target.text)))
 		}
 		p.failf("len() arg must be a var (v2)")
 	case "arrlen":
@@ -1655,16 +1919,26 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 			// TrimPrefix(s, p) → ${s#p} — remove ONE leading literal
 			// (bash `#` strips a single occurrence; a glob-metachar p
 			// would glob-match in the shell, so literals only).
-			if len(e.args) == 2 && e.args[0].kind == "var" && e.args[1].kind == "str" {
-				return paramCall("#", e.args[0].name, e.args[1].text)
+			if len(e.args) == 2 {
+				if e.args[0].kind == "var" && e.args[1].kind == "str" {
+					return paramCall("#", e.args[0].name, e.args[1].text)
+				}
+				if w, ok := foldPureLiteralCall(e.callee, e.args); ok {
+					return strExpr(w)
+				}
 			}
-			p.failf("strings.TrimPrefix needs (var, str) (v2)")
+			p.failf("strings.TrimPrefix needs (var|str, str) (v2)")
 		case "strings.TrimSuffix":
 			// TrimSuffix(s, p) → ${s%p} — remove ONE trailing literal.
-			if len(e.args) == 2 && e.args[0].kind == "var" && e.args[1].kind == "str" {
-				return paramCall("%", e.args[0].name, e.args[1].text)
+			if len(e.args) == 2 {
+				if e.args[0].kind == "var" && e.args[1].kind == "str" {
+					return paramCall("%", e.args[0].name, e.args[1].text)
+				}
+				if w, ok := foldPureLiteralCall(e.callee, e.args); ok {
+					return strExpr(w)
+				}
 			}
-			p.failf("strings.TrimSuffix needs (var, str) (v2)")
+			p.failf("strings.TrimSuffix needs (var|str, str) (v2)")
 		case "strings.Join":
 			// Join(arr[lo:hi], " ") → ${arr[@]:lo:len} joined with a space
 			// — exactly the A1 join(param("slice", …)) shape (the runtime
@@ -1674,6 +1948,34 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 				return p.sliceWord(e.args[0])
 			}
 			p.failf(`strings.Join needs (arr[lo:hi], " ") (v2)`)
+		case "filepath.Dir", "filepath.Ext":
+			// Pure path ops on string literals — folded at emit time with
+			// exact Go stdlib semantics (t55).
+			if len(e.args) == 1 && e.args[0].kind == "str" {
+				if w, ok := foldPureLiteralCall(e.callee, e.args); ok {
+					return strExpr(w)
+				}
+			}
+			p.failf("%s needs a string literal (v2)", e.callee)
+		case "strings.HasPrefix":
+			if len(e.args) == 2 {
+				if w, ok := foldPureLiteralCall(e.callee, e.args); ok {
+					return strExpr(w)
+				}
+			}
+			p.failf("strings.HasPrefix needs (str, str) literals (v2)")
+		case "strings.ToUpper", "strings.ToLower", "strings.Contains", "strings.HasSuffix":
+			if w, ok := foldPureLiteralCall(e.callee, e.args); ok {
+				return strExpr(w)
+			}
+			p.failf("%s needs literal args (v2)", e.callee)
+		case "fmt.Sprintf":
+			// Sprintf over literals folds at emit time with the Go stdlib
+			// (t74).
+			if w, ok := foldPureLiteralCall(e.callee, e.args); ok {
+				return strExpr(w)
+			}
+			p.failf("fmt.Sprintf needs literal args (v2)")
 		}
 		// sc.Text() inside a scanner read-loop → the read var
 		if strings.HasSuffix(e.callee, ".Text") {
@@ -1682,12 +1984,89 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 				return getVarExpr(base)
 			}
 		}
+		// b.String() on a bytes.Buffer → the accumulated contents
+		if strings.HasSuffix(e.callee, ".String") {
+			base := strings.TrimSuffix(e.callee, ".String")
+			if _, ok := p.bufs[base]; ok {
+				return strExpr(p.bufs[base])
+			}
+		}
 		p.failf("unsupported call %q in word position (v2)", e.callee)
 	case "binop":
 		p.failf("comparison in word position (v2)")
 	}
 	p.failf("unsupported expression %q (v2 subset)", e.kind)
 	return nil
+}
+
+// foldPureLiteralCall folds a pure stdlib call over string/number
+// literals at emit time, returning the Go-stdlib-exact result string.
+// The frontend's literal-only contract makes this deterministic (t55,
+// t57); non-literal args keep the shell-shape paths above.
+func foldPureLiteralCall(callee string, args []*expr) (string, bool) {
+	for _, a := range args {
+		if a.kind != "str" && a.kind != "num" {
+			return "", false
+		}
+	}
+	s := func(i int) string { return args[i].text }
+	switch callee {
+	case "filepath.Dir":
+		if len(args) == 1 {
+			return filepath.Dir(s(0)), true
+		}
+	case "filepath.Ext":
+		if len(args) == 1 {
+			return filepath.Ext(s(0)), true
+		}
+	case "strings.TrimPrefix":
+		if len(args) == 2 {
+			return strings.TrimPrefix(s(0), s(1)), true
+		}
+	case "strings.TrimSuffix":
+		if len(args) == 2 {
+			return strings.TrimSuffix(s(0), s(1)), true
+		}
+	case "strings.ToUpper":
+		if len(args) == 1 {
+			return strings.ToUpper(s(0)), true
+		}
+	case "strings.ToLower":
+		if len(args) == 1 {
+			return strings.ToLower(s(0)), true
+		}
+	case "strings.Contains":
+		if len(args) == 2 {
+			return fmt.Sprintf("%t", strings.Contains(s(0), s(1))), true
+		}
+	case "strings.HasSuffix":
+		if len(args) == 2 {
+			return fmt.Sprintf("%t", strings.HasSuffix(s(0), s(1))), true
+		}
+	case "strings.ReplaceAll":
+		if len(args) == 3 {
+			return strings.ReplaceAll(s(0), s(1), s(2)), true
+		}
+	case "fmt.Sprintf":
+		if len(args) >= 1 && args[0].kind == "str" {
+			rest := make([]any, 0, len(args)-1)
+			for _, a := range args[1:] {
+				if a.kind == "num" {
+					if n, err := strconv.ParseInt(a.text, 0, 64); err == nil {
+						rest = append(rest, n)
+						continue
+					}
+				}
+				rest = append(rest, a.text)
+			}
+			return fmt.Sprintf(args[0].text, rest...), true
+		}
+	case "strings.HasPrefix":
+		if len(args) == 2 {
+			return fmt.Sprintf("%t", strings.HasPrefix(s(0), s(1))), true
+		}
+	}
+	return "", false
 }
 
 // sliceWord lowers a slice expr to its A1 word JSON. A1 slice args are
@@ -1904,18 +2283,23 @@ func (p *parser) condToJSON(c *expr) map[string]any {
 			"lhs": p.condToJSON(c.lhs), "rhs": p.condToJSON(c.rhs),
 		}
 	}
-	// strings.Contains(haystack, needle) → the `X | grep Y` contains
-	// shape (haystack: var → getVar, literal → Interpolate; needle:
-	// SingleQuoted — matching the core).
+	// strings.Contains(s, p) → the `[[ $s == *p* ]]` glob-test shape —
+	// the HasPrefix/Suffix precedent (`"$s"=h*`): operand quoted, the
+	// pattern bare so the glob engine sees it (t68). The `test` call
+	// records its verdict in sh2.lastExit, so it works as a BinOp
+	// And/Or operand too; the `contains` call (PureCpu → native
+	// String.includes) does NOT set lastExit, and the core's native
+	// &&/|| lowering of a pure operand branches on the STALE status —
+	// t68 was silently dropping the `alt2` branch.
 	if c.kind == "call" && c.callee == "strings.Contains" {
-		if len(c.args) != 2 {
-			p.failf("strings.Contains needs (haystack, needle) (v2)")
+		if len(c.args) != 2 || c.args[1].kind != "str" {
+			p.failf("strings.Contains needs (haystack, str needle) (v2)")
 		}
-		return map[string]any{
-			"type": "Call", "func": "contains",
-			"args":   []any{p.containsWord(c.args[0]), p.containsNeedle(c.args[1])},
-			"purity": "PureCpu",
+		hk := c.args[0].kind
+		if hk != "var" && hk != "str" && hk != "num" {
+			p.failf("strings.Contains haystack must be var|str|num (v2): %s", hk)
 		}
+		return testCall(p.condOperandQ(c.args[0]) + "=*" + c.args[1].text + "*")
 	}
 	// strings.HasPrefix(s, p) / strings.HasSuffix(s, p) → the `[[ $s ==
 	// p* ]]` / `[[ $s == *p ]]` glob-test shape (the core's `$s==p*`
@@ -1981,29 +2365,6 @@ func (p *parser) condTestString(c *expr) string {
 	return ""
 }
 
-// containsWord: the haystack word of a strings.Contains cond.
-func (p *parser) containsWord(e *expr) map[string]any {
-	switch e.kind {
-	case "str":
-		return interpLit(e.text)
-	case "var":
-		if n, ok := p.paramNumber(e.name); ok {
-			return getVarExpr(strconv.Itoa(n))
-		}
-		return getVarExpr(e.name)
-	}
-	p.failf("unsupported contains haystack (v2): %s", e.kind)
-	return nil
-}
-
-// containsNeedle: the grep pattern — a SingleQuoted Str (core shape).
-func (p *parser) containsNeedle(e *expr) map[string]any {
-	if e.kind != "str" {
-		p.failf("contains needle must be a string literal (v2)")
-	}
-	return map[string]any{"type": "Str", "value": e.text, "style": "SingleQuoted"}
-}
-
 // condOperandQ: `==`/`!=` operand — quoted: `"$x"` / `"lit"` / `"42"`.
 func (p *parser) condOperandQ(e *expr) string {
 	switch e.kind {
@@ -2033,38 +2394,22 @@ func (p *parser) condOperandArg(e *expr) string {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// main
+// Shir — go-sh as a library: Go source -> A1 shIR JSON bytes (no
+// trailing newline). Both the CLI (cmd/go-sh) and the combined busybox
+// dispatch through this single entry point.
 // ─────────────────────────────────────────────────────────────────────
 
-func main() {
-	args := os.Args[1:]
-	raw := false
-	filtered := []string{}
-	for _, a := range args {
-		if a == "--raw" {
-			raw = true
-		} else {
-			filtered = append(filtered, a)
-		}
-	}
-	if len(filtered) != 2 || filtered[0] != "--shir" {
-		fmt.Fprintln(os.Stderr, "usage: go-sh --shir <file.go> [--raw]")
-		os.Exit(2)
-	}
-	inp := filtered[1]
-	src := inp
-	if b, err := os.ReadFile(inp); err == nil {
-		src = string(b)
-	}
+func Shir(src string) ([]byte, error) {
 	toks, err := lex(src)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "go-sh: "+err.Error())
-		os.Exit(2)
+		return nil, err
 	}
 	p := &parser{
 		toks:     toks,
 		varTypes: map[string]string{},
 		arrays:   map[string]arrayInfo{},
+		maps:     map[string]bool{},
+		bufs:     map[string]string{},
 		cmds:     map[string][]*expr{},
 		stdinRdr: map[string]bool{},
 		fnNames:  map[string]bool{},
@@ -2072,21 +2417,10 @@ func main() {
 	}
 	stmts, err := p.run()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "go-sh: "+err.Error())
-		os.Exit(2)
+		return nil, err
 	}
 	prog := &shiremit.Program{Stmts: stmts}
-	out, err := shiremit.Emit(prog)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "emit: "+err.Error())
-		os.Exit(1)
-	}
-	if raw {
-		os.Stdout.Write(out)
-	} else {
-		os.Stdout.Write(out)
-		os.Stdout.Write([]byte{'\n'})
-	}
+	return shiremit.Emit(prog)
 }
 
 // run drives the parser with panic-based error recovery.
