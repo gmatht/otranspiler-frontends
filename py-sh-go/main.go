@@ -64,6 +64,18 @@ type BoolE struct {
 }
 type TernaryE struct{ Cond, Then, Else Expr }
 type ListE struct{ Elems []Expr }
+
+// CompE — list comprehension (grammars-v4 listcomp: `test comp_for`, with
+// the optional comp_if filter): an EXPRESSION evaluating to a NEW array
+// built by iterating Iter, binding each item to Var, and keeping Elem for
+// the items that pass the optional Cond filter. Lowered to the A1
+// ArrayComp expr node (core request py-sh-go-comp-if).
+type CompE struct {
+	Var  string
+	Iter Expr
+	Elem Expr
+	Cond Expr // nil = no filter
+}
 type DictE struct {
 	Keys   []Expr // string-literal keys in the v1 subset
 	Values []Expr
@@ -1457,23 +1469,61 @@ func (e *exprParser) parsePrimary() (Expr, error) {
 			return first, nil
 		}
 		if t.text == "[" {
-			// list literal
+			// list literal — or a comprehension when the first element is
+			// followed by `for` (grammars-v4 comp_for [+ comp_if]; the A1
+			// ArrayComp expr node): `[elem for var in iter (if cond)]`
 			var elems []Expr
 			if e.isOp("]") {
 				e.next()
 				return &ListE{}, nil
 			}
-			for {
-				el, err := e.parseTernary()
+			el, err := e.parseTernary()
+			if err != nil {
+				return nil, err
+			}
+			if e.isKw("for") {
+				// comp_for: 'for' exprlist 'in' or_test comp_iter?
+				e.next()
+				vt := e.next()
+				if vt.kind != tIdent {
+					return nil, fmt.Errorf("comp: expected variable")
+				}
+				if !e.isKw("in") {
+					return nil, fmt.Errorf("comp: expected in")
+				}
+				e.next()
+				// or_test level (NOT ternary): a trailing `if` belongs to
+				// comp_if, not to an `if ... else` in the iterable.
+				iter, err := e.parseOr()
 				if err != nil {
 					return nil, err
 				}
-				elems = append(elems, el)
+				var cond Expr
+				if e.isKw("if") {
+					// comp_if: 'if' test_nocond comp_iter?
+					e.next()
+					cond, err = e.parseOr()
+					if err != nil {
+						return nil, err
+					}
+				}
+				if err := e.expectOp("]"); err != nil {
+					return nil, err
+				}
+				return &CompE{Var: vt.text, Iter: iter, Elem: el, Cond: cond}, nil
+			}
+			elems = append(elems, el)
+			for {
 				if e.isOp(",") {
 					e.next()
 					if e.isOp("]") {
 						break
 					}
+					el, err := e.parseTernary()
+					if err != nil {
+						return nil, err
+					}
+					elems = append(elems, el)
 					continue
 				}
 				break
@@ -1721,6 +1771,8 @@ func (l *lowerer) setType(name, t string) {
 
 func (l *lowerer) typeOf(e Expr) string {
 	switch t := e.(type) {
+	case *CompE:
+		return "list"
 	case *LitInt:
 		return "int"
 	case *LitStr, *FStrE, *PercentE:
@@ -2892,6 +2944,34 @@ func (l *lowerer) assignOne(target, op string, val Expr) ([]map[string]any, erro
 			exprStmt(execCall("declare", []any{st("-A"), st(target)})),
 			assignStmt(target, call("setArray", []any{st(target), array(elems)})),
 		}, nil
+	}
+	// list comprehension → the A1 ArrayComp expr node (core request
+	// py-sh-go-comp-if): setArray(target, ArrayComp) — the runtime builds
+	// a NEW array, binding each iter item to the comp var and skipping
+	// items that fail the optional comp_if filter.
+	if cp, ok := val.(*CompE); ok {
+		if op == "+=" {
+			return nil, fmt.Errorf("comp: += unsupported")
+		}
+		iter, err := l.iterIR(cp.Iter)
+		if err != nil {
+			return nil, err
+		}
+		elem, err := l.argIR(cp.Elem)
+		if err != nil {
+			return nil, err
+		}
+		var cond any
+		if cp.Cond != nil {
+			c, err := l.testIR(cp.Cond)
+			if err != nil {
+				return nil, err
+			}
+			cond = c
+		}
+		l.setType(target, "list")
+		ac := map[string]any{"type": "ArrayComp", "var": cp.Var, "iter": iter, "elem": elem, "cond": cond}
+		return []map[string]any{assignStmt(target, call("setArray", []any{st(target), ac}))}, nil
 	}
 	// list literal → setArray / setArrayAppend (arr += (...))
 	if lst, ok := val.(*ListE); ok {
