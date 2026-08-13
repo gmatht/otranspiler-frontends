@@ -32,7 +32,7 @@ while true; do
     # scope = THIS dir + harness/* + c-requests/ — never c-sh-go-owned files
     changes=$(git -C "$WORKSPACE" status --porcelain 2>/dev/null \
               | awk '/^.. /{print $2}' \
-              | awk -v d="$(pwd)" '$0 ~ "^"d || $0 ~ /^harness\// || $0 ~ /^c-requests\//' || true)
+              | awk -v d="${pwd#$WORKSPACE/}" '$0 ~ "^"d"/" || $0 ~ /^harness\// || $0 ~ /^c-requests\//' || true)
     if [ -n "$changes" ]; then
       git -C "$WORKSPACE" add $changes 2>/dev/null || true
       git -C "$WORKSPACE" commit -m "frontend cpp-sh-go: gate green" >> "$LOG" 2>&1 || true

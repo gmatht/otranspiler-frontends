@@ -26,7 +26,7 @@ while true; do
     # scope = THIS dir + harness/*
     changes=$(git -C "$WORKSPACE" status --porcelain 2>/dev/null \
               | awk '/^.. /{print $2}' \
-              | awk -v d="$(pwd)" '$0 ~ "^"d || $0 ~ /^harness\//' || true)
+              | awk -v d="${pwd#$WORKSPACE/}" '$0 ~ "^"d"/" || $0 ~ /^harness\//' || true)
     if [ -n "$changes" ]; then
       git -C "$WORKSPACE" add $changes 2>/dev/null || true
       git -C "$WORKSPACE" commit -m "frontend zig-sh-go: gate green" >> "$LOG" 2>&1 || true

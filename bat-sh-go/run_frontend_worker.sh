@@ -13,7 +13,7 @@ while true; do
   fi
   changes=$(git -C "$WORKSPACE" status --porcelain 2>/dev/null \
             | awk '/^.. /{print $2}' \
-            | awk -v d="$PWD" '$0 ~ "^"d || $0 ~ /^harness\//' || true)
+            | awk -v d="${PWD#$WORKSPACE/}" '$0 ~ "^"d"/" || $0 ~ /^harness\//' || true)
   if [ -n "$changes" ]; then
     bash "$WORKSPACE/setup_backends.sh" --wait 2>>"$LOG" || true
     if make build >> "$LOG" 2>&1 && make test >> "$LOG" 2>&1; then

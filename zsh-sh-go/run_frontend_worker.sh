@@ -23,7 +23,7 @@ while true; do
     # commit any scoped changes the fix may have made (this dir + harness/*)
     changes=$(git -C "$WORKSPACE" status --porcelain 2>/dev/null \
               | awk '/^.. /{print $2}' \
-              | awk -v d="$(pwd)" '$0 ~ "^"d || $0 ~ /^harness\//' || true)
+              | awk -v d="${pwd#$WORKSPACE/}" '$0 ~ "^"d"/" || $0 ~ /^harness\//' || true)
     if [ -n "$changes" ]; then
       git -C "$WORKSPACE" add $changes 2>/dev/null || true
       git -C "$WORKSPACE" commit -m "frontend zsh-sh-go: gate green" >> "$LOG" 2>&1 || true
