@@ -47,7 +47,7 @@ test: build $(DEBASHC)
 	    echo "FAIL $$bn (emit is not valid A1 shIR)"; exit 1; \
 	  fi; \
 	done
-	@echo "--- executed-stdout comparison (recorded expectations vs JS/ESTree) ---"
+	@echo "--- executed-stdout comparison (live pwsh vs JS/ESTree) ---"
 	@bash "$(abspath ../../harness/frontend-stdout.sh)" powershell ./powershell-sh-go testdata "$(DEBASHC)" || exit 1
 	@rm -rf $(SCRATCH)
 
