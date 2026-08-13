@@ -21,11 +21,21 @@ gen:
 	@exit 1
 
 build:
-	# self-healing: a stale/corrupt output (e.g. an interrupted build leaves
-	# a non-object file) makes `go build -o` refuse to overwrite it and the
-	# gate wedges. Drop it first; the fresh binary is always rebuilt.
-	rm -f posix-sh-go
-	$(GO) build -o posix-sh-go .
+	# Atomic publish: build to a temp file, then rename over the target, so a
+	# CONCURRENT gate run (the worker loop and the coverage step both run
+	# `make test` in this dir and they can overlap) never observes the binary
+	# missing or half-written mid-gate (2026-08-13 15:17: 4 tests failed
+	# "frontend emit: ./posix-sh-go: No such file or directory" while the
+	# byte-equal phase of the same run had passed). The old `rm -f` +
+	# in-place `go build -o` left a window with NO binary; the in-place
+	# write left one with a PARTIAL binary. mv(1) is atomic: any concurrent
+	# exec sees either the previous complete binary or the new one.
+	# Self-healing (a stale/corrupt OUTPUT used to make `go build -o` refuse
+	# to overwrite it and wedge the gate) now guards the temp file only, so
+	# a corrupt published binary can never block a rebuild either.
+	rm -f .posix-sh-go.tmp
+	$(GO) build -o .posix-sh-go.tmp .
+	mv -f .posix-sh-go.tmp posix-sh-go
 
 test: build
 	@for f in testdata/*.sh; do \
@@ -47,4 +57,4 @@ worker: test
 	@echo "posix-sh-go worker gate: byte-equality + executed-stdout passed"
 
 clean:
-	rm -f posix-sh-go /tmp/*.mine /tmp/*.core
+	rm -f posix-sh-go .posix-sh-go.tmp /tmp/*.mine /tmp/*.core
