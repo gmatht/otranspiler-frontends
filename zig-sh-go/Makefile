@@ -6,7 +6,7 @@
 # A1->ESTree->JS, via harness/frontend-stdout.sh).
 DEBASHC ?= $(abspath ../../sh2perl/target/debug/debashc)
 GO ?= go
-ZIG ?= /snap/zig/current/bin/zig
+ZIG ?= /snap/zig/current/zig
 SCRATCH := $(shell { [ -w $(abspath .gate-tmp) ] || rm -rf $(abspath .gate-tmp); mkdir -p $(abspath .gate-tmp) && mktemp -d $(abspath .gate-tmp)/gate.XXXXXX; } 2>/dev/null || mktemp -d /tmp/zig-sh-go-gate.XXXXXX)
 
 .PHONY: all build test worker clean
@@ -27,6 +27,15 @@ $(DEBASHC):
 
 test: build $(DEBASHC)
 	@test -n "$(SCRATCH)" || { echo "FAIL: cannot create gate scratch dir"; exit 1; }
+	@echo "--- planned rung pins (PLAN_ZIG_F §3): the subset must GROW, not idle at t01/t02 ---"
+	@for pin in t03_if_else t04_while t05_for_range t06_for_items t07_fn t08_pointers t09_string t10_defer t11_switch t12_comptime_const t13_const_cast; do \
+	  if ls testdata/$${pin}*.zig >/dev/null 2>&1; then \
+	    echo "OK rung pin $${pin} landed"; \
+	  else \
+	    echo "FAIL: planned rung $${pin} is unimplemented — the failure-driven worker implements PLAN_ZIG_F §3 in order; the gate stays RED until $${pin} lands (subset starvation guard)"; \
+	    exit 1; \
+	  fi; \
+	done
 	@echo "--- refusals: testdata_refuse/*.zig must FAIL loudly ---"
 	@for f in testdata_refuse/*.zig; do \
 	  bn=$$(basename $$f); \
