@@ -25,6 +25,7 @@ import (
 //	                                 → cast_expression  (type_literal + operand)
 //	            generic_token                     (bareword)
 //	            variable
+//	            expandable_bareword               ($foo-bar — t09)
 //	            concatenated_command_argument     (adjacent pieces — t05)
 //	      pipeline_chain_tail*    (REFUSE: `|` pipe — t08 rung)
 //	    do_statement                (t06 — the do-while duplication)
@@ -408,11 +409,51 @@ func lowerCommandElement(n *sitter.Node, src []byte) (any, error) {
 		return strExpr(n.Content(src), "DoubleQuoted"), nil
 	case "variable":
 		return getVarCall(variableName(n, src)), nil
+	case "expandable_bareword":
+		return lowerExpandableBareword(n, src)
 	case "concatenated_command_argument":
 		return lowerConcatArg(n, src)
 	default:
 		return nil, refuse(n, src, "argument form %q", n.Type())
 	}
+}
+
+// lowerExpandableBareword — the expandable_bareword node: a variable
+// immediately followed by unquoted literal text with no whitespace
+// (`$foo-bar`: the grammar's variable + a generic_token tail; the
+// tail's first char cannot be `.` / `$` / `[` / `{` / a quote, so
+// `$foo.txt` is member_access and `$foo2` is ONE variable token — this
+// node is exactly the bareword-tail twin of the t05 variable-headed
+// concatenation). Live pwsh 7.6.4 argument-mode tokenization (verified
+// 2026-08-13): the variable expands and the tail is literal —
+// `Write-Output $foo-bar` with foo unset prints `-bar` (the argument
+// starts with `$`, so `-bar` is NOT parsed as a parameter) and with
+// `$foo = "abc"` prints `abc-bar`; the braced spelling `${foo}-bar`
+// parses as the SAME node (the t02 brace precedent — braces are pure
+// spelling, both name the same getVar slot). The pieces lower exactly
+// like the core's adjacent-word folding for bash `echo $foo-bar`
+// (verified byte-identical: Interpolate [expr getVar("foo"), lit
+// "-bar"]) via the same mergeConcatParts fold as t05.
+func lowerExpandableBareword(n *sitter.Node, src []byte) (any, error) {
+	var varNode, tail *sitter.Node
+	for i := 0; i < int(n.NamedChildCount()); i++ {
+		ch := n.NamedChild(i)
+		switch ch.Type() {
+		case "variable":
+			varNode = ch
+		case "generic_token":
+			tail = ch
+		default:
+			return nil, refuse(ch, src, "expandable_bareword part %q", ch.Type())
+		}
+	}
+	if varNode == nil || tail == nil {
+		return nil, refuse(n, src, "expandable_bareword without a variable+tail pair")
+	}
+	return mergeConcatParts([]any{
+		exprPart(getVarCall(variableName(varNode, src))),
+		litPart(tail.Content(src)),
+	})
 }
 
 // lowerConcatArg — the concatenated_command_argument node: adjacent

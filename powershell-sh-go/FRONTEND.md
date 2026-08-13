@@ -109,6 +109,26 @@ line) — now the worker's fixes, not records):
   program without the `;` and the executed-stdout oracle matches live
   pwsh by construction. The nil return is skipped by lowerStatementList
   and covers block bodies too (lowerBlock shares the path).
+- t09_expandable_bareword: the expandable_bareword node — a variable
+  immediately followed by unquoted literal text with no whitespace
+  (`$foo-bar`: the grammar's variable + a generic_token tail; the
+  tail's first char cannot be `.` / `$` / `[` / `{` / a quote, so
+  `$foo.txt` is member_access and `$foo2` is ONE variable token —
+  this node is exactly the bareword-tail twin of the t05
+  variable-headed concatenation `$x"b"`). Live pwsh 7.6.4
+  argument-mode tokenization (verified 2026-08-13): the variable
+  expands and the tail is literal — with foo UNSET, `Write-Output
+  $foo-bar` prints `-bar` (the argument starts with `$`, so `-bar` is
+  NOT parsed as a parameter) and with `$foo = "abc"` it prints
+  `abc-bar`; the braced spelling `${foo}-bar` parses as the SAME node
+  (the t02 brace precedent — braces are pure spelling, both name the
+  same getVar slot). The pieces lower exactly like the core's
+  adjacent-word folding for bash `echo $foo-bar` (byte-identical:
+  Interpolate [expr getVar("foo"), lit "-bar"]) via the same
+  mergeConcatParts fold as t05 — the transpiled run prints "-bar" on
+  both sides (the A1 store reads "" for foo: the tail makes the
+  argument an expandable STRING, not the bare-$null t02 print edge,
+  so the unset-variable oracle is CONSISTENT).
 - Comments, comment-only files (empty Program), and the REFUSE table
   (refuse.go): anything outside the subset errors loudly — including
   .NET member access (`$x.Length`), assignment, `|` pipelines, unknown
