@@ -137,6 +137,22 @@ type WithS struct {
 	FhVar string
 	Body  []Stmt
 }
+
+// TryS — Python try/except/else/finally (grammars-v4 `try_stmt`), the
+// A1 `Try` node (core request py-sh-go 20260813). Except arms lower to
+// TryExcept entries (match null for a bare except, as null when the
+// clause has no binding); else/finally are plain statement lists.
+type TryS struct {
+	Body     []Stmt
+	Except   []ExceptS
+	ElseBody []Stmt
+	Finally  []Stmt
+}
+type ExceptS struct {
+	Match Expr // nil = bare except
+	As    string
+	Body  []Stmt
+}
 type ImportS struct{}
 type GlobalS struct{}
 
@@ -497,6 +513,8 @@ func (p *parser) parseStmt() (Stmt, error) {
 			return p.parseReturn(toks[1:])
 		case "with":
 			return p.parseWith(toks[1:], ln.indent)
+		case "try":
+			return p.parseTry(toks[1:], ln.indent)
 		}
 	}
 	// expression statement — may be an assignment
@@ -603,6 +621,109 @@ func (p *parser) parseIf(toks []tok, indent int) (Stmt, error) {
 		}
 	}
 	return st, nil
+}
+
+// parseTry parses `try: body (except [expr [as name]]: body)*
+// [else: body] [finally: body]` (grammars-v4 `try_stmt`). The
+// except/else/finally clauses continue at the try's OWN indent — the
+// same continuation pattern parseIf uses for elif/else. Nothing may
+// follow a finally (Python forbids it); anything else at the same
+// indent ends the statement.
+func (p *parser) parseTry(toks []tok, indent int) (Stmt, error) {
+	if len(toks) == 0 || toks[0].text != ":" {
+		return nil, fmt.Errorf("try: expected :")
+	}
+	body, err := p.parseBody(indent)
+	if err != nil {
+		return nil, err
+	}
+	st := &TryS{Body: body}
+	for p.pos < len(p.lines) && p.lines[p.pos].indent == indent {
+		t2 := lexLine(p.lines[p.pos].text)
+		if len(t2) == 0 || t2[0].kind != tIdent {
+			break
+		}
+		switch t2[0].text {
+		case "except":
+			p.pos++
+			match, asName, err := p.parseExceptClause(t2[1:])
+			if err != nil {
+				return nil, err
+			}
+			b, err := p.parseBody(indent)
+			if err != nil {
+				return nil, err
+			}
+			st.Except = append(st.Except, ExceptS{Match: match, As: asName, Body: b})
+		case "else":
+			p.pos++
+			if len(t2) < 2 || t2[1].text != ":" {
+				return nil, fmt.Errorf("else: expected :")
+			}
+			b, err := p.parseBody(indent)
+			if err != nil {
+				return nil, err
+			}
+			st.ElseBody = b
+		case "finally":
+			p.pos++
+			if len(t2) < 2 || t2[1].text != ":" {
+				return nil, fmt.Errorf("finally: expected :")
+			}
+			b, err := p.parseBody(indent)
+			if err != nil {
+				return nil, err
+			}
+			st.Finally = b
+			return st, nil // nothing may follow finally
+		default:
+			return st, nil
+		}
+	}
+	return st, nil
+}
+
+// parseExceptClause parses the `[expr [as name]] :` tail after the
+// leading `except` keyword. Bare `except:` yields a nil match and no
+// binding; `except E:` a NameE match; `except E as n:` both.
+func (p *parser) parseExceptClause(toks []tok) (Expr, string, error) {
+	colon := -1
+	for i, t := range toks {
+		if t.text == ":" {
+			colon = i
+			break
+		}
+	}
+	if colon < 0 {
+		return nil, "", fmt.Errorf("except: expected :")
+	}
+	clause := toks[:colon]
+	if len(clause) == 0 {
+		return nil, "", nil // bare except
+	}
+	asName := ""
+	for i, t := range clause {
+		if t.kind == tIdent && t.text == "as" {
+			rest := clause[i+1:]
+			if len(rest) != 1 || rest[0].kind != tIdent {
+				return nil, "", fmt.Errorf("except: bad as binding")
+			}
+			asName = rest[0].text
+			clause = clause[:i]
+			break
+		}
+	}
+	if len(clause) == 0 {
+		return nil, "", fmt.Errorf("except: expected exception")
+	}
+	e, rest, err := parseExprUntil(clause, "\x00") // no terminator
+	if err != nil {
+		return nil, "", err
+	}
+	if len(rest) > 0 && rest[0].kind != tEOF {
+		return nil, "", fmt.Errorf("except: trailing tokens")
+	}
+	return e, asName, nil
 }
 
 func (p *parser) parseWhile(toks []tok, indent int) (Stmt, error) {
@@ -2526,8 +2647,62 @@ func (l *lowerer) stmtIR(s Stmt) ([]map[string]any, error) {
 		return l.exprStmtIR(t.Expr)
 	case *WithS:
 		return l.withIR(t)
+	case *TryS:
+		return l.tryIR(t)
 	}
 	return nil, fmt.Errorf("unsupported statement")
+}
+
+// tryIR lowers Python try/except/else/finally to the A1 `Try` node
+// (core request py-sh-go 20260813): body/excepts/else/finally, with
+// TryExcept entries {type, match (null for bare except), as (null when
+// absent), body} — the exact shape src/shir_json.rs emits and
+// src/shir_json_in.rs ingests.
+func (l *lowerer) tryIR(t *TryS) ([]map[string]any, error) {
+	body, err := l.stmtsIR(t.Body)
+	if err != nil {
+		return nil, err
+	}
+	excepts := []any{}
+	for _, e := range t.Except {
+		eb, err := l.stmtsIR(e.Body)
+		if err != nil {
+			return nil, err
+		}
+		var match any
+		if e.Match != nil {
+			m, err := l.argIR(e.Match)
+			if err != nil {
+				return nil, err
+			}
+			match = m
+		}
+		var asName any
+		if e.As != "" {
+			asName = e.As
+		}
+		excepts = append(excepts, map[string]any{
+			"type":  "TryExcept",
+			"match": match,
+			"as":    asName,
+			"body":  toAnyStmts(eb),
+		})
+	}
+	elseB, err := l.stmtsIR(t.ElseBody)
+	if err != nil {
+		return nil, err
+	}
+	finB, err := l.stmtsIR(t.Finally)
+	if err != nil {
+		return nil, err
+	}
+	return []map[string]any{{
+		"type":    "Try",
+		"body":    toAnyStmts(body),
+		"excepts": excepts,
+		"else":    toAnyStmts(elseB),
+		"finally": toAnyStmts(finB),
+	}}, nil
 }
 
 func (l *lowerer) printIR(t *PrintS) ([]map[string]any, error) {
