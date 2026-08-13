@@ -4,7 +4,7 @@ PowerShell (.ps1) source -> A1 shIR JSON — **the bat sibling**
 (workspace-side dir; no git worktree; the object pipeline is a stated
 TEXT approximation for v1; see PLAN_POWERSHELL_F.md).
 
-**Status: WORKER-IMPLEMENTED, t17 landed (gate green).** The parser is
+**Status: WORKER-IMPLEMENTED, t18 landed (gate green).** The parser is
 wharflab/tree-sitter-powershell (vendored under
 `grammars/tree-sitter-powershell/`, loaded via smacker/go-tree-sitter
 cgo) — the plan's choice, empirically verified. The emitter produces A1
@@ -263,6 +263,23 @@ line) — now the worker's fixes, not records):
   (`{0:D2}`), a placeholder/argument count mismatch and any NON-format
   parenthesized expression (`("a")` / `($x)`) all REFUSE (the runtime
   printf-style rung is a later milestone; refuse > guess).
+- t18_label: the label node — the `:name` prefix of a labeled loop
+  (the grammar's `_statement` rule: `[label] _labeled_statement`; the
+  label is a SIBLING node before the loop statement in the
+  statement_list, and `_labeled_statement` is one of switch/foreach/
+  for/while/do — v1's expressible hosts are do (t06), for-condition
+  (t12) and foreach (t13); a label before a while/switch still refuses
+  on the loop itself). A label has NO runtime effect unless a
+  break/continue targets it, and v1 REFUSES break/continue (the t11
+  loop-signal pin) — so every expressible program's label is
+  UNREFERENCED: pure spelling, dropped exactly like the t02 braces /
+  t04 invocation operator (verified against live pwsh 7.6.4:
+  `:outer do { … } while ($x)` runs identically to the unlabeled do),
+  and the emit is byte-identical to the unlabeled form (the t06
+  do-while duplication). The labeled break/continue tail
+  (`label_expression` in flow_control_statement — `break :label`) is
+  a separate construct and still REFUSES (lowerFlowControl's labeled
+  break/continue refusal).
 - Comments, comment-only files (empty Program), and the REFUSE table
   (refuse.go): anything outside the subset errors loudly — including
   .NET member access (`$x.Length`), assignment, `|` pipelines, unknown

@@ -14,6 +14,9 @@ import (
 //	program
 //	  comment*                    (skip)
 //	  statement_list
+//	    label                     (t18 — the `:name` prefix of a labeled
+//	                                loop, a SIBLING before the loop
+//	                                statement; unreferenced in v1 → dropped)
 //	    pipeline                  (a single statement)
 //	      pipeline_chain          (a command / expression)
 //	        command
@@ -71,6 +74,22 @@ func lowerStatementList(n *sitter.Node, src []byte) ([]any, error) {
 	var stmts []any
 	for i := 0; i < int(n.NamedChildCount()); i++ {
 		ch := n.NamedChild(i)
+		if ch.Type() == "label" {
+			// the `:name` prefix of a labeled loop (the grammar's
+			// _statement rule: [label] _labeled_statement — the label
+			// is a SIBLING node before the loop statement in the
+			// statement_list; _labeled_statement is one of switch /
+			// foreach / for / while / do). A label has NO runtime
+			// effect unless a break/continue targets it, and v1
+			// REFUSES break/continue (lowerFlowControl — the loop
+			// signals) — so every expressible program's label is
+			// UNREFERENCED: pure spelling, dropped exactly like the
+			// t02 braces / t04 invocation operator (the t18 pin). The
+			// following loop statement lowers through its normal path
+			// (a label before a refused loop — while / switch — still
+			// refuses on the loop itself, loudly).
+			continue
+		}
 		if ch.Type() == "do_statement" {
 			// the do-while duplication expands to SEVERAL statements
 			// (body once + the While re-check) — flatten into the list
