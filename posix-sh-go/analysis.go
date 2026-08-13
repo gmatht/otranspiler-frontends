@@ -2887,6 +2887,358 @@ func optimizeStmts(stmts []Stmt) []Stmt {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// A1 `Ident` arith reads (mirror shir_json.rs rewrite_loop_var_idents /
+// shir.rs analyze_loop_var_refs; core request zsh-sh-go-20260813-155123)
+// ─────────────────────────────────────────────────────────────────────
+
+// analyzeLoopVarRefs — mirror analyze_loop_var_refs (shir.rs). Returns
+// (num, str) refined by the copy-region drop rule: a var with ANY loop
+// inside a copy region (subshell/background/capture) AND any external
+// ref stays store-bound and is removed from both lift sets.
+type loopRef struct{ Var string; InCopy bool }
+
+func analyzeLoopVarRefs(stmts []Stmt, num, str map[string]bool) (map[string]bool, map[string]bool) {
+	// per-For-stmt: (var, loop inside a copy region)
+	var loops []loopRef
+	// vars with any ref outside their loop stack
+	external := map[string]bool{}
+
+	copyArrowCall := func(fn string) bool {
+		switch fn {
+		case "capture", "captureWords", "subshell", "background":
+			return true
+		}
+		return false
+	}
+	inStack := func(stack []string, v string) bool {
+		for _, s := range stack {
+			if s == v {
+				return true
+			}
+		}
+		return false
+	}
+	var refExpr func(e Expr, stack []string, inCopy bool)
+	var refStmt func(st Stmt, stack []string, inCopy bool)
+	refExpr = func(e Expr, stack []string, inCopy bool) {
+		switch t := e.(type) {
+		case *VarE:
+			if !inStack(stack, t.Name) {
+				external[t.Name] = true
+			}
+		case *CallE:
+			if t.Func == "getVar" && len(t.Args) == 1 {
+				if n, ok := t.Args[0].(*StrE); ok && !inStack(stack, n.Value) {
+					external[n.Value] = true
+				}
+			}
+			if t.Func == "setVar" && len(t.Args) >= 1 {
+				if n, ok := t.Args[0].(*StrE); ok && !inStack(stack, n.Value) {
+					external[n.Value] = true
+				}
+			}
+			innerCopy := inCopy || copyArrowCall(t.Func)
+			for _, a := range t.Args {
+				refExpr(a, stack, innerCopy)
+			}
+		case *ArrowE:
+			for _, st := range t.Body {
+				refStmt(st, stack, inCopy)
+			}
+		case *BinOpE:
+			refExpr(t.Lhs, stack, inCopy)
+			refExpr(t.Rhs, stack, inCopy)
+		case *ArrayE:
+			for _, el := range t.Elems {
+				refExpr(el, stack, inCopy)
+			}
+		case *ObjectE:
+			for _, p := range t.Props {
+				refExpr(p.Val, stack, inCopy)
+			}
+		case *InterpE:
+			for _, p := range t.Parts {
+				if !p.IsLit {
+					refExpr(p.Expr, stack, inCopy)
+				}
+			}
+		}
+	}
+	refStmt = func(st Stmt, stack []string, inCopy bool) {
+		switch t := st.(type) {
+		case *ForS:
+			loops = append(loops, loopRef{Var: t.Var, InCopy: inCopy})
+			s2 := make([]string, 0, len(stack)+1)
+			s2 = append(s2, stack...)
+			s2 = append(s2, t.Var)
+			refExpr(t.Iter, s2, inCopy)
+			for _, b := range t.Body {
+				refStmt(b, s2, inCopy)
+			}
+		case *AssignS:
+			if !inStack(stack, t.Var) {
+				external[t.Var] = true
+			}
+			refExpr(t.Expr, stack, inCopy)
+		case *WhileS:
+			refExpr(t.Cond, stack, inCopy)
+			for _, b := range t.Body {
+				refStmt(b, stack, inCopy)
+			}
+		case *IfS:
+			refExpr(t.Cond, stack, inCopy)
+			for _, b := range t.Then {
+				refStmt(b, stack, inCopy)
+			}
+			for _, b := range t.Else {
+				refStmt(b, stack, inCopy)
+			}
+		case *ExprS:
+			refExpr(t.Expr, stack, inCopy)
+		case *FunctionS:
+			for _, b := range t.Body {
+				refStmt(b, stack, inCopy)
+			}
+		case *BlockS:
+			for _, b := range t.Body {
+				refStmt(b, stack, inCopy)
+			}
+		case *SubshellS:
+			for _, b := range t.Body {
+				refStmt(b, stack, true)
+			}
+		case *BackgroundS:
+			for _, b := range t.Body {
+				refStmt(b, stack, true)
+			}
+		case *RedirectS:
+			for _, b := range t.Inner {
+				refStmt(b, stack, inCopy)
+			}
+			for _, r := range t.Redirects {
+				refExpr(r.Target, stack, inCopy)
+			}
+		case *CaseS:
+			refExpr(t.Disc, stack, inCopy)
+			for _, c := range t.Clauses {
+				for _, b := range c.Body {
+					refStmt(b, stack, inCopy)
+				}
+			}
+		case *ReturnS:
+			if t.Value != nil {
+				refExpr(t.Value, stack, inCopy)
+			}
+		case *PipelineS:
+			for _, stage := range t.Stages {
+				for _, b := range stage {
+					refStmt(b, stack, inCopy)
+				}
+			}
+		}
+	}
+	for _, st := range stmts {
+		refStmt(st, nil, false)
+	}
+
+	num2 := make(map[string]bool, len(num))
+	for n := range num {
+		num2[n] = true
+	}
+	str2 := make(map[string]bool, len(str))
+	for n := range str {
+		str2[n] = true
+	}
+	// a var with ANY loop inside a copy region AND any external ref stays
+	// store-bound (the persist machinery would leak the copy-local loop
+	// writes into the module binding)
+	for _, l := range loops {
+		if l.InCopy && external[l.Var] {
+			delete(num2, l.Var)
+			delete(str2, l.Var)
+		}
+	}
+	return num2, str2
+}
+
+// rewriteLoopVarIdents — mirror rewrite_loop_var_idents (shir_json.rs):
+// in-body arith reads of a NUMERIC/STRING-LIFTED `for` loop variable are
+// rewritten Var → Ident (export-only; the analyses already ran).
+func rewriteLoopVarIdents(stmts []Stmt, lifted map[string]bool) {
+	for _, s := range stmts {
+		if t, ok := s.(*ForS); ok {
+			if lifted[t.Var] {
+				v := t.Var
+				for _, b := range t.Body {
+					rewriteStmtArithIdent(b, &v)
+				}
+				continue
+			}
+		}
+		// recurse into statement containers (a nested For inside an
+		// If/While/Block/Case/... body gets its own rewrite)
+		switch t := s.(type) {
+		case *BlockS:
+			rewriteLoopVarIdents(t.Body, lifted)
+		case *SubshellS:
+			rewriteLoopVarIdents(t.Body, lifted)
+		case *BackgroundS:
+			rewriteLoopVarIdents(t.Body, lifted)
+		case *IfS:
+			rewriteLoopVarIdents(t.Then, lifted)
+			rewriteLoopVarIdents(t.Else, lifted)
+		case *WhileS:
+			rewriteLoopVarIdents(t.Body, lifted)
+		case *FunctionS:
+			rewriteLoopVarIdents(t.Body, lifted)
+		case *RedirectS:
+			rewriteLoopVarIdents(t.Inner, lifted)
+		case *CaseS:
+			for _, c := range t.Clauses {
+				rewriteLoopVarIdents(c.Body, lifted)
+			}
+		case *PipelineS:
+			for _, stage := range t.Stages {
+				rewriteLoopVarIdents(stage, lifted)
+			}
+		case *ExprS:
+			rewriteExprArithIdent(t.Expr, nil)
+		case *AssignS:
+			rewriteExprArithIdent(t.Expr, nil)
+		}
+	}
+}
+
+// rewriteStmtArithIdent — mirror rewrite_stmt_arith_ident: rewrite every
+// arith read of `var` throughout a statement (recursing into containers).
+func rewriteStmtArithIdent(st Stmt, v *string) {
+	switch t := st.(type) {
+	case *ExprS:
+		rewriteExprArithIdent(t.Expr, v)
+	case *AssignS:
+		rewriteExprArithIdent(t.Expr, v)
+	case *IfS:
+		rewriteExprArithIdent(t.Cond, v)
+		for _, s := range t.Then {
+			rewriteStmtArithIdent(s, v)
+		}
+		for _, s := range t.Else {
+			rewriteStmtArithIdent(s, v)
+		}
+	case *WhileS:
+		rewriteExprArithIdent(t.Cond, v)
+		for _, s := range t.Body {
+			rewriteStmtArithIdent(s, v)
+		}
+	case *ForS:
+		rewriteExprArithIdent(t.Iter, v)
+		for _, s := range t.Body {
+			rewriteStmtArithIdent(s, v)
+		}
+	case *BlockS:
+		for _, s := range t.Body {
+			rewriteStmtArithIdent(s, v)
+		}
+	case *SubshellS:
+		for _, s := range t.Body {
+			rewriteStmtArithIdent(s, v)
+		}
+	case *BackgroundS:
+		for _, s := range t.Body {
+			rewriteStmtArithIdent(s, v)
+		}
+	case *FunctionS:
+		for _, s := range t.Body {
+			rewriteStmtArithIdent(s, v)
+		}
+	case *RedirectS:
+		for _, s := range t.Inner {
+			rewriteStmtArithIdent(s, v)
+		}
+		for _, r := range t.Redirects {
+			rewriteExprArithIdent(r.Target, v)
+		}
+	case *ReturnS:
+		if t.Value != nil {
+			rewriteExprArithIdent(t.Value, v)
+		}
+	case *CaseS:
+		rewriteExprArithIdent(t.Disc, v)
+		for _, c := range t.Clauses {
+			for _, s := range c.Body {
+				rewriteStmtArithIdent(s, v)
+			}
+		}
+	case *PipelineS:
+		for _, stage := range t.Stages {
+			for _, s := range stage {
+				rewriteStmtArithIdent(s, v)
+			}
+		}
+	}
+}
+
+// rewriteExprArithIdent — mirror rewrite_expr_arith_ident: with `v == nil`
+// this is the structural walk only (no rewrite), exactly like the core's
+// generic driver pass.
+func rewriteExprArithIdent(e Expr, v *string) {
+	switch t := e.(type) {
+	case *ArithE:
+		if v != nil {
+			t.Ast = rewriteArithIdent(t.Ast, *v)
+		}
+	case *ArrowE:
+		if v != nil {
+			for _, s := range t.Body {
+				rewriteStmtArithIdent(s, v)
+			}
+		}
+	case *CallE:
+		for _, a := range t.Args {
+			rewriteExprArithIdent(a, v)
+		}
+	case *ArrayE:
+		for _, el := range t.Elems {
+			rewriteExprArithIdent(el, v)
+		}
+	case *ObjectE:
+		for _, p := range t.Props {
+			rewriteExprArithIdent(p.Val, v)
+		}
+	case *BinOpE:
+		rewriteExprArithIdent(t.Lhs, v)
+		rewriteExprArithIdent(t.Rhs, v)
+	}
+}
+
+// rewriteArithIdent — mirror rewrite_arith_ident (reads only —
+// Assign/IncDec TARGETS keep their var name; the node's `name` field is
+// the read). Returns the (possibly replaced) node.
+func rewriteArithIdent(a ArithAst, v string) ArithAst {
+	switch t := a.(type) {
+	case *ArithVar:
+		if t.Name == v {
+			return &ArithIdent{Name: t.Name}
+		}
+	case *ArithIndex:
+		return &ArithIndex{Var: t.Var, Key: rewriteArithIdent(t.Key, v)}
+	case *ArithBin:
+		return &ArithBin{Op: t.Op, Lhs: rewriteArithIdent(t.Lhs, v), Rhs: rewriteArithIdent(t.Rhs, v)}
+	case *ArithUn:
+		return &ArithUn{Op: t.Op, Arg: rewriteArithIdent(t.Arg, v)}
+	case *ArithCond:
+		return &ArithCond{
+			Test: rewriteArithIdent(t.Test, v),
+			Then: rewriteArithIdent(t.Then, v),
+			Else: rewriteArithIdent(t.Else, v),
+		}
+	case *ArithAssign:
+		return &ArithAssign{Var: t.Var, Op: t.Op, Rhs: rewriteArithIdent(t.Rhs, v)}
+	}
+	return a
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // A1 JSON emit (mirror shir_json.rs)
 // ─────────────────────────────────────────────────────────────────────
 
@@ -2956,6 +3308,8 @@ func arithJSON(a ArithAst) map[string]interface{} {
 		return map[string]interface{}{"type": "Num", "value": t.Val}
 	case *ArithVar:
 		return map[string]interface{}{"type": "Var", "name": t.Name}
+	case *ArithIdent:
+		return map[string]interface{}{"type": "Ident", "name": t.Name}
 	case *ArithIndex:
 		return map[string]interface{}{"type": "Index", "var": t.Var, "key": arithJSON(t.Key)}
 	case *ArithBin:
@@ -3171,6 +3525,23 @@ func shirForSource(src string) ([]byte, error) {
 	vlif := analyzeVarLifetimes(stmts)
 	vn := analyzeVarNoSpace(stmts)
 	vbe := analyzeVarBashEnv(stmts)
+	// A1 `Ident` arith reads (core request zsh-sh-go-20260813-155123):
+	// in-body arith reads of a NUMERIC/STRING-LIFTED `for` loop variable
+	// are exported as `{"type":"Ident","name":…}` — mirror the core's
+	// gate (numeric_lift_vars + string_lift_vars + analyze_loop_var_refs)
+	// so every backend's output is unchanged (Ident renders like a lifted
+	// Var read everywhere).
+	numeric := numericLiftVars(stmts)
+	strs := stringLiftVars(stmts, numeric)
+	num2, str2 := analyzeLoopVarRefs(stmts, numeric, strs)
+	lifted := map[string]bool{}
+	for n := range num2 {
+		lifted[n] = true
+	}
+	for n := range str2 {
+		lifted[n] = true
+	}
+	rewriteLoopVarIdents(stmts, lifted)
 	computeProvablyRuns(stmts)
 	return programJSON(stmts, vt, vl, vc, vlif, vn, vbe), nil
 }

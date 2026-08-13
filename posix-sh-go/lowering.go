@@ -922,6 +922,11 @@ func containsIdent(s, varName string) bool {
 type ArithAst interface{}
 type ArithNum struct{ Val int64 }
 type ArithVar struct{ Name string }
+// ArithIdent — A1 export-only node: an arith read of a NUMERIC/STRING-
+// LIFTED `for` loop variable inside its own loop body (mirror
+// shir_json.rs rewrite_loop_var_idents; core request
+// zsh-sh-go-20260813-155123). Emitted as `{"type":"Ident","name":…}`.
+type ArithIdent struct{ Name string }
 type ArithIndex struct {
 	Var string
 	Key ArithAst
