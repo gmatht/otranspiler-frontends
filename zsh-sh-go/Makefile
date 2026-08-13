@@ -43,25 +43,27 @@ gen:
 	@exit 1
 
 build:
-	# Atomic publish: build to a PID-unique temp file, then rename over the
-	# target, so a CONCURRENT reader (the triage sweep's emit_a1 runs
-	# ./zsh-sh-go while this gate rebuilds it) never observes the binary
-	# missing or half-written mid-build. The old `rm -f` + in-place
-	# `go build -o` left a window with NO binary, which the 2026-08-14
-	# 01:45:44 triage sweep hit mid-rebuild and mis-recorded as
-	# FAIL-FRONTEND-EMIT (frontend refused) for t16-t20.
-	# The temp name is PID-unique ($$) so two CONCURRENT `make build`s
-	# (worker gate + anything else) can't interleave writes to the same
-	# temp and publish a partial binary — a fixed-name temp did exactly
-	# that on 2026-08-14. mv(1) is atomic: any concurrent exec sees either
-	# the previous complete binary or the new one.
-	# Self-healing (a stale/corrupt OUTPUT used to make `go build -o` refuse
-	# to overwrite it and wedge the gate) now guards the temp file only, so
-	# a corrupt published binary can never block a rebuild either.
-	rm -f .zsh-sh-go.tmp.$$
-	$(GO) build -o .zsh-sh-go.tmp.$$ ./cmd/zsh-sh-go \
-	  && mv -f .zsh-sh-go.tmp.$$ zsh-sh-go \
-	  || { rm -f .zsh-sh-go.tmp.$$; exit 1; }
+	# Atomic + conditional rebuild (concurrent-gate safety; see cpp-sh-go):
+	# rebuild ONLY when the sources changed, via a PID-unique temp file +
+	# rename. The old `rm -f; go build -o` left a window with NO binary —
+	# the 2026-08-14 01:45:44 triage sweep hit it mid-rebuild and
+	# mis-recorded t16-t20 as FAIL-FRONTEND-EMIT (frontend refused).
+	# A fixed-name temp is NOT enough: two concurrent `make build`s
+	# interleave writes to it and publish a partial binary (observed
+	# 2026-08-14), so the temp is PID-unique. Note the FOUR-dollar temp:
+	# make collapses dollar-pairs, so four reach the shell as two (the
+	# shell PID); two would reach it as one literal dollar and collide
+	# again. An up-to-date binary is never touched; concurrent
+	# builds are atomic (last COMPLETE one wins); mv(1) means any
+	# concurrent reader (triage sweep, coverage step) sees either the
+	# previous complete binary or the new one.
+	@if [ ! -x zsh-sh-go ] || find cmd *.go go.mod -newer zsh-sh-go 2>/dev/null | grep -q .; then \
+	  echo "  building zsh-sh-go…"; \
+	  rm -f .zsh-sh-go.tmp.$$$$; \
+	  $(GO) build -o .zsh-sh-go.tmp.$$$$ ./cmd/zsh-sh-go \
+	    && mv -f .zsh-sh-go.tmp.$$$$ zsh-sh-go \
+	    || { rm -f .zsh-sh-go.tmp.$$$$; exit 1; }; \
+	fi
 
 # PLAN v12: zsh arrays are 1-based but the A1 contract is canonical
 # 0-based — the frontend normalizes subscripts at emit, which the core's
