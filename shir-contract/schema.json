@@ -77,6 +77,15 @@
     "else": "stmt[]"
    }
   },
+  "Try": {
+   "fields": {
+    "type": "str",
+    "body": "stmt[]",
+    "excepts": "try_except[]",
+    "else": "stmt[]",
+    "finally": "stmt[]"
+   }
+  },
   "For": {
    "fields": {
     "type": "str",
@@ -513,6 +522,14 @@
   "elsif": {
    "fields": {
     "cond": "expr",
+    "body": "stmt[]"
+   }
+  },
+  "try_except": {
+   "fields": {
+    "type": "str",
+    "match": "expr|null",
+    "as": "str|null",
     "body": "stmt[]"
    }
   },
