@@ -1,6 +1,7 @@
 package ps1lib
 
 import (
+	"bytes"
 	"fmt"
 	"strings"
 
@@ -654,6 +655,8 @@ func lowerStringLiteral(n *sitter.Node, src []byte) (any, error) {
 	switch inner.Type() {
 	case "expandable_string_literal":
 		return lowerExpandableString(inner, src)
+	case "expandable_here_string_literal":
+		return lowerExpandableHereString(inner, src)
 	case "verbatim_string_characters":
 		// 'single-quoted' — a literal string, no interpolation. The core
 		// emits bash '…' with style DoubleQuoted; match it byte-for-byte.
@@ -726,6 +729,91 @@ func lowerExpandableStringParts(n *sitter.Node, src []byte) ([]any, error) {
 	end := n.EndByte()
 	if end > pos && src[end-1] == '"' {
 		end-- // drop the closing quote
+	}
+	if txt := string(src[pos:end]); txt != "" {
+		parts = append(parts, litPart(txt))
+	}
+	return parts, nil
+}
+
+// lowerExpandableHereString — the @"…"@ body of a string_literal: the
+// expandable here-string, the multi-line twin of the t01 double-quoted
+// string (the grammar's string_literal admits both bodies). Live pwsh
+// 7.6.4 semantics (verified 2026-08-13): the opening @" must sit at
+// END of line — the content starts AFTER the first newline following
+// it — and the newline(s) immediately before the closing "@ are NOT
+// part of the string (the closing delimiter is `(\r?\n)+"@`, so the
+// content ends before that final newline run). Variables interpolate
+// exactly like a double-quoted string — an UNSET variable reads $null
+// and interpolates as EMPTY text (verified: `Write-Output @"a $foo
+// b"@` with foo unset prints "a  b"), CONSISTENT with the A1 store's
+// "" (the t09 argument-string edge, unlike the bare-$null t02 print
+// edge) — so the lowering is the SAME Interpolate fold as
+// lowerExpandableStringParts, byte-identical to the core's bash `echo
+// "a $foo b\nc"` emission. Backtick escape_character text REFUSES:
+// pwsh processes `x escapes inside an expandable here-string
+// (backtick-n is a real newline — verified), but the vendored runtime
+// does not materialize them as named children, so the byte-span
+// reconstruction would emit them as literal text — a silent
+// miscompile (the t05 backtick precedent: refuse > guess).
+func lowerExpandableHereString(n *sitter.Node, src []byte) (any, error) {
+	parts, err := lowerExpandableHereStringParts(n, src)
+	if err != nil {
+		return nil, err
+	}
+	return interpExpr(parts), nil
+}
+
+// lowerExpandableHereStringParts — the interior of a @"…"@ here-string
+// as Interpolate parts (lit text + getVar exprs), reconstructed from
+// the byte spans between the named children — the same vendored-runtime
+// quirk as lowerExpandableStringParts (the interior text tokens are
+// not materialized as children; only the interpolated variables are).
+// The only differences from the double-quoted path are the content
+// boundaries: the opening newline after @" is skipped and the final
+// newline run before "@ is excluded.
+func lowerExpandableHereStringParts(n *sitter.Node, src []byte) ([]any, error) {
+	// opening: `@"` + optional spaces + the FIRST newline — the content
+	// starts after it (a here-string header must end its line).
+	pos := n.StartByte() + 2 // skip `@"`
+	for pos < n.EndByte() && (src[pos] == ' ' || src[pos] == '\t') {
+		pos++
+	}
+	if pos < n.EndByte() && src[pos] == '\r' {
+		pos++
+	}
+	if pos < n.EndByte() && src[pos] == '\n' {
+		pos++
+	} else {
+		return nil, refuse(n, src, "here-string without a newline after the opening @\"")
+	}
+	// closing: `(\r?\n)+"@` — the content ends before the final newline
+	// run preceding the closing `"@`.
+	end := n.EndByte() - 2 // skip the final `"@`
+	for end > pos && (src[end-1] == '\n' || src[end-1] == '\r') {
+		end--
+	}
+	// backtick escapes: pwsh processes `x inside an expandable
+	// here-string (verified: backtick-n prints a real newline), but the
+	// byte-span reconstruction would emit them as literal text — a
+	// silent miscompile. Refuse loudly (refuse > guess), the t05
+	// precedent.
+	if bytes.Contains(src[pos:end], []byte{'`'}) {
+		return nil, refuse(n, src, "backtick escape_character inside a here-string (pwsh processes `x; the byte-span reconstruction would emit it literally)")
+	}
+	var parts []any
+	for i := 0; i < int(n.NamedChildCount()); i++ {
+		ch := n.NamedChild(i)
+		switch ch.Type() {
+		case "variable":
+			if txt := string(src[pos:ch.StartByte()]); txt != "" {
+				parts = append(parts, litPart(txt))
+			}
+			parts = append(parts, exprPart(getVarCall(variableName(ch, src))))
+			pos = ch.EndByte()
+		default:
+			return nil, refuse(ch, src, "%q inside a here-string", ch.Type())
+		}
 	}
 	if txt := string(src[pos:end]); txt != "" {
 		parts = append(parts, litPart(txt))

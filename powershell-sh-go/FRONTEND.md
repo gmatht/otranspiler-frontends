@@ -129,6 +129,29 @@ line) — now the worker's fixes, not records):
   both sides (the A1 store reads "" for foo: the tail makes the
   argument an expandable STRING, not the bare-$null t02 print edge,
   so the unset-variable oracle is CONSISTENT).
+- t10_here_string: the expandable here-string (@"…"@ — the grammar's
+  expandable_here_string_literal, a string_literal body): the
+  multi-line twin of the t01 double-quoted string. Live pwsh 7.6.4
+  (verified 2026-08-13): the opening @" must END its line — the
+  content starts after the first newline — and the newline(s) right
+  before the closing "@ are NOT part of the string (the closing
+  delimiter is `(\r?\n)+"@`). Variables interpolate exactly like a
+  double-quoted string — an UNSET variable reads $null and
+  interpolates as EMPTY text (verified: prints "a  b"), CONSISTENT
+  with the A1 store's "" (the t09 argument-string edge, unlike the
+  bare-$null t02 print edge) — so the body lowers through the same
+  byte-span reconstruction as the t01 strings (Interpolate with
+  lit/expr parts, byte-identical to the core's `echo "a $foo b\nc"`
+  emission), with the here-string boundary math (the open/close
+  newline runs) in place of the quote stripping. Backtick
+  escape_character text REFUSES — pinned in
+  `testdata_refuse/t06_here_string_backtick.ps1`: pwsh processes `x
+  escapes inside @"…"@ (backtick-n is a real newline — verified), but
+  the vendored runtime does not materialize them as named children,
+  so the byte-span reconstruction would emit them literally — a
+  silent miscompile (the t05 backtick precedent: refuse > guess). The
+  literal here-string (@'…'@ — verbatim_here_string_characters) is
+  the sibling of a later rung, still a loud REFUSE.
 - Comments, comment-only files (empty Program), and the REFUSE table
   (refuse.go): anything outside the subset errors loudly — including
   .NET member access (`$x.Length`), assignment, `|` pipelines, unknown
