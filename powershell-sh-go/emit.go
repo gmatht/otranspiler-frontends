@@ -85,6 +85,20 @@ func arrayExpr(elements []any) any {
 	return map[string]any{"type": "Array", "elements": elements}
 }
 
+// whileStmt — the A1 While statement (the t06 do-while duplication:
+// `do { B } while (C)` → `B; while (C) { B }`). "runs" mirrors the
+// core's stmt_provably_runs verdict: false unless the cond is provably
+// true (a getVar cond is never provable — the core emits the same
+// false for `while true; do …; done`).
+func whileStmt(cond any, body []any) any {
+	return map[string]any{
+		"type": "While",
+		"cond": cond,
+		"body": body,
+		"runs": false,
+	}
+}
+
 // getVarCall — $name reads lower to getVar("name") (the core's var-read
 // channel; Emulable per the A4 namespace spec).
 func getVarCall(name string) any {

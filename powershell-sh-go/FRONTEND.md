@@ -4,7 +4,7 @@ PowerShell (.ps1) source -> A1 shIR JSON — **the bat sibling**
 (workspace-side dir; no git worktree; the object pipeline is a stated
 TEXT approximation for v1; see PLAN_POWERSHELL_F.md).
 
-**Status: WORKER-IMPLEMENTED, t01 landed (gate green).** The parser is
+**Status: WORKER-IMPLEMENTED, t06 landed (gate green).** The parser is
 wharflab/tree-sitter-powershell (vendored under
 `grammars/tree-sitter-powershell/`, loaded via smacker/go-tree-sitter
 cgo) — the plan's choice, empirically verified. The emitter produces A1
@@ -66,13 +66,31 @@ line) — now the worker's fixes, not records):
   guess). `"a""b"` is NOT this node (the doubled quote is an
   escaped quote inside ONE string); backtick escape_character and
   `$(…)` pieces inside a concatenated argument still REFUSE.
+- t06_do_statement: the do_statement node — `do { … } while
+  (cond)` (do + statement_block + `while` keyword + `(`
+  while_condition `)`). Live pwsh 7.6.4: the body runs ONCE, then the
+  condition re-checks; the plan's lowering is "the do-while
+  duplication" (PLAN_POWERSHELL_F.md §1): `do { B } while (C)` →
+  `B; while (C) { B }` — the body once, then the While re-check,
+  byte-identical to the core's While statement shape (the A1 DoWhile
+  node is Perl-only in the ESTree renderer — "Perl-only IR statement
+  reached the ESTree renderer" — so the duplication keeps the
+  construct on the renderable node; the equivalence is exact). The
+  condition is a bare variable read, pinned for an UNSET variable:
+  pwsh reads $null (FALSY) and the A1 store reads "" (FALSY) — the
+  condition-position null edge is CONSISTENT (unlike the t02 PRINT
+  edge, which stays outside the subset). Truthy pwsh automatics in a
+  condition (`$true`, `$PID`, …) DIVERGE (pwsh truthy → infinite
+  loop vs A1 "" → falsy) — `$true` REFUSES, the `until` keyword form
+  of the same node REFUSES (unpinned; needs the A1 Not-cond wrap),
+  both pinned in `testdata_refuse/`.
 - Comments, comment-only files (empty Program), and the REFUSE table
   (refuse.go): anything outside the subset errors loudly — including
   .NET member access (`$x.Length`), assignment, `|` pipelines, unknown
   commands, named parameters (all pinned in `testdata_refuse/`).
 
 The v1 subset and the refusal table are PLAN_POWERSHELL_F.md. The next
-construct (t06_var: assignment + `$var` interpolation) lands on the
+construct (t07_var: assignment + `$var` interpolation) lands on the
 next RED pin; the string-interpolation machinery it needs is already
 in place (lower.go reconstructs string parts from byte spans — the
 smacker runtime does not materialize the interior text tokens of

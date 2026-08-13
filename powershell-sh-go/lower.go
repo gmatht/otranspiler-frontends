@@ -27,6 +27,10 @@ import (
 //	            variable
 //	            concatenated_command_argument     (adjacent pieces — t05)
 //	      pipeline_chain_tail*    (REFUSE: `|` pipe — t08 rung)
+//	    do_statement                (t06 — the do-while duplication)
+//	      statement_block → statement_list → … (the body, lowered once)
+//	      `while` / `until` keyword, `(` while_condition `)`
+//	        while_condition → pipeline → pipeline_chain → variable
 //	    assignment_expression / if_statement / …  (REFUSE until pinned)
 
 // lowerProgram — walk the CST root and lower the v1 subset to A1
@@ -57,6 +61,16 @@ func lowerStatementList(n *sitter.Node, src []byte) ([]any, error) {
 	var stmts []any
 	for i := 0; i < int(n.NamedChildCount()); i++ {
 		ch := n.NamedChild(i)
+		if ch.Type() == "do_statement" {
+			// the do-while duplication expands to SEVERAL statements
+			// (body once + the While re-check) — flatten into the list
+			ds, err := lowerDoStatement(ch, src)
+			if err != nil {
+				return nil, err
+			}
+			stmts = append(stmts, ds...)
+			continue
+		}
 		s, err := lowerStatement(ch, src)
 		if err != nil {
 			return nil, err
@@ -73,9 +87,133 @@ func lowerStatement(n *sitter.Node, src []byte) (any, error) {
 	switch n.Type() {
 	case "pipeline":
 		return lowerPipeline(n, src)
+	case "do_statement":
+		// NOTE: handled in lowerStatementList (it expands to several
+		// statements — the do-while duplication); reaching this switch
+		// means a new call site appeared — refuse loudly rather than
+		// box the multi-statement slice as one element.
+		return nil, refuse(n, src, "do_statement outside a statement_list")
 	default:
 		return nil, refuse(n, src, "statement type %q", n.Type())
 	}
+}
+
+// lowerDoStatement — the do_statement node: `do { … } while (cond)`. The
+// grammar's shape is `do` + statement_block + a `while`/`until` keyword
+// + `(` while_condition `)`. Live pwsh 7.6.4 semantics: the body runs
+// ONCE, then the condition is re-checked. The plan's lowering is "the
+// do-while duplication" (PLAN_POWERSHELL_F.md §1): `do { B } while (C)`
+// ≡ `B; while (C) { B }` — the body executes once either way, and the
+// emission stays on the A1 While node the ESTree renderer supports (the
+// A1 DoWhile node is Perl-only there — the renderer panics, "Perl-only
+// IR statement reached the ESTree renderer"; the duplication is the
+// plan's chosen shape, not a workaround). The `until` keyword form
+// (`do { … } until (cond)`, same node) REFUSES: unpinned — its
+// lowering would need the A1 Not-cond wrap the core uses for bash
+// `until` (a later rung).
+func lowerDoStatement(n *sitter.Node, src []byte) ([]any, error) {
+	for i := 0; i < int(n.ChildCount()); i++ {
+		if n.Child(i).Type() == "until" {
+			return nil, refuse(n, src, "do/until (the t06 pin is the do/while form; `until` unpinned)")
+		}
+	}
+	var body []any
+	var cond any
+	for i := 0; i < int(n.NamedChildCount()); i++ {
+		ch := n.NamedChild(i)
+		switch ch.Type() {
+		case "statement_block":
+			// the body lowers through the same statement_list path as
+			// top-level statements
+			if bl := ch.ChildByFieldName("statement_list"); bl != nil {
+				b, err := lowerStatementList(bl, src)
+				if err != nil {
+					return nil, err
+				}
+				body = b
+			}
+		case "while_condition":
+			c, err := lowerCondition(ch, src)
+			if err != nil {
+				return nil, err
+			}
+			cond = c
+		default:
+			return nil, refuse(ch, src, "do_statement part %q", ch.Type())
+		}
+	}
+	if cond == nil {
+		return nil, refuse(n, src, "do_statement without a condition")
+	}
+	// the do-while duplication: the body once, then the while re-check
+	stmts := append([]any{}, body...)
+	stmts = append(stmts, whileStmt(cond, body))
+	return stmts, nil
+}
+
+// lowerCondition — a `(…)` loop condition (the while_condition node: a
+// pipeline). The t06 subset pins ONLY a bare variable read (`while
+// ($x)`). Verified against live pwsh 7.6.4: an UNSET variable reads
+// $null there (FALSY) and "" from the A1 store (FALSY) — the
+// condition-position null edge is CONSISTENT (unlike the t02 PRINT
+// edge, where `Write-Output $x` prints nothing vs the A1 echo's blank
+// line — that print edge stays outside the subset). Truthy pwsh
+// automatic variables (`$true`, `$PID`, …) DIVERGE — pwsh truthy
+// (infinite loop) vs the A1 store read "" (falsy) — so `$true` REFUSES
+// explicitly, and the general automatic-variable / env-var classes stay
+// outside the v1 text-closed subset (refuse > guess).
+func lowerCondition(n *sitter.Node, src []byte) (any, error) {
+	var pipeline *sitter.Node
+	for i := 0; i < int(n.NamedChildCount()); i++ {
+		ch := n.NamedChild(i)
+		switch ch.Type() {
+		case "pipeline":
+			if pipeline == nil {
+				pipeline = ch
+			}
+		default:
+			return nil, refuse(ch, src, "condition %q (the t06 subset pins a bare variable read)", ch.Type())
+		}
+	}
+	if pipeline == nil {
+		return nil, refuse(n, src, "condition without a pipeline")
+	}
+	var chain *sitter.Node
+	for i := 0; i < int(pipeline.NamedChildCount()); i++ {
+		ch := pipeline.NamedChild(i)
+		switch ch.Type() {
+		case "pipeline_chain":
+			if chain == nil {
+				chain = ch
+			}
+		case "pipeline_chain_tail":
+			return nil, refuse(ch, src, "`|` inside a loop condition")
+		default:
+			return nil, refuse(ch, src, "condition %q", ch.Type())
+		}
+	}
+	if chain == nil {
+		return nil, refuse(pipeline, src, "condition without a chain")
+	}
+	if chain.NamedChildCount() != 1 {
+		return nil, refuse(chain, src, "condition chain with %d children", chain.NamedChildCount())
+	}
+	op := chain.NamedChild(0)
+	if op.Type() != "unary_expression" {
+		return nil, refuse(op, src, "condition %q (the t06 subset pins a bare variable read)", op.Type())
+	}
+	if op.NamedChildCount() != 1 {
+		return nil, refuse(op, src, "condition unary_expression with %d children", op.NamedChildCount())
+	}
+	inner := op.NamedChild(0)
+	if inner.Type() != "variable" {
+		return nil, refuse(inner, src, "condition operand %q (the t06 subset pins a bare variable read)", inner.Type())
+	}
+	name := variableName(inner, src)
+	if name == "true" {
+		return nil, refuse(inner, src, "`$true` in a condition: pwsh loops forever (truthy automatic) while the A1 getVar read is \"\" (falsy) — the truthy-automatic divergence; the t06 subset pins unset-user-variable conditions")
+	}
+	return getVarCall(name), nil
 }
 
 // lowerPipeline — a single statement; `|` pipelines refuse until the
