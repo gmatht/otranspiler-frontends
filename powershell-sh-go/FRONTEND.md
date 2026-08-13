@@ -4,7 +4,7 @@ PowerShell (.ps1) source -> A1 shIR JSON — **the bat sibling**
 (workspace-side dir; no git worktree; the object pipeline is a stated
 TEXT approximation for v1; see PLAN_POWERSHELL_F.md).
 
-**Status: WORKER-IMPLEMENTED, t06 landed (gate green).** The parser is
+**Status: WORKER-IMPLEMENTED, t07 landed (gate green).** The parser is
 wharflab/tree-sitter-powershell (vendored under
 `grammars/tree-sitter-powershell/`, loaded via smacker/go-tree-sitter
 cgo) — the plan's choice, empirically verified. The emitter produces A1
@@ -84,16 +84,30 @@ line) — now the worker's fixes, not records):
   loop vs A1 "" → falsy) — `$true` REFUSES, the `until` keyword form
   of the same node REFUSES (unpinned; needs the A1 Not-cond wrap),
   both pinned in `testdata_refuse/`.
+- t07_if_else: the if_statement node with its else_clause tail — `if
+  (cond) { B } else { E }` (the plan's "If / else-if chain" row,
+  PLAN_POWERSHELL_F.md §1): the A1 If node, byte-identical to the
+  core's `if` emission (cond/then/elsifs/else, sorted keys, no runs
+  field). The condition is the t06 condition subset — a bare variable
+  read, shared with while/do via lowerCondPipeline (so the `$true`
+  divergence refuses the same way, pinned in
+  `testdata_refuse/t05_if_true.ps1`); the else_clause is OPTIONAL (a
+  bare `if ($c) { B }` lowers with else: []); the grammar's
+  elseif_clauses field REFUSES until its own rung (the A1 elsifs
+  slot is ready but unpinned — `testdata_refuse/t04_if_elseif.ps1`).
+  Pinned for an UNSET variable condition: pwsh $null (FALSY) and A1
+  "" (FALSY) both take the else branch — the executed-stdout oracle
+  compares the transpiled run against live pwsh (both print "no").
 - Comments, comment-only files (empty Program), and the REFUSE table
   (refuse.go): anything outside the subset errors loudly — including
   .NET member access (`$x.Length`), assignment, `|` pipelines, unknown
   commands, named parameters (all pinned in `testdata_refuse/`).
 
 The v1 subset and the refusal table are PLAN_POWERSHELL_F.md. The next
-construct (t07_var: assignment + `$var` interpolation) lands on the
-next RED pin; the string-interpolation machinery it needs is already
-in place (lower.go reconstructs string parts from byte spans — the
-smacker runtime does not materialize the interior text tokens of
+construct (assignment + `$var` interpolation, the elseif chain) lands
+on the next RED pin; the string-interpolation machinery it needs is
+already in place (lower.go reconstructs string parts from byte spans —
+the smacker runtime does not materialize the interior text tokens of
 expandable_string_literal as children, verified against the core).
 
 Scope: this dir + harness/* (shared test infra). Shared core

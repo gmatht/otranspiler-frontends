@@ -85,6 +85,27 @@ func arrayExpr(elements []any) any {
 	return map[string]any{"type": "Array", "elements": elements}
 }
 
+// ifStmt — the A1 If statement (the t07 rung: `if ($c) { B } else { E }`
+// — the plan's "If / else-if chain" row). Shape mirrors the core's
+// shir_json.rs emission exactly: cond/then/elsifs/else, no runs field.
+// Nil branches normalize to [] — the core emits empty arrays, never
+// null. The elsifs slot stays empty until the elseif rung lands.
+func ifStmt(cond any, then, els []any) any {
+	if then == nil {
+		then = []any{}
+	}
+	if els == nil {
+		els = []any{}
+	}
+	return map[string]any{
+		"type":   "If",
+		"cond":   cond,
+		"then":   then,
+		"elsifs": []any{},
+		"else":   els,
+	}
+}
+
 // whileStmt — the A1 While statement (the t06 do-while duplication:
 // `do { B } while (C)` → `B; while (C) { B }`). "runs" mirrors the
 // core's stmt_provably_runs verdict: false unless the cond is provably

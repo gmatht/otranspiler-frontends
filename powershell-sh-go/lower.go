@@ -31,7 +31,8 @@ import (
 //	      statement_block → statement_list → … (the body, lowered once)
 //	      `while` / `until` keyword, `(` while_condition `)`
 //	        while_condition → pipeline → pipeline_chain → variable
-//	    assignment_expression / if_statement / …  (REFUSE until pinned)
+//	    if_statement (t07 — then + optional else_clause; elseif_clauses REFUSES)
+//	    assignment_expression / …          (REFUSE until pinned)
 
 // lowerProgram — walk the CST root and lower the v1 subset to A1
 // statements. Comments are skipped; anything outside the subset returns
@@ -87,6 +88,8 @@ func lowerStatement(n *sitter.Node, src []byte) (any, error) {
 	switch n.Type() {
 	case "pipeline":
 		return lowerPipeline(n, src)
+	case "if_statement":
+		return lowerIfStatement(n, src)
 	case "do_statement":
 		// NOTE: handled in lowerStatementList (it expands to several
 		// statements — the do-while duplication); reaching this switch
@@ -125,13 +128,11 @@ func lowerDoStatement(n *sitter.Node, src []byte) ([]any, error) {
 		case "statement_block":
 			// the body lowers through the same statement_list path as
 			// top-level statements
-			if bl := ch.ChildByFieldName("statement_list"); bl != nil {
-				b, err := lowerStatementList(bl, src)
-				if err != nil {
-					return nil, err
-				}
-				body = b
+			b, err := lowerBlock(ch, src)
+			if err != nil {
+				return nil, err
 			}
+			body = b
 		case "while_condition":
 			c, err := lowerCondition(ch, src)
 			if err != nil {
@@ -153,15 +154,8 @@ func lowerDoStatement(n *sitter.Node, src []byte) ([]any, error) {
 
 // lowerCondition — a `(…)` loop condition (the while_condition node: a
 // pipeline). The t06 subset pins ONLY a bare variable read (`while
-// ($x)`). Verified against live pwsh 7.6.4: an UNSET variable reads
-// $null there (FALSY) and "" from the A1 store (FALSY) — the
-// condition-position null edge is CONSISTENT (unlike the t02 PRINT
-// edge, where `Write-Output $x` prints nothing vs the A1 echo's blank
-// line — that print edge stays outside the subset). Truthy pwsh
-// automatic variables (`$true`, `$PID`, …) DIVERGE — pwsh truthy
-// (infinite loop) vs the A1 store read "" (falsy) — so `$true` REFUSES
-// explicitly, and the general automatic-variable / env-var classes stay
-// outside the v1 text-closed subset (refuse > guess).
+// ($x)`); the same pipeline lowering is shared with the t07 if
+// condition (lowerCondPipeline).
 func lowerCondition(n *sitter.Node, src []byte) (any, error) {
 	var pipeline *sitter.Node
 	for i := 0; i < int(n.NamedChildCount()); i++ {
@@ -178,6 +172,21 @@ func lowerCondition(n *sitter.Node, src []byte) (any, error) {
 	if pipeline == nil {
 		return nil, refuse(n, src, "condition without a pipeline")
 	}
+	return lowerCondPipeline(pipeline, src)
+}
+
+// lowerCondPipeline — a condition pipeline lowered as a bare variable
+// read (the t06 subset, shared by the while/do conditions and the t07
+// if condition). Verified against live pwsh 7.6.4: an UNSET variable
+// reads $null there (FALSY) and "" from the A1 store (FALSY) — the
+// condition-position null edge is CONSISTENT (unlike the t02 PRINT
+// edge, where `Write-Output $x` prints nothing vs the A1 echo's blank
+// line — that print edge stays outside the subset). Truthy pwsh
+// automatic variables (`$true`, `$PID`, …) DIVERGE — pwsh truthy vs
+// the A1 store read "" (falsy) — so `$true` REFUSES explicitly, and
+// the general automatic-variable / env-var classes stay outside the v1
+// text-closed subset (refuse > guess).
+func lowerCondPipeline(pipeline *sitter.Node, src []byte) (any, error) {
 	var chain *sitter.Node
 	for i := 0; i < int(pipeline.NamedChildCount()); i++ {
 		ch := pipeline.NamedChild(i)
@@ -187,7 +196,7 @@ func lowerCondition(n *sitter.Node, src []byte) (any, error) {
 				chain = ch
 			}
 		case "pipeline_chain_tail":
-			return nil, refuse(ch, src, "`|` inside a loop condition")
+			return nil, refuse(ch, src, "`|` inside a condition")
 		default:
 			return nil, refuse(ch, src, "condition %q", ch.Type())
 		}
@@ -211,9 +220,97 @@ func lowerCondition(n *sitter.Node, src []byte) (any, error) {
 	}
 	name := variableName(inner, src)
 	if name == "true" {
-		return nil, refuse(inner, src, "`$true` in a condition: pwsh loops forever (truthy automatic) while the A1 getVar read is \"\" (falsy) — the truthy-automatic divergence; the t06 subset pins unset-user-variable conditions")
+		return nil, refuse(inner, src, "`$true` in a condition: pwsh reads a TRUTHY automatic while the A1 getVar read is \"\" (falsy) — the branches DIVERGE (a while condition would loop forever, an if condition would take the wrong branch); the t06/t07 subset pins unset-user-variable conditions")
 	}
 	return getVarCall(name), nil
+}
+
+// lowerBlock — a statement_block's statement_list lowered as a list
+// (the t06 do-body and the t07 if/else bodies share this path). An
+// empty block (`{ }`) has NO statement_list child in this grammar —
+// the t06 do-body path treated that as an empty body (no statements,
+// no output); keep the same reading here (an empty list is not a
+// guess, and the A1 accepts empty arrays).
+func lowerBlock(n *sitter.Node, src []byte) ([]any, error) {
+	if bl := n.ChildByFieldName("statement_list"); bl != nil {
+		return lowerStatementList(bl, src)
+	}
+	return []any{}, nil
+}
+
+// lowerIfStatement — the if_statement node: `if` `(` condition `)`
+// statement_block [elseif_clauses] [else_clause]. The t07 rung lands
+// the else_clause tail: `if ($c) { B } else { E }` lowers to the A1 If
+// node (cond/then/elsifs/else — the plan's "If / else-if chain" row,
+// PLAN_POWERSHELL_F.md §1; byte-identical to the core's `if`
+// emission). The condition is the t06 condition subset (a bare
+// variable read — lowerCondPipeline, so the `$true` divergence refuses
+// the same way). The else_clause is OPTIONAL: a bare `if ($c) { B }`
+// lowers with else: [] (the core's shape for an if without an else
+// branch). The elseif_clauses field REFUSES — the elseif chain is a
+// separate rung (the A1 elsifs slot is ready but unpinned; refuse >
+// guess).
+func lowerIfStatement(n *sitter.Node, src []byte) (any, error) {
+	var cond any
+	var then []any
+	var els []any
+	gotCond, gotThen := false, false
+	for i := 0; i < int(n.NamedChildCount()); i++ {
+		ch := n.NamedChild(i)
+		switch ch.Type() {
+		case "pipeline":
+			// the `condition` field: `if (…)`
+			if gotCond {
+				return nil, refuse(ch, src, "if_statement with multiple conditions")
+			}
+			c, err := lowerCondPipeline(ch, src)
+			if err != nil {
+				return nil, err
+			}
+			cond, gotCond = c, true
+		case "statement_block":
+			// the then-branch body
+			if gotThen {
+				return nil, refuse(ch, src, "if_statement with multiple bodies")
+			}
+			b, err := lowerBlock(ch, src)
+			if err != nil {
+				return nil, err
+			}
+			then, gotThen = b, true
+		case "elseif_clauses":
+			return nil, refuse(ch, src, "elseif clauses (the elseif chain is a separate rung — this rung pins the else_clause; the A1 elsifs slot is ready)")
+		case "else_clause":
+			// the `else` tail: else keyword (anonymous) + statement_block
+			var block *sitter.Node
+			for j := 0; j < int(ch.NamedChildCount()); j++ {
+				ec := ch.NamedChild(j)
+				switch ec.Type() {
+				case "statement_block":
+					block = ec
+				default:
+					return nil, refuse(ec, src, "else_clause part %q", ec.Type())
+				}
+			}
+			if block == nil {
+				return nil, refuse(ch, src, "else_clause without a body")
+			}
+			b, err := lowerBlock(block, src)
+			if err != nil {
+				return nil, err
+			}
+			els = b
+		default:
+			return nil, refuse(ch, src, "if_statement part %q", ch.Type())
+		}
+	}
+	if !gotCond {
+		return nil, refuse(n, src, "if_statement without a condition")
+	}
+	if !gotThen {
+		return nil, refuse(n, src, "if_statement without a body")
+	}
+	return ifStmt(cond, then, els), nil
 }
 
 // lowerPipeline — a single statement; `|` pipelines refuse until the

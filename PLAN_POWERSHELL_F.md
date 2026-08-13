@@ -1,10 +1,36 @@
 # PLAN_POWERSHELL_F — a PowerShell frontend on the bat precedent
 
-**Status: IN PROGRESS — t01 landed (gate green, 2026-08-12).** The
+**Status: IN PROGRESS — t06 landed (gate green, 2026-08-13).** The
 proposal is implemented as described; revision history below.
 
 ## 0. Revision history
 
+- 2026-08-13 (t07_if_else, gate green): the if_statement node with
+  its else_clause tail lands — `if ($c) { B } else { E }` lowers to
+  the A1 If node (cond/then/elsifs/else, byte-identical to the core's
+  `if` emission; the else_clause is optional, a bare if lowers with
+  else: []). The condition is the t06 condition subset (a bare
+  variable read — lowerCondPipeline is now shared with while/do; the
+  `$true` divergence refuses the same way, pinned
+  `testdata_refuse/t05_if_true.ps1`). The grammar's elseif_clauses
+  field REFUSES until its own rung (the A1 elsifs slot is ready but
+  unpinned — `testdata_refuse/t04_if_elseif.ps1`); the while_statement
+  node remains a separate uncovered construct.
+- 2026-08-13 (t06_do_statement, gate green): the do_statement node
+  (`do { … } while (cond)`) lands via the plan's "do-while
+  duplication" — `do { B } while (C)` lowers to `B; while (C) { B }`
+  (body once + the While re-check, byte-identical to the core's While
+  statement shape), because the A1 DoWhile node is Perl-only in the
+  ESTree renderer ("Perl-only IR statement reached the ESTree
+  renderer") and the duplication is the exact-equivalent renderable
+  form. The condition is pinned as a bare variable read of an UNSET
+  variable (pwsh $null FALSY vs A1 "" FALSY — the condition-position
+  null edge is consistent, unlike the t02 print edge); the truthy-
+  automatic class (`$true` …) diverges and REFUSES, the `until`
+  keyword form of the same node REFUSES (unpinned — needs the A1
+  Not-cond wrap the core uses for bash `until`); both refusal pins
+  live in `testdata_refuse/`. The plain `while_statement` node
+  (`while ($c) {}`) remains a separate uncovered construct.
 - 2026-08-13 (live pwsh oracle + t02/t03 fixes, gate green): pwsh
   7.6.4 is installed and the harness flips powershell to a LIVE native
   oracle (`native_limits_powershell` emptied; direct snap binary
