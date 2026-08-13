@@ -192,7 +192,8 @@
    "fields": {
     "type": "str",
     "name": "str",
-    "body": "stmt[]"
+    "body": "stmt[]",
+    "named_blocks": "map[str, stmt[]]"
    }
   },
   "Subshell": {
