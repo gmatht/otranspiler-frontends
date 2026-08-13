@@ -43,11 +43,25 @@ gen:
 	@exit 1
 
 build:
-	# self-healing: a stale/corrupt output (e.g. an interrupted build leaves
-	# a non-object file) makes `go build -o` refuse to overwrite it and the
-	# gate wedges. Drop it first; the fresh binary is always rebuilt.
-	rm -f zsh-sh-go
-	$(GO) build -o zsh-sh-go ./cmd/zsh-sh-go
+	# Atomic publish: build to a PID-unique temp file, then rename over the
+	# target, so a CONCURRENT reader (the triage sweep's emit_a1 runs
+	# ./zsh-sh-go while this gate rebuilds it) never observes the binary
+	# missing or half-written mid-build. The old `rm -f` + in-place
+	# `go build -o` left a window with NO binary, which the 2026-08-14
+	# 01:45:44 triage sweep hit mid-rebuild and mis-recorded as
+	# FAIL-FRONTEND-EMIT (frontend refused) for t16-t20.
+	# The temp name is PID-unique ($$) so two CONCURRENT `make build`s
+	# (worker gate + anything else) can't interleave writes to the same
+	# temp and publish a partial binary — a fixed-name temp did exactly
+	# that on 2026-08-14. mv(1) is atomic: any concurrent exec sees either
+	# the previous complete binary or the new one.
+	# Self-healing (a stale/corrupt OUTPUT used to make `go build -o` refuse
+	# to overwrite it and wedge the gate) now guards the temp file only, so
+	# a corrupt published binary can never block a rebuild either.
+	rm -f .zsh-sh-go.tmp.$$
+	$(GO) build -o .zsh-sh-go.tmp.$$ ./cmd/zsh-sh-go \
+	  && mv -f .zsh-sh-go.tmp.$$ zsh-sh-go \
+	  || { rm -f .zsh-sh-go.tmp.$$; exit 1; }
 
 # PLAN v12: zsh arrays are 1-based but the A1 contract is canonical
 # 0-based — the frontend normalizes subscripts at emit, which the core's
@@ -89,5 +103,5 @@ worker: test
 	@echo "zsh-sh-go worker gate: ingress acceptance + executed-stdout passed"
 
 clean:
-	rm -f zsh-sh-go /tmp/*.mine /tmp/*.core
+	rm -f zsh-sh-go .zsh-sh-go.tmp.* /tmp/*.mine /tmp/*.core
 	rm -rf $(GATE_TMP)
