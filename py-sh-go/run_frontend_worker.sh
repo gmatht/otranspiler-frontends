@@ -13,6 +13,9 @@ set -euo pipefail
 cd "$(dirname "$0")"
 WORKSPACE="$(cd ../.. && pwd)"
 LOG="$WORKSPACE/loop-frontend-py-sh-go.log"
+# Worker cgroup enrollment (harness/WorkerPool.pm): this frontend worker
+# runs inside sh2workers; best-effort (unprivileged WSL -> cooperative).
+perl "$WORKSPACE/harness/WorkerPool.pm" --enter-worker $$ >> "$LOG" 2>&1 || true
 echo "[$(date +%FT%T)] frontend py-sh-go worker started (pid=$$)" >> "$LOG"
 fail_count=0
 while true; do
