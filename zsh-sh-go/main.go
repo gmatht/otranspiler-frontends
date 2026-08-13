@@ -2182,10 +2182,14 @@ func (p *Parser) parseWhile(until bool) (*Command, error) {
 	return &Command{Kind: "while", Cond: cond, Until: until, Body: body}, nil
 }
 
-// parseFor — `for var [in words]; do body; done`
+// parseFor — `for var [in words]; do body; done` and the C-style
+// `for (( init; cond; step )); do body; done` (zsh/bash C-style for).
 func (p *Parser) parseFor() (*Command, error) {
 	p.pos += 3 // "for"
 	p.skipInlineWSAndComments()
+	if p.starts("((") {
+		return p.parseCStyleFor()
+	}
 	if !isIdentStart(p.peek()) {
 		return nil, fmt.Errorf("for: expected variable at %d", p.pos)
 	}
@@ -2437,6 +2441,51 @@ func (p *Parser) parseBracketTest(dbl bool) (*Command, error) {
 		p.pos++
 	}
 	return nil, fmt.Errorf("test: missing closing bracket")
+}
+
+// parseCStyleFor — `for (( init; cond; step )); do body; done` (the
+// core's Command::CStyleFor). The header is captured RAW between the
+// parens (the core reconstructs arith_content from token texts with the
+// original spacing preserved): the ForInit lowering trims the ';'-split
+// parts, the opaque cstyleFor fallback emits the raw text verbatim.
+// Depth-counted like parseArithEval so nested parens/`$(( ))` survive.
+func (p *Parser) parseCStyleFor() (*Command, error) {
+	p.pos += 2 // ((
+	start := p.pos
+	depth := 2
+	for !p.eof() {
+		c := p.peek()
+		if c == '(' {
+			depth++
+		} else if c == ')' {
+			depth--
+			if depth == 0 {
+				content := p.src[start : p.pos-1]
+				p.pos++
+				p.skipInlineWSAndComments()
+				if p.peek() == ';' || isNL(p.peek()) {
+					p.pos++
+				}
+				p.skipWSAndComments()
+				if !p.atKeyword("do") {
+					return nil, fmt.Errorf("for: expected do at %d", p.pos)
+				}
+				p.pos += 2
+				p.skipWSAndComments()
+				body, err := p.parseCommandListUntil([]string{"done"})
+				if err != nil {
+					return nil, err
+				}
+				if !p.atKeyword("done") {
+					return nil, fmt.Errorf("for: expected done at %d", p.pos)
+				}
+				p.pos += 4
+				return &Command{Kind: "cfor", ArithRaw: content, ForBody: body}, nil
+			}
+		}
+		p.pos++
+	}
+	return nil, fmt.Errorf("for: missing ))")
 }
 
 // parseArithEval — `(( expr ))` → exec let with the raw expression.

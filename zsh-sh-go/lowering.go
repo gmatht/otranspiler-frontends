@@ -64,6 +64,17 @@ type ForS struct {
 	Iter Expr
 	Body []Stmt
 }
+
+// ForInitS — the rich A1 C-style for node (`for (( init; cond; step ))`):
+// init/step are the lowered arith-assignment stmts (Assign{Arith}), cond
+// the exec-let call (or Int(1) when empty), body the do-block. Mirrors
+// the core's IrStmt::ForInit (shir.rs ast_to_ir CStyleFor arm).
+type ForInitS struct {
+	Init []Stmt
+	Cond Expr
+	Step []Stmt
+	Body []Stmt
+}
 type RedirectS struct {
 	Inner     []Stmt
 	Redirects []RedirectIR
@@ -2324,6 +2335,8 @@ func stmtForCommand(cmd *Command) Stmt {
 	case "for":
 		items := mergedWordsIR(cmd.Items, func(w *Word) Expr { return forItemIR(w, nil) })
 		return &ForS{Var: cmd.ForVar, Iter: &ArrayE{Elems: items}, Body: bodyStmtsOfList(cmd.ForBody)}
+	case "cfor":
+		return lowerCStyleFor(cmd)
 	case "function":
 		// mirrors Command::Function → IrStmt::Function (body flattened
 		// from the Block, like body_stmts(&Command::Block(..)))
@@ -2358,6 +2371,70 @@ func stmtForCommand(cmd *Command) Stmt {
 		return arithEvalStmt(cmd.ArithRaw)
 	}
 	return nil
+}
+
+// lowerCStyleFor — mirror the core's Command::CStyleFor lowering (shir.rs
+// ast_to_ir): the header splits exactly like the runtime's
+// parseCStyleHeader (plain ';' split, parts trimmed — parts beyond the
+// third are ignored), init/step lower through the arith-assignment
+// machinery (`((i=0))` → Assign{Arith(Assign)} and `((i++))` →
+// Assign{Arith(IncDec)} — the arith-forms shapes), the cond through the
+// shell path's existing `while (( ... ))` lowering (exec "let" with the
+// arith text). An empty cond is always-true (`for ((;;))` — Int(1)). Any
+// init/step part that does not parse as a let-able arith assignment
+// (Assign/IncDec) keeps the WHOLE construct on the opaque cstyleFor Call
+// (REFUSE > GUESS — the raw header text verbatim, spacing preserved).
+func lowerCStyleFor(cmd *Command) Stmt {
+	parts := strings.Split(cmd.ArithRaw, ";")
+	part := func(i int) string {
+		if i < len(parts) {
+			return strings.TrimSpace(parts[i])
+		}
+		return ""
+	}
+	initTxt, condTxt, stepTxt := part(0), part(1), part(2)
+	arithAssign := func(t string) (Stmt, bool) {
+		if t == "" {
+			return nil, true
+		}
+		ast, ok := parseArith(t)
+		if !ok {
+			return nil, false
+		}
+		var target string
+		switch v := ast.(type) {
+		case *ArithAssign:
+			target = v.Var
+		case *ArithIncDec:
+			target = v.Var
+		default:
+			// any other node is not a let-able form (`i*2` is not a write)
+			return nil, false
+		}
+		return &AssignS{Var: target, Expr: &ArithE{Ast: ast}}, true
+	}
+	init, initOK := arithAssign(initTxt)
+	step, stepOK := arithAssign(stepTxt)
+	body := bodyStmtsOfList(cmd.ForBody)
+	if initOK && stepOK {
+		var initL, stepL []Stmt
+		if init != nil {
+			initL = append(initL, init)
+		}
+		if step != nil {
+			stepL = append(stepL, step)
+		}
+		var cond Expr
+		if condTxt == "" {
+			// `for ((;;))` — an empty cond is always-true (the runtime's
+			// cstyleFor loop treats '' as no break).
+			cond = &IntE{Value: 1}
+		} else {
+			cond = call("exec", []Expr{st("let"), &ArrayE{Elems: []Expr{st(condTxt)}}})
+		}
+		return &ForInitS{Init: initL, Cond: cond, Step: stepL, Body: body}
+	}
+	return &ExprS{Expr: call("cstyleFor", []Expr{st(cmd.ArithRaw), &ArrowE{Body: body}})}
 }
 
 // execCallIR — mirror exec_call_ir.

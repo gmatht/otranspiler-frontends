@@ -1179,6 +1179,10 @@ func rewriteLoopVarIdents(stmts []Stmt, lifted map[string]bool) {
 			rewriteLoopVarIdents(t.Else, lifted)
 		case *WhileS:
 			rewriteLoopVarIdents(t.Body, lifted)
+		case *ForInitS:
+			rewriteLoopVarIdents(t.Init, lifted)
+			rewriteLoopVarIdents(t.Step, lifted)
+			rewriteLoopVarIdents(t.Body, lifted)
 		case *FunctionS:
 			rewriteLoopVarIdents(t.Body, lifted)
 		case *RedirectS:
@@ -1232,6 +1236,17 @@ func rewriteStmtArithIdent(st Stmt, var_ string) {
 		}
 	case *ForS:
 		rewriteExprArithIdent(t.Iter, &var_)
+		for _, s := range t.Body {
+			rewriteStmtArithIdent(s, var_)
+		}
+	case *ForInitS:
+		for _, s := range t.Init {
+			rewriteStmtArithIdent(s, var_)
+		}
+		rewriteExprArithIdent(t.Cond, &var_)
+		for _, s := range t.Step {
+			rewriteStmtArithIdent(s, var_)
+		}
 		for _, s := range t.Body {
 			rewriteStmtArithIdent(s, var_)
 		}
@@ -2080,6 +2095,17 @@ func walkStmtConst(st Stmt, acc *varConstAcc, multiRun bool) {
 		for _, s := range t.Body {
 			walkStmtConst(s, acc, true)
 		}
+	case *ForInitS:
+		for _, s := range t.Init {
+			walkStmtConst(s, acc, multiRun)
+		}
+		walkExprConst(t.Cond, acc, multiRun)
+		for _, s := range t.Step {
+			walkStmtConst(s, acc, multiRun)
+		}
+		for _, s := range t.Body {
+			walkStmtConst(s, acc, true)
+		}
 	case *WhileS:
 		walkExprConst(t.Cond, acc, multiRun)
 		for _, s := range t.Body {
@@ -2236,6 +2262,11 @@ func walkStmtLife(st Stmt, pos *int, acc *lifetimeAcc, inClosure, copied bool) {
 		// the loop var is defined at the loop head, then per iteration
 		access(t.Var, p, acc, inClosure)
 		walkExprLife(t.Iter, p, acc, inClosure)
+		walkStmtsLife(t.Body, pos, acc, inClosure, copied)
+	case *ForInitS:
+		walkStmtsLife(t.Init, pos, acc, inClosure, copied)
+		walkExprLife(t.Cond, p, acc, inClosure)
+		walkStmtsLife(t.Step, pos, acc, inClosure, copied)
 		walkStmtsLife(t.Body, pos, acc, inClosure, copied)
 	case *WhileS:
 		walkExprLife(t.Cond, p, acc, inClosure)
@@ -2457,6 +2488,11 @@ func markStmtVarsEscape(st Stmt, acc *lifetimeAcc) {
 		}
 		acc.escapes[t.Var] = true
 		markVarsEscape(t.Iter, acc)
+		markStmtsVarsEscape(t.Body, acc)
+	case *ForInitS:
+		markStmtsVarsEscape(t.Init, acc)
+		markVarsEscape(t.Cond, acc)
+		markStmtsVarsEscape(t.Step, acc)
 		markStmtsVarsEscape(t.Body, acc)
 	case *WhileS:
 		markVarsEscape(t.Cond, acc)
@@ -3163,6 +3199,15 @@ func stmtJSON(s Stmt) map[string]interface{} {
 			"type": "For",
 			"var":  t.Var,
 			"iter": exprJSON(t.Iter),
+			"body": stmtsJSON(t.Body),
+			"runs": provablyRunningLoops[s],
+		}
+	case *ForInitS:
+		return map[string]interface{}{
+			"type": "ForInit",
+			"init": stmtsJSON(t.Init),
+			"cond": exprJSON(t.Cond),
+			"step": stmtsJSON(t.Step),
 			"body": stmtsJSON(t.Body),
 			"runs": provablyRunningLoops[s],
 		}
