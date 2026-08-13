@@ -29,28 +29,53 @@
   }
  },
  "stmts": {
-  "Output": {
-   "fields": {
-    "type": "str",
-    "value": "expr",
-    "newline": "bool",
-    "target": "str|null"
-   }
-  },
-  "WriteFile": {
-   "fields": {
-    "type": "str",
-    "path": "expr",
-    "content": "expr",
-    "append": "bool"
-   }
-  },
   "Assign": {
    "fields": {
     "type": "str",
     "targets": "assign_target[]",
     "expr": "expr"
    }
+  },
+  "Background": {
+   "fields": {
+    "type": "str",
+    "body": "stmt[]"
+   }
+  },
+  "Block": {
+   "fields": {
+    "type": "str",
+    "body": "stmt[]"
+   }
+  },
+  "Break": {
+   "type": "object",
+   "properties": {
+    "type": {
+     "const": "Break"
+    }
+   },
+   "required": [
+    "type"
+   ]
+  },
+  "Case": {
+   "fields": {
+    "type": "str",
+    "discriminant": "expr",
+    "clauses": "case_clause[]"
+   }
+  },
+  "Continue": {
+   "type": "object",
+   "properties": {
+    "type": {
+     "const": "Continue"
+    }
+   },
+   "required": [
+    "type"
+   ]
   },
   "Declare": {
    "fields": {
@@ -68,37 +93,11 @@
     "elements": "expr[]"
    }
   },
-  "If": {
+  "Die": {
    "fields": {
     "type": "str",
-    "cond": "expr",
-    "then": "stmt[]",
-    "elsifs": "elsif[]",
-    "else": "stmt[]"
-   }
-  },
-  "Try": {
-   "fields": {
-    "type": "str",
-    "body": "stmt[]",
-    "excepts": "try_except[]",
-    "else": "stmt[]",
-    "finally": "stmt[]"
-   }
-  },
-  "For": {
-   "fields": {
-    "type": "str",
-    "var": "str",
-    "iter": "expr",
-    "body": "stmt[]"
-   }
-  },
-  "While": {
-   "fields": {
-    "type": "str",
-    "cond": "expr",
-    "body": "stmt[]"
+    "expr": "expr",
+    "carp": "bool"
    }
   },
   "DoWhile": {
@@ -107,20 +106,6 @@
     "body": "stmt[]",
     "cond": "expr",
     "until": "bool"
-   }
-  },
-  "Die": {
-   "fields": {
-    "type": "str",
-    "expr": "expr",
-    "carp": "bool"
-   }
-  },
-  "Warn": {
-   "fields": {
-    "type": "str",
-    "expr": "expr",
-    "carp": "bool"
    }
   },
   "Exec": {
@@ -134,90 +119,24 @@
     "purity": "purity"
    }
   },
-  "Pipeline": {
-   "fields": {
-    "type": "str",
-    "stages": "stmt[][]",
-    "last_output": "str|null",
-    "capture": "str|null",
-    "cmd_str": "str|null",
-    "purity": "purity"
-   }
-  },
-  "Return": {
-   "fields": {
-    "type": "str",
-    "value": "expr|null"
-   }
-  },
   "Exit": {
    "fields": {
     "type": "str",
     "value": "expr|null"
    }
   },
-  "SetChildError": {
-   "fields": {
-    "type": "str",
-    "expr": "expr"
-   }
-  },
-  "Require": {
-   "fields": {
-    "type": "str",
-    "module": "str"
-   }
-  },
-  "RawText": {
-   "fields": {
-    "type": "str",
-    "text": "str"
-   }
-  },
-  "Case": {
-   "fields": {
-    "type": "str",
-    "discriminant": "expr",
-    "clauses": "case_clause[]"
-   }
-  },
-  "Redirect": {
-   "fields": {
-    "type": "str",
-    "inner": "stmt[]",
-    "redirects": "redirect[]"
-   }
-  },
-  "Function": {
-   "fields": {
-    "type": "str",
-    "name": "str",
-    "body": "stmt[]",
-    "named_blocks": "map[str, stmt[]]"
-   }
-  },
-  "Subshell": {
-   "fields": {
-    "type": "str",
-    "body": "stmt[]"
-   }
-  },
-  "Background": {
-   "fields": {
-    "type": "str",
-    "body": "stmt[]"
-   }
-  },
-  "Block": {
-   "fields": {
-    "type": "str",
-    "body": "stmt[]"
-   }
-  },
   "Expr": {
    "fields": {
     "type": "str",
     "expr": "expr"
+   }
+  },
+  "For": {
+   "fields": {
+    "type": "str",
+    "var": "str",
+    "iter": "expr",
+    "body": "stmt[]"
    }
   },
   "ForInit": {
@@ -254,55 +173,142 @@
     "body"
    ]
   },
-  "Continue": {
-   "type": "object",
-   "properties": {
-    "type": {
-     "const": "Continue"
-    }
-   },
-   "required": [
-    "type"
-   ]
-  },
-  "Break": {
-   "type": "object",
-   "properties": {
-    "type": {
-     "const": "Break"
-    }
-   },
-   "required": [
-    "type"
-   ]
-  }
- },
- "exprs": {
-  "Int": {
-   "fields": {
-    "type": "str",
-    "value": "int"
-   }
-  },
-  "Str": {
-   "fields": {
-    "type": "str",
-    "value": "str",
-    "style": "style"
-   }
-  },
-  "Var": {
+  "Function": {
    "fields": {
     "type": "str",
     "name": "str",
-    "sigil": "sigil"
+    "body": "stmt[]",
+    "named_blocks": "map[str, stmt[]]"
    }
   },
-  "Index": {
+  "If": {
+   "fields": {
+    "type": "str",
+    "cond": "expr",
+    "then": "stmt[]",
+    "elsifs": "elsif[]",
+    "else": "stmt[]"
+   }
+  },
+  "Output": {
+   "fields": {
+    "type": "str",
+    "value": "expr",
+    "newline": "bool",
+    "target": "str|null"
+   }
+  },
+  "Pipeline": {
+   "fields": {
+    "type": "str",
+    "stages": "stmt[][]",
+    "last_output": "str|null",
+    "capture": "str|null",
+    "cmd_str": "str|null",
+    "purity": "purity"
+   }
+  },
+  "RawText": {
+   "fields": {
+    "type": "str",
+    "text": "str"
+   }
+  },
+  "Redirect": {
+   "fields": {
+    "type": "str",
+    "inner": "stmt[]",
+    "redirects": "redirect[]"
+   }
+  },
+  "Require": {
+   "fields": {
+    "type": "str",
+    "module": "str"
+   }
+  },
+  "Return": {
+   "fields": {
+    "type": "str",
+    "value": "expr|null"
+   }
+  },
+  "Select": {
+   "fields": {
+    "type": "str",
+    "clauses": "select_clause[]"
+   }
+  },
+  "SetChildError": {
+   "fields": {
+    "type": "str",
+    "expr": "expr"
+   }
+  },
+  "Subshell": {
+   "fields": {
+    "type": "str",
+    "body": "stmt[]"
+   }
+  },
+  "Try": {
+   "fields": {
+    "type": "str",
+    "body": "stmt[]",
+    "excepts": "try_except[]",
+    "else": "stmt[]",
+    "finally": "stmt[]"
+   }
+  },
+  "Warn": {
+   "fields": {
+    "type": "str",
+    "expr": "expr",
+    "carp": "bool"
+   }
+  },
+  "While": {
+   "fields": {
+    "type": "str",
+    "cond": "expr",
+    "body": "stmt[]"
+   }
+  },
+  "WriteFile": {
+   "fields": {
+    "type": "str",
+    "path": "expr",
+    "content": "expr",
+    "append": "bool"
+   }
+  }
+ },
+ "exprs": {
+  "Arith": {
+   "fields": {
+    "type": "str",
+    "ast": "arith"
+   }
+  },
+  "Array": {
+   "fields": {
+    "type": "str",
+    "elements": "expr[]"
+   }
+  },
+  "ArrayComp": {
    "fields": {
     "type": "str",
     "var": "str",
-    "key": "expr"
+    "iter": "expr",
+    "elem": "expr",
+    "cond": "expr|null"
+   }
+  },
+  "Arrow": {
+   "fields": {
+    "type": "str",
+    "body": "stmt[]"
    }
   },
   "BinOp": {
@@ -313,12 +319,70 @@
     "rhs": "expr"
    }
   },
+  "Bool": {
+   "fields": {
+    "type": "str",
+    "value": "bool"
+   }
+  },
   "Call": {
    "fields": {
     "type": "str",
     "func": "str",
     "args": "expr[]",
     "purity": "purity"
+   }
+  },
+  "Capture": {
+   "fields": {
+    "type": "str",
+    "expr": "expr",
+    "native": "bool"
+   }
+  },
+  "DefinedOr": {
+   "fields": {
+    "type": "str",
+    "expr": "expr",
+    "default": "expr"
+   }
+  },
+  "Ident": {
+   "fields": {
+    "type": "str",
+    "name": "str"
+   }
+  },
+  "Index": {
+   "fields": {
+    "type": "str",
+    "var": "str",
+    "key": "expr"
+   }
+  },
+  "Int": {
+   "fields": {
+    "type": "str",
+    "value": "int"
+   }
+  },
+  "Interpolate": {
+   "fields": {
+    "type": "str",
+    "parts": "interp_part[]"
+   }
+  },
+  "Json": {
+   "fields": {
+    "type": "str",
+    "value": "any"
+   }
+  },
+  "Lambda": {
+   "fields": {
+    "type": "str",
+    "params": "str[]",
+    "body": "stmt[]"
    }
   },
   "MethodCall": {
@@ -329,39 +393,10 @@
     "args": "expr[]"
    }
   },
-  "Ternary": {
+  "Object": {
    "fields": {
     "type": "str",
-    "cond": "expr",
-    "then": "expr",
-    "else": "expr"
-   }
-  },
-  "DefinedOr": {
-   "fields": {
-    "type": "str",
-    "expr": "expr",
-    "default": "expr"
-   }
-  },
-  "Interpolate": {
-   "fields": {
-    "type": "str",
-    "parts": "interp_part[]"
-   }
-  },
-  "Capture": {
-   "fields": {
-    "type": "str",
-    "expr": "expr",
-    "native": "bool"
-   }
-  },
-  "Regex": {
-   "fields": {
-    "type": "str",
-    "pattern": "str",
-    "flags": "str"
+    "properties": "obj_prop[]"
    }
   },
   "Range": {
@@ -377,46 +412,33 @@
     "text": "str"
    }
   },
-  "Arrow": {
+  "Regex": {
    "fields": {
     "type": "str",
-    "body": "stmt[]"
+    "pattern": "str",
+    "flags": "str"
    }
   },
-  "Array": {
+  "Str": {
    "fields": {
     "type": "str",
-    "elements": "expr[]"
+    "value": "str",
+    "style": "style"
    }
   },
-  "Arith": {
+  "Ternary": {
    "fields": {
     "type": "str",
-    "ast": "arith"
+    "cond": "expr",
+    "then": "expr",
+    "else": "expr"
    }
   },
-  "Bool": {
+  "Var": {
    "fields": {
     "type": "str",
-    "value": "bool"
-   }
-  },
-  "Json": {
-   "fields": {
-    "type": "str",
-    "value": "any"
-   }
-  },
-  "Ident": {
-   "fields": {
-    "type": "str",
-    "name": "str"
-   }
-  },
-  "Object": {
-   "fields": {
-    "type": "str",
-    "properties": "obj_prop[]"
+    "name": "str",
+    "sigil": "sigil"
    }
   }
  },
@@ -488,6 +510,7 @@
  },
  "leaf": {
   "assign_target": {
+   "_comment": "var: a store-name string. Plain idents (x), indexed keys (a[1] — the indexed-assign convention), and DOTTED MEMBER KEYS (s.X — go-sh structType, core request go-sh-structtype-20260814-054454): a struct member read/write lowers to the runtime store keyed by the member name — getVar(\"s.X\") / setVar(\"s.X\", v) / Assign{targets:[{var:\"s.X\"}]} — one Assign per composite-literal field. Member keys are store strings, never JS identifiers: the core keeps them out of the native-binding lifts. In runtime-expanded TEXT they must be rendered BRACED (${s.X}) — the bare $s.X would expand $s and append .X.",
    "fields": {
     "var": "str",
     "sigil": "sigil",
@@ -545,6 +568,15 @@
     "kind": "enum[lit,expr]",
     "text": "str|opt",
     "expr": "expr|opt"
+   }
+  },
+  "select_clause": {
+   "fields": {
+    "comm": "str (recv|send|default)",
+    "target": "str|null",
+    "ch": "expr|null",
+    "value": "expr|null",
+    "body": "stmt[]"
    }
   }
  },
