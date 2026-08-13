@@ -16,7 +16,7 @@ all: build
 
 build:
 	# Atomic + conditional rebuild (concurrent-gate safety; see cpp-sh-go)
-	@if [ ! -x powershell-sh-go ] || find cmd main.go go.mod -newer powershell-sh-go 2>/dev/null | grep -q .; then \
+	@if [ ! -x powershell-sh-go ] || find cmd *.go go.mod go.sum -newer powershell-sh-go 2>/dev/null | grep -q .; then \
 	  echo "  building powershell-sh-go…"; \
 	  $(GO) build -o powershell-sh-go.new.$$ ./cmd/powershell-sh-go \
 	    && mv -f powershell-sh-go.new.$$ powershell-sh-go \
