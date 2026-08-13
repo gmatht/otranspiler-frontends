@@ -21,7 +21,7 @@ gen:
 	@exit 1
 
 build:
-	$(GO) build -o fish-sh-go .
+	$(GO) build -o fish-sh-go ./cmd/fish-sh-go
 
 # Self-heal the ingress oracle too: a missing core debashc binary (fresh
 # checkout, interrupted core build) wedges the gate as a confusing
