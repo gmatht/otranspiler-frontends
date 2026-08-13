@@ -1372,6 +1372,7 @@ func forItemIR(w *Word, cmds map[string][]*Command) Expr {
 type ArithAst interface{}
 type ArithNum struct{ Val int64 }
 type ArithVar struct{ Name string }
+type ArithIdent struct{ Name string } // A1 export-only (core request zsh-sh-go-20260813-155123): lifted loop-var reads
 type ArithIndex struct {
 	Var string
 	Key ArithAst
