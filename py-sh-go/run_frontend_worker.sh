@@ -24,9 +24,13 @@ while true; do
     # `git status` paths are repo-relative, so match the frontend dir as a
     # RELATIVE prefix (the old absolute-path match never fired — fixes
     # piled up uncommitted until a stray `git stash` wiped them).
+    # NOTE: ${PWD#...} (uppercase) — `pwd` is a builtin, not a variable;
+    # the old ${pwd#...} was an unbound-variable error under set -u, so
+    # the filter silently never matched and gate-green fixes piled up
+    # uncommitted (2026-08-13 triage takeover found them still pending).
     changes=$(git -C "$WORKSPACE" status --porcelain 2>/dev/null \
               | awk '/^.. /{print $2}' \
-              | awk -v d="${pwd#$WORKSPACE/}" '$0 ~ "^"d"/" || $0 ~ /^harness\//' || true)
+              | awk -v d="${PWD#$WORKSPACE/}" '$0 ~ "^"d"/" || $0 ~ /^harness\//' || true)
     if [ -n "$changes" ]; then
       git -C "$WORKSPACE" add $changes 2>/dev/null || true
       git -C "$WORKSPACE" commit -m "frontend py-sh-go: gate green" >> "$LOG" 2>&1 || true
