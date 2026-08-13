@@ -976,6 +976,31 @@ func (p *parser) parseStage() ([]map[string]any, error) {
 	if name == "set" {
 		return p.setStmts(args)
 	}
+	if name == "return" {
+		// fish `return [N]` — stop the innermost function with status N
+		// (bare `return` keeps the last command's status; fish rejects
+		// extra arguments). Lowered to the core A1 `Return` node. A
+		// plain numeric word becomes `Int`: the ESTree backend's
+		// function-call status recording accepts only numeric return
+		// values (a Str would be dropped, leaving $status stale); any
+		// other single value keeps its natural value shape.
+		if len(args) > 2 {
+			return nil, fmt.Errorf("line %d: return: too many arguments", args[1].line)
+		}
+		var value any
+		if len(args) == 2 {
+			if n, err := strconv.ParseInt(args[1].text, 10, 64); err == nil {
+				value = map[string]any{"type": "Int", "value": n}
+			} else {
+				e, err := p.valueExpr(args[1])
+				if err != nil {
+					return nil, err
+				}
+				value = e
+			}
+		}
+		return []map[string]any{{"type": "Return", "value": value}}, nil
+	}
 	// fish builtins with no external binary: lower to core A1 shapes (the
 	// bash analogs — see the header) or fall back to the generic exec.
 	if name == "math" || name == "string" || name == "count" {
