@@ -1,10 +1,35 @@
 # PLAN_POWERSHELL_F — a PowerShell frontend on the bat precedent
 
-**Status: IN PROGRESS — t06 landed (gate green, 2026-08-13).** The
+**Status: IN PROGRESS — t11 landed (gate green).** The
 proposal is implemented as described; revision history below.
 
 ## 0. Revision history
 
+- 2026-08-13 (t11_exit, gate green): the flow_control_statement node's
+  `exit` form lands — `exit 5` lowers to the A1 Exit statement with a
+  bare Int code, `exit` bare to Exit with value null (lastExit), the
+  bat frontend's `exit /b` precedent (all backends render it; the
+  A1→ESTree renderer emits process.exit(Number(5)) — the executed-
+  stdout oracle matches live pwsh by construction: both print
+  "before" and stop, exit code 5). The other four keyword forms of
+  the same node REFUSE, pinned `testdata_refuse/t11-t14`: break /
+  continue are the A1 loop signals, and v1's only landed loop (the
+  t06 do_statement) duplicates its body OUTSIDE the loop — a
+  break/continue there would miscompile (the while/for rungs host
+  them); return is the function rung's value channel (functions
+  refuse in v1); throw is the exception model (the A1 has no
+  exceptions). `exit -1` (expression_with_unary_operator), `exit $x`,
+  `exit "5"` refuse (the subset pins a bare decimal integer).
+- 2026-08-13 (t08_empty_statement, gate green): the empty_statement
+  node lands — a lone `;` where the _statement rule expects a
+  statement (this grammar parses EVERY standalone `;` as this node,
+  including a trailing `;` after a pipeline). Live pwsh 7.6.4 accepts
+  it as a NO-OP (verified: `Write-Output "a"; ; Write-Output "b"`
+  prints a then b, exit 0). Lowering: ZERO statements — the node is
+  dropped exactly like comments (the `#`-comments row below), so the
+  emitted program is byte-identical to the same program without the
+  `;` and the executed-stdout oracle matches live pwsh by
+  construction; no A1 node is needed (a no-op has no semantics).
 - 2026-08-13 (t07_if_else, gate green): the if_statement node with
   its else_clause tail lands — `if ($c) { B } else { E }` lowers to
   the A1 If node (cond/then/elsifs/else, byte-identical to the core's
@@ -91,6 +116,9 @@ The new semantics to map (each a deliberate choice, refuse > guess):
 | PowerShell | A1 lowering (v1) |
 |---|---|
 | `#` comments | skipped |
+| `;` empty statement | skipped (a NO-OP — pwsh 7.6.4 accepts a lone
+  `;` and it emits ZERO statements, byte-identical to the same
+  program without it; the A1 needs no no-op node, t08 pin) |
 | `$x = 5` / `$x` (case-insensitive) | `Assign x` / `getVar("x")` |
 | `"str $x $(expr)"` interpolation | the A1 Interpolate/template (the shell frontends already do `"$var"`); `` `n `t `` escapes |
 | `'literal'` single quotes | literal string (no interpolation) |

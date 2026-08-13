@@ -4,7 +4,7 @@ PowerShell (.ps1) source -> A1 shIR JSON — **the bat sibling**
 (workspace-side dir; no git worktree; the object pipeline is a stated
 TEXT approximation for v1; see PLAN_POWERSHELL_F.md).
 
-**Status: WORKER-IMPLEMENTED, t07 landed (gate green).** The parser is
+**Status: WORKER-IMPLEMENTED, t11 landed (gate green).** The parser is
 wharflab/tree-sitter-powershell (vendored under
 `grammars/tree-sitter-powershell/`, loaded via smacker/go-tree-sitter
 cgo) — the plan's choice, empirically verified. The emitter produces A1
@@ -152,6 +152,25 @@ line) — now the worker's fixes, not records):
   silent miscompile (the t05 backtick precedent: refuse > guess). The
   literal here-string (@'…'@ — verbatim_here_string_characters) is
   the sibling of a later rung, still a loud REFUSE.
+- t11_exit: the flow_control_statement node's `exit` form — `exit 5`
+  → the A1 Exit statement, `exit` bare → Exit with value null
+  (lastExit). Live pwsh 7.6.4: `exit 5` terminates the script with
+  status 5, the statements after it never run (verified: "before"
+  prints, "after" does not, exit code 5). The value lowers as a bare
+  Int code (pipeline → pipeline_chain → unary_expression →
+  integer_literal) — the bat frontend's `exit /b N` precedent
+  (`{"type":"Exit","value":{"type":"Int","value":5}}`); the
+  A1→ESTree renderer emits process.exit(Number(5)), so the
+  executed-stdout oracle matches live pwsh by construction (both
+  print "before" and stop; the second echo never runs). `exit -1` /
+  `exit $x` / `exit "5"` REFUSE (the subset pins a bare decimal
+  integer). The other four keyword forms of the same node REFUSE,
+  pinned in `testdata_refuse/t11-t14`: break and continue are loop
+  signals whose only v1 loop host (the t06 do-while duplication)
+  lowers the body OUTSIDE the loop — emitting them would miscompile
+  (the while/for rungs host them); return is the function rung's
+  value channel (functions refuse in v1); throw is the exception
+  model (the A1 has no exceptions).
 - Comments, comment-only files (empty Program), and the REFUSE table
   (refuse.go): anything outside the subset errors loudly — including
   .NET member access (`$x.Length`), assignment, `|` pipelines, unknown

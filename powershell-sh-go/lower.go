@@ -3,6 +3,7 @@ package ps1lib
 import (
 	"bytes"
 	"fmt"
+	"strconv"
 	"strings"
 
 	sitter "github.com/smacker/go-tree-sitter"
@@ -116,9 +117,124 @@ func lowerStatement(n *sitter.Node, src []byte) (any, error) {
 		// (and covers block bodies via lowerBlock, which shares this
 		// path).
 		return nil, nil
+	case "flow_control_statement":
+		return lowerFlowControl(n, src)
 	default:
 		return nil, refuse(n, src, "statement type %q", n.Type())
 	}
+}
+
+// lowerFlowControl — the flow_control_statement node: the grammar's five
+// keyword statements `break` / `continue` / `throw` / `return` / `exit`
+// (keyword token + optional tail — a label_expression for break/continue,
+// a pipeline for throw/return/exit). The t11 rung lands the EXIT form:
+// `exit N` → the A1 Exit statement with an Int code, `exit` bare → Exit
+// with value null (the lastExit channel) — the bat frontend's `exit /b`
+// precedent, the only A1 Exit the renderer family already emits (estree
+// → process.exit, all backends render it). The other four forms REFUSE:
+//
+//   - break / continue — the A1 Break/Continue loop signals (the plan's
+//     "loop signals" row) need a LOOP to signal. v1's only landed loop is
+//     the t06 do_statement, whose do-while duplication lowers the body
+//     ONCE OUTSIDE the loop (`do { B } while (C)` → `B; while (C) { B }`) —
+//     a break/continue inside B would land its first copy at top level,
+//     a miscompile (the A1 renders a top-level Break as a runtime signal
+//     throw; bash's top-level break is an error-and-continue, pwsh's
+//     halts the script — three different semantics, none soundly
+//     mappable). The while/for rungs (not yet landed) host them; until
+//     then refuse > guess.
+//   - return — the function rung's value channel (the plan maps `return
+//     v` inside functions, which refuse in v1; a top-level return in pwsh
+//     halts the script — unpinned).
+//   - throw — the exception model: the A1 has no exceptions (the plan's
+//     try/catch/finally refusal, PLAN_POWERSHELL_F.md §1).
+func lowerFlowControl(n *sitter.Node, src []byte) (any, error) {
+	var kw string
+	var pipeline *sitter.Node
+	// NOTE: the keyword token (break/continue/throw/return/exit) is an
+	// ANONYMOUS alias in this grammar (ALIAS named:false — the --cst
+	// dump shows it because dumpNode walks ChildCount, ALL children), so
+	// the scan iterates ChildCount and matches the token types; the
+	// optional tail is a named child (pipeline / label_expression).
+	for i := 0; i < int(n.ChildCount()); i++ {
+		ch := n.Child(i)
+		switch ch.Type() {
+		case "break", "continue", "throw", "return", "exit":
+			if kw != "" {
+				return nil, refuse(n, src, "flow_control_statement with multiple keywords")
+			}
+			kw = ch.Type()
+		case "pipeline":
+			if pipeline != nil {
+				return nil, refuse(n, src, "flow_control_statement with multiple pipelines")
+			}
+			pipeline = ch
+		default:
+			if ch.IsNamed() {
+				return nil, refuse(ch, src, "flow_control_statement part %q (a labeled break/continue is outside the v1 subset)", ch.Type())
+			}
+		}
+	}
+	switch kw {
+	case "exit":
+		if pipeline == nil {
+			// bare `exit` — the A1 Exit with no code (lastExit)
+			return exitStmt(nil), nil
+		}
+		code, err := lowerExitCode(pipeline, src)
+		if err != nil {
+			return nil, err
+		}
+		return exitStmt(code), nil
+	case "break", "continue":
+		return nil, refuse(n, src, "%s: the A1 %s is a loop signal, and v1's only landed loop (the t06 do_statement) duplicates its body OUTSIDE the loop — a break/continue there would miscompile; the while/for rungs host it (the t11 pin lands the exit form)", kw, strings.ToUpper(kw[:1])+kw[1:])
+	case "return":
+		return nil, refuse(n, src, "return: the A1 Return is the function rung's value channel (functions refuse in v1); a top-level return in pwsh halts the script — unpinned")
+	case "throw":
+		return nil, refuse(n, src, "throw: the exception model — the A1 has no exceptions (the try/catch/finally refusal, PLAN_POWERSHELL_F.md §1)")
+	default:
+		return nil, refuse(n, src, "flow_control_statement keyword %q", kw)
+	}
+}
+
+// lowerExitCode — the `exit` form's optional pipeline as an Int code.
+// The t11 subset pins a BARE decimal integer (`exit 5` — the plan's
+// `exit N` row): pipeline → pipeline_chain → unary_expression →
+// integer_literal, no pipes, no unary operators (a `-` head parses as
+// expression_with_unary_operator — refused), no variables. Anything else
+// is unpinned and refuses (refuse > guess).
+func lowerExitCode(pipeline *sitter.Node, src []byte) (any, error) {
+	var chain *sitter.Node
+	for i := 0; i < int(pipeline.NamedChildCount()); i++ {
+		ch := pipeline.NamedChild(i)
+		switch ch.Type() {
+		case "pipeline_chain":
+			if chain != nil {
+				return nil, refuse(pipeline, src, "exit code with multiple chains")
+			}
+			chain = ch
+		case "pipeline_chain_tail":
+			return nil, refuse(ch, src, "`|` in an exit code")
+		default:
+			return nil, refuse(ch, src, "exit code %q", ch.Type())
+		}
+	}
+	if chain == nil || chain.NamedChildCount() != 1 {
+		return nil, refuse(pipeline, src, "exit code without a single chain")
+	}
+	op := chain.NamedChild(0)
+	if op.Type() != "unary_expression" || op.NamedChildCount() != 1 {
+		return nil, refuse(op, src, "exit code %q (the t11 subset pins a bare decimal integer)", op.Type())
+	}
+	inner := op.NamedChild(0)
+	if inner.Type() != "integer_literal" {
+		return nil, refuse(inner, src, "exit code operand %q (the t11 subset pins a bare decimal integer)", inner.Type())
+	}
+	n, err := strconv.ParseInt(inner.Content(src), 10, 64)
+	if err != nil {
+		return nil, refuse(inner, src, "exit code %q is not a decimal integer", inner.Content(src))
+	}
+	return intExpr(n), nil
 }
 
 // lowerDoStatement — the do_statement node: `do { … } while (cond)`. The

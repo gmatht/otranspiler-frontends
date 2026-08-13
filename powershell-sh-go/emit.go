@@ -120,6 +120,23 @@ func whileStmt(cond any, body []any) any {
 	}
 }
 
+// exitStmt — the A1 Exit statement (the t11 rung: the flow_control
+// statement's `exit` form). Shape mirrors shir_json.rs exactly: no runs
+// field; `value` is the code expression or null for a bare `exit` (the
+// lastExit channel) — the bat frontend's `exit /b` precedent (bat-sh-go
+// parseExit emits {"type":"Exit","value":{"type":"Int",...}} /
+// {"type":"Exit","value":nil}).
+func exitStmt(value any) any {
+	return map[string]any{"type": "Exit", "value": value}
+}
+
+// intExpr — a bare integer literal (`exit 5`): the A1 Int expr, matching
+// the bat frontend's exit-code emission (the core's `echo 5` lowers to a
+// Str — the Int shape is the Exit-code precedent, not the argument one).
+func intExpr(n int64) any {
+	return map[string]any{"type": "Int", "value": n}
+}
+
 // getVarCall — $name reads lower to getVar("name") (the core's var-read
 // channel; Emulable per the A4 namespace spec).
 func getVarCall(name string) any {
