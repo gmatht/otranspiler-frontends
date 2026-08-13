@@ -27,6 +27,15 @@
 // (params -> $1.., fresh vars -> `local`), go-func background,
 // raw-string heredocs, comments, shebang.
 //
+// Top-level func decls `func name[typeParams](params) [ret] { body }`
+// lower to the same Function subs as func literals. Go GENERICS (grammar
+// typeParameters / typeArgs, core request go-sh-typeargs): a generic
+// call `id[int](x)` carries typeArgs on the Call — the A1 deserializer
+// validates the string array and ERASES it at ingress (documented
+// erasure contract; no runtime form), and only type-INDEPENDENT generic
+// bodies lower (type-dependent bodies would need compile-time
+// substitution and stay Refuse > guess territory).
+//
 // Refuse > guess: anything outside the subset is a hard error (the gate
 // reports FAIL), never a silent mis-lowering.
 package golib
@@ -287,17 +296,35 @@ func assignStmt(name string, expr map[string]any) map[string]any {
 	}
 }
 func execStmt(cmd string, words []map[string]any, purity string) map[string]any {
+	return execStmtTA(cmd, words, purity, nil)
+}
+
+// execStmtTA: execStmt with Go generic type arguments (grammar rule
+// typeArgs, `Name[TypeList](args)`) attached to the Call. The A1
+// erasure contract (core request go-sh-typeargs) validates them as a
+// string array and drops them at ingress, so the runtime behavior is
+// identical to execStmt — the type arguments are carried for fidelity,
+// never executed.
+func execStmtTA(cmd string, words []map[string]any, purity string, typeArgs []string) map[string]any {
 	elems := make([]any, len(words))
 	for i, w := range words {
 		elems[i] = w
 	}
+	call := map[string]any{
+		"type": "Call", "func": "exec",
+		"args":   []any{strExpr(cmd), map[string]any{"type": "Array", "elements": elems}},
+		"purity": purity,
+	}
+	if len(typeArgs) > 0 {
+		ta := make([]any, len(typeArgs))
+		for i, s := range typeArgs {
+			ta[i] = s
+		}
+		call["typeArgs"] = ta
+	}
 	return map[string]any{
 		"type": "Expr",
-		"expr": map[string]any{
-			"type": "Call", "func": "exec",
-			"args":   []any{strExpr(cmd), map[string]any{"type": "Array", "elements": elems}},
-			"purity": purity,
-		},
+		"expr": call,
 	}
 }
 
@@ -343,8 +370,9 @@ type expr struct {
 	idx1e  *expr // expression bound (Go computed indices)
 	idx2e  *expr
 	// call
-	callee string
-	args   []*expr
+	callee   string
+	args     []*expr
+	typeArgs []string // generic instantiation `Name[TypeList](args)` (typeArgs)
 	// func literal (lowered body, params in args)
 	body   []map[string]any
 	params []string
@@ -525,6 +553,19 @@ func (p *parser) parsePostfix() *expr {
 			args := p.parseArgs()
 			e = &expr{kind: "call", callee: callName(e), args: args}
 		case p.atPunct("["):
+			// generic instantiation call `Name[TypeList](args)` (grammar rule
+			// typeArgs): the type arguments ride on the Call (A1 erasure
+			// contract, core request go-sh-typeargs — validated string array,
+			// dropped at ingress). Only DEFINED functions are instantiable in
+			// the subset, so a non-function base falls through to index/slice.
+			if p.isTypeArgsBracket(callName(e)) {
+				tas := p.parseTypeArgs()
+				p.skipNL()
+				p.expect(tPunct, "(")
+				args := p.parseArgs()
+				e = &expr{kind: "call", callee: callName(e), args: args, typeArgs: tas}
+				break
+			}
 			p.pos++
 			p.skipNL()
 			lo, hi := "", ""
@@ -570,6 +611,83 @@ func callName(e *expr) string {
 		return e.name
 	}
 	return ""
+}
+
+// isTypeArgsBracket: the token at pos is `[` and the bracketed contents
+// are a Go typeList (`IDENT (. IDENT)* (, ...)*`) immediately followed
+// by `(` — the generic-instantiation call shape `Name[TypeList](args)`
+// (grammar rule typeArgs) — AND the base name is a defined function
+// (generic decls lower to subs; only defined generic functions are
+// instantiable in the subset — an array/map index followed by a call
+// stays a plain index and refuses as unsupported). Everything else
+// falls through to the index/slice parser.
+func (p *parser) isTypeArgsBracket(base string) bool {
+	if !p.fnNames[base] {
+		return false
+	}
+	if p.tok().kind != tPunct || p.tok().text != "[" {
+		return false
+	}
+	i := p.pos + 1
+	wantItem := true
+	for {
+		if i >= len(p.toks) {
+			return false
+		}
+		t := p.toks[i]
+		if t.kind == tEOF {
+			return false
+		}
+		if wantItem {
+			if t.kind != tIdent {
+				return false
+			}
+			wantItem = false
+			i++
+			continue
+		}
+		switch t.text {
+		case ".":
+			i++ // qualified type name (pkg.T)
+		case ",":
+			i++
+			wantItem = true
+		case "]":
+			i++
+			return i < len(p.toks) && p.toks[i].kind == tPunct && p.toks[i].text == "("
+		default:
+			return false
+		}
+	}
+}
+
+// parseTypeArgs: `[TypeList]` — collects the type-argument strings
+// (IDENT, possibly qualified pkg.T, comma-separated) and consumes
+// through the closing `]`. The A1 erasure contract (core request
+// go-sh-typeargs) validates them (string array) on the Call and drops
+// them at ingress — the runtime behavior is the plain call.
+func (p *parser) parseTypeArgs() []string {
+	p.expect(tPunct, "[")
+	var tas []string
+	p.skipNL()
+	item := ""
+	for {
+		item += p.expect(tIdent, "").text
+		if p.acceptPunct(".") {
+			item += "."
+			continue
+		}
+		tas = append(tas, item)
+		item = ""
+		if p.acceptPunct(",") {
+			p.skipNL()
+			continue
+		}
+		break
+	}
+	p.skipNL()
+	p.expect(tPunct, "]")
+	return tas
 }
 
 func (p *parser) parseArgs() []*expr {
@@ -760,8 +878,70 @@ func (p *parser) parseTopLevel() []map[string]any {
 				p.skipToLineEnd()
 			}
 		case p.atIdent("func"):
+			// top-level func decl `func name[typeParams](params) [ret] { body }`
+			// — lowers to the same Function sub as the t22/t23 func
+			// literals. Generic decls (grammar typeParameters, call-site
+			// typeArgs — core request go-sh-typeargs): type parameters are
+			// erased under the A1 erasure contract, which only lowers
+			// type-INDEPENDENT bodies (erasure is faithful there). `main`
+			// stays the entry: its body parses as top-level statements
+			// below. Method decls `func (r T) m(...)` stay skipped
+			// (methods are outside the subset, methodDecl ledgered).
 			p.pos++
-			p.skipToLineEnd()
+			p.skipNL()
+			if p.atPunct("(") {
+				p.skipToLineEnd()
+				break
+			}
+			nm := p.expect(tIdent, "").text
+			if nm == "main" {
+				p.skipToLineEnd()
+				break
+			}
+			// type parameters [T any] — erased (no runtime form)
+			if p.atPunct("[") {
+				p.pos++ // [
+				p.skipNL()
+				for !p.atPunct("]") {
+					if p.tok().kind == tEOF {
+						p.failf("unterminated type parameter list (v2)")
+					}
+					p.pos++
+				}
+				p.expect(tPunct, "]")
+				p.skipNL()
+			}
+			p.expect(tPunct, "(")
+			params := p.parseFuncParams()
+			p.skipNL()
+			// optional return type: ident | (a, b) | []T | *T
+			for p.tok().kind == tIdent && p.tok().text != "{" {
+				p.pos++
+				p.skipNL()
+			}
+			for p.atPunct("(") || p.atPunct("[") || p.atPunct("*") {
+				p.pos++
+				p.skipNL()
+				for p.tok().kind == tIdent {
+					p.pos++
+				}
+				p.skipNL()
+			}
+			p.skipNL()
+			// function scope (mirrors parseFuncLit)
+			saveParams, saveOrd, saveLocals, saveIn := p.fnParams, p.fnParamOrd, p.fnLocals, p.inFunc
+			p.fnParams = map[string]bool{}
+			p.fnParamOrd = nil
+			p.fnLocals = map[string]bool{}
+			p.inFunc = true
+			for _, prm := range params {
+				p.fnParams[prm] = true
+				p.fnParamOrd = append(p.fnParamOrd, prm)
+			}
+			body := p.parseBlockStmts()
+			p.fnParams, p.fnParamOrd, p.fnLocals, p.inFunc = saveParams, saveOrd, saveLocals, saveIn
+			p.fnNames[nm] = true
+			out = append(out, map[string]any{"type": "Function", "name": nm, "body": body})
 		default:
 			out = append(out, p.parseStmt()...)
 		}
@@ -975,7 +1155,7 @@ func (p *parser) printlnStmt() []map[string]any {
 		for _, a := range args[0].args {
 			words = append(words, p.exprToWord(a))
 		}
-		return []map[string]any{execStmt(args[0].callee, words, "Spawn")}
+		return []map[string]any{execStmtTA(args[0].callee, words, "Spawn", args[0].typeArgs)}
 	}
 	var words []map[string]any
 	if len(args) > 1 {
@@ -1698,8 +1878,8 @@ func (p *parser) parseSwitch() []map[string]any {
 				p.expect(tPunct, ":")
 				clauses = append(clauses, map[string]any{
 					"patterns": []any{"*"},
-				"body":     p.parseTypeSwitchBody(gv, x),
-			})
+					"body":     p.parseTypeSwitchBody(gv, x),
+				})
 			} else if p.atIdent("case") {
 				p.pos++
 				var pats []any
@@ -1718,7 +1898,7 @@ func (p *parser) parseSwitch() []map[string]any {
 			}
 		}
 		return []map[string]any{{
-			"type":         "Case",
+			"type": "Case",
 			"discriminant": map[string]any{
 				"type": "Call", "func": "typeof",
 				"args":   []any{getVarExpr(x)},
