@@ -17,7 +17,8 @@
 // strings.ReplaceAll (${s//o/n}) + strings.Contains (grep idiom),
 // string-concat + arithmetic exprs, len(), slicing, indexing, array
 // literals + range-for, if/else if/else, for cond, for init;cond;post
-// (→ seq Range when numeric), switch/case/default, TYPE SWITCH
+// (numeric header → the core's ForInit C-style shape), switch/case/default,
+// TYPE SWITCH
 // (`switch [v :=] x.(type) { case T: ... default: ... }` — lowered to the
 // Case node with discriminant Call{func:"typeof", args:[x]} (sh2.typeOf:
 // store strings -> "string", lifted numbers -> "int"/"float", bools ->
@@ -293,6 +294,42 @@ func assignStmt(name string, expr map[string]any) map[string]any {
 			"var": name, "sigil": nil, "indices": []any{},
 		}},
 		"expr": expr,
+	}
+}
+
+// arithAssignStmt: the core's ForInit init shape (byte-identical to the
+// `for ((i=N; ...))` lowering in shir.rs): Assign wrapping an Arith ast
+// `Assign` node (`i = N`), NOT a plain Str assignment.
+func arithAssignStmt(name string, n int) map[string]any {
+	return map[string]any{
+		"type": "Assign",
+		"targets": []any{map[string]any{
+			"var": name, "sigil": nil, "indices": []any{},
+		}},
+		"expr": map[string]any{
+			"type": "Arith",
+			"ast": map[string]any{
+				"type": "Assign", "op": "=", "var": name, "rhs": arithNum(n),
+			},
+		},
+	}
+}
+
+// arithIncDecStmt: the core's ForInit step shape (byte-identical to the
+// `for ((...; i++))` lowering): Assign wrapping an Arith ast `IncDec`
+// node (`i++`).
+func arithIncDecStmt(name string) map[string]any {
+	return map[string]any{
+		"type": "Assign",
+		"targets": []any{map[string]any{
+			"var": name, "sigil": nil, "indices": []any{},
+		}},
+		"expr": map[string]any{
+			"type": "Arith",
+			"ast": map[string]any{
+				"type": "IncDec", "var": name, "delta": 1, "prefix": false,
+			},
+		},
 	}
 }
 func execStmt(cmd string, words []map[string]any, purity string) map[string]any {
@@ -1813,22 +1850,30 @@ func (p *parser) parseFor() []map[string]any {
 		post := []map[string]any{assignStmt(postName,
 			arithBin(arithVar(postName), "+", arithNum(1)))}
 		body := p.parseBlockStmts()
-		// `i := N; i <= M; i++` (or `i < M`) → the core's For Range
-		// (`for i in $(seq N M)`) shape — byte-identical lowering.
+		// `i := N; i <= M; i++` (or `i < M`) → the core's ForInit shape
+		// (byte-identical to the `for ((i=N; i<=M; i++))` lowering in
+		// shir.rs): init Assign(Arith Assign) / cond exec `let "i<=M"` /
+		// step Assign(Arith IncDec) / body. NOT the For+Range iter form:
+		// the core emits Range only for `for i in $(seq N M)` (the
+		// seq_range_for transform), and the ESTree lowering of that Range
+		// counter keeps the loop var as a native JS local WITHOUT syncing
+		// sh2.vars — string-context body reads (`echo n$i` / printf) then
+		// see "" (t58_seq_range DIFF: n vs n2/n3/n4). ForInit lowers to
+		// the setVar-synced while machinery, which matches bash exactly.
 		if rhs.kind == "num" && initName == postName &&
 			cond.kind == "binop" && cond.BOpKind == "cmp" &&
 			cond.lhs.kind == "var" && cond.lhs.name == initName &&
 			cond.rhs.kind == "num" {
 			if start, err := strconv.Atoi(rhs.text); err == nil {
-				if end, err2 := strconv.Atoi(cond.rhs.text); err2 == nil {
-					if cond.BOp == "<" {
-						end--
-					}
+				if _, err2 := strconv.Atoi(cond.rhs.text); err2 == nil {
 					if cond.BOp == "<" || cond.BOp == "<=" {
 						return []map[string]any{{
-							"type": "For",
-							"var":  initName,
-							"iter": map[string]any{"type": "Range", "start": start, "end": end},
+							"type": "ForInit",
+							"init": []any{arithAssignStmt(initName, start)},
+							"cond": execCond("let", []map[string]any{
+								strExpr(initName + cond.BOp + cond.rhs.text),
+							}),
+							"step": []any{arithIncDecStmt(postName)},
 							"body": body,
 						}}
 					}
