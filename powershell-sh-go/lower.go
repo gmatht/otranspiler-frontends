@@ -494,8 +494,8 @@ func lowerStatementList(n *sitter.Node, src []byte) ([]any, error) {
 			// UNREFERENCED: pure spelling, dropped exactly like the
 			// t02 braces / t04 invocation operator (the t18 pin). The
 			// following loop statement lowers through its normal path
-			// (a label before a refused loop — while / switch — still
-			// refuses on the loop itself, loudly).
+			// (a label before a refused loop — switch — still refuses
+			// on the loop itself, loudly).
 			continue
 		}
 		if ch.Type() == "do_statement" {
@@ -549,6 +549,12 @@ func lowerStatement(n *sitter.Node, src []byte) ([]any, error) {
 		return []any{s}, nil
 	case "foreach_statement":
 		s, err := lowerForEachStatement(n, src)
+		if err != nil {
+			return nil, err
+		}
+		return []any{s}, nil
+	case "while_statement":
+		s, err := lowerWhileStatement(n, src)
 		if err != nil {
 			return nil, err
 		}
@@ -908,6 +914,57 @@ func lowerForStatement(n *sitter.Node, src []byte) (any, error) {
 	}
 	// `for (; C; ) { B }` ≡ `while (C) { B }` — the A1 While statement
 	// (the same shape the t06 do-while duplication emits).
+	return whileStmt(cond, body), nil
+}
+
+// lowerWhileStatement — the while_statement node: `while` `(`
+// while_condition `)` statement_block (the `while` keyword and the
+// parens are anonymous alias tokens; the named children are the
+// while_condition field and the body). The t35 rung lands the plan's
+// plain-while row (PLAN_POWERSHELL_F.md §1: "`while ($c) {}` / `do {}
+// while ($c)` → While / the do-while duplication"): the t06 do-while
+// duplication's re-check shape and the t12 condition-only for BOTH
+// emit this node's While, so `while ($c) { B }` lowers to the A1 While
+// statement directly — the same whileStmt the t06/t12 rungs emit,
+// byte-identical to the core's `while` emission. The while_condition
+// node is the SAME node type the t06 do_statement's re-check uses
+// (verified against node-types.json), so the condition lowers through
+// the same lowerCondition / lowerCondPipeline — the t06/t07 subset: a
+// bare variable read. Live pwsh 7.6.4: with $c unset the condition
+// reads $null (FALSY) and the body NEVER runs — CONSISTENT with the
+// A1 getVar read "" (the t06/t07 condition-position null edge) — so
+// the executed-stdout oracle matches by construction (both print the
+// statement after the loop, never the body; the body echo is
+// structural — a wrongly-run body would DIFF). Truthy pwsh automatics
+// ($true, …) DIVERGE exactly as in the do/for conditions and refuse
+// through the same lowerCondVar gate.
+func lowerWhileStatement(n *sitter.Node, src []byte) (any, error) {
+	var body []any
+	var cond any
+	for i := 0; i < int(n.NamedChildCount()); i++ {
+		ch := n.NamedChild(i)
+		switch ch.Type() {
+		case "statement_block":
+			// the body lowers through the same statement_list path as
+			// top-level statements (the t06/t07/t12 bodies)
+			b, err := lowerBlock(ch, src)
+			if err != nil {
+				return nil, err
+			}
+			body = b
+		case "while_condition":
+			c, err := lowerCondition(ch, src)
+			if err != nil {
+				return nil, err
+			}
+			cond = c
+		default:
+			return nil, refuse(ch, src, "while_statement part %q", ch.Type())
+		}
+	}
+	if cond == nil {
+		return nil, refuse(n, src, "while_statement without a condition")
+	}
 	return whileStmt(cond, body), nil
 }
 

@@ -268,8 +268,8 @@ line) — now the worker's fixes, not records):
   label is a SIBLING node before the loop statement in the
   statement_list, and `_labeled_statement` is one of switch/foreach/
   for/while/do — v1's expressible hosts are do (t06), for-condition
-  (t12) and foreach (t13); a label before a while/switch still refuses
-  on the loop itself). A label has NO runtime effect unless a
+  (t12), foreach (t13) and while (t35); a label before a switch still
+  refuses on the loop itself). A label has NO runtime effect unless a
   break/continue targets it, and v1 REFUSES break/continue (the t11
   loop-signal pin) — so every expressible program's label is
   UNREFERENCED: pure spelling, dropped exactly like the t02 braces /
@@ -749,6 +749,29 @@ line) — now the worker's fixes, not records):
   command's ONLY element (the t21/t25 precedent). The executed-stdout
   oracle matches live pwsh by construction: both print b, d and 9 —
   the integer ELSE branch, exercised at runtime.
+- t35_while_statement: the while_statement node — `while ($c) { B }`
+  (the `while` keyword and the parens are anonymous alias tokens; the
+  named children are the while_condition field and the statement_block
+  body). The t06 do-while duplication's re-check shape and the t12
+  condition-only for BOTH emit this node's While, so the rung lowers
+  `while ($c) { B }` to the A1 While statement directly — the same
+  whileStmt the t06/t12 rungs emit, byte-identical to the core's
+  `while` emission (the plan's "`while ($c) {}` / `do {} while ($c)` →
+  While / the do-while duplication" row, PLAN_POWERSHELL_F.md §1).
+  The while_condition node is the SAME node type the t06
+  do_statement's re-check uses (verified against node-types.json), so
+  the condition lowers through the shared lowerCondition /
+  lowerCondPipeline — the t06/t07 condition subset: a bare variable
+  read. Pinned for an UNSET variable (the t06/t07/t12
+  condition-position null edge is CONSISTENT: pwsh $null FALSY vs A1
+  "" FALSY): the body NEVER runs on either side, the statement after
+  the loop prints on both (the body echo is structural — a
+  wrongly-run body would DIFF). Truthy pwsh automatics (`$true`, …)
+  DIVERGE exactly as in the do/for conditions and refuse through the
+  same lowerCondVar gate; the t18 label before a while now lands
+  (pure spelling, dropped) and break/continue inside the body stay
+  refused (the flow-control keyword forms are their own unpinned
+  construct).
 
 Comments, comment-only files (empty Program), and the REFUSE table
   (refuse.go): anything outside the subset errors loudly — including

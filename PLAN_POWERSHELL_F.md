@@ -5,6 +5,31 @@ proposal is implemented as described; revision history below.
 
 ## 0. Revision history
 
+- 2026-08-14 (t35_while_statement, gate green): the while_statement
+  node lands — `while ($c) { B }` (the `while` keyword and the parens
+  are anonymous alias tokens; the named children are the
+  while_condition field and the statement_block body) — the plan's
+  "`while ($c) {}` / `do {} while ($c)` → While / the do-while
+  duplication" row's PLAIN form. The t06 do-while duplication's
+  re-check shape and the t12 condition-only for BOTH emit this node's
+  While, so the rung lowers `while ($c) { B }` to the A1 While
+  statement directly — the same whileStmt, byte-identical to the
+  core's `while` emission. The while_condition node is the SAME node
+  type the t06 do_statement's re-check uses (verified against
+  node-types.json), so the condition lowers through the shared
+  lowerCondition / lowerCondPipeline — the t06/t07 subset: a bare
+  variable read. Pinned for an UNSET variable (the condition-position
+  null edge is CONSISTENT — pwsh $null FALSY vs A1 "" FALSY): the
+  body NEVER runs on either side and the executed-stdout oracle
+  matches live pwsh by construction (both print only "after"; the
+  body echo is structural — a wrongly-run body would DIFF). Truthy
+  pwsh automatics ($true, …) DIVERGE exactly as in the do/for
+  conditions and refuse through the same lowerCondVar gate; the t18
+  label before a while now lands (pure spelling, dropped) and
+  break/continue inside the body stay refused (their own unpinned
+  flow-control construct). Gate: 39/39 refusals + ingress + stdout
+  match (35/35).
+
 - 2026-08-21 (t33_ternary_expression, gate green): the
   ternary_expression node lands — the `? :` ternary operator in a
   PARENTHESIZED command argument (`Write-Output ($x ? "a" : "b")`;
@@ -438,7 +463,7 @@ The new semantics to map (each a deliberate choice, refuse > guess):
 | `if ($c) {} elseif {} else {}` | If / else-if chain |
 | `for ($i = 0; $i -lt 3; $i++) {}` | the C frontend's for-lowering (init/cond/update → while) |
 | `foreach ($x in $list) {}` | For over the A1 array |
-| `while ($c) {}` / `do {} while ($c)` | While / the do-while duplication |
+| `while ($c) {}` / `do {} while ($c)` | While / the do-while duplication — both forms landed: the plain `while ($c) { B }` lowers directly to the A1 While (t35 2026-08-14, the same whileStmt the t06 duplication's re-check and the t12 condition-only for emit), the do form via the t06 do-while duplication (`do { B } while (C)` → `B; while (C) { B }`); the condition is the t06/t07 bare-variable-read subset, pinned for an UNSET variable |
 | `switch` | the A1 Case node (landed t31 2026-08-21 — the vendored grammar's switch-clause gap closed; the "clib switch lowering" the old refuse-note anticipated: `switch ($v) { 1 { … } default { … } }` → `case "$v" in 1) … ;; *) … ;; esac`, byte-identical to the core; the t31 subset pins a bare-variable / decimal-integer discriminant and decimal-integer clauses + a trailing `default`, the divergent edges (non-last default, duplicate clause values, string / bareword clause conditions, the -Regex/-Wildcard/… flags) refuse) |
 | `break` / `continue` | the loop signals |
 | `@(1, 2, 3)` array literal, `$a[0]`, `$a.Count` | setArray / arrayIndex / arrayLen |
