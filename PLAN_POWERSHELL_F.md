@@ -1,9 +1,83 @@
 # PLAN_POWERSHELL_F — a PowerShell frontend on the bat precedent
 
-**Status: IN PROGRESS — t30 landed (gate green).** The
+**Status: IN PROGRESS — t33 landed (gate green).** The
 proposal is implemented as described; revision history below.
 
 ## 0. Revision history
+
+- 2026-08-21 (t33_ternary_expression, gate green): the
+  ternary_expression node lands — the `? :` ternary operator in a
+  PARENTHESIZED command argument (`Write-Output ($x ? "a" : "b")`;
+  the grammar reaches this node ONLY inside a parenthesized_expression
+  command element and in bare statement position, which stays REFUSED
+  — the t17 statement-level precedent; the t32 file pins the OTHER
+  node, ternary_argument_expression, inside an argument_list —
+  verified against the CST that the two spellings parse as DIFFERENT
+  nodes with IDENTICAL child structure, the t20/t21 twin cadence).
+  Verified against live pwsh 7.6.4: the parens evaluate the ternary
+  to ONE object (`Write-Output ($x ? "a" : "b")` with $x unset
+  prints `b`), so the command lowers to the ternary If ALONE — the
+  t32 machinery, shared through lowerTernary, minus the head flush;
+  the A1 If is a statement, not an expression, so lowerCommand
+  intercepts the element via lowerParenTernary (the t21/t25
+  interceptor precedent). The t33 subset pins the SAME
+  condition/branch discipline as t32 (the shared lowerCondVar /
+  ternaryBranch checks — the t32 refuse pins carry over by
+  construction) and the paren as the command's ONLY element (a
+  further argument would be a SECOND pipeline object — refuse >
+  guess). Zero new A1 surface; the executed-stdout oracle matches
+  live pwsh by construction (both print b, d and 9 — the integer
+  else branch exercised at runtime).
+
+- 2026-08-21 (t32_ternary, gate green): the ternary_argument_expression
+  node lands — the `? :` ternary operator in an argument list
+  (`head($x ? "a" : "b")`; the grammar reaches this node ONLY inside
+  an argument_list, the argument_expression alternative at the top of
+  the precedence chain — the t14/t20 host; the parenthesized
+  `Write-Output ($x ? "a" : "b")` is the DIFFERENT ternary_expression
+  node — the t33 rung, above — the t20/t21 twin cadence). Verified against
+  live pwsh 7.6.4: the head argument and the ternary value are
+  SEPARATE pipeline objects (`Write-Output foo($x ? "a" : "b")`
+  prints `foo` then `b`), so the command lowers to ONE echo per
+  object — the t14 one-object-per-argument rule, the ternary itself
+  ONE object — and the ternary lowers through the SAME condition
+  semantics as if/while (the t20 coalesce precedent): a bare variable
+  read condition (UNSET: pwsh $null FALSY vs A1 "" FALSY) and a
+  literal string / decimal integer on each branch → `if (C) { echo A }
+  else { echo B }`, the t07 If shape, byte-identical to the core's if
+  emission — zero new A1 surface (the executed-stdout oracle matches
+  live pwsh by construction; the integer else branch is exercised at
+  runtime, the then-branch echo is structural). The divergent edges
+  refuse (pinned testdata_refuse/t32_*): `$true` condition (the t06
+  `$true` precedent — pwsh takes the then-branch, the falsy-lowering
+  the else), variable branch (evaluates to $null → the t02 PRINT
+  edge), chained ternary (a NESTED ternary_argument_expression
+  branch — the operand-shape check refuses) and a following
+  comma-list element (the array rung).
+
+- 2026-08-21 (t31_switch, gate green): the switch_statement node lands —
+  the plan's `switch` row, which §1 held as a refuse-node while the
+  grammar could not parse switch clause blocks ("the clib switch
+  lowering is ready when the grammar closes the gap"). The vendored
+  grammar parses the full shape (switch_condition + switch_body /
+  switch_clauses / switch_clause / switch_clause_condition; the
+  `default` keyword is an anonymous _switch_condition_token,
+  case-insensitive), verified against the CST, so the rung lands the
+  "clib switch lowering": the A1 Case node, byte-identical to the
+  core's `case "$x" in 1) … ;; *) … ;; esac` emission (verified
+  against `debashc --shir --raw`). The subset pins a bare-variable /
+  bare-decimal-integer discriminant (pwsh $null vs A1 "" is a
+  CONSISTENT null edge in the value position — $null -eq <literal> is
+  False exactly like "" failing every non-* case pattern) and decimal
+  integer clauses + a TRAILING default; the divergent edges refuse:
+  non-last default (pwsh runs a matching later clause and skips the
+  default, the A1 `*` would match first), duplicate clause values
+  (pwsh runs EVERY matching clause), string / bareword clause
+  conditions (pwsh -eq is case-insensitive, the A1 pattern match is
+  case-sensitive), the -regex/-wildcard/-exact/-casesensitive/
+  -parallel switch_parameters and the -File switch_filename form —
+  pinned `testdata_refuse/t31_*`. The executed-stdout oracle matches
+  live pwsh 7.6.4 by construction (both print "d" then "two").
 
 - 2026-08-20 (t30_sub_expression, gate green): the sub_expression node
   lands — the `$(…)` subexpression inside an expandable string
@@ -365,7 +439,7 @@ The new semantics to map (each a deliberate choice, refuse > guess):
 | `for ($i = 0; $i -lt 3; $i++) {}` | the C frontend's for-lowering (init/cond/update → while) |
 | `foreach ($x in $list) {}` | For over the A1 array |
 | `while ($c) {}` / `do {} while ($c)` | While / the do-while duplication |
-| `switch` | refuse-node (the grammar cannot parse switch clause blocks yet — the if/elseif chain covers the dispatch pattern; the clib switch lowering is ready when the grammar closes the gap) |
+| `switch` | the A1 Case node (landed t31 2026-08-21 — the vendored grammar's switch-clause gap closed; the "clib switch lowering" the old refuse-note anticipated: `switch ($v) { 1 { … } default { … } }` → `case "$v" in 1) … ;; *) … ;; esac`, byte-identical to the core; the t31 subset pins a bare-variable / decimal-integer discriminant and decimal-integer clauses + a trailing `default`, the divergent edges (non-last default, duplicate clause values, string / bareword clause conditions, the -Regex/-Wildcard/… flags) refuse) |
 | `break` / `continue` | the loop signals |
 | `@(1, 2, 3)` array literal, `$a[0]`, `$a.Count` | setArray / arrayIndex / arrayLen |
 | `@{ k = v }` hashtable | assoc store (or refuse v1 — bat has no dict precedent; pin one) |
@@ -413,9 +487,10 @@ Two REAL gaps, characterized precisely:
   parse; the workarounds parse CLEAN: `function name($a, $b) { … }`
   (parens-param) and the `$args[0]` style. v1 supports functions via
   those forms and pins the param()-block form as a refuse-node.
-- `switch ($v) { 1 { … } default { … } }` — switch clause blocks fail;
-  a genuine grammar gap, so `switch` is a refuse-node for v1 (the
-  if/elseif chain covers the common dispatch pattern meanwhile).
+- (The `switch ($v) { 1 { … } default { … } }` clause-block gap this
+  section originally reported CLOSED with the 2026-08-10 grammar push
+  — the vendored grammar parses the full switch shape and the t31 rung
+  landed the "clib switch lowering" (the A1 Case node) 2026-08-21.)
 
 The grammar is young (2★, created 2026-04) but ACTIVELY developed
 (pushed 2026-08-10 — the gaps above may close fast); the empirical parse
@@ -477,8 +552,9 @@ never against a guessed string.
 - **The `$_` rung** (ForEach-Object/Where-Object with the pipeline variable)
   is the first follow-up milestone — and the grammar ALREADY parses it
   (verified 2026-08-11): `$_` lowers to a per-item store var, the pipeline
-  becomes a loop over the A1 array. The `switch`-clause grammar gap is the
-  other watch item (the grammar pushed 2026-08-10 — it may close fast).
+  becomes a loop over the A1 array. (The `switch`-clause grammar gap that
+  used to be the other watch item closed with the 2026-08-10 grammar push
+  — the t31 rung landed the switch lowering 2026-08-21.)
 - Milestones: (1) scaffold + the hand lexer + echo/var/arith + the recorded
   gate, (2) control flow + functions + foreach/switch, (3) the refusal table
   + worker + fleet registration, (4) the `$_` pipeline rung or pwsh-native

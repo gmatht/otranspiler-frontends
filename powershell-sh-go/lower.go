@@ -1516,6 +1516,7 @@ func lowerCommand(n *sitter.Node, src []byte) ([]any, error) {
 	seenList := false
 	seenParenCoalesce := false
 	seenParenRange := false
+	seenParenTernary := false
 	seenStopParsing := false
 	if elems := n.ChildByFieldName("command_elements"); elems != nil {
 		for i := 0; i < int(elems.NamedChildCount()); i++ {
@@ -1612,6 +1613,34 @@ func lowerCommand(n *sitter.Node, src []byte) ([]any, error) {
 					continue
 				}
 				return nil, refuse(e, src, "element after a parenthesized null-coalesce (the t21 subset pins the paren as the command's only element; a further argument would be another pipeline object — refuse > guess)")
+			}
+			if ts, handled, err := lowerParenTernary(e, src); err != nil {
+				return nil, err
+			} else if handled {
+				// the t33 rung: `Write-Output ($x ? "a" : "b")` — the
+				// parenthesized ternary is ONE pipeline object, so the
+				// command lowers to the ternary If ALONE (the t32
+				// machinery, minus the head flush — the A1 If is a
+				// statement, not an expression). The t33 subset pins the
+				// paren as the command's ONLY element: a further argument
+				// would be a SECOND pipeline object (the multi-object
+				// shape stays outside the v1 single-object echo mapping;
+				// refuse > guess).
+				if len(redirects) > 0 {
+					return nil, refuse(e, src, "parenthesized ternary combined with a redirection (the t33 subset pins a plain command)")
+				}
+				if len(argExprs) != 0 {
+					return nil, refuse(e, src, "parenthesized ternary with %d preceding argument(s) (the t33 subset pins `Write-Output ($x ? \"a\" : \"b\")` — the paren is the command's only element)", len(argExprs))
+				}
+				stmts = append(stmts, ts...)
+				seenParenTernary = true
+				continue
+			}
+			if seenParenTernary {
+				if e.Type() == "command_argument_sep" {
+					continue
+				}
+				return nil, refuse(e, src, "element after a parenthesized ternary (the t33 subset pins the paren as the command's only element; a further argument would be another pipeline object — refuse > guess)")
 			}
 			if e.Type() == "redirection" {
 				// the t19 rung: the pwsh merging redirection (stream N
@@ -2014,6 +2043,49 @@ func lowerParenRange(e *sitter.Node, src []byte) ([]any, bool, error) {
 	return rs, true, nil
 }
 
+// lowerParenTernary — a parenthesized TERNARY command element:
+// `unary_expression` → `parenthesized_expression` whose single
+// pipeline_chain is a ternary_expression (`Write-Output ($x ? "a" :
+// "b")` — the t33 rung, the parenthesized twin of the t32
+// ternary_argument_expression; the grammar reaches the
+// ternary_expression node exactly in this parenthesized command
+// element and in bare statement position, which stays REFUSED — the
+// t17 statement-level precedent). Live pwsh 7.6.4 (verified
+// 2026-08-21): the parens evaluate the ternary to ONE object —
+// `Write-Output ($x ? "a" : "b")` with $x unset prints `b` — the
+// standard v1 single-object echo mapping, so the command lowers to
+// the ternary If ALONE (the t32 machinery, shared through
+// lowerTernary, minus the head flush; the A1 If is a statement, not
+// an expression, so lowerCommand intercepts the element via
+// lowerParenTernary). The t33 subset pins the paren as the command's
+// ONLY element — a further argument would be a SECOND pipeline
+// object (the multi-object shape stays outside the v1 single-object
+// echo mapping; refuse > guess). Returns (stmts, true, nil) for the
+// ternary shape, (nil, false, nil) for any other element /
+// parenthesized content (the caller falls through to the t17
+// expression path), and refuses a malformed paren.
+func lowerParenTernary(e *sitter.Node, src []byte) ([]any, bool, error) {
+	if e.Type() != "unary_expression" || e.NamedChildCount() != 1 {
+		return nil, false, nil
+	}
+	pe := e.NamedChild(0)
+	if pe.Type() != "parenthesized_expression" {
+		return nil, false, nil
+	}
+	chain, err := parenPipelineChain(pe, src)
+	if err != nil {
+		return nil, false, err
+	}
+	if chain.NamedChildCount() != 1 || chain.NamedChild(0).Type() != "ternary_expression" {
+		return nil, false, nil
+	}
+	ts, err := lowerTernary(chain.NamedChild(0), src)
+	if err != nil {
+		return nil, false, err
+	}
+	return ts, true, nil
+}
+
 // lowerCoalesce — the `??` null-coalescing operator, shared by the TWO
 // grammar nodes that reach it (verified identical child structure
 // against the CST — unary_expression, `??`, unary_expression):
@@ -2098,23 +2170,27 @@ func lowerCoalesce(n *sitter.Node, src []byte) ([]any, error) {
 	return []any{ifStmt(cond, []any{exprStmt(execCall("echo", []any{cond}))}, []any{exprStmt(execCall("echo", []any{def}))})}, nil
 }
 
-// lowerTernary — the `? :` ternary operator in an argument list (the
-// t32 rung): the ternary_argument_expression node (`head($x ? "a" :
-// "b")`). The grammar reaches this node ONLY inside an argument_list —
-// the `(` argument_expression_list `)` attached to a command argument
-// (verified against the CST: the node has THREE named children — the
-// condition and the two branches, all unary_expression — plus the
-// anonymous `?` / `:` operator tokens; the parenthesized `Write-Output
-// ($x ? "a" : "b")` parses as the DIFFERENT ternary_expression node,
-// still refused, and a bare `?` in argument position is a
-// command_parameter).
+// lowerTernary — the `? :` ternary operator, shared by the TWO grammar
+// nodes that reach it (verified identical child structure against the
+// CST — unary_expression, `?`, unary_expression, `:`, unary_expression):
+//   - ternary_argument_expression (the t32 rung): inside an argument_list,
+//     as an argument_expression child (`head($x ? "a" : "b")` — the
+//     grammar reaches this node ONLY inside an argument_list);
+//   - ternary_expression (the t33 rung): inside a parenthesized_expression
+//     command element (`Write-Output ($x ? "a" : "b")` — reached via
+//     lowerParenTernary; the argument-list and parenthesized spellings
+//     parse as DIFFERENT nodes, the t20/t21 precedent).
+//
+// A bare `?` in argument position is a command_parameter.
 //
 // Live pwsh 7.6.4 (verified 2026-08-21): the head argument and the
 // ternary value are SEPARATE pipeline objects — `Write-Output
 // foo($x ? "a" : "b")` with $x unset prints `foo` then `b` — so the
 // command lowers to ONE echo per object (the t14
 // one-object-per-argument rule; the head flush is the t14 machinery),
-// the ternary itself being ONE object. The t32 subset pins the
+// the ternary itself being ONE object (and in the t33 parenthesized
+// position the paren evaluates to that ONE object alone — `Write-Output
+// ($x ? "a" : "b")` prints just `b`). The t32/t33 subset pins the
 // t06/t07 condition shape — a bare variable read condition (UNSET in
 // the subset: variables are never assigned in v1) and a literal
 // string / decimal integer on EACH branch (the t20 literal-default
@@ -2131,8 +2207,8 @@ func lowerCoalesce(n *sitter.Node, src []byte) ([]any, error) {
 // ? "a" : $y` with both unset evaluates to $null — `Write-Output` of
 // a bare $null prints NOTHING vs the A1 echo's blank line (the t02
 // PRINT edge). A chained `$x ? "a" : $y ? "b" : "c"` parses as a
-// NESTED ternary_argument_expression branch and REFUSES on the
-// operand-shape check (refuse > guess).
+// NESTED ternary branch and REFUSES on the operand-shape check
+// (refuse > guess).
 func lowerTernary(n *sitter.Node, src []byte) ([]any, error) {
 	var cond, thenN, elseN *sitter.Node
 	for i := 0; i < int(n.ChildCount()); i++ {
@@ -2748,7 +2824,7 @@ func lowerParenthesized(n *sitter.Node, src []byte) (any, error) {
 		return nil, err
 	}
 	if chain.NamedChildCount() != 1 {
-		return nil, refuse(n, src, "parenthesized pipeline chain with %d children (the t17/t21 subsets pin a single format_expression / null_coalesce_expression host)", chain.NamedChildCount())
+		return nil, refuse(n, src, "parenthesized pipeline chain with %d children (the t17/t21/t33 subsets pin a single format_expression / null_coalesce_expression / ternary_expression host)", chain.NamedChildCount())
 	}
 	op := chain.NamedChild(0)
 	switch op.Type() {
@@ -2762,8 +2838,16 @@ func lowerParenthesized(n *sitter.Node, src []byte) (any, error) {
 		// nested inside another operand (a cast operand, a t14
 		// argument-list element, …) — unpinned, refuse > guess.
 		return nil, refuse(n, src, "parenthesized null-coalesce in a nested operand position (the t21 subset pins the `Write-Output ($x ?? \"d\")` command element; refuse > guess)")
+	case "ternary_expression":
+		// the command path intercepts this shape BEFORE the expression
+		// lowering (lowerCommand → lowerParenTernary — the t33 rung:
+		// the ternary lowers to the If STATEMENT, and the A1 has no
+		// conditional-expression node); reaching here means the paren is
+		// nested inside another operand (a cast operand, a t14
+		// argument-list element, …) — unpinned, refuse > guess.
+		return nil, refuse(n, src, "parenthesized ternary in a nested operand position (the t33 subset pins the `Write-Output ($x ? \"a\" : \"b\")` command element; refuse > guess)")
 	default:
-		return nil, refuse(n, src, "parenthesized expression %q (the t17/t21 subsets pin the `-f` format_expression host and the parenthesized null-coalesce; other parenthesized expressions are unpinned)", n.Content(src))
+		return nil, refuse(n, src, "parenthesized expression %q (the t17/t21/t33 subsets pin the `-f` format_expression host, the parenthesized null-coalesce and the parenthesized ternary; other parenthesized expressions are unpinned)", n.Content(src))
 	}
 }
 

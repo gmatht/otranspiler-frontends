@@ -695,9 +695,9 @@ line) — now the worker's fixes, not records):
   ternary operator in an argument list (`head($x ? "a" : "b")`; the
   grammar reaches this node ONLY inside an argument_list, the
   argument_expression alternative at the top of the precedence chain
-  — the t14/t20 host; a parenthesized `Write-Output ($x ? "a" :
-  "b")` parses as the DIFFERENT ternary_expression node, still
-  refused, and a bare `?` in argument position is a
+  — the t14/t20 host; the parenthesized `Write-Output ($x ? "a" :
+  "b")` parses as the DIFFERENT ternary_expression node — the t33
+  rung, below — and a bare `?` in argument position is a
   command_parameter). Live pwsh 7.6.4 (verified 2026-08-21): the
   head argument and the ternary value are SEPARATE pipeline objects
   — `Write-Output foo($x ? "a" : "b")` prints `foo` then `b` — so
@@ -727,6 +727,28 @@ line) — now the worker's fixes, not records):
   discipline). The condition refusal shares lowerCondVar with the
   t06/t07 conditions and the t20 LHS (extracted when the t20 rung
   landed).
+- t33_ternary_expression: the ternary_expression node — the `? :`
+  ternary operator in a PARENTHESIZED command argument (`Write-Output
+  ($x ? "a" : "b")`; the grammar reaches this node ONLY inside a
+  parenthesized_expression command element and in bare statement
+  position, which stays REFUSED — the t17 statement-level precedent;
+  the t32 file pins the OTHER node, ternary_argument_expression,
+  inside an argument_list — verified against the CST that the two
+  spellings parse as DIFFERENT nodes with IDENTICAL child structure,
+  the t20/t21 precedent). Live pwsh 7.6.4 (verified 2026-08-21): the
+  parens evaluate the ternary to ONE object — `Write-Output ($x ?
+  "a" : "b")` with $x unset prints `b` — the standard v1
+  single-object echo mapping, so the command lowers to the ternary If
+  ALONE (the t32 machinery, shared through lowerTernary, minus the
+  head flush; the A1 If is a statement, not an expression, so
+  lowerCommand intercepts the element via lowerParenTernary). The
+  t33 subset pins the SAME condition/branch discipline as t32 (the
+  shared lowerCondVar / ternaryBranch checks — the t32 refuse pins
+  carry over by construction, and a further argument would be a
+  SECOND pipeline object, refuse > guess) and the paren as the
+  command's ONLY element (the t21/t25 precedent). The executed-stdout
+  oracle matches live pwsh by construction: both print b, d and 9 —
+  the integer ELSE branch, exercised at runtime.
 
 Comments, comment-only files (empty Program), and the REFUSE table
   (refuse.go): anything outside the subset errors loudly — including
@@ -735,8 +757,7 @@ Comments, comment-only files (empty Program), and the REFUSE table
 
 The v1 subset and the refusal table are PLAN_POWERSHELL_F.md. The next
 construct (assignment + `$var` interpolation, the elseif chain, the
-parenthesized ternary_expression twin, the runtime printf-style `-f`
-rung, the nested `&&`/`||` chain) lands on
+runtime printf-style `-f` rung, the nested `&&`/`||` chain) lands on
 the next RED pin; the
 string-interpolation machinery it needs is already in place (lower.go
 reconstructs string parts from byte spans — the smacker runtime does
