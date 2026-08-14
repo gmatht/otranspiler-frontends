@@ -256,6 +256,28 @@ func binOpExpr(op string, lhs, rhs any) any {
 	}
 }
 
+// arithNum / arithBin / arithExpr — the A1 Arith expression (the t36
+// rung: the parenthesized `+ - * %` arithmetic of a command argument —
+// `Write-Output (1 + 2)` → the core's `echo $((1+2))` Arith shape,
+// byte-identical: {"type":"Arith","ast":{"type":"Bin","op":"+",
+// "lhs":{"type":"Num","value":1},"rhs":{"type":"Num","value":2}}},
+// sorted keys — ast < type, lhs < op < rhs < type inside ast). The
+// A1→ESTree renderer lowers + - * to native JS arithmetic (and % to the
+// bash-semantics runtime helper), which agrees with pwsh 7.6.4 on
+// integer operands — the executed-stdout oracle matches live pwsh by
+// construction.
+func arithNum(n int64) any {
+	return map[string]any{"type": "Num", "value": n}
+}
+
+func arithBin(op string, lhs, rhs any) any {
+	return map[string]any{"type": "Bin", "op": op, "lhs": lhs, "rhs": rhs}
+}
+
+func arithExpr(ast any) any {
+	return map[string]any{"type": "Arith", "ast": ast}
+}
+
 // getVarCall — $name reads lower to getVar("name") (the core's var-read
 // channel; Emulable per the A4 namespace spec).
 func getVarCall(name string) any {

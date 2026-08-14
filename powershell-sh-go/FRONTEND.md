@@ -4,7 +4,7 @@ PowerShell (.ps1) source -> A1 shIR JSON — **the bat sibling**
 (workspace-side dir; no git worktree; the object pipeline is a stated
 TEXT approximation for v1; see PLAN_POWERSHELL_F.md).
 
-**Status: WORKER-IMPLEMENTED, t32 landed (gate green).** The parser is
+**Status: WORKER-IMPLEMENTED, t36 landed (gate green).** The parser is
 wharflab/tree-sitter-powershell (vendored under
 `grammars/tree-sitter-powershell/`, loaded via smacker/go-tree-sitter
 cgo) — the plan's choice, empirically verified. The emitter produces A1
@@ -772,6 +772,39 @@ line) — now the worker's fixes, not records):
   (pure spelling, dropped) and break/continue inside the body stay
   refused (the flow-control keyword forms are their own unpinned
   construct).
+- t36_arithmetic: the additive_expression / multiplicative_expression
+  nodes — the binary arithmetic operators in a PARENTHESIZED command
+  argument (`Write-Output (1 + 2)`; the grammar reaches them exactly
+  there and in bare statement position, which stays REFUSED — the t17
+  statement-level precedent; the argument_list forms (additive_ /
+  multiplicative_argument_expression) stay REFUSED on the t14
+  machinery). The A1 Arith node — the plan's "`+ - * / %` (numeric) →
+  the Arith AST" row (PLAN_POWERSHELL_F.md §1; the planned
+  t03_arith.ps1 surface) — is the construct the example exercises:
+  the core's `echo $((1+2))` emission, byte-identical (verified
+  against `debashc --shir --raw`). Live pwsh 7.6.4 (verified
+  2026-08-24): the parens evaluate the arithmetic to ONE object —
+  `Write-Output (1 + 2)` prints 3, `7 - 2` → 5, `2 * 3` → 6, `7 % 3`
+  → 1, `1 + 2 * 3` → 7 (precedence), `1 + 2 + 3` → 6 (left
+  associativity) — the standard v1 single-object echo mapping, so the
+  command lowers to ONE echo of the A1 Arith (the A1→ESTree renderer
+  lowers + - * to native JS arithmetic and % to the bash-semantics
+  helper, which agree with pwsh on integer operands; the
+  executed-stdout oracle matches live pwsh by construction). The t36
+  subset pins an ALL-LITERAL arithmetic: every operand is a bare
+  decimal integer_literal or a nested expression of the same shape
+  (the precedence / associativity pins), so the ArithAst is a
+  compile-time Num/Bin tree with NO variables — pwsh arithmetic is
+  overloaded (string concat, $null→0 coercion, real division) and a
+  variable / string / real / hex / cast / unary-operator operand
+  would DIVERGE from the A1's bash-integer semantics (refuse >
+  guess), each pinned in `testdata_refuse/t36_*`. `/` REFUSES — pwsh
+  7.6.4 REAL division (`Write-Output (7 / 2)` prints 3.5) vs the A1
+  Arith's bash INTEGER division (Math.trunc — the transpiled run
+  prints 3) — and `\` (pwsh integer division; the A1 ArithAst has no
+  such operator) refuses too, as do a head/tail argument around the
+  paren (a SECOND pipeline object — the t21/t25/t33 only-element
+  precedent).
 
 Comments, comment-only files (empty Program), and the REFUSE table
   (refuse.go): anything outside the subset errors loudly — including

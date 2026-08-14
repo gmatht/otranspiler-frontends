@@ -3,6 +3,7 @@ package ps1lib
 import (
 	"bytes"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -16,6 +17,13 @@ import (
 // statements). The subset pins short literal ranges; anything beyond
 // the cap REFUSES (the runtime array rung is a later milestone).
 const maxRangeSpan = 1000
+
+// decimalLiteralRe — the t36 arith rung's bare-decimal-integer check:
+// an integer_literal operand is admitted ONLY in the pure decimal
+// spelling (hexadecimal_integer_literal / real_literal operands stay
+// unpinned — the t16/t27 precedents; the grammar reaches them as
+// DIFFERENT literal node shapes).
+var decimalLiteralRe = regexp.MustCompile(`^[0-9]+$`)
 
 // ── CST structure (tree-sitter-powershell, vendored grammar) ──────────
 //
@@ -1574,6 +1582,7 @@ func lowerCommand(n *sitter.Node, src []byte) ([]any, error) {
 	seenParenCoalesce := false
 	seenParenRange := false
 	seenParenTernary := false
+	seenParenArith := false
 	seenStopParsing := false
 	if elems := n.ChildByFieldName("command_elements"); elems != nil {
 		for i := 0; i < int(elems.NamedChildCount()); i++ {
@@ -1698,6 +1707,35 @@ func lowerCommand(n *sitter.Node, src []byte) ([]any, error) {
 					continue
 				}
 				return nil, refuse(e, src, "element after a parenthesized ternary (the t33 subset pins the paren as the command's only element; a further argument would be another pipeline object — refuse > guess)")
+			}
+			if as, handled, err := lowerParenArith(e, src); err != nil {
+				return nil, err
+			} else if handled {
+				// the t36 rung: `Write-Output (1 + 2)` — the parenthesized
+				// arithmetic paren evaluates to ONE object (live pwsh
+				// 7.6.4: prints `3`), so the argument lowers to ONE A1
+				// Arith expression — the core's `echo $((1+2))` shape,
+				// byte-identical, and the A1→ESTree renderer's native JS
+				// arithmetic prints the same text as pwsh by construction.
+				// The t36 subset pins the paren as the command's ONLY
+				// element: a further argument would be a SECOND pipeline
+				// object (the multi-object shape stays outside the v1
+				// single-object echo mapping; refuse > guess).
+				if len(redirects) > 0 {
+					return nil, refuse(e, src, "parenthesized arithmetic combined with a redirection (the t36 subset pins a plain command)")
+				}
+				if len(argExprs) != 0 {
+					return nil, refuse(e, src, "parenthesized arithmetic with %d preceding argument(s) (the t36 subset pins `Write-Output (1 + 2)` — the paren is the command's only element)", len(argExprs))
+				}
+				argExprs = append(argExprs, as)
+				seenParenArith = true
+				continue
+			}
+			if seenParenArith {
+				if e.Type() == "command_argument_sep" {
+					continue
+				}
+				return nil, refuse(e, src, "element after a parenthesized arithmetic (the t36 subset pins the paren as the command's only element; a further argument would be another pipeline object — refuse > guess)")
 			}
 			if e.Type() == "redirection" {
 				// the t19 rung: the pwsh merging redirection (stream N
@@ -2141,6 +2179,143 @@ func lowerParenTernary(e *sitter.Node, src []byte) ([]any, bool, error) {
 		return nil, false, err
 	}
 	return ts, true, nil
+}
+
+// lowerParenArith — a parenthesized ARITHMETIC command element:
+// `unary_expression` → `parenthesized_expression` whose single
+// pipeline_chain is an additive_expression / multiplicative_expression
+// (`Write-Output (1 + 2)` — the t36 rung, the A1 Arith node; the
+// grammar reaches the arithmetic nodes exactly in this parenthesized
+// command element and in bare statement position, which stays REFUSED
+// — the t17 statement-level precedent — and inside an argument_list as
+// the DIFFERENT additive_argument_expression /
+// multiplicative_argument_expression nodes, which stay REFUSED on the
+// t14 machinery — the t14/t24/t32 host). Live pwsh 7.6.4 (verified
+// 2026-08-24): the parens evaluate the arithmetic to ONE object —
+// `Write-Output (1 + 2)` prints `3`, `Write-Output (7 / 2)` prints
+// `3.5` — the standard v1 single-object echo mapping, so the argument
+// lowers to ONE A1 Arith expression (the core's `echo $((1+2))`
+// emission, byte-identical — verified against `debashc --shir --raw`;
+// the A1→ESTree renderer lowers + - * to native JS arithmetic and %
+// to the bash-semantics runtime helper, and the executed-stdout oracle
+// matches live pwsh by construction). The t36 subset pins an
+// ALL-LITERAL arithmetic: every operand is a bare decimal
+// integer_literal (or a nested expression of the same shape — the
+// precedence/associativity pins), so the ArithAst is a compile-time
+// Num/Bin tree with NO variables — pwsh arithmetic is overloaded
+// (string concat, $null→0 coercion, real division) and a variable /
+// string / real operand would DIVERGE from the A1's bash-integer
+// semantics (refuse > guess). `/` REFUSES — pwsh real division vs the
+// A1's bash INTEGER division (Math.trunc): `Write-Output (7 / 2)`
+// prints 3.5 in pwsh and 3 transpiled (verified 2026-08-24) — and
+// `\` (pwsh integer division) refuses too: the A1 ArithAst has no
+// such operator. Returns (arg, true, nil) for the arithmetic shape,
+// (nil, false, nil) for any other element / parenthesized content
+// (the caller falls through to the t17 expression path), and refuses
+// a malformed paren.
+func lowerParenArith(e *sitter.Node, src []byte) (any, bool, error) {
+	if e.Type() != "unary_expression" || e.NamedChildCount() != 1 {
+		return nil, false, nil
+	}
+	pe := e.NamedChild(0)
+	if pe.Type() != "parenthesized_expression" {
+		return nil, false, nil
+	}
+	chain, err := parenPipelineChain(pe, src)
+	if err != nil {
+		return nil, false, err
+	}
+	if chain.NamedChildCount() != 1 {
+		return nil, false, nil
+	}
+	op := chain.NamedChild(0)
+	if op.Type() != "additive_expression" && op.Type() != "multiplicative_expression" {
+		return nil, false, nil
+	}
+	ast, err := lowerArithExpr(op, src)
+	if err != nil {
+		return nil, false, err
+	}
+	return arithExpr(ast), true, nil
+}
+
+// lowerArithExpr — the additive_expression / multiplicative_expression
+// nodes (the t36 rung): `1 + 2` / `2 * 3` — the grammar's binary
+// arithmetic: `_additive_expression ("+"|"-") _multiplicative_expression`
+// and `_multiplicative_expression ("/"|"\\"|"%"|"*") _format_expression`
+// (verified against grammar.json and the CST: the operands are
+// unary_expression leaves or NESTED additive/multiplicative
+// expressions — `1 + 2 * 3` nests the multiplicative RHS, `1 + 2 + 3`
+// nests the additive LHS, left-assoc — so the lowering recurses on
+// named operand children). Leaf operands must be bare decimal
+// integer_literals (hex / real / variable / string / cast / unary-
+// operator operands REFUSE — the pwsh coercions diverge from the A1's
+// bash-integer Arith semantics). The A1 shape mirrors the core's
+// `$((...))` emission exactly: Bin with the op string and Num leaves.
+func lowerArithExpr(n *sitter.Node, src []byte) (any, error) {
+	switch n.Type() {
+	case "unary_expression":
+		// leaf: the single operand must be a bare decimal integer
+		// literal (the t11/t14/t24 decimal-integer discipline; hex /
+		// real operands stay unpinned — the t16/t27 precedents).
+		if n.NamedChildCount() != 1 {
+			return nil, refuse(n, src, "arithmetic operand unary_expression with %d children", n.NamedChildCount())
+		}
+		lit := n.NamedChild(0)
+		if lit.Type() != "integer_literal" {
+			return nil, refuse(lit, src, "arithmetic operand %q (the t36 subset pins bare decimal integer literals; a variable/string/real/cast operand would DIVERGE — pwsh arithmetic is overloaded, the A1 Arith is bash-integer — refuse > guess)", lit.Type())
+		}
+		text := lit.Content(src)
+		if !decimalLiteralRe.MatchString(text) {
+			return nil, refuse(lit, src, "arithmetic operand %q (the t36 subset pins bare decimal integer literals — hex/reals are the t16/t27 unpinned shapes)", text)
+		}
+		v, err := strconv.ParseInt(text, 10, 64)
+		if err != nil {
+			return nil, refuse(lit, src, "arithmetic operand %q (out of int64 range)", text)
+		}
+		return arithNum(v), nil
+	case "additive_expression", "multiplicative_expression":
+		// named children are the operands, anonymous children the
+		// operator tokens (the grammar's PREC_LEFT chain: at most one
+		// operator per node — a longer chain nests).
+		var operands []*sitter.Node
+		var ops []string
+		for i := 0; i < int(n.ChildCount()); i++ {
+			ch := n.Child(i)
+			if ch.IsNamed() {
+				operands = append(operands, ch)
+			} else {
+				ops = append(ops, ch.Type())
+			}
+		}
+		if len(ops) != 1 || len(operands) != 2 {
+			return nil, refuse(n, src, "%s with %d operator(s) / %d operand(s) (the t36 subset pins a single binary operator per node)", n.Type(), len(ops), len(operands))
+		}
+		switch ops[0] {
+		case "+", "-", "*", "%":
+			// the A1-expressible set: the core's ArithBin ops the
+			// renderer lowers to native JS (+ - *) or the bash-semantics
+			// helper (%) — pwsh 7.6.4 agrees on integer operands
+			// (verified: 1+2→3, 7-2→5, 2*3→6, 7%3→1, 1+2*3→7).
+		case "/":
+			return nil, refuse(n, src, "arithmetic `/` (pwsh 7.6.4 REAL division — `Write-Output (7 / 2)` prints 3.5 — vs the A1 Arith's bash INTEGER division Math.trunc — the transpiled run prints 3; refuse > guess)")
+		case "\\":
+			return nil, refuse(n, src, "arithmetic `\\` (pwsh integer division — the A1 ArithAst has no such operator; refuse > guess)")
+		default:
+			return nil, refuse(n, src, "arithmetic operator %q (unpinned)", ops[0])
+		}
+		lhs, err := lowerArithExpr(operands[0], src)
+		if err != nil {
+			return nil, err
+		}
+		rhs, err := lowerArithExpr(operands[1], src)
+		if err != nil {
+			return nil, err
+		}
+		return arithBin(ops[0], lhs, rhs), nil
+	default:
+		return nil, refuse(n, src, "arithmetic expression %q", n.Type())
+	}
 }
 
 // lowerCoalesce — the `??` null-coalescing operator, shared by the TWO
@@ -2903,6 +3078,14 @@ func lowerParenthesized(n *sitter.Node, src []byte) (any, error) {
 		// nested inside another operand (a cast operand, a t14
 		// argument-list element, …) — unpinned, refuse > guess.
 		return nil, refuse(n, src, "parenthesized ternary in a nested operand position (the t33 subset pins the `Write-Output ($x ? \"a\" : \"b\")` command element; refuse > guess)")
+	case "additive_expression", "multiplicative_expression":
+		// the command path intercepts this shape BEFORE the expression
+		// lowering (lowerCommand → lowerParenArith — the t36 rung: the
+		// arithmetic paren is the command's ONLY element); reaching here
+		// means the paren is nested inside another operand (a cast
+		// operand, a t14 argument-list element, …) — unpinned, refuse
+		// > guess.
+		return nil, refuse(n, src, "parenthesized arithmetic in a nested operand position (the t36 subset pins the `Write-Output (1 + 2)` command element; refuse > guess)")
 	default:
 		return nil, refuse(n, src, "parenthesized expression %q (the t17/t21/t33 subsets pin the `-f` format_expression host, the parenthesized null-coalesce and the parenthesized ternary; other parenthesized expressions are unpinned)", n.Content(src))
 	}
