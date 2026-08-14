@@ -1703,7 +1703,9 @@ func lowerCommand(n *sitter.Node, src []byte) ([]any, error) {
 // every following list element as its arguments — the comma-list is
 // the format operator's argument array in pwsh; see lowerFormatArg);
 // the t24 subset pins the `..` RANGE form (lowerRangeArg — the range
-// must be the ONLY list element); a plain literal list (`foo("x")`)
+// must be the ONLY list element); the t32 subset pins the `? :`
+// TERNARY form (lowerTernary — the ternary must be the ONLY list
+// element, the t20 precedent); a plain literal list (`foo("x")`)
 // is a different rung and REFUSES.
 func lowerArgumentList(n *sitter.Node, src []byte) ([]any, error) {
 	list := n.ChildByFieldName("argument_expression_list")
@@ -1739,6 +1741,19 @@ func lowerArgumentList(n *sitter.Node, src []byte) ([]any, error) {
 				return nil, err
 			}
 			out = append(out, cs...)
+		case "ternary_argument_expression":
+			// the t32 rung: `head($x ? "a" : "b")` — the ternary must be
+			// the ONLY list element (a following comma-list is the
+			// plain argument-list / array rung — the t20 precedent;
+			// refuse > guess).
+			if i != int(list.NamedChildCount())-1 {
+				return nil, refuse(c, src, "element after a ternary argument (the t32 subset pins `head($x ? \"a\" : \"b\")` with the ternary as the only list element; a comma-list is the array rung)")
+			}
+			ts, err := lowerTernary(c, src)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, ts...)
 		case "range_argument_expression":
 			// the t24 rung: `head(1..3)` — the `..` range argument must
 			// be the ONLY list element (a following comma-list is the
@@ -2081,6 +2096,111 @@ func lowerCoalesce(n *sitter.Node, src []byte) ([]any, error) {
 	// construction (the t07 shape: cond/then/elsifs/else, byte-identical
 	// to the core's if emission).
 	return []any{ifStmt(cond, []any{exprStmt(execCall("echo", []any{cond}))}, []any{exprStmt(execCall("echo", []any{def}))})}, nil
+}
+
+// lowerTernary — the `? :` ternary operator in an argument list (the
+// t32 rung): the ternary_argument_expression node (`head($x ? "a" :
+// "b")`). The grammar reaches this node ONLY inside an argument_list —
+// the `(` argument_expression_list `)` attached to a command argument
+// (verified against the CST: the node has THREE named children — the
+// condition and the two branches, all unary_expression — plus the
+// anonymous `?` / `:` operator tokens; the parenthesized `Write-Output
+// ($x ? "a" : "b")` parses as the DIFFERENT ternary_expression node,
+// still refused, and a bare `?` in argument position is a
+// command_parameter).
+//
+// Live pwsh 7.6.4 (verified 2026-08-21): the head argument and the
+// ternary value are SEPARATE pipeline objects — `Write-Output
+// foo($x ? "a" : "b")` with $x unset prints `foo` then `b` — so the
+// command lowers to ONE echo per object (the t14
+// one-object-per-argument rule; the head flush is the t14 machinery),
+// the ternary itself being ONE object. The t32 subset pins the
+// t06/t07 condition shape — a bare variable read condition (UNSET in
+// the subset: variables are never assigned in v1) and a literal
+// string / decimal integer on EACH branch (the t20 literal-default
+// discipline) — so the ternary lowers through the SAME condition
+// semantics as if/while: pwsh reads $null (FALSY) and the A1 store
+// reads "" (FALSY), both take the else branch — `C ? A : B` →
+// `if (C) { echo A } else { echo B }`, the t07 If shape
+// (cond/then/elsifs/else, byte-identical to the core's if emission;
+// the then-branch echo is dead within the subset, where every
+// variable reads falsy). Truthy pwsh automatics (`$true`) and a
+// variable branch DIVERGE and REFUSE (both pinned in
+// testdata_refuse/): `$true ? "a" : "b"` prints the then-branch a in
+// pwsh vs the falsy-lowering's b (the t06 `$true` refusal), and `$x
+// ? "a" : $y` with both unset evaluates to $null — `Write-Output` of
+// a bare $null prints NOTHING vs the A1 echo's blank line (the t02
+// PRINT edge). A chained `$x ? "a" : $y ? "b" : "c"` parses as a
+// NESTED ternary_argument_expression branch and REFUSES on the
+// operand-shape check (refuse > guess).
+func lowerTernary(n *sitter.Node, src []byte) ([]any, error) {
+	var cond, thenN, elseN *sitter.Node
+	for i := 0; i < int(n.ChildCount()); i++ {
+		ch := n.Child(i)
+		switch ch.Type() {
+		case "unary_expression":
+			if cond == nil {
+				cond = ch
+			} else if thenN == nil {
+				thenN = ch
+			} else if elseN == nil {
+				elseN = ch
+			} else {
+				return nil, refuse(ch, src, "ternary with more than three operands")
+			}
+		case "?", ":":
+			// the operator tokens — structure only
+		default:
+			return nil, refuse(ch, src, "ternary part %q (the t32 subset pins the `cond ? a : b` shape)", ch.Type())
+		}
+	}
+	if cond == nil || thenN == nil || elseN == nil {
+		return nil, refuse(n, src, "ternary without all three operands")
+	}
+	condExpr, err := lowerCondVar(cond, src, "ternary condition")
+	if err != nil {
+		return nil, err
+	}
+	thenV, err := ternaryBranch(thenN, src, "then")
+	if err != nil {
+		return nil, err
+	}
+	elseV, err := ternaryBranch(elseN, src, "else")
+	if err != nil {
+		return nil, err
+	}
+	// the ternary is ONE pipeline object → the A1 If with an echo per
+	// branch; the unset-variable subset takes the else branch on BOTH
+	// oracles, so the executed-stdout gate matches live pwsh by
+	// construction (the t07 shape: cond/then/elsifs/else, byte-identical
+	// to the core's if emission).
+	return []any{ifStmt(condExpr, []any{exprStmt(execCall("echo", []any{thenV}))}, []any{exprStmt(execCall("echo", []any{elseV}))})}, nil
+}
+
+// ternaryBranch — ONE ternary branch as the A1 value: the t32 subset
+// pins a literal string / decimal integer on each branch (the t20
+// literal-default discipline — a variable branch would evaluate to
+// $null for an unset variable → the t02 bare-$null PRINT edge;
+// refuse > guess).
+func ternaryBranch(n *sitter.Node, src []byte, what string) (any, error) {
+	if n.NamedChildCount() != 1 {
+		return nil, refuse(n, src, "ternary %s branch with %d children", what, n.NamedChildCount())
+	}
+	op := n.NamedChild(0)
+	var v any
+	var err error
+	switch op.Type() {
+	case "string_literal":
+		v, err = lowerStringLiteral(op, src)
+	case "integer_literal":
+		v = strExpr(op.Content(src), "DoubleQuoted")
+	default:
+		return nil, refuse(op, src, "ternary %s branch %q (the t32 subset pins a literal string / decimal integer branch)", what, op.Type())
+	}
+	if err != nil {
+		return nil, err
+	}
+	return v, nil
 }
 
 // lowerRange — the `..` range operator's compile-time fold, shared by

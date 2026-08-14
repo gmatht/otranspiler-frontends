@@ -4,7 +4,7 @@ PowerShell (.ps1) source -> A1 shIR JSON — **the bat sibling**
 (workspace-side dir; no git worktree; the object pipeline is a stated
 TEXT approximation for v1; see PLAN_POWERSHELL_F.md).
 
-**Status: WORKER-IMPLEMENTED, t31 landed (gate green).** The parser is
+**Status: WORKER-IMPLEMENTED, t32 landed (gate green).** The parser is
 wharflab/tree-sitter-powershell (vendored under
 `grammars/tree-sitter-powershell/`, loaded via smacker/go-tree-sitter
 cgo) — the plan's choice, empirically verified. The emitter produces A1
@@ -691,6 +691,42 @@ line) — now the worker's fixes, not records):
   oracle matches live pwsh 7.6.4 by construction (both print "d" then
   "two"; the unset-variable switch exercises the default path, the
   literal-discriminant switch the match path).
+- t32_ternary: the ternary_argument_expression node — the `? :`
+  ternary operator in an argument list (`head($x ? "a" : "b")`; the
+  grammar reaches this node ONLY inside an argument_list, the
+  argument_expression alternative at the top of the precedence chain
+  — the t14/t20 host; a parenthesized `Write-Output ($x ? "a" :
+  "b")` parses as the DIFFERENT ternary_expression node, still
+  refused, and a bare `?` in argument position is a
+  command_parameter). Live pwsh 7.6.4 (verified 2026-08-21): the
+  head argument and the ternary value are SEPARATE pipeline objects
+  — `Write-Output foo($x ? "a" : "b")` prints `foo` then `b` — so
+  the command lowers to ONE echo per object (the t14
+  one-object-per-argument rule; the head flush is the t14 machinery),
+  the ternary itself being ONE object. The t32 subset pins the t06/t07
+  condition shape — a bare variable read condition (UNSET in the
+  subset: variables are never assigned in v1) and a literal string /
+  decimal integer on EACH branch (the t20 literal-default discipline)
+  — so `C ? A : B` lowers through the SAME condition semantics as
+  if/while, `if (C) { echo A } else { echo B }` (the t07 If shape,
+  byte-identical to the core's if emission; the then-branch echo is
+  dead within the subset, where every variable reads falsy): pwsh
+  reads $null (FALSY) and the A1 store reads "" (FALSY), both take
+  the else branch, so the executed-stdout oracle matches live pwsh by
+  construction (both print foo/b, 5/d and baz/9 — the integer ELSE
+  branch, exercised at runtime). Truthy pwsh automatics (`$true`) and
+  a variable branch DIVERGE and REFUSE (pinned
+  testdata_refuse/t32_ternary_true_cond.ps1 — `$true ? "a" : "b"`
+  prints the then-branch a in pwsh vs the falsy-lowering's b, the
+  t06 `$true` precedent — and t32_ternary_var_branch.ps1 — `$x ?
+  "a" : $y` with both unset evaluates to $null, the t02 PRINT edge),
+  as do a chained `$x ? "a" : $y ? "b" : "c"` (parses as a NESTED
+  ternary_argument_expression branch — the operand-shape check
+  refuses), a comma-list after the ternary (the array rung) and a
+  non-literal branch (`1.5` — the t27 bare-decimal-integer
+  discipline). The condition refusal shares lowerCondVar with the
+  t06/t07 conditions and the t20 LHS (extracted when the t20 rung
+  landed).
 
 Comments, comment-only files (empty Program), and the REFUSE table
   (refuse.go): anything outside the subset errors loudly — including
@@ -699,7 +735,8 @@ Comments, comment-only files (empty Program), and the REFUSE table
 
 The v1 subset and the refusal table are PLAN_POWERSHELL_F.md. The next
 construct (assignment + `$var` interpolation, the elseif chain, the
-runtime printf-style `-f` rung, the nested `&&`/`||` chain) lands on
+parenthesized ternary_expression twin, the runtime printf-style `-f`
+rung, the nested `&&`/`||` chain) lands on
 the next RED pin; the
 string-interpolation machinery it needs is already in place (lower.go
 reconstructs string parts from byte spans — the smacker runtime does
