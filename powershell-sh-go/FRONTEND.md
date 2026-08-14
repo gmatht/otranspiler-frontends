@@ -4,7 +4,7 @@ PowerShell (.ps1) source -> A1 shIR JSON — **the bat sibling**
 (workspace-side dir; no git worktree; the object pipeline is a stated
 TEXT approximation for v1; see PLAN_POWERSHELL_F.md).
 
-**Status: WORKER-IMPLEMENTED, t23 landed (gate green).** The parser is
+**Status: WORKER-IMPLEMENTED, t24 landed (gate green).** The parser is
 wharflab/tree-sitter-powershell (vendored under
 `grammars/tree-sitter-powershell/`, loaded via smacker/go-tree-sitter
 cgo) — the plan's choice, empirically verified. The emitter produces A1
@@ -388,7 +388,6 @@ line) — now the worker's fixes, not records):
   pinned (refuse > guess: the subset never guesses what the operator
   targets).
 - t22_param_block: the param_block node — the script-level `param(...)`
-  parameter declaration (the grammar's program rule is
   `[using/requires] [param_block] statement_list`, so the node sits
   BETWEEN the directives and the statement_list as a direct child of
   program; `param($alpha, $beta)` = a `param` keyword + `(` + optional
@@ -416,7 +415,33 @@ line) — now the worker's fixes, not records):
   advanced-attribute refusal). `param()` (the childless form) and the
   t02 braced spelling `param(${name})` are the same node and express
   the same way.
-- Comments, comment-only files (empty Program), and the REFUSE table
+- t24_range: the range_argument_expression node — the `..` range
+  operator in an argument list (`head(1..3)`; the grammar reaches this
+  node ONLY inside an argument_list — the argument_expression
+  alternative at the bottom of the precedence chain, the t14/t20 host;
+  a parenthesized `Write-Output (1..3)` parses as the DIFFERENT
+  range_expression node, still refused). Live pwsh 7.6.4 (verified
+  2026-08-17): the range evaluates to an ARRAY whose elements are
+  enumerated as SEPARATE pipeline objects — `Write-Output foo(1..3)`
+  prints `foo`, `1`, `2`, `3` on FOUR lines — so the argument lowers
+  to ONE echo statement PER ELEMENT (the t14 one-object-per-argument
+  rule, extended: the range is an array of objects, not one object).
+  The t24 subset pins an ALL-LITERAL range — both bounds are bare
+  decimal integers (the t11 decimal-integer precedent) — so the
+  element list is a COMPILE-TIME constant (the t14 fold precedent):
+  ascending `1..3` emits 1 2 3, descending `3..1` emits 3 2 1 (both
+  verified against live pwsh), each element its own A1 echo Str — the
+  executed-stdout oracle matches live pwsh by construction (both print
+  foo/1/2/3 then 5/3/2/1). A variable or non-decimal bound (`$a..3` —
+  pinned `testdata_refuse/t24_range_var_bound.ps1`), a chained range
+  (`1..3..5`), a following comma-list element (the array-literal rung)
+  and a span beyond the fold cap (one echo per element would blow up
+  the A1 from a tiny source) all REFUSE — the runtime array rung is a
+  later milestone, and the A1 Range bounded-iterable node is the shape
+  that rung needs (zero contract surface landed here: the fold needs
+  only the echo statements every rung uses).
+
+Comments, comment-only files (empty Program), and the REFUSE table
   (refuse.go): anything outside the subset errors loudly — including
   .NET member access (`$x.Length`), assignment, `|` pipelines, unknown
   commands, named parameters (all pinned in `testdata_refuse/`).

@@ -1,9 +1,122 @@
 # PLAN_POWERSHELL_F — a PowerShell frontend on the bat precedent
 
-**Status: IN PROGRESS — t13 landed (gate green).** The
+**Status: IN PROGRESS — t24 landed (gate green).** The
 proposal is implemented as described; revision history below.
 
 ## 0. Revision history
+
+- 2026-08-17 (t24_range, gate green): the range_argument_expression
+  node lands — the `..` range operator in an argument list
+  (`head(1..3)`; the grammar reaches this node ONLY inside an
+  argument_list, the argument_expression alternative at the bottom of
+  the precedence chain — the t14/t20 host; the parenthesized
+  `Write-Output (1..3)` is the DIFFERENT range_expression node, still
+  refused). Verified against live pwsh 7.6.4: the range evaluates to
+  an ARRAY whose elements are enumerated as SEPARATE pipeline objects
+  (`Write-Output foo(1..3)` prints `foo`, `1`, `2`, `3` on four
+  lines), so the argument lowers to ONE echo statement PER ELEMENT —
+  the t14 one-object-per-argument rule, extended (the range is an
+  array of objects, not one object). The t24 subset pins an
+  ALL-LITERAL range — both bounds are bare decimal integers (the t11
+  decimal-integer precedent) — so the element list is a COMPILE-TIME
+  constant (the t14 fold precedent): ascending `1..3` emits 1 2 3,
+  descending `3..1` emits 3 2 1, each element its own A1 echo Str —
+  the executed-stdout oracle matches live pwsh by construction
+  (zero new A1 surface: the A1 Range bounded-iterable node stays for
+  the runtime array rung). The refuse edges REFUSE, pinned
+  `testdata_refuse/t24_range_var_bound.ps1`: a variable / non-decimal
+  bound, a chained range (`1..3..5`), a following comma-list element
+  (the array-literal rung) and a span beyond the fold cap (one echo
+  per element would blow up the A1 from a tiny source).
+
+- 2026-08-16 (t22_param_block, gate green): the param_block node
+  lands — the script-level `param(...)` parameter declaration (the
+  grammar's program rule is `[using/requires] [param_block]
+  statement_list`; the node sits BETWEEN the directives and the
+  statement_list as a direct child of program; the same node hosts
+  the param-block form of function bodies, which refuse on the
+  function itself — functions are the function rung). Verified
+  against live pwsh 7.6.4: with NO arguments the block leaves every
+  parameter $null, EXACTLY like an undeclared variable, so within the
+  v1 text-closed subset (empty argv; no script-arguments channel) the
+  declaration has NO runtime effect — the lowering is ZERO statements
+  (dropped), the t18-label pure-spelling precedent, byte-identical
+  to the same program without the param line; parameter reads lower
+  through the usual getVar slots (the t09/t10 consistent edge), so
+  the executed-stdout oracle matches live pwsh by construction. The
+  value-changing forms REFUSE (pinned testdata_refuse/t22_*):
+  script_parameter_default (`param($a = "d")` — pwsh binds the
+  default, divergent output; the assignment rung lands it) and
+  attribute_list (`param([string]$a)` / `[CmdletBinding()]` /
+  `[Parameter()]` — the `Param()` advanced-attribute refusal).
+
+- 2026-08-14 (t21_null_coalesce_expression, gate green): the
+  null_coalesce_expression node lands — the parenthesized twin of the
+  t20 null_coalesce_argument_expression, the SAME `??` operator in a
+  parenthesized command argument (`Write-Output ($x ?? "d")`; the
+  two spellings parse as DIFFERENT nodes, verified against the CST;
+  the bare-statement form stays REFUSED — the t17 statement-level
+  precedent). Verified against live pwsh 7.6.4: the parens evaluate
+  the coalesce to ONE object (`Write-Output ($x ?? "d")` prints `d`,
+  `Write-Output ($x ?? 7)` prints `7` — both with $x unset), so the
+  command lowers to the t20 coalesce If ALONE — zero new A1 surface:
+  the t20 machinery (lowerCoalesce — the shared lowering, extracted
+  when the rung landed) plus the t17 paren-chain extraction
+  (parenPipelineChain, shared with the format host). The A1 If is a
+  statement and the A1 has no conditional-expression node, so
+  lowerCommand intercepts the element via lowerParenCoalesce instead
+  of the argument-expression channel; the subset pins the paren as
+  the command's ONLY element (a further argument would be a SECOND
+  pipeline object — refuse > guess). The t20 refuse edges carry over
+  by construction: `$true` LHS (lowerCondVar), variable RHS, chained
+  `??`, cast-nested paren. The executed-stdout oracle matches live
+  pwsh by construction; emission byte-identical to t20's If shape.
+
+- 2026-08-14 (t19_merging_redirection, gate green): the
+  merging_redirection_operator node lands — the pwsh stream-merge
+  `N>&1` (stream N into the SUCCESS stream), the command-element
+  redirection form (`Write-Output "hi" 2>&1`; the file form
+  file_redirection_operator stays on the by-design refused ledger).
+  Verified against live pwsh 7.6.4: `Write-Output "hi" 2>&1` prints
+  hi, exit 0 — nothing in the v1 subset writes to streams 2-6, so the
+  merge never changes the observable output; the executed-stdout
+  oracle matches live pwsh (both print "hi") while the EMIT carries
+  the pin (the A1 Redirect statement, byte-identical to the core's
+  `echo "hi" 2>&1` emission — the "&N" fd-dup target the ESTree
+  renderer lowers to `sh2.redirectSync` and the runtime installs as a
+  shared-fd duplicate). The other operator forms REFUSE (pinned
+  testdata_refuse/t19_*): `*>&1` (the A1 IrRedirect.fd is an int —
+  no "all streams" fd in the contract; a core request would be
+  needed) and every `X>&2` form (live pwsh 7.6.4 rejects them at
+  parse time — "The 'N>&2' operator is reserved for future use" —
+  while the vendored grammar over-accepts; refuse > guess).
+
+- 2026-08-14 (t17_format_expression, gate green): the format_expression
+  node lands — the `-f` .NET composite-format operator in EXPRESSION
+  position, the parenthesized twin of the t14 argument_list form
+  (`Write-Output ("{0}" -f "a")`; the grammar reaches this node in a
+  parenthesized command argument — the t14 note's "DIFFERENT
+  format_expression node" — and in a bare `"{0}" -f "a"` statement,
+  which stays REFUSED: statement-level expressions are the command-only
+  rung). Verified against live pwsh 7.6.4: the parens evaluate the
+  format to ONE object (`Write-Output ("{0}" -f "a")` prints `a`,
+  `Write-Output ("{1} {0}" -f "x","y")` prints `y x`) — the standard
+  single-object echo mapping, so the argument lowers to ONE echo of the
+  folded value (the t14 object-per-argument split does NOT apply: the
+  paren is a single argument, not an argument list). The t17 subset
+  pins the SAME all-literal constant-fold as t14 through the shared
+  fold machinery (literalStringText / literalArgText / foldFormat —
+  zero new A1 surface): the format string and every argument are
+  literal strings / decimal integers → ONE compile-time A1 Str. In the
+  paren the grammar parses the comma-list RHS as ONE
+  array_literal_expression (the t14 list-split workaround does not
+  apply) — the lowering collects its elements as the format's argument
+  array, the pwsh semantics; `{1} {0}` pins reordering. A variable
+  anywhere, a nested paren/format, a range RHS, escaped braces,
+  alignment/format specifiers, a placeholder/argument count mismatch
+  and any NON-format parenthesized expression (`("a")` / `($x)`) all
+  REFUSE (the runtime printf-style rung is still the next milestone;
+  refuse > guess).
 
 - 2026-08-14 (t13_foreach, gate green): the foreach_statement node
   lands — `foreach ($x in $list) { B }` lowers to the A1 For statement
@@ -188,7 +301,10 @@ The new semantics to map (each a deliberate choice, refuse > guess):
 | `exit N` | the Exit statement (all backends render it) |
 | `cmd.exe args` (external) | exec (the allowlist gate) |
 | `a | b` pipeline | bash pipe (TEXT — see §1 note) |
-| `-f` format operator `"{0} {1}" -f a, b` | printf-style |
+| `-f` format operator `"{0} {1}" -f a, b` | printf-style — t14 lands the
+  ALL-LITERAL constant-fold: literal format + literal args fold to ONE
+  compile-time A1 Str (the argument_list form; the runtime printf
+  channel is the next rung) |
 | `[int]x` cast (argument position) | literal text — argument mode does NOT evaluate a leading type literal (pwsh 7.6.4: `Write-Output [int]5` prints `[int]5`, `[string]"x"` prints `[string]x`); the argument lowers as an expandable string (lit type text + operand). Identity holds only in EXPRESSION position, unreachable in v1 (assignment refuses) |
 
 ### Pinned refusals (testdata_ps1/*_refuse.ps1 — the emit must FAIL)
@@ -267,7 +383,11 @@ interpolation), `t03_arith.ps1` (+ - * / %, and the string-concat pin),
 param()-block gap is pinned as a refuse case), `t08_pipeline.ps1` (text
 pipe), `t09_strings.ps1` (single-quote literal, `` `n `` escapes),
 `t10_cmp.ps1` (-eq/-ne/-lt/-and/-or),
-`t12_format.ps1` (-f operator), `t13_args.ps1` ($args, $LASTEXITCODE), plus
+`t12_format.ps1` (-f operator — landed as `t14_format.ps1`,
+2026-08-13: the all-literal constant-fold, argument_list form;
+`t17_format_expression.ps1` lands the parenthesized format_expression
+twin 2026-08-14; the runtime printf-style
+rung stays on the list), `t13_args.ps1` ($args, $LASTEXITCODE), plus
 a `*_refuse` set pinning every refusal-table entry. Every recorded
 expectation is pinned by running the transpiled output against the record,
 never against a guessed string.

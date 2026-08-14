@@ -9,6 +9,14 @@ import (
 	sitter "github.com/smacker/go-tree-sitter"
 )
 
+// maxRangeSpan — the t24 range rung's compile-time fold cap: a range
+// lowers to ONE A1 echo statement PER element (each element is its own
+// pipeline object in pwsh), so an unbounded span would blow up the
+// emitted A1 from a tiny source (`1..1000000` is 9 bytes → a million
+// statements). The subset pins short literal ranges; anything beyond
+// the cap REFUSES (the runtime array rung is a later milestone).
+const maxRangeSpan = 1000
+
 // ── CST structure (tree-sitter-powershell, vendored grammar) ──────────
 //
 //	program
@@ -916,7 +924,9 @@ func lowerCommand(n *sitter.Node, src []byte) ([]any, error) {
 // must be a format_argument_expression (which consumes the RHS AND
 // every following list element as its arguments — the comma-list is
 // the format operator's argument array in pwsh; see lowerFormatArg);
-// a plain literal list (`foo("x")`) is a different rung and REFUSES.
+// the t24 subset pins the `..` RANGE form (lowerRangeArg — the range
+// must be the ONLY list element); a plain literal list (`foo("x")`)
+// is a different rung and REFUSES.
 func lowerArgumentList(n *sitter.Node, src []byte) ([]any, error) {
 	list := n.ChildByFieldName("argument_expression_list")
 	if list == nil {
@@ -951,6 +961,19 @@ func lowerArgumentList(n *sitter.Node, src []byte) ([]any, error) {
 				return nil, err
 			}
 			out = append(out, cs...)
+		case "range_argument_expression":
+			// the t24 rung: `head(1..3)` — the `..` range argument must
+			// be the ONLY list element (a following comma-list is the
+			// plain argument-list / array rung — the t20 precedent;
+			// refuse > guess).
+			if i != int(list.NamedChildCount())-1 {
+				return nil, refuse(c, src, "element after a range argument (the t24 subset pins `head(1..3)` with the range as the only list element; a comma-list is the array rung)")
+			}
+			rs, err := lowerRangeArg(c, src)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, rs...)
 		default:
 			return nil, refuse(c, src, "%q in an argument list (the t14 subset pins the `-f` format operator; a plain argument list is unpinned)", c.Type())
 		}
@@ -1237,6 +1260,103 @@ func lowerCoalesce(n *sitter.Node, src []byte) ([]any, error) {
 	// construction (the t07 shape: cond/then/elsifs/else, byte-identical
 	// to the core's if emission).
 	return []any{ifStmt(cond, []any{exprStmt(execCall("echo", []any{cond}))}, []any{exprStmt(execCall("echo", []any{def}))})}, nil
+}
+
+// lowerRangeArg — the range_argument_expression node: `LHS .. RHS` in
+// an argument_list (`head(1..3)`; the grammar reaches this node ONLY
+// inside an argument_list — the argument_expression alternative at the
+// bottom of the precedence chain, the t14/t20 host — verified against
+// the CST; a parenthesized `Write-Output (1..3)` parses as the
+// DIFFERENT range_expression node, still refused). The `..` range
+// operator (the plan's array rung sibling) evaluates to an ARRAY —
+// live pwsh 7.6.4 (verified 2026-08-17): `Write-Output foo(1..3)`
+// prints `foo`, `1`, `2`, `3` on FOUR lines — the range's elements
+// are enumerated as SEPARATE pipeline objects, so the argument lowers
+// to ONE echo statement PER ELEMENT (the t14 one-object-per-argument
+// rule, extended: the range is an ARRAY of objects, not one object).
+// The t24 subset pins an ALL-LITERAL range: both bounds are bare
+// decimal integers, so the element list is a COMPILE-TIME constant
+// (the t14 fold precedent) — ascending `1..3` emits 1 2 3, descending
+// `3..1` emits 3 2 1 (both verified against live pwsh) — and each
+// element lowers to its own A1 echo Str, so the executed-stdout
+// oracle matches live pwsh by construction. A variable / non-decimal
+// bound (`$a..3`), a chained range (`1..3..5` — a nested
+// range_argument_expression LHS), a span beyond the fold cap (the A1
+// would otherwise blow up one echo per element) and a following
+// comma-list element all REFUSE (the runtime array rung is a later
+// milestone — the A1 Range bounded-iterable node is the shape that
+// rung needs; refuse > guess).
+func lowerRangeArg(n *sitter.Node, src []byte) ([]any, error) {
+	var lhs, rhs *sitter.Node
+	for i := 0; i < int(n.ChildCount()); i++ {
+		ch := n.Child(i)
+		switch ch.Type() {
+		case "unary_expression":
+			if lhs == nil {
+				lhs = ch
+			} else if rhs == nil {
+				rhs = ch
+			} else {
+				return nil, refuse(ch, src, "range with more than two operands")
+			}
+		case "..":
+			// the operator itself — structure only
+		default:
+			return nil, refuse(ch, src, "range part %q (the t24 subset pins `LHS .. RHS` with decimal-integer bounds)", ch.Type())
+		}
+	}
+	if lhs == nil || rhs == nil {
+		return nil, refuse(n, src, "range without both bounds")
+	}
+	start, err := rangeBound(lhs, src)
+	if err != nil {
+		return nil, err
+	}
+	end, err := rangeBound(rhs, src)
+	if err != nil {
+		return nil, err
+	}
+	span := end - start
+	if span < 0 {
+		span = -span
+	}
+	if span > maxRangeSpan {
+		return nil, refuse(n, src, "range span %d (the t24 subset pins spans up to %d — one echo per element would blow up the A1; refuse > guess)", span, maxRangeSpan)
+	}
+	// the range's elements are SEPARATE pipeline objects — one echo
+	// statement per element, descending ranges step -1 (verified
+	// against live pwsh 7.6.4: `3..1` prints 3, 2, 1).
+	step := 1
+	if end < start {
+		step = -1
+	}
+	var stmts []any
+	for v := start; ; v += step {
+		stmts = append(stmts, exprStmt(execCall("echo", []any{strExpr(strconv.Itoa(v), "DoubleQuoted")})))
+		if v == end {
+			break
+		}
+	}
+	return stmts, nil
+}
+
+// rangeBound — one `..` operand: a bare decimal integer (the t11
+// `exit 5` precedent — the subset pins decimal integers; a negative
+// bound parses as expression_with_unary_operator and a variable as
+// `variable`, both REFUSED here).
+func rangeBound(n *sitter.Node, src []byte) (int, error) {
+	if n.Type() != "unary_expression" || n.NamedChildCount() != 1 {
+		return 0, refuse(n, src, "range bound %q (the t24 subset pins a bare decimal integer)", n.Type())
+	}
+	op := n.NamedChild(0)
+	if op.Type() != "integer_literal" {
+		return 0, refuse(op, src, "range bound %q (the t24 subset pins a bare decimal integer)", op.Type())
+	}
+	v, err := strconv.Atoi(op.Content(src))
+	if err != nil {
+		return 0, refuse(op, src, "range bound %q (the t24 subset pins a bare decimal integer)", op.Content(src))
+	}
+	return v, nil
 }
 
 // literalStringText — a string_literal node whose interior is EXACTLY
