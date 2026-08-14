@@ -695,14 +695,18 @@ func lowerPipeline(n *sitter.Node, src []byte) ([]any, error) {
 // to the core's exec-echo Call (byte-identical to the core frontend's
 // `echo …` lowering). Every other command name REFUSES.
 //
-// A command element may be an argument_list (`foo(…)` — the t14 rung):
-// live pwsh 7.6.4 writes ONE pipeline OBJECT per command argument — the
-// head argument is its own object and the parenthesized list's value(s)
+// A command element may be an argument_list (`foo(…)` — the t14 rung)
+// or a parenthesized null-coalesce (`Write-Output ($x ?? "d")` — the
+// t21 rung, intercepted via lowerParenCoalesce): live pwsh 7.6.4
+// writes ONE pipeline OBJECT per command argument — the head
+// argument is its own object and the parenthesized list's value(s)
 // follow as further objects — so the command lowers to one echo
 // statement PER OBJECT (the A1 echo joins its own args with spaces on
 // one line, which would miscompile the object-per-argument reality).
 // The t14 subset pins EXACTLY ONE head argument before the list and
-// the list itself must be the `-f` format form; anything else REFUSES.
+// the list itself must be the `-f` format form; the t21 subset pins
+// the parenthesized null-coalesce as the command's ONLY element;
+// anything else REFUSES.
 func lowerCommand(n *sitter.Node, src []byte) ([]any, error) {
 	nameNode := n.ChildByFieldName("command_name")
 	if nameNode == nil {
@@ -720,6 +724,7 @@ func lowerCommand(n *sitter.Node, src []byte) ([]any, error) {
 	var stmts []any
 	var redirects []any
 	seenList := false
+	seenParenCoalesce := false
 	if elems := n.ChildByFieldName("command_elements"); elems != nil {
 		for i := 0; i < int(elems.NamedChildCount()); i++ {
 			e := elems.NamedChild(i)
@@ -752,6 +757,34 @@ func lowerCommand(n *sitter.Node, src []byte) ([]any, error) {
 					continue
 				}
 				return nil, refuse(e, src, "argument after an argument_list (the t14 subset pins the `head(fmt -f args)` shape with nothing after the parens)")
+			}
+			if cs, handled, err := lowerParenCoalesce(e, src); err != nil {
+				return nil, err
+			} else if handled {
+				// the t21 rung: `Write-Output ($x ?? "d")` — the
+				// parenthesized coalesce is ONE argument = ONE pipeline
+				// object, so the command lowers to the coalesce If ALONE
+				// (the t20 machinery, minus the head flush — the A1 If is
+				// a statement, not an expression). The t21 subset pins the
+				// paren as the command's ONLY element: a further argument
+				// would be a SECOND pipeline object (the multi-object
+				// shape stays outside the v1 single-object echo mapping;
+				// refuse > guess).
+				if len(redirects) > 0 {
+					return nil, refuse(e, src, "parenthesized null-coalesce combined with a redirection (the t21 subset pins a plain command)")
+				}
+				if len(argExprs) != 0 {
+					return nil, refuse(e, src, "parenthesized null-coalesce with %d preceding argument(s) (the t21 subset pins `Write-Output ($x ?? \"d\")` — the paren is the command's only element)", len(argExprs))
+				}
+				stmts = append(stmts, cs...)
+				seenParenCoalesce = true
+				continue
+			}
+			if seenParenCoalesce {
+				if e.Type() == "command_argument_sep" {
+					continue
+				}
+				return nil, refuse(e, src, "element after a parenthesized null-coalesce (the t21 subset pins the paren as the command's only element; a further argument would be another pipeline object — refuse > guess)")
 			}
 			if e.Type() == "redirection" {
 				// the t19 rung: the pwsh merging redirection (stream N
@@ -829,7 +862,7 @@ func lowerArgumentList(n *sitter.Node, src []byte) ([]any, error) {
 			if i != int(list.NamedChildCount())-1 {
 				return nil, refuse(c, src, "element after a null-coalesce argument (the t20 subset pins `head($x ?? \"d\")` with the coalesce as the only list element; a comma-list is the array rung)")
 			}
-			cs, err := lowerCoalesceArg(c, src)
+			cs, err := lowerCoalesce(c, src)
 			if err != nil {
 				return nil, err
 			}
@@ -1002,30 +1035,74 @@ func lowerFormatExpr(n *sitter.Node, src []byte) (any, error) {
 	return strExpr(folded, "DoubleQuoted"), nil
 }
 
-// lowerCoalesceArg — the null_coalesce_argument_expression node: the
-// `??` null-coalescing operator in an argument_list (`head($x ?? "d")`
-// — the grammar reaches this node ONLY inside an argument_list, as an
-// argument_expression child; a parenthesized `Write-Output ($x ?? "d")`
-// parses as the DIFFERENT null_coalesce_expression node). Live pwsh
-// 7.6.4 (verified 2026-08-15): the head argument and the coalesced
-// value are SEPARATE pipeline objects — `Write-Output foo($x ?? "d")`
-// with $x unset prints `foo` then `d`, with `$x = "abc"` it prints
-// `foo` then `abc`. The t20 subset pins the t06/t07 condition shape:
-// the LHS is a bare variable read (UNSET in the subset — variables are
-// never assigned in v1) and the RHS is a literal string / decimal
-// integer — a NON-null constant — so `??` (a NULL check) lowers
-// through the SAME condition semantics as if/while: pwsh reads $null
-// (FALSY) and the A1 store reads "" (FALSY), both take the default:
-// `LHS ?? RHS` → `if (LHS) { echo LHS } else { echo RHS }` — the t07
-// If shape, ONE pipeline object → the A1 If (the t14 one-object-per-
-// argument rule; the then-branch echo is dead within the subset, where
-// every variable reads falsy). Truthy pwsh automatics (`$true`) and a
-// variable RHS DIVERGE and REFUSE (both pinned in testdata_refuse/):
-// `$true ?? "d"` prints True in pwsh vs the falsy-lowering's d (the
-// t06 `$true` refusal), and `$x ?? $y` with both unset coalesces to
-// $null — `Write-Output` of a bare $null prints NOTHING vs the A1
-// echo's blank line (the t02 PRINT edge).
-func lowerCoalesceArg(n *sitter.Node, src []byte) ([]any, error) {
+// lowerParenCoalesce — a parenthesized null-coalesce COMMAND element:
+// `unary_expression` → `parenthesized_expression` whose single
+// pipeline_chain is a null_coalesce_expression (`Write-Output ($x ??
+// "d")` — the t21 rung, the parenthesized twin of the t20
+// null_coalesce_argument_expression; the grammar reaches the
+// null_coalesce_expression node exactly in this parenthesized command
+// element and in bare statement position, which stays REFUSED — the
+// t17 statement-level precedent). The coalesce lowers to the A1 If
+// STATEMENT, and the A1 has no conditional-expression node, so the
+// command element cannot ride the argument-expression channel — the
+// caller (lowerCommand) intercepts the shape and appends the If to
+// its statement list. Returns (stmts, true, nil) for the coalesce
+// shape, (nil, false, nil) for any other element / parenthesized
+// content (the caller falls through to the t17 expression path), and
+// refuses a malformed paren.
+func lowerParenCoalesce(e *sitter.Node, src []byte) ([]any, bool, error) {
+	if e.Type() != "unary_expression" || e.NamedChildCount() != 1 {
+		return nil, false, nil
+	}
+	pe := e.NamedChild(0)
+	if pe.Type() != "parenthesized_expression" {
+		return nil, false, nil
+	}
+	chain, err := parenPipelineChain(pe, src)
+	if err != nil {
+		return nil, false, err
+	}
+	if chain.NamedChildCount() != 1 || chain.NamedChild(0).Type() != "null_coalesce_expression" {
+		return nil, false, nil
+	}
+	cs, err := lowerCoalesce(chain.NamedChild(0), src)
+	if err != nil {
+		return nil, false, err
+	}
+	return cs, true, nil
+}
+
+// lowerCoalesce — the `??` null-coalescing operator, shared by the TWO
+// grammar nodes that reach it (verified identical child structure
+// against the CST — unary_expression, `??`, unary_expression):
+//   - null_coalesce_argument_expression (the t20 rung): inside an
+//     argument_list, as an argument_expression child (`head($x ?? "d")`);
+//   - null_coalesce_expression (the t21 rung): inside a
+//     parenthesized_expression command element (`Write-Output ($x ??
+//     "d")` — reached via lowerParenCoalesce; the argument-list and
+//     parenthesized spellings parse as DIFFERENT nodes, verified
+//     against the CST).
+// Live pwsh 7.6.4: the head argument and the coalesced value are
+// SEPARATE pipeline objects — `Write-Output foo($x ?? "d")` with $x
+// unset prints `foo` then `d` (the t20 form, verified 2026-08-15) —
+// while the paren evaluates the coalesce to ONE object — `Write-Output
+// ($x ?? "d")` prints `d`, `Write-Output ($x ?? 7)` prints `7` (the
+// t21 form, verified 2026-08-14). The t20/t21 subset pins the t06/t07
+// condition shape: the LHS is a bare variable read (UNSET in the
+// subset — variables are never assigned in v1) and the RHS is a
+// literal string / decimal integer — a NON-null constant — so `??` (a
+// NULL check) lowers through the SAME condition semantics as if/while:
+// pwsh reads $null (FALSY) and the A1 store reads "" (FALSY), both
+// take the default: `LHS ?? RHS` → `if (LHS) { echo LHS } else { echo
+// RHS }` — the t07 If shape, ONE pipeline object → the A1 If (the t14
+// one-object-per-argument rule; the then-branch echo is dead within
+// the subset, where every variable reads falsy). Truthy pwsh
+// automatics (`$true`) and a variable RHS DIVERGE and REFUSE (both
+// pinned in testdata_refuse/): `$true ?? "d"` prints True in pwsh vs
+// the falsy-lowering's d (the t06 `$true` refusal), and `$x ?? $y`
+// with both unset coalesces to $null — `Write-Output` of a bare $null
+// prints NOTHING vs the A1 echo's blank line (the t02 PRINT edge).
+func lowerCoalesce(n *sitter.Node, src []byte) ([]any, error) {
 	var lhs, rhs *sitter.Node
 	for i := 0; i < int(n.ChildCount()); i++ {
 		ch := n.Child(i)
@@ -1036,16 +1113,16 @@ func lowerCoalesceArg(n *sitter.Node, src []byte) ([]any, error) {
 			} else if rhs == nil {
 				rhs = ch
 			} else {
-				return nil, refuse(ch, src, "null-coalesce argument with more than two operands")
+				return nil, refuse(ch, src, "null-coalesce with more than two operands")
 			}
 		case "??":
 			// the operator itself — structure only
 		default:
-			return nil, refuse(ch, src, "null-coalesce argument part %q", ch.Type())
+			return nil, refuse(ch, src, "null-coalesce part %q", ch.Type())
 		}
 	}
 	if lhs == nil || rhs == nil {
-		return nil, refuse(n, src, "null-coalesce argument without both operands")
+		return nil, refuse(n, src, "null-coalesce without both operands")
 	}
 	cond, err := lowerCondVar(lhs, src, "null-coalesce left operand")
 	if err != nil {
@@ -1065,7 +1142,7 @@ func lowerCoalesceArg(n *sitter.Node, src []byte) ([]any, error) {
 	case "integer_literal":
 		def = strExpr(op.Content(src), "DoubleQuoted")
 	default:
-		return nil, refuse(op, src, "null-coalesce right operand %q (the t20 subset pins a literal string / decimal integer default)", op.Type())
+		return nil, refuse(op, src, "null-coalesce right operand %q (the t20/t21 subset pins a literal string / decimal integer default)", op.Type())
 	}
 	if err != nil {
 		return nil, err
@@ -1449,20 +1526,11 @@ func lowerExpr(n *sitter.Node, src []byte) (any, error) {
 	}
 }
 
-// lowerParenthesized — the parenthesized_expression node: `( expr )` in
-// COMMAND-ARGUMENT position. Live pwsh 7.6.4 (verified 2026-08-14):
-// the parens evaluate the inner pipeline to ONE object, and the
-// argument passes that single object on (`Write-Output ("{0}" -f "a")`
-// prints `a`) — the standard v1 single-object echo mapping. The t17
-// subset pins the parens ONLY as the format_expression host (the
-// grammar reaches the format_expression node exactly here and in a
-// bare statement position — both the t14 twin `-f` rung; the
-// statement form stays a loud REFUSE): the inner pipeline must be
-// exactly ONE pipeline_chain containing ONE format_expression. Any
-// other parenthesized content (`Write-Output ("a")` / `($x)` — a
-// different expression rung) REFUSES (refuse > guess), matching the
-// t14 plain-literal-list refusal.
-func lowerParenthesized(n *sitter.Node, src []byte) (any, error) {
+// parenPipelineChain — the single pipeline_chain inside a
+// parenthesized_expression: exactly one pipeline, exactly one chain,
+// no `|` tails (the shared shape of the t17 format host and the t21
+// null-coalesce host).
+func parenPipelineChain(n *sitter.Node, src []byte) (*sitter.Node, error) {
 	var pl *sitter.Node
 	for i := 0; i < int(n.NamedChildCount()); i++ {
 		ch := n.NamedChild(i)
@@ -1495,10 +1563,45 @@ func lowerParenthesized(n *sitter.Node, src []byte) (any, error) {
 	if chain == nil {
 		return nil, refuse(n, src, "parenthesized_expression without a pipeline_chain")
 	}
-	if chain.NamedChildCount() != 1 || chain.NamedChild(0).Type() != "format_expression" {
-		return nil, refuse(n, src, "parenthesized expression %q (the t17 subset pins the `-f` format_expression host; other parenthesized expressions are unpinned)", n.Content(src))
+	return chain, nil
+}
+
+// lowerParenthesized — the parenthesized_expression node: `( expr )` in
+// COMMAND-ARGUMENT position. Live pwsh 7.6.4 (verified 2026-08-14):
+// the parens evaluate the inner pipeline to ONE object, and the
+// argument passes that single object on (`Write-Output ("{0}" -f "a")`
+// prints `a`) — the standard v1 single-object echo mapping. The t17
+// subset pins the parens ONLY as the format_expression host (the
+// grammar reaches the format_expression node exactly here and in a
+// bare statement position — both the t14 twin `-f` rung; the
+// statement form stays a loud REFUSE): the inner pipeline must be
+// exactly ONE pipeline_chain containing ONE format_expression. Any
+// other parenthesized content (`Write-Output ("a")` / `($x)` — a
+// different expression rung) REFUSES (refuse > guess), matching the
+// t14 plain-literal-list refusal.
+func lowerParenthesized(n *sitter.Node, src []byte) (any, error) {
+	chain, err := parenPipelineChain(n, src)
+	if err != nil {
+		return nil, err
 	}
-	return lowerFormatExpr(chain.NamedChild(0), src)
+	if chain.NamedChildCount() != 1 {
+		return nil, refuse(n, src, "parenthesized pipeline chain with %d children (the t17/t21 subsets pin a single format_expression / null_coalesce_expression host)", chain.NamedChildCount())
+	}
+	op := chain.NamedChild(0)
+	switch op.Type() {
+	case "format_expression":
+		return lowerFormatExpr(op, src)
+	case "null_coalesce_expression":
+		// the command path intercepts this shape BEFORE the expression
+		// lowering (lowerCommand → lowerParenCoalesce — the t21 rung:
+		// the coalesce lowers to the If STATEMENT, and the A1 has no
+		// conditional-expression node); reaching here means the paren is
+		// nested inside another operand (a cast operand, a t14
+		// argument-list element, …) — unpinned, refuse > guess.
+		return nil, refuse(n, src, "parenthesized null-coalesce in a nested operand position (the t21 subset pins the `Write-Output ($x ?? \"d\")` command element; refuse > guess)")
+	default:
+		return nil, refuse(n, src, "parenthesized expression %q (the t17/t21 subsets pin the `-f` format_expression host and the parenthesized null-coalesce; other parenthesized expressions are unpinned)", n.Content(src))
+	}
 }
 
 // lowerCast — `[type] operand` in COMMAND-ARGUMENT position. Verified

@@ -4,7 +4,7 @@ PowerShell (.ps1) source -> A1 shIR JSON — **the bat sibling**
 (workspace-side dir; no git worktree; the object pipeline is a stated
 TEXT approximation for v1; see PLAN_POWERSHELL_F.md).
 
-**Status: WORKER-IMPLEMENTED, t20 landed (gate green).** The parser is
+**Status: WORKER-IMPLEMENTED, t20 + t21 landed (gate green).** The parser is
 wharflab/tree-sitter-powershell (vendored under
 `grammars/tree-sitter-powershell/`, loaded via smacker/go-tree-sitter
 cgo) — the plan's choice, empirically verified. The emitter produces A1
@@ -311,7 +311,7 @@ line) — now the worker's fixes, not records):
   `??` null-coalescing operator in an argument_list (`head($x ??
   "d")`; the grammar reaches this node ONLY inside an argument_list
   — a parenthesized `Write-Output ($x ?? "d")` parses as the
-  DIFFERENT null_coalesce_expression node, still refused, and a bare
+  DIFFERENT null_coalesce_expression node, landed as t21, and a bare
   `??` in argument position is a command_parameter). Live pwsh 7.6.4
   (verified 2026-08-15): the head argument and the coalesced value
   are SEPARATE pipeline objects (`Write-Output foo($x ?? "d")`
@@ -337,6 +337,31 @@ line) — now the worker's fixes, not records):
   rung). The LHS refusal shares lowerCondVar with the t06/t07
   conditions (extracted from lowerCondPipeline when the rung
   landed).
+- t21_null_coalesce_expression: the parenthesized twin of t20 — the
+  null_coalesce_expression node, the SAME `??` operator in a
+  parenthesized command argument (`Write-Output ($x ?? "d")`; the
+  grammar reaches this node inside a parenthesized_expression
+  command element and in bare statement position, which stays
+  REFUSED — the t17 statement-level precedent). Live pwsh 7.6.4
+  (verified 2026-08-14): the parens evaluate the coalesce to ONE
+  object (`Write-Output ($x ?? "d")` prints `d`, `Write-Output
+  ($x ?? 7)` prints `7` — both with $x unset), the standard v1
+  single-object echo mapping — so the command lowers to the t20
+  coalesce If ALONE (the t20 machinery, minus the head flush). The
+  A1 If is a STATEMENT and the A1 has no conditional-expression
+  node, so lowerCommand intercepts the element via
+  lowerParenCoalesce (the paren-chain extraction is shared with the
+  t17 host through parenPipelineChain) instead of the argument-
+  expression channel; the t21 subset pins the paren as the
+  command's ONLY element (a further argument would be a SECOND
+  pipeline object — the multi-object shape stays outside the v1
+  single-object echo mapping; refuse > guess — `Write-Output a
+  ($x ?? "d")` and `Write-Output ($x ?? "d") b` both refuse). The
+  t20 refuse edges carry over by construction (the same
+  lowerCondVar / literal-default checks): `$true` LHS, variable
+  RHS, chained `??`, and a cast-nested paren all refuse. The
+  executed-stdout oracle matches live pwsh by construction (both
+  print "d" then "7").
 - Comments, comment-only files (empty Program), and the REFUSE table
   (refuse.go): anything outside the subset errors loudly — including
   .NET member access (`$x.Length`), assignment, `|` pipelines, unknown
