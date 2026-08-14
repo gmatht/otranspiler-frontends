@@ -1754,6 +1754,13 @@ type lowerer struct {
 	types     map[string]string   // var → int|str|list
 	params    map[string][]string // function name → params (for scoping)
 	curParams map[string]string   // active function: param → positional string
+	// pending Popen pipe chains (the `a | b` idiom): tail var → ordered
+	// stages (each stage is one exec statement). Flushed as an A1
+	// `Pipeline` statement at the first non-chain statement / end of
+	// body. pipeOrder keeps the flush order deterministic across
+	// concurrent chains.
+	pipes     map[string][][]map[string]any
+	pipeOrder []string
 }
 
 func (l *lowerer) collectFuncs(stmts []Stmt) {
@@ -1979,6 +1986,26 @@ func interpExpr(e map[string]any) map[string]any {
 
 func arrow(body []map[string]any) map[string]any {
 	return map[string]any{"type": "Arrow", "body": toAnyStmts(body)}
+}
+
+// pipelineStmt builds the A1 `Pipeline` statement node (schema.json
+// "Pipeline", the exact shape src/shir_json.rs emits for a top-level
+// shell `a | b`): each stage is a stmt[] (one exec per stage here), and
+// the optional fields are null — the same node the core request
+// py-sh-go-20260814-164552-pipeline made the ESTree renderer accept.
+func pipelineStmt(stages [][]map[string]any) map[string]any {
+	ss := make([]any, 0, len(stages))
+	for _, st := range stages {
+		ss = append(ss, toAnyStmts(st))
+	}
+	return map[string]any{
+		"type":        "Pipeline",
+		"stages":      ss,
+		"last_output": nil,
+		"capture":     nil,
+		"cmd_str":     nil,
+		"purity":      "Spawn",
+	}
 }
 
 func capture(e map[string]any) map[string]any {
@@ -2607,15 +2634,134 @@ func (l *lowerer) testOperand(e Expr) (string, error) {
 // Statement lowering
 // ─────────────────────────────────────────────────────────────────────
 
+// pipeChainStmt recognizes a statement in the Popen pipe-chain idiom
+// (the Python spelling of `a | b`):
+//
+//	p1 = subprocess.Popen(["a"], stdout=subprocess.PIPE)
+//	p2 = subprocess.Popen(["b"], stdin=p1.stdout)
+//	p2.wait()
+//
+// Chain statements are CONSUMED (no A1 emitted for them); the chain is
+// flushed as one A1 `Pipeline` statement at the first non-chain
+// statement or the end of the enclosing body. Returns (flushPending,
+// consumed, err): a non-chain statement requests a flush of every
+// pending chain before it lowers normally.
+func (l *lowerer) pipeChainStmt(s Stmt) (bool, bool, error) {
+	switch t := s.(type) {
+	case *AssignS:
+		if len(t.Targets) != 1 || t.Op != "=" {
+			return true, false, nil
+		}
+		c, ok := t.Expr.(*CallE)
+		if !ok || strings.Join(c.Path, ".") != "subprocess.Popen" {
+			return true, false, nil
+		}
+		prog, ws, err := l.procArgs(c.Args)
+		if err != nil {
+			return false, false, err
+		}
+		stage := []map[string]any{exprStmt(execCall(prog, ws))}
+		stdinFrom := ""
+		toPipe := false
+		for _, kw := range c.Kwargs {
+			switch kw.Key {
+			case "stdout":
+				if at, ok := kw.Value.(*AttrE); ok {
+					if path, ok2 := dottedPath(at); ok2 && strings.Join(path, ".") == "subprocess.PIPE" {
+						toPipe = true
+					}
+				}
+			case "stdin":
+				if at, ok := kw.Value.(*AttrE); ok && at.Name == "stdout" {
+					if n, ok := at.Obj.(*NameE); ok {
+						stdinFrom = n.Name
+					}
+				}
+			}
+		}
+		if !toPipe && stdinFrom == "" {
+			// plain background Popen — normal lowering
+			return true, false, nil
+		}
+		if stdinFrom != "" {
+			stages, ok := l.pipes[stdinFrom]
+			if !ok {
+				return false, false, fmt.Errorf("Popen: stdin feeds %s which is not a piped Popen", stdinFrom)
+			}
+			delete(l.pipes, stdinFrom)
+			for i, v := range l.pipeOrder {
+				if v == stdinFrom {
+					l.pipeOrder = append(l.pipeOrder[:i], l.pipeOrder[i+1:]...)
+					break
+				}
+			}
+			l.pipes[t.Targets[0]] = append(stages, stage)
+			l.pipeOrder = append(l.pipeOrder, t.Targets[0])
+		} else {
+			// stdout=PIPE starts a chain; re-assigning an existing tail
+			// flushes the old chain first (deterministic order)
+			if _, exists := l.pipes[t.Targets[0]]; exists {
+				for i, v := range l.pipeOrder {
+					if v == t.Targets[0] {
+						l.pipeOrder = append(l.pipeOrder[:i], l.pipeOrder[i+1:]...)
+						break
+					}
+				}
+			}
+			l.pipes[t.Targets[0]] = [][]map[string]any{stage}
+			l.pipeOrder = append(l.pipeOrder, t.Targets[0])
+		}
+		return false, true, nil
+	case *ExprS:
+		// p2.wait() — the Pipeline statement runs synchronously, so the
+		// wait on the chain's tail is a no-op
+		mc, ok := t.Expr.(*MethodCallE)
+		if !ok || mc.Name != "wait" {
+			return true, false, nil
+		}
+		if n, ok := mc.Obj.(*NameE); ok {
+			if _, isTail := l.pipes[n.Name]; isTail {
+				return false, true, nil
+			}
+		}
+		return true, false, nil
+	}
+	return true, false, nil
+}
+
+func (l *lowerer) flushPipes() []map[string]any {
+	var out []map[string]any
+	for _, tail := range l.pipeOrder {
+		if stages, ok := l.pipes[tail]; ok {
+			out = append(out, pipelineStmt(stages))
+			delete(l.pipes, tail)
+		}
+	}
+	l.pipeOrder = nil
+	return out
+}
+
 func (l *lowerer) stmtsIR(stmts []Stmt) ([]map[string]any, error) {
 	var out []map[string]any
 	for _, s := range stmts {
+		flush, consumed, err := l.pipeChainStmt(s)
+		if err != nil {
+			return nil, err
+		}
+		if flush {
+			out = append(out, l.flushPipes()...)
+		}
+		if consumed {
+			continue
+		}
 		irs, err := l.stmtIR(s)
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, irs...)
 	}
+	// end of body: close any chains the body left open
+	out = append(out, l.flushPipes()...)
 	return out, nil
 }
 
@@ -3247,6 +3393,7 @@ func buildProgram(stmts []Stmt) (*shiremit.Program, error) {
 		fns:    map[string]bool{},
 		types:  map[string]string{},
 		params: map[string][]string{},
+		pipes:  map[string][][]map[string]any{},
 	}
 	l.collectFuncs(stmts)
 	irs, err := l.stmtsIR(stmts)
