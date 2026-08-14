@@ -29,6 +29,21 @@ toggle added to `rules-gap.sh` / `ts-node-gap.sh` / `coverage-gap.sh` — the
 fresh gap chain is untouched). Raw is what the detectors would report if the
 ledgers didn't exist; "in raw" ⇔ "still unexercised by testdata".
 
+**Per-vocabulary, not first-non-empty.** The refused ledger accumulates
+entries from every detector across time (A1-node refusals from the A1 proxy,
+ts-node refusals from ts-node-gap, rule-name refusals from rules-gap), so
+each entry is judged against **its own vocabulary's** raw set:
+`A1 node *`/`syn kind *` → coverage-gap; `ts node *` → ts-node-gap; bare
+rule names → rules-gap. First-non-empty reports only one vocabulary and
+falsely "stales" all refusals from the others — see the incident below.
+
+**Silent own-detector ⇒ keep.** An entry is stale only when its own
+detector is healthy (raw non-empty) AND no longer reports it. A silent own
+detector (torn binary / failed inventory / no grammar) makes the verdict
+unprovable — keep the entry. Conservative direction: a false drop costs a
+pi re-judgment (self-heals via the fresh loop), a missed drop costs
+nothing.
+
 ## Trigger — fresh-first
 
 `worker-coverage-step.sh` runs the refresh **only** in the `gaps == ""`
@@ -44,7 +59,8 @@ source after the fresh set is exhausted.
 - **Rate limit:** one re-proposal per language per `REFUSE_REFRESH_INTERVAL`
   (default 86400s, env-overridable; stamp file
   `refused-refresh-stamp-<lang>.txt`). A construct judged refused yesterday
-  is unlikely to emit today; the interval bounds pi-call burn.
+  is unlikely to emit today; the interval bounds pi-call burn. The stamp
+  check runs BEFORE the detector chain, so rate-limited cycles stay cheap.
 - **Rotation:** a cursor (`refused-refresh-cursor-<lang>.txt`) records the
   last re-proposed entry; each refresh re-proposes the next candidate after
   the cursor (wrap around). Prevents re-litigating the same entry while
@@ -106,3 +122,21 @@ rate-limited to once per interval per language.
 position + refresh log lines show the march. A language whose refused list
 stays flat across many refresh cycles is at its true subset boundary; one
 whose list shrinks is validating the pass.
+
+## Incident 2026-08-14 22:26 — first-non-empty false drop (fixed + repaired)
+
+The v1 refresh judged stale-drops against the chain's first-non-empty raw
+detector. At 22:26 zsh's ts-node-gap reported ts-node gaps, so the A1-proxy
+raw was never computed — and all 22 `A1 node` refusals were "not in raw" →
+falsely dropped as stale. They re-surfaced as fresh gaps within the hour
+(ArrayComp/Continue/Declare/DefinedOr re-refused at 22:36–23:25; Break and
+Capture re-escalated to core-requests) — pi-call churn from a bookkeeping
+action. The same bug hit go-sh (22:29) and py-sh-go (22:31), dropping their
+A1 refusals too. Fix: per-vocabulary judgment (each entry vs its own
+detector's raw; silent own-detector ⇒ keep). The bare rule names go/py
+dropped that night (fieldDecl, structType, typeCaseClause, except_clause,
+test_nocond…) were judged against rules-gap and were GENUINELY exercised —
+those drops were correct and stayed. The A1-node drops were re-appended by
+a one-time repair pass that re-verified each entry against the current raw
+sets (re-appended iff still unexercised; skipped when already re-ledgered
+or pending a core-request).

@@ -55,17 +55,22 @@ gap_chain() {
   [ -z "$g" ] && g=$(bash "$DIR/coverage-gap.sh" "$lang" 2>/dev/null)
   printf '%s' "$g"
 }
-# raw_gap_chain: the same detectors WITHOUT the refused/bugs/pending
-# exclusions (COVERAGE_NO_EXCLUDE=1 — an opt-in pass-through in the
-# detectors' exclude()). The pre-exclusion unexercised set; used by
-# refresh_refused to tell "still unexercised" (candidate) from "now
-# exercised / inventory changed" (stale).
-raw_gap_chain() {
-  local g
-  g=$(COVERAGE_NO_EXCLUDE=1 bash "$DIR/rules-gap.sh" "$lang" 2>/dev/null)
-  [ -z "$g" ] && g=$(COVERAGE_NO_EXCLUDE=1 bash "$DIR/ts-node-gap.sh" "$lang" 2>/dev/null)
-  [ -z "$g" ] && g=$(COVERAGE_NO_EXCLUDE=1 bash "$DIR/coverage-gap.sh" "$lang" 2>/dev/null)
-  printf '%s' "$g"
+# raw_vocabs: write each detector's raw (pre-exclusion) output to a temp
+# file (COVERAGE_NO_EXCLUDE=1 — an opt-in pass-through in the detectors'
+# exclude()). Used by refresh_refused to tell "still unexercised"
+# (candidate) from "now exercised / inventory changed" (stale).
+#
+# PER-VOCABULARY, NOT first-non-empty: the refused ledger accumulates
+# entries from every detector across time, so each entry must be judged
+# against ITS OWN detector's raw set. First-non-empty reports only one
+# vocabulary and falsely "stales" all refusals from the others
+# (zsh-sh-go 2026-08-14 22:26: 22 A1-node refusals dropped because only
+# ts-node gaps were reported — they re-surfaced as fresh gaps within the
+# hour and were re-refused/re-escalated).
+raw_vocabs() {  # fills $T/raw.{rules,ts,proxy}
+  COVERAGE_NO_EXCLUDE=1 bash "$DIR/rules-gap.sh" "$lang" 2>/dev/null > "$T/raw.rules"
+  COVERAGE_NO_EXCLUDE=1 bash "$DIR/ts-node-gap.sh" "$lang" 2>/dev/null > "$T/raw.ts"
+  COVERAGE_NO_EXCLUDE=1 bash "$DIR/coverage-gap.sh" "$lang" 2>/dev/null > "$T/raw.proxy"
 }
 
 # ---- core-pending prune -------------------------------------------------
@@ -229,16 +234,48 @@ attempt_gap() {  # <gap> <mode: fresh|refresh>
 refresh_refused() {
   local r="$DIR/refused-$lang.txt"
   [ -f "$r" ] && [ -s "$r" ] || return 0
-  local raw
-  raw=$(raw_gap_chain | sort -u)
-  # no raw inventory (silent detector / no external grammar): do nothing —
-  # dropping every entry as "stale" would un-suppress everything and churn
-  # re-refusals.
-  [ -n "$raw" ] || { echo "$TS coverage[$lang]: no raw gap inventory — refused-refresh skipped" >> "$LOG"; return 0; }
-  # stale-drop: entries the RAW detectors no longer report (now exercised by
-  # testdata, or the grammar inventory changed) — bookkeeping, no pi call.
-  grep -xFf <(printf '%s\n' "$raw") "$r" > "$T/ref.keep" || true
-  grep -vxFf <(printf '%s\n' "$raw") "$r" > "$T/ref.stale" || true
+  # rate limit: one re-proposal per language per REFUSE_REFRESH_INTERVAL
+  # (checked BEFORE the detector runs — rate-limited cycles stay cheap)
+  local stamp="$DIR/refused-refresh-stamp-$lang.txt" now last
+  if [ -f "$stamp" ]; then
+    now=$(date +%s); last=$(cat "$stamp" 2>/dev/null || echo 0)
+    if [ $((now - last)) -lt "${REFUSE_REFRESH_INTERVAL:-86400}" ]; then
+      echo "$TS coverage[$lang]: refused-refresh rate-limited" >> "$LOG"
+      return 0
+    fi
+  fi
+  # per-vocabulary raw sets (rules / ts-node / A1+syn). Each refused entry
+  # is judged against ITS OWN vocabulary's raw set — see raw_vocabs.
+  raw_vocabs
+  # no raw inventory at all (all detectors silent / no external grammar):
+  # do nothing — dropping every entry as "stale" would un-suppress
+  # everything and churn re-refusals.
+  if [ ! -s "$T/raw.rules" ] && [ ! -s "$T/raw.ts" ] && [ ! -s "$T/raw.proxy" ]; then
+    echo "$TS coverage[$lang]: no raw gap inventory — refused-refresh skipped" >> "$LOG"
+    return 0
+  fi
+  # stale-drop: an entry is STALE only when its own vocabulary's detector
+  # is healthy (raw non-empty) AND no longer reports it (now exercised by
+  # testdata, or the grammar/inventory changed). When the own detector is
+  # silent (torn binary / failed inventory / no grammar) the verdict is
+  # unprovable — keep the entry (conservative; a false drop costs a pi
+  # re-judgment, a missed drop costs nothing).
+  : > "$T/ref.keep"; : > "$T/ref.stale"
+  local e det
+  while IFS= read -r e; do
+    [ -n "$e" ] || continue
+    case "$e" in
+      "ts node "*)   det="$T/raw.ts" ;;
+      "A1 node "*)   det="$T/raw.proxy" ;;
+      "syn kind "*)  det="$T/raw.proxy" ;;
+      *)             det="$T/raw.rules" ;;
+    esac
+    if [ ! -s "$det" ] || grep -qxF "$e" "$det"; then
+      printf '%s\n' "$e" >> "$T/ref.keep"
+    else
+      printf '%s\n' "$e" >> "$T/ref.stale"
+    fi
+  done < "$r"
   if [ -s "$T/ref.stale" ]; then
     local g
     while IFS= read -r g; do
@@ -248,15 +285,6 @@ refresh_refused() {
     done < "$T/ref.stale"
   fi
   [ -s "$T/ref.keep" ] || return 0
-  # rate limit: one re-proposal per language per REFUSE_REFRESH_INTERVAL
-  local stamp="$DIR/refused-refresh-stamp-$lang.txt" now last
-  if [ -f "$stamp" ]; then
-    now=$(date +%s); last=$(cat "$stamp" 2>/dev/null || echo 0)
-    if [ $((now - last)) -lt "${REFUSE_REFRESH_INTERVAL:-86400}" ]; then
-      echo "$TS coverage[$lang]: refused-refresh rate-limited" >> "$LOG"
-      return 0
-    fi
-  fi
   # rotating cursor: re-propose the candidate after the last one (wrap)
   local cur="$DIR/refused-refresh-cursor-$lang.txt" prev=""
   [ -f "$cur" ] && prev=$(cat "$cur")
