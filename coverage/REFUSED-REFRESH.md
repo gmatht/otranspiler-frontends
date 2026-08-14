@@ -96,10 +96,13 @@ A1-contract gap → escalate (migrates refused → core-pending).
 - **Fresh-first:** refresh never runs while fresh gaps exist.
 - **No duplicates:** the refresh keep-path must not re-append (`printf >>
   refused` would duplicate — the entry is already there).
-- **No inventory, no refresh:** if the raw gap set is empty the detector is
-  silent (no external grammar / no inventory) — refresh skips rather than
-  dropping every refused entry as "stale" (that would un-suppress
-  everything and churn re-refusals).
+- **No inventory, no refresh:** if all three raw sets are empty the
+  refresh skips rather than dropping every refused entry as "stale" (that
+  would un-suppress everything and churn re-refusals). Ambiguous by design:
+  the detectors exit 0 with empty output both on failure (no grammar /
+  failed inventory / torn binary) and on a healthy run with nothing
+  uncovered (rust-frontend: syn-coverage builds fine, every expressible
+  kind is exercised). Either way there is nothing to re-propose — skip.
 - **`grep -vxF` / `grep -xF` for ledger ops:** exact-line + fixed-string
   (entries contain spaces; `-F` avoids regex metachar surprises).
 - **Atomicity:** every ledger rewrite is tmp + mv; a parallel worker

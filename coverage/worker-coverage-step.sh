@@ -251,7 +251,13 @@ refresh_refused() {
   # do nothing — dropping every entry as "stale" would un-suppress
   # everything and churn re-refusals.
   if [ ! -s "$T/raw.rules" ] && [ ! -s "$T/raw.ts" ] && [ ! -s "$T/raw.proxy" ]; then
-    echo "$TS coverage[$lang]: no raw gap inventory — refused-refresh skipped" >> "$LOG"
+    # ambiguous by design: the detectors exit 0 with EMPTY output both on
+    # failure (no grammar / failed inventory / torn binary) and on a
+    # healthy run with nothing uncovered (rust: every expressible syn kind
+    # is exercised — syn-coverage builds fine and reports all-used).
+    # Either way there is nothing to re-propose or judge stale, so skip;
+    # the log line is informational, not a diagnosis.
+    echo "$TS coverage[$lang]: no raw gap output (nothing uncovered, or no detector/inventory) — refused-refresh skipped" >> "$LOG"
     return 0
   fi
   # stale-drop: an entry is STALE only when its own vocabulary's detector
