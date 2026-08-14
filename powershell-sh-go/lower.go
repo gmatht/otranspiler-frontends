@@ -40,7 +40,13 @@ const maxRangeSpan = 1000
 //	            variable
 //	            expandable_bareword               ($foo-bar — t09)
 //	            concatenated_command_argument     (adjacent pieces — t05)
-//	      pipeline_chain_tail*    (REFUSE: `|` pipe — t08 rung)
+//	      pipeline_chain_tail*    (`&&` / `||` — the t26 pipeline-chain
+//	                                operators: TWO chains + ONE tail →
+//	                                the A1 BinOp And/Or. The `|` pipe is
+//	                                NOT this node — it is the anonymous
+//	                                _pipeline_tail token INSIDE a chain
+//	                                (two command children) → the t08
+//	                                text-pipe rung, REFUSE)
 //	    do_statement                (t06 — the do-while duplication)
 //	      statement_block → statement_list → … (the body, lowered once)
 //	      `while` / `until` keyword, `(` while_condition `)`
@@ -750,37 +756,134 @@ func lowerIfStatement(n *sitter.Node, src []byte) (any, error) {
 }
 
 // lowerPipeline — a single statement; `|` pipelines refuse until the
-// t08 rung (the plan's text-pipe approximation). Returns the command's
-// A1 statements — normally one, but the t14 argument_list echo split
-// can emit several.
+// t08 rung (the plan's text-pipe approximation). The grammar's pipeline
+// node is a chain of pipeline_chain parts joined by pipeline_chain_tail
+// tokens — the pwsh 7.0+ pipeline-chain operators `&&` / `||` (NOTE the
+// `|` pipe is NOT this node: `a | b` parses as ONE pipeline_chain whose
+// anonymous `|` token, the _pipeline_tail rule, sits between two
+// command children — the t26 rung's refusal below). Returns the
+// command's A1 statements — normally one, but the t14 argument_list
+// echo split can emit several.
 func lowerPipeline(n *sitter.Node, src []byte) ([]any, error) {
-	var chain *sitter.Node
+	var chains []*sitter.Node
+	var tails []*sitter.Node
 	for i := 0; i < int(n.NamedChildCount()); i++ {
 		ch := n.NamedChild(i)
 		switch ch.Type() {
 		case "pipeline_chain":
-			if chain == nil {
-				chain = ch
-			}
+			chains = append(chains, ch)
 		case "pipeline_chain_tail":
-			return nil, refuse(ch, src, "pipeline `|` (the t08 text-pipe rung)")
+			tails = append(tails, ch)
 		default:
 			return nil, refuse(ch, src, "statement %q (outside the v1 subset)", ch.Type())
 		}
 	}
-	if chain == nil {
+	if len(chains) == 0 {
 		return nil, refuse(n, src, "pipeline without a chain")
 	}
+	if len(tails) == 0 {
+		// one chain — the plain statement (the t01 command shape and
+		// every rung that lands a single-chain form). A chain with TWO
+		// command children is the `|` pipe — the anonymous _pipeline_tail
+		// token sits INSIDE the chain, NOT as a pipeline_chain_tail (that
+		// node is `&&` / `||` only) — REFUSE loudly (the t08 text-pipe
+		// rung; the pre-t26 loop returned on the first command and
+		// silently DROPPED the pipe's right-hand command — a miscompile).
+		return lowerSingleChain(chains[0], src)
+	}
+	// the t26 rung: the pipeline-chain operators. The subset pins
+	// exactly TWO chains and ONE operator; a longer chain nests BinOps
+	// and REFUSES (refuse > guess — the nested shape is the next rung).
+	if len(chains) != 2 || len(tails) != 1 {
+		return nil, refuse(tails[0], src, "pipeline chain with %d chains (the t26 subset pins exactly two chains and one `&&`/`||`)", len(chains))
+	}
+	return lowerChainOperator(chains[0], tails[0], chains[1], src)
+}
+
+// lowerSingleChain — one pipeline_chain as a statement (the shared
+// single-chain path: the t01 command and every rung that lands a
+// single-chain form). A chain with a SECOND command child is the `|`
+// pipe — the grammar's anonymous _pipeline_tail token (`|` + command,
+// INSIDE the chain; NOT the pipeline_chain_tail `&&`/`||` node, which
+// lives BETWEEN chains) — REFUSE (the t08 text-pipe rung: silently
+// emitting only the first command would miscompile the RHS away).
+func lowerSingleChain(chain *sitter.Node, src []byte) ([]any, error) {
+	var cmd *sitter.Node
 	for i := 0; i < int(chain.NamedChildCount()); i++ {
 		ch := chain.NamedChild(i)
 		switch ch.Type() {
 		case "command":
-			return lowerCommand(ch, src)
+			if cmd != nil {
+				return nil, refuse(ch, src, "pipeline `|` (the t08 text-pipe rung)")
+			}
+			cmd = ch
 		default:
 			return nil, refuse(ch, src, "expression %q at statement level", ch.Type())
 		}
 	}
-	return nil, refuse(chain, src, "empty pipeline chain")
+	if cmd == nil {
+		return nil, refuse(chain, src, "empty pipeline chain")
+	}
+	return lowerCommand(cmd, src)
+}
+
+// lowerChainOperator — the t26 rung: `c1 && c2` / `c1 || c2` — the
+// pipeline_chain_tail node of tree-sitter-powershell (the pwsh 7.0+
+// pipeline-chain operators; the `|` pipe is a DIFFERENT node — the
+// anonymous _pipeline_tail token inside one chain, lowerSingleChain's
+// two-command refusal). Live pwsh 7.6.4 (verified 2026-08-18): the
+// right-hand pipeline runs only when the left-hand's success flag is
+// set — `Write-Output "a" && Write-Output "b"` prints a then b,
+// `Write-Output "c" || Write-Output "d"` prints c only. Lowering:
+// the A1 BinOp And/Or — {"type":"BinOp","op":"And"|"Or",
+// "lhs":call,"rhs":call} — byte-identical to the core's `echo a &&
+// echo b` / `echo c || echo d` emission (verified against `debashc
+// --shir --raw`): the A1→ESTree renderer lowers the BinOp to an `if
+// (sh2.lastExit === 0)` / `if (sh2.lastExit !== 0)` guard, and within
+// the v1 subset every expressible command SUCCEEDS on both sides — the
+// transpiled run prints the same output as live pwsh by construction
+// (the `&&` tail runs on both, the `||` tail is skipped on both). The
+// subset pins the plain command shape on BOTH sides: each operand must
+// lower to EXACTLY ONE Expr statement carrying a Call (the t01 shape) —
+// a chain whose command emits several statements (the t14/t24 argument
+// forms) or a non-Call statement (the t19 Redirect) has no single
+// value to chain on, and a longer chain (3+ chains) nests BinOps —
+// both REFUSE (refuse > guess; the nested shape is the next rung).
+func lowerChainOperator(lhsChain, tail, rhsChain *sitter.Node, src []byte) ([]any, error) {
+	lhs, err := chainOperand(lhsChain, src, "left")
+	if err != nil {
+		return nil, err
+	}
+	rhs, err := chainOperand(rhsChain, src, "right")
+	if err != nil {
+		return nil, err
+	}
+	switch tail.Content(src) {
+	case "&&":
+		return []any{exprStmt(binOpExpr("And", lhs, rhs))}, nil
+	case "||":
+		return []any{exprStmt(binOpExpr("Or", lhs, rhs))}, nil
+	default:
+		return nil, refuse(tail, src, "pipeline chain tail %q (the t26 subset pins `&&` / `||`)", tail.Content(src))
+	}
+}
+
+// chainOperand — one `&&` / `||` side as the A1 expr of its single
+// statement: the t26 subset pins the plain command shape on both sides
+// (the chain lowers through lowerSingleChain — the t01 echo surface).
+func chainOperand(chain *sitter.Node, src []byte, what string) (any, error) {
+	stmts, err := lowerSingleChain(chain, src)
+	if err != nil {
+		return nil, err
+	}
+	if len(stmts) != 1 {
+		return nil, refuse(chain, src, "%s chain with %d statements (the t26 subset pins one command per chain side)", what, len(stmts))
+	}
+	st, ok := stmts[0].(map[string]any)
+	if !ok || st["type"] != "Expr" {
+		return nil, refuse(chain, src, "%s chain %q (the t26 subset pins a plain command)", what, st["type"])
+	}
+	return st["expr"], nil
 }
 
 // lowerCommand — `Write-Output "…"` / `Write-Host "…"` / `echo …` lower

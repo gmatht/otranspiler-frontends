@@ -199,6 +199,23 @@ func intExpr(n int64) any {
 	return map[string]any{"type": "Int", "value": n}
 }
 
+// binOpExpr — the A1 BinOp expression (the t26 rung: the pwsh 7.0+
+// pipeline-chain operators `&&` / `||` — the pipeline_chain_tail node —
+// between two command pipelines). Shape mirrors shir_json.rs exactly,
+// the core's `echo a && echo b` emission: {"type":"BinOp",
+// "op":"And"|"Or","lhs":expr,"rhs":expr} (sorted keys — lhs < op <
+// rhs < type). The A1→ESTree renderer lowers it to an `if (sh2.lastExit
+// === 0)` / `if (sh2.lastExit !== 0)` guard (the shir.rs BinOp And/Or
+// arms), so the tail runs exactly when the head's success flag is set.
+func binOpExpr(op string, lhs, rhs any) any {
+	return map[string]any{
+		"type": "BinOp",
+		"op":   op,
+		"lhs":  lhs,
+		"rhs":  rhs,
+	}
+}
+
 // getVarCall — $name reads lower to getVar("name") (the core's var-read
 // channel; Emulable per the A4 namespace spec).
 func getVarCall(name string) any {

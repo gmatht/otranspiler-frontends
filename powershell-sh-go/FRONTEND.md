@@ -4,7 +4,7 @@ PowerShell (.ps1) source -> A1 shIR JSON — **the bat sibling**
 (workspace-side dir; no git worktree; the object pipeline is a stated
 TEXT approximation for v1; see PLAN_POWERSHELL_F.md).
 
-**Status: WORKER-IMPLEMENTED, t25 landed (gate green).** The parser is
+**Status: WORKER-IMPLEMENTED, t26 landed (gate green).** The parser is
 wharflab/tree-sitter-powershell (vendored under
 `grammars/tree-sitter-powershell/`, loaded via smacker/go-tree-sitter
 cgo) — the plan's choice, empirically verified. The emitter produces A1
@@ -474,6 +474,45 @@ line) — now the worker's fixes, not records):
   and the A1 Range bounded-iterable node is the shape that rung needs
   (zero contract surface landed here: the fold needs only the echo
   statements every rung uses).
+- t26_pipeline_chain: the pipeline_chain_tail node — the pwsh 7.0+
+  pipeline-chain operators `&&` / `||` between command pipelines (the
+  grammar's _pipeline rule: `pipeline_chain (pipeline_chain_tail
+  pipeline_chain)*`; NOTE the `|` pipe is NOT this node — the grammar
+  parses `a | b` as ONE pipeline_chain whose ANONYMOUS `|` token (the
+  _pipeline_tail rule) sits between two command children — verified
+  against the CST). The pre-t26 frontend refused this node under a
+  mislabel — "pipeline `|` (the t08 text-pipe rung)" fired on the
+  `&&`/`||` token — but the pipe and the chain operator are different
+  constructs, and the A1 contract has the chain operator: the core
+  frontend emits `echo a && echo b` as the BinOp And/Or (the t26
+  lowering is byte-identical, verified against `debashc --shir --raw`).
+  Live pwsh 7.6.4 (verified 2026-08-18): the right-hand pipeline runs
+  only when the left-hand's success flag is set — `Write-Output "a" &&
+  Write-Output "b"` prints a then b, `Write-Output "c" || Write-Output
+  "d"` prints c only (Write-Output always succeeds). Lowering: the A1
+  BinOp `{"type":"BinOp","op":"And"|"Or","lhs":call,"rhs":call}`
+  in an Expr statement — the A1→ESTree renderer lowers it to an `if
+  (sh2.lastExit === 0)` / `if (sh2.lastExit !== 0)` guard (the shir.rs
+  BinOp And/Or arms), and within the v1 subset every expressible
+  command SUCCEEDS on both sides — the transpiled run prints the same
+  output as live pwsh by construction (the `&&` tail runs on both, the
+  `||` tail is skipped on both; the skipped `||` tail is structural —
+  a wrongly-run echo would DIFF). The subset pins TWO chains with the
+  plain command shape on BOTH sides: each operand must lower to EXACTLY
+  ONE Expr statement carrying a Call (the t01 shape) — a chain whose
+  command emits several statements (the t14/t24 argument forms) or a
+  non-Call statement (the t19 Redirect) has no single value to chain
+  on — and a longer chain (3+ chains, the nested BinOp shape — the
+  core's `a && b && c` left-assoc nesting) is unpinned: all REFUSE
+  (refuse > guess), pinned `testdata_refuse/t26_pipeline_chain_three.ps1`.
+  The rung also made the `|` pipe refusal REAL: the pre-t26 chain loop
+  returned on the first command and silently DROPPED the pipe's
+  right-hand command (a miscompile no pin exercised — the pipe is
+  anonymous inside the chain, invisible to the old
+  pipeline_chain_tail refusal); a chain with two command children now
+  REFUSES loudly (the t08 text-pipe rung), pinned
+  `testdata_refuse/t26_pipeline.ps1` (FRONTEND.md's "`|` pipelines …
+  pinned" claim is now actually true).
 
 Comments, comment-only files (empty Program), and the REFUSE table
   (refuse.go): anything outside the subset errors loudly — including
@@ -482,7 +521,8 @@ Comments, comment-only files (empty Program), and the REFUSE table
 
 The v1 subset and the refusal table are PLAN_POWERSHELL_F.md. The next
 construct (assignment + `$var` interpolation, the elseif chain, the
-runtime printf-style `-f` rung) lands on the next RED pin; the
+runtime printf-style `-f` rung, the nested `&&`/`||` chain) lands on
+the next RED pin; the
 string-interpolation machinery it needs is already in place (lower.go
 reconstructs string parts from byte spans — the smacker runtime does
 not materialize the interior text tokens of expandable_string_literal
