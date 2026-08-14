@@ -553,6 +553,12 @@ func lowerStatement(n *sitter.Node, src []byte) ([]any, error) {
 			return nil, err
 		}
 		return []any{s}, nil
+	case "switch_statement":
+		s, err := lowerSwitchStatement(n, src)
+		if err != nil {
+			return nil, err
+		}
+		return []any{s}, nil
 	case "empty_statement":
 		// the lone `;` — the _statement rule's empty_statement
 		// alternative; this grammar parses EVERY standalone `;` as
@@ -988,6 +994,281 @@ func lowerForEachStatement(n *sitter.Node, src []byte) (any, error) {
 		return nil, refuse(n, src, "foreach_statement without a body")
 	}
 	return forStmt(varName, iter, body), nil
+}
+
+// lowerSwitchStatement — the switch_statement node: `switch (cond) {
+// clauses }` (the grammar: switch + optional switch_parameters +
+// switch_condition + switch_body; the switch_body wraps a
+// switch_clauses list of switch_clause children, each a
+// switch_clause_condition + statement_block). The plan's switch row
+// (PLAN_POWERSHELL_F.md §1) was a refuse-node while the grammar could
+// not parse switch clause blocks — "the clib switch lowering is ready
+// when the grammar closes the gap" — and the vendored grammar parses
+// the full shape (verified against the CST), so the rung lands the
+// plan's "clib switch lowering": the A1 Case node, the shape the core
+// emits for bash `case` (byte-identical, verified against `debashc
+// --shir --raw`).
+//
+// The t31 subset pins: a discriminant that is a bare variable read (the
+// t06/t07 condition shape — an UNSET variable reads $null in pwsh /
+// "" from the A1 store, and $null -eq <literal> is False exactly like
+// "" failing every non-* case pattern, so the null edge is CONSISTENT)
+// or a bare decimal integer (the t24 range-bound / t11 exit-code
+// precedent — pwsh matches `switch (2)` by -eq against the literal
+// clauses and the A1 `case "2"` pattern text coincides); clause
+// conditions that are bare decimal integer_literals or a trailing
+// `default` keyword (the _switch_condition_token — case-insensitive,
+// verified against live pwsh); and clause bodies through the usual
+// lowerBlock path. The executed-stdout oracle matches live pwsh by
+// construction: the unset-variable discriminant runs the default clause
+// on both sides and the literal discriminant runs its matching clause
+// on both sides (a wrongly-matched clause would DIFF).
+//
+// The divergent edges REFUSE (refuse > guess):
+//
+//   - switch_parameters (`switch -Regex/-Wildcard/-Case/-Exact …`)
+//     change the matching semantics (regex / glob / case-sensitive /
+//     exact) — outside the subset; the -File form reaches the
+//     condition as switch_filename, also refused;
+//   - a `default` clause that is NOT the last clause — pwsh runs a
+//     matching later clause and skips the default (ALL matching
+//     clauses run, default only when nothing matched — verified: `switch
+//     (1) { default { "d" } 1 { "one" } }` prints one) while the A1
+//     `*` pattern would match FIRST — the branches DIVERGE;
+//   - duplicate clause conditions — pwsh runs EVERY matching clause
+//     (no fallthrough suppression) while the A1 case runs the first
+//     match only;
+//   - a string / bareword clause condition — pwsh matches strings with
+//     the CASE-INSENSITIVE `-eq` (and coerces barewords to strings)
+//     while the A1 case pattern is case-sensitive; integer clauses
+//     coincide (the t31 pin), everything else refuses;
+//   - a hex / real / variable discriminant or clause (the t27
+//     bare-decimal-integer discipline, the t24 rangeBound precedent).
+func lowerSwitchStatement(n *sitter.Node, src []byte) (any, error) {
+	var condNode, bodyNode *sitter.Node
+	for i := 0; i < int(n.NamedChildCount()); i++ {
+		ch := n.NamedChild(i)
+		switch ch.Type() {
+		case "switch_condition":
+			if condNode != nil {
+				return nil, refuse(n, src, "switch_statement with multiple conditions")
+			}
+			condNode = ch
+		case "switch_body":
+			if bodyNode != nil {
+				return nil, refuse(n, src, "switch_statement with multiple bodies")
+			}
+			bodyNode = ch
+		case "switch_parameters":
+			return nil, refuse(ch, src, "switch parameters (the -regex / -wildcard / -exact / -casesensitive / -parallel flags change the matching semantics — outside the t31 subset)")
+		default:
+			return nil, refuse(ch, src, "switch_statement part %q", ch.Type())
+		}
+	}
+	if condNode == nil {
+		return nil, refuse(n, src, "switch_statement without a condition")
+	}
+	disc, err := lowerSwitchCondition(condNode, src)
+	if err != nil {
+		return nil, err
+	}
+	var clauses []any
+	if bodyNode != nil {
+		clauses, err = lowerSwitchClauses(bodyNode, src)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return caseStmt(disc, clauses), nil
+}
+
+// lowerSwitchCondition — the switch_condition node: `(` pipeline `)`
+// (the -File form reaches the condition as a switch_filename child —
+// line-based file matching, refused). The discriminant is a VALUE
+// compared by -eq against each clause condition, not a truthiness
+// condition, so the t31 subset pins a bare variable read (the t06/t07
+// lowerCondVar shape — including the `$true` automatic refusal) or a
+// bare decimal integer (the t24 rangeBound shape; the text passes
+// through as a Str, the t27 argument precedent — the core emits the
+// same Str for a literal `case 2 in` discriminant, verified).
+func lowerSwitchCondition(n *sitter.Node, src []byte) (any, error) {
+	var pipeline *sitter.Node
+	for i := 0; i < int(n.NamedChildCount()); i++ {
+		ch := n.NamedChild(i)
+		switch ch.Type() {
+		case "pipeline":
+			if pipeline != nil {
+				return nil, refuse(n, src, "switch condition with multiple pipelines")
+			}
+			pipeline = ch
+		case "switch_filename":
+			return nil, refuse(ch, src, "switch -File: line-based file matching is outside the v1 subset (the t31 switch pins an expression condition)")
+		default:
+			return nil, refuse(ch, src, "switch condition %q", ch.Type())
+		}
+	}
+	if pipeline == nil {
+		return nil, refuse(n, src, "switch condition without a pipeline")
+	}
+	var chain *sitter.Node
+	for i := 0; i < int(pipeline.NamedChildCount()); i++ {
+		ch := pipeline.NamedChild(i)
+		switch ch.Type() {
+		case "pipeline_chain":
+			if chain != nil {
+				return nil, refuse(pipeline, src, "switch condition with multiple chains")
+			}
+			chain = ch
+		case "pipeline_chain_tail":
+			return nil, refuse(ch, src, "`|` inside a switch condition")
+		default:
+			return nil, refuse(ch, src, "switch condition %q", ch.Type())
+		}
+	}
+	if chain == nil {
+		return nil, refuse(pipeline, src, "switch condition without a chain")
+	}
+	if chain.NamedChildCount() != 1 {
+		return nil, refuse(chain, src, "switch condition chain with %d children", chain.NamedChildCount())
+	}
+	op := chain.NamedChild(0)
+	if op.Type() != "unary_expression" || op.NamedChildCount() != 1 {
+		return nil, refuse(op, src, "switch discriminant %q (the t31 subset pins a bare variable read or a bare decimal integer)", op.Type())
+	}
+	inner := op.NamedChild(0)
+	switch inner.Type() {
+	case "variable":
+		return lowerCondVar(op, src, "switch discriminant")
+	case "integer_literal":
+		if _, err := strconv.Atoi(inner.Content(src)); err != nil {
+			return nil, refuse(inner, src, "switch discriminant %q (the t31 subset pins a bare decimal integer)", inner.Content(src))
+		}
+		return strExpr(inner.Content(src), "DoubleQuoted"), nil
+	default:
+		return nil, refuse(inner, src, "switch discriminant %q (the t31 subset pins a bare variable read or a bare decimal integer)", inner.Type())
+	}
+}
+
+// lowerSwitchClauses — the switch_body's switch_clauses list, as the
+// A1 Case clause array. An empty `switch ($x) { }` body has NO
+// switch_clauses child (node-types: required false) — no clause
+// matches, no output, the empty clause array.
+func lowerSwitchClauses(body *sitter.Node, src []byte) ([]any, error) {
+	var sc *sitter.Node
+	for i := 0; i < int(body.NamedChildCount()); i++ {
+		ch := body.NamedChild(i)
+		if ch.Type() == "switch_clauses" {
+			if sc != nil {
+				return nil, refuse(body, src, "switch body with multiple switch_clauses")
+			}
+			sc = ch
+		} else {
+			return nil, refuse(ch, src, "switch body %q", ch.Type())
+		}
+	}
+	if sc == nil {
+		return []any{}, nil
+	}
+	var clauses []any
+	seen := map[int]bool{}
+	for i := 0; i < int(sc.NamedChildCount()); i++ {
+		cl := sc.NamedChild(i)
+		if cl.Type() != "switch_clause" {
+			return nil, refuse(cl, src, "switch clause %q", cl.Type())
+		}
+		patterns, clBody, err := lowerSwitchClause(cl, src)
+		if err != nil {
+			return nil, err
+		}
+		for _, p := range patterns {
+			if p == "*" {
+				if i != int(sc.NamedChildCount())-1 {
+					return nil, refuse(cl, src, "default clause before a later clause: pwsh runs a matching later clause and SKIPS the default (all matching clauses run, default only when nothing matched) while the A1 `*` pattern would match FIRST — the branches DIVERGE; the t31 subset pins default LAST")
+				}
+				continue
+			}
+			v, err := strconv.Atoi(p)
+			if err != nil {
+				return nil, refuse(cl, src, "switch clause condition %q", p)
+			}
+			if seen[v] {
+				return nil, refuse(cl, src, "duplicate switch clause condition %q: pwsh runs EVERY matching clause (no fallthrough suppression) while the A1 case runs the first match only — the branches DIVERGE; the t31 subset pins distinct clause values", p)
+			}
+			seen[v] = true
+		}
+		clauses = append(clauses, map[string]any{"patterns": patterns, "body": clBody})
+	}
+	return clauses, nil
+}
+
+// lowerSwitchClause — one switch_clause: the switch_clause_condition
+// (the `default` keyword or a bare decimal integer) + the
+// statement_block body (the usual lowerBlock path — the clause bodies
+// go through the same statement lowering as every other body, so
+// break/continue/exit inside a clause refuse the same way).
+func lowerSwitchClause(cl *sitter.Node, src []byte) ([]string, []any, error) {
+	var condNode, blockNode *sitter.Node
+	for i := 0; i < int(cl.NamedChildCount()); i++ {
+		ch := cl.NamedChild(i)
+		switch ch.Type() {
+		case "switch_clause_condition":
+			if condNode != nil {
+				return nil, nil, refuse(cl, src, "switch clause with multiple conditions")
+			}
+			condNode = ch
+		case "statement_block":
+			if blockNode != nil {
+				return nil, nil, refuse(cl, src, "switch clause with multiple bodies")
+			}
+			blockNode = ch
+		default:
+			return nil, nil, refuse(ch, src, "switch clause part %q", ch.Type())
+		}
+	}
+	if condNode == nil {
+		return nil, nil, refuse(cl, src, "switch clause without a condition")
+	}
+	patterns, err := lowerSwitchClauseCondition(condNode, src)
+	if err != nil {
+		return nil, nil, err
+	}
+	body, err := lowerBlock(blockNode, src)
+	if err != nil {
+		return nil, nil, err
+	}
+	return patterns, body, nil
+}
+
+// lowerSwitchClauseCondition — one clause condition. The `default`
+// keyword is the grammar's ANONYMOUS _switch_condition_token (the node
+// has NO named children; the keyword is case-insensitive — `Default`
+// parses the same and pwsh treats it as the default clause, verified
+// 2026-08-21) → the A1 `*` pattern. A named child must be a bare
+// decimal integer_literal → its raw text as the case pattern (pwsh
+// matches `$x -eq <int>` and the A1 pattern text coincides). Strings /
+// barewords REFUSE: pwsh's `-eq` is CASE-INSENSITIVE for strings (and
+// coerces barewords), while the A1 case pattern match is
+// case-sensitive — the branches would diverge for any discriminant
+// differing in case (refuse > guess; the t27 bare-decimal-integer
+// discipline).
+func lowerSwitchClauseCondition(n *sitter.Node, src []byte) ([]string, error) {
+	if n.NamedChildCount() == 0 {
+		if strings.EqualFold(n.Content(src), "default") {
+			return []string{"*"}, nil
+		}
+		return nil, refuse(n, src, "switch clause condition %q: a bareword condition is a pwsh STRING match (the case-insensitive -eq vs the case-sensitive A1 pattern diverges); the t31 subset pins integer clauses and default", n.Content(src))
+	}
+	if n.NamedChildCount() != 1 {
+		return nil, refuse(n, src, "switch clause condition with %d children", n.NamedChildCount())
+	}
+	op := n.NamedChild(0)
+	if op.Type() != "integer_literal" {
+		return nil, refuse(op, src, "switch clause condition %q (the t31 subset pins a bare decimal integer clause or default; pwsh string/-eq conditions are case-insensitive and diverge from the case-sensitive A1 pattern)", op.Type())
+	}
+	if _, err := strconv.Atoi(op.Content(src)); err != nil {
+		return nil, refuse(op, src, "switch clause condition %q (the t31 subset pins a bare decimal integer)", op.Content(src))
+	}
+	return []string{op.Content(src)}, nil
 }
 
 // lowerIfStatement — the if_statement node: `if` `(` condition `)`

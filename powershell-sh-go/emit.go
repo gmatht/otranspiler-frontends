@@ -211,6 +211,27 @@ func exitStmt(value any) any {
 	return map[string]any{"type": "Exit", "value": value}
 }
 
+// caseStmt — the A1 Case statement (the t31 rung: the switch_statement
+// node — pwsh `switch ($v) { 1 { … } default { … } }` — the plan's
+// "clib switch lowering" row, the A1 Case node the core emits for bash
+// `case`). Shape mirrors shir_json.rs exactly: type/discriminant/
+// clauses, sorted keys (clauses < discriminant < type); each clause is
+// {"patterns":[…],"body":[…]}. The discriminant lowers through the
+// t31 subset (a bare variable read or a bare decimal integer, the t24
+// range-bound precedent) and each clause pattern is the literal
+// condition text with `*` for the default clause — byte-identical to
+// the core's `case "$x" in 1) … ;; *) … ;; esac` emission.
+func caseStmt(discriminant any, clauses []any) any {
+	if clauses == nil {
+		clauses = []any{}
+	}
+	return map[string]any{
+		"type":         "Case",
+		"discriminant": discriminant,
+		"clauses":      clauses,
+	}
+}
+
 // intExpr — a bare integer literal (`exit 5`): the A1 Int expr, matching
 // the bat frontend's exit-code emission (the core's `echo 5` lowers to a
 // Str — the Int shape is the Exit-code precedent, not the argument one).

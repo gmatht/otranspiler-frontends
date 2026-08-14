@@ -4,7 +4,7 @@ PowerShell (.ps1) source -> A1 shIR JSON — **the bat sibling**
 (workspace-side dir; no git worktree; the object pipeline is a stated
 TEXT approximation for v1; see PLAN_POWERSHELL_F.md).
 
-**Status: WORKER-IMPLEMENTED, t29 landed (gate green).** The parser is
+**Status: WORKER-IMPLEMENTED, t31 landed (gate green).** The parser is
 wharflab/tree-sitter-powershell (vendored under
 `grammars/tree-sitter-powershell/`, loaded via smacker/go-tree-sitter
 cgo) — the plan's choice, empirically verified. The emitter produces A1
@@ -648,6 +648,49 @@ line) — now the worker's fixes, not records):
   are a different tokenizer shape (the subexpression would be a
   separate pipeline object, the multi-object output outside the v1
   single-object echo mapping).
+- t31_switch: the switch_statement node — `switch ($v) { 1 { … }
+  default { … } }` (the grammar: switch + optional switch_parameters +
+  switch_condition + switch_body; the switch_body wraps a
+  switch_clauses list of switch_clause children, each a
+  switch_clause_condition + statement_block; the `default` keyword is
+  the ANONYMOUS _switch_condition_token — a default clause's condition
+  node has NO named children — and the keyword is case-insensitive,
+  `Default` parses the same, verified 2026-08-21). The plan's switch
+  row (PLAN_POWERSHELL_F.md §1) was a refuse-node while the grammar
+  could not parse switch clause blocks — "the clib switch lowering is
+  ready when the grammar closes the gap" — and the vendored grammar
+  parses the full shape (verified against the CST), so the rung lands
+  the plan's "clib switch lowering": the A1 Case node, byte-identical
+  to the core's `case "$x" in 1) … ;; *) … ;; esac` emission
+  (verified against `debashc --shir --raw`; the clause bodies lower
+  through the usual lowerBlock / lowerStatementList path). The t31
+  subset pins a discriminant that is a bare variable read (the t06/t07
+  condition shape — an UNSET variable reads $null in pwsh and "" from
+  the A1 store, and $null -eq <literal> is False exactly like ""
+  failing every non-* case pattern, so the null edge is CONSISTENT:
+  the first pinned switch runs its default clause on BOTH sides) or a
+  bare decimal integer (the t24 range-bound precedent — pwsh matches
+  `switch (2)` by -eq against the literal clauses and the A1 `case
+  "2"` pattern text coincides: the second pinned switch runs its `2`
+  clause on BOTH sides — a wrongly-matched clause would DIFF). Clause
+  conditions are bare decimal integer_literals or a TRAILING `default`
+  (the t27 bare-decimal-integer discipline — hex/real clause
+  conditions refuse). The divergent edges REFUSE (refuse > guess),
+  pinned `testdata_refuse/t31_*`: a `default` before a later clause
+  (pwsh runs the matching later clause and SKIPS the default — ALL
+  matching clauses run, default only when nothing matched, verified:
+  `switch (1) { default { "d" } 1 { "one" } }` prints one — while the
+  A1 `*` pattern would match FIRST), duplicate clause values (pwsh
+  runs EVERY matching clause, the A1 case runs the first match only),
+  a string / bareword clause condition (pwsh's `-eq` is
+  case-INSENSITIVE for strings while the A1 pattern match is
+  case-sensitive), switch_parameters (`switch -Regex/-Wildcard/
+  -Exact/-CaseSensitive/-Parallel` — the vendored grammar's flag
+  tokens; they change the matching semantics) and the -File condition
+  (switch_filename — line-based file matching). The executed-stdout
+  oracle matches live pwsh 7.6.4 by construction (both print "d" then
+  "two"; the unset-variable switch exercises the default path, the
+  literal-discriminant switch the match path).
 
 Comments, comment-only files (empty Program), and the REFUSE table
   (refuse.go): anything outside the subset errors loudly — including
