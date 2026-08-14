@@ -1210,8 +1210,12 @@ func chainOperand(chain *sitter.Node, src []byte, what string) (any, error) {
 // one line, which would miscompile the object-per-argument reality).
 // The t14 subset pins EXACTLY ONE head argument before the list and
 // the list itself must be the `-f` format form; the t21 subset pins
-// the parenthesized null-coalesce as the command's ONLY element;
-// anything else REFUSES.
+// the parenthesized null-coalesce as the command's ONLY element; the
+// t25 subset pins the parenthesized range the same way; the t29
+// subset pins the stop-parsing token `--%` as the command's only
+// argument-producing element (the token and its verbatim remainder
+// are SEPARATE pipeline objects — one echo each, see the element
+// loop); anything else REFUSES.
 func lowerCommand(n *sitter.Node, src []byte) ([]any, error) {
 	nameNode := n.ChildByFieldName("command_name")
 	if nameNode == nil {
@@ -1231,9 +1235,17 @@ func lowerCommand(n *sitter.Node, src []byte) ([]any, error) {
 	seenList := false
 	seenParenCoalesce := false
 	seenParenRange := false
+	seenStopParsing := false
 	if elems := n.ChildByFieldName("command_elements"); elems != nil {
 		for i := 0; i < int(elems.NamedChildCount()); i++ {
 			e := elems.NamedChild(i)
+			if seenStopParsing {
+				// the `--%` token consumes the rest of ITS line — the
+				// grammar cannot place a command element after it (the
+				// token ends at the newline; the next line starts a new
+				// statement). Defensive (refuse > guess).
+				return nil, refuse(e, src, "element after a stop-parsing token (the `--%%` token consumes the rest of its line)")
+			}
 			if e.Type() == "argument_list" {
 				// the head argument(s) accumulated so far form ONE
 				// pipeline object each — the t14 subset pins a single
@@ -1331,6 +1343,49 @@ func lowerCommand(n *sitter.Node, src []byte) ([]any, error) {
 					return nil, err
 				}
 				redirects = append(redirects, spec)
+				continue
+			}
+			if e.Type() == "stop_parsing" {
+				// the t29 rung: the pwsh stop-parsing token `--%` — the
+				// grammar's stop_parsing token (`--%[^\r\n]*`) consumes
+				// the REST of its line VERBATIM as ONE command element
+				// (the node text is `--%` plus the remainder; the token
+				// ends at the newline, so it is always the command's LAST
+				// element). Live pwsh 7.6.4 (verified 2026-08-20): with a
+				// CMDLET the `--%` token is passed as its OWN pipeline
+				// object and the verbatim remainder as ONE more —
+				// `Write-Output --% hello world` prints `--%` then
+				// `hello world` on TWO lines, and `Write-Output --%
+				// $HOME tail` prints `$HOME tail` UNEXPANDED (verbatim is
+				// the point of the token — no variable interpolation, no
+				// quote processing; leading whitespace after the token is
+				// trimmed, interior spacing preserved). Both objects are
+				// COMPILE-TIME literal text (the t14 fold precedent), so
+				// the element lowers to ONE echo per object (the t14
+				// one-object-per-argument rule) — byte-identical to the
+				// core's `echo "--%"` + `echo "…"` emissions. The t29
+				// subset pins the token as the command's ONLY
+				// argument-producing element on the enumeration commands
+				// (Write-Output / echo — the t01 whitelist): preceding
+				// arguments (`Write-Output "pre" --% tail` — pwsh writes
+				// THREE objects, the unpinned head-args shape), a
+				// redirection, and `Write-Host --% …` (Write-Host JOINS
+				// its objects on one line — the two-object enumeration
+				// would miscompile) all REFUSE (refuse > guess).
+				if len(redirects) > 0 {
+					return nil, refuse(e, src, "stop-parsing token combined with a redirection (the t29 subset pins a plain command)")
+				}
+				if len(argExprs) != 0 {
+					return nil, refuse(e, src, "stop-parsing token with %d preceding argument(s) (the t29 subset pins `Write-Output --%% …` — the token is the command's only element)", len(argExprs))
+				}
+				if strings.ToLower(name) == "write-host" {
+					return nil, refuse(e, src, "Write-Host with the stop-parsing token (Write-Host JOINS its arguments on one line — the t29 two-object enumeration would miscompile; the Write-Output / echo form is the pinned surface)")
+				}
+				text := e.Content(src)
+				rest := strings.TrimLeft(text[3:], " \t")
+				stmts = append(stmts, exprStmt(execCall("echo", []any{strExpr("--%", "DoubleQuoted")})))
+				stmts = append(stmts, exprStmt(execCall("echo", []any{strExpr(rest, "DoubleQuoted")})))
+				seenStopParsing = true
 				continue
 			}
 			a, err := lowerCommandElement(e, src)

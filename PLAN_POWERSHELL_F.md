@@ -1,9 +1,33 @@
 # PLAN_POWERSHELL_F — a PowerShell frontend on the bat precedent
 
-**Status: IN PROGRESS — t25 landed (gate green).** The
+**Status: IN PROGRESS — t29 landed (gate green).** The
 proposal is implemented as described; revision history below.
 
 ## 0. Revision history
+
+- 2026-08-20 (t29_stop_parsing, gate green): the stop_parsing token
+  lands — the pwsh stop-parsing `--%` (the grammar's stop_parsing
+  token `--%[^\r\n]*`, a _command_element of command_elements; the
+  node text is `--%` PLUS the rest of its line, consumed VERBATIM —
+  the token ends at the newline, so it is always the command's LAST
+  element). Verified against live pwsh 7.6.4: with a CMDLET the
+  `--%` token is passed as its OWN pipeline object and the verbatim
+  remainder as ONE more — `Write-Output --% hello world` prints
+  `--%` then `hello world` on TWO lines, and `Write-Output --%
+  $HOME tail` prints `$HOME tail` UNEXPANDED (verbatim is the point
+  of the token; leading whitespace after the token is trimmed,
+  interior spacing preserved). Both objects are COMPILE-TIME literal
+  text (the t14 fold precedent), so the element lowers to ONE echo
+  per object (the t14 one-object-per-argument rule), byte-identical
+  to the core's `echo "--%"` + `echo "…"` emissions; the
+  executed-stdout oracle matches live pwsh by construction (the
+  `$HOME` line pins the verbatim-ness). The subset pins the token as
+  the command's ONLY argument-producing element on the enumeration
+  commands (Write-Output / echo): preceding arguments, a redirection
+  and `Write-Host --% …` (Write-Host JOINS its objects on one line
+  — the two-object enumeration would miscompile) all REFUSE (refuse
+  > guess). Zero new A1 surface: the two objects are Str arguments
+  of the same exec-echo Call every rung uses.
 
 - 2026-08-14 (t25_range_expression, gate green): the range_expression
   node lands — the `..` range operator in a parenthesized command

@@ -4,7 +4,7 @@ PowerShell (.ps1) source -> A1 shIR JSON — **the bat sibling**
 (workspace-side dir; no git worktree; the object pipeline is a stated
 TEXT approximation for v1; see PLAN_POWERSHELL_F.md).
 
-**Status: WORKER-IMPLEMENTED, t28 landed (gate green).** The parser is
+**Status: WORKER-IMPLEMENTED, t29 landed (gate green).** The parser is
 wharflab/tree-sitter-powershell (vendored under
 `grammars/tree-sitter-powershell/`, loaded via smacker/go-tree-sitter
 cgo) — the plan's choice, empirically verified. The emitter produces A1
@@ -590,6 +590,34 @@ line) — now the worker's fixes, not records):
   as a comment — the comment case now REFUSES `#requires`-prefixed
   text (pinned `testdata_refuse/t28_requires_midfile.ps1`; `#
   requires` with a space is a real comment and stays dropped).
+- t29_stop_parsing: the stop_parsing token of tree-sitter-powershell —
+  the pwsh stop-parsing `--%` (the grammar's stop_parsing token
+  `--%[^\r\n]*`, a _command_element of command_elements; the node
+  text is `--%` PLUS the rest of its line, consumed VERBATIM — the
+  token ends at the newline, so it is always the command's LAST
+  element and the next line starts a fresh statement). Live pwsh
+  7.6.4 (verified 2026-08-20): with a CMDLET the `--%` token is
+  passed as its OWN pipeline object and the verbatim remainder as ONE
+  more — `Write-Output --% hello world` prints `--%` then `hello
+  world` on TWO lines, and `Write-Output --% $HOME tail` prints
+  `$HOME tail` UNEXPANDED (verbatim is the point of the token — no
+  variable interpolation, no quote processing; the leading whitespace
+  after the token is trimmed, interior spacing preserved). Both
+  objects are COMPILE-TIME literal text (the t14 fold precedent), so
+  the element lowers to ONE echo per object (the t14
+  one-object-per-argument rule) — byte-identical to the core's `echo
+  "--%"` + `echo "…"` emissions, and the executed-stdout oracle
+  matches live pwsh by construction (the `$HOME` line pins the
+  verbatim-ness: an interpolating lowering would print the home dir).
+  The t29 subset pins the token as the command's ONLY
+  argument-producing element on the enumeration commands (Write-
+  Output / echo — the t01 whitelist): preceding arguments
+  (`Write-Output "pre" --% tail` — pwsh writes THREE objects, the
+  unpinned head-args shape), a redirection and `Write-Host --% …`
+  (Write-Host JOINS its objects on one line — the two-object
+  enumeration would miscompile; the join form is unpinned) all
+  REFUSE (refuse > guess). Zero new A1 surface: the two objects are
+  Str arguments of the same exec-echo Call every rung uses.
 
 Comments, comment-only files (empty Program), and the REFUSE table
   (refuse.go): anything outside the subset errors loudly — including
