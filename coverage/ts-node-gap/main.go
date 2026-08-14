@@ -26,9 +26,11 @@ import (
 )
 
 /*
-#cgo CFLAGS: -std=c11 -fPIC -I${SRCDIR}/../../powershell-sh-go/grammars/tree-sitter-powershell/src
-#include "../../powershell-sh-go/grammars/tree-sitter-powershell/src/parser.c"
-#include "../../powershell-sh-go/grammars/tree-sitter-powershell/src/scanner.c"
+#cgo LDFLAGS: ${SRCDIR}/libgrammars.a
+extern void *tree_sitter_powershell(void);
+extern void *tree_sitter_fish(void);
+extern void *tree_sitter_zsh(void);
+extern void *tree_sitter_zig(void);
 */
 import "C"
 
@@ -36,6 +38,18 @@ import "unsafe"
 
 func powershellLanguage() *sitter.Language {
 	return sitter.NewLanguage(unsafe.Pointer(C.tree_sitter_powershell()))
+}
+
+func fishLanguage() *sitter.Language {
+	return sitter.NewLanguage(unsafe.Pointer(C.tree_sitter_fish()))
+}
+
+func zshLanguage() *sitter.Language {
+	return sitter.NewLanguage(unsafe.Pointer(C.tree_sitter_zsh()))
+}
+
+func zigLanguage() *sitter.Language {
+	return sitter.NewLanguage(unsafe.Pointer(C.tree_sitter_zig()))
 }
 
 type nodeType struct {
@@ -59,6 +73,12 @@ func main() {
 		grammar = cpp.GetLanguage()
 	case "powershell-sh-go":
 		grammar = powershellLanguage()
+	case "fish-sh-go":
+		grammar = fishLanguage()
+	case "zsh-sh-go":
+		grammar = zshLanguage()
+	case "zig-sh-go":
+		grammar = zigLanguage()
 	default:
 		os.Exit(0) // not a tree-sitter frontend — no ts inventory
 	}

@@ -18,17 +18,23 @@ DIR="$ROOT/frontends/coverage"
 lang="$1"
 BIN="$DIR/ts-node-gap/ts-node-gap"
 if [ ! -x "$BIN" ]; then
-  (cd "$DIR/ts-node-gap" && go build -o ts-node-gap . >/dev/null 2>&1) || exit 0
+  (cd "$DIR/ts-node-gap" && make ts-node-gap >/dev/null 2>&1) || exit 0
 fi
 
 case "$lang" in
   c-sh-go)        td="$ROOT/frontends/c-sh-go/testdata";       ext=c ;;
   cpp-sh-go)      td="$ROOT/frontends/cpp-sh-go/testdata_cpp"; ext=cc ;;
   powershell-sh-go) td="$ROOT/frontends/powershell-sh-go/testdata"; ext=ps1 ;;
+  fish-sh-go)     td="$ROOT/frontends/fish-sh-go/testdata";    ext=fish ;;
+  zsh-sh-go)      td="$ROOT/frontends/zsh-sh-go/testdata";     ext=zsh ;;
+  zig-sh-go)      td="$ROOT/frontends/zig-sh-go/testdata";     ext=zig ;;
   *) exit 0 ;;  # no vendored tree-sitter grammar for this frontend
 esac
 inv="$DIR/grammar-inventories/$lang.json"
-[ "$lang" = "powershell-sh-go" ] && inv="$ROOT/frontends/powershell-sh-go/grammars/tree-sitter-powershell/src/node-types.json"
+case "$lang" in
+  powershell-sh-go|fish-sh-go|zsh-sh-go|zig-sh-go)
+    inv="$ROOT/frontends/$lang/grammars/tree-sitter-${lang%-sh-go}/src/node-types.json" ;;
+esac
 
 # known-refused / known-bug / core-pending exclusions (same as coverage-gap.sh)
 excl="$DIR/refused-$lang.txt $DIR/bugs-$lang.txt"
