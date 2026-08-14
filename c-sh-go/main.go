@@ -2960,6 +2960,33 @@ func splitMidBreaks(body, rest []any) []any {
 	return append(append([]any{}, body...), rest...)
 }
 
+// bodyHasSignals — does a statement subtree contain first-class
+// Break/Continue? The ESTree DoWhile arm renders a NATIVE do-while
+// (unlike the While arm, which falls back to the runtime whileLoopSync
+// that catches the sh2.break()/sh2.continue() signals), so a do-while
+// body with a break/continue must stay on the pre-test While lowering.
+func bodyHasSignals(s any) bool {
+	switch v := s.(type) {
+	case map[string]any:
+		switch v["type"] {
+		case "Break", "Continue":
+			return true
+		}
+		for _, k := range []string{"body", "then", "else", "elsifs"} {
+			if sub, ok := v[k]; ok && bodyHasSignals(sub) {
+				return true
+			}
+		}
+	case []any:
+		for _, x := range v {
+			if bodyHasSignals(x) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // condValueRead — does a CONDITION expression contain a runtime VALUE
 // read (deref / index / call / prefix-inc) that the test-string and
 // arith-string grammars cannot express? Such reads are hoisted to temps
@@ -3821,12 +3848,19 @@ func (p *parser) stmt() (any, error) {
 		if err := p.expectOp(";"); err != nil {
 			return nil, err
 		}
-		// do b while (c) → b; while (c) b — the A1 While is pre-test and
-		// DoWhile has no ESTree lowering in the core, so the body
-		// duplication is the faithful form (the body has no declarations
-		// whose scope the duplication would break in the v1 subset). A
-		// cond needing runtime reads gets the refresh-and-guard While.
-		body := append([]any{}, b...)
+		// do b while (c) → the A1 DoWhile node (post-test: the body runs
+		// first, THEN the cond; until:false = C do-while). The core's
+		// ESTree renderer has handled DoWhile natively since core request
+		// c-sh-go-20260814-111815, so the body-duplication workaround is
+		// gone for the faithful case. Two shapes stay on the pre-test
+		// While lowering: a cond needing runtime reads (the test-string
+		// grammar cannot express the read — the temps must refresh after
+		// every body run, and the guard's break signal cannot live inside
+		// the ESTree DoWhile arm's native do-while) and a body containing
+		// first-class Break/Continue (same reason: the native do-while
+		// has no signal catcher, so the runtime sh2.break()/sh2.continue()
+		// throw would escape the loop — the While arm falls back to the
+		// runtime loop that catches them).
 		if condValueRead(c) {
 			var condTemps []any
 			c = p.hoistCondReads(c, &condTemps)
@@ -3840,11 +3874,19 @@ func (p *parser) stmt() (any, error) {
 				}),
 				"type": "Block",
 			}
+			body := append([]any{}, b...)
 			body = append(body, map[string]any{"cond": testCall("1"), "body": append([]any{guard}, append([]any{}, b...)...), "type": "While"})
-		} else {
-			body = append(body, map[string]any{"cond": condCall(c), "body": append([]any{}, b...), "type": "While"})
+			return map[string]any{"body": body, "type": "Block"}, nil
 		}
-		return map[string]any{"body": body, "type": "Block"}, nil
+		if bodyHasSignals(b) {
+			// body has a Break/Continue — the faithful form stays the
+			// body duplication `b; while (c) b` (the A1 While renders to
+			// the runtime loop that catches the signals).
+			body := append([]any{}, b...)
+			body = append(body, map[string]any{"cond": condCall(c), "body": append([]any{}, b...), "type": "While"})
+			return map[string]any{"body": body, "type": "Block"}, nil
+		}
+		return map[string]any{"cond": condCall(c), "body": b, "type": "DoWhile", "until": false}, nil
 	case p.isId("struct"):
 		return p.structDecl()
 	case p.isId("printf"):
