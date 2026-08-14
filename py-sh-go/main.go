@@ -10,7 +10,7 @@
 //	os.environ reads & sets                  → getVar / Assign
 //	os.system / subprocess.run / Popen       → exec / capture / Background
 //	if/elif/else, while, for, def/return     → If / While / For / Function
-//	lists, indexing, slicing, len            → setArray / arrayIndex /
+//	lists, indexing, slicing, len            → setArray / Index /
 //	                                           param("slice") / param("len")
 //	with open(...) as fh: fh.write(...)      → Redirect (echo > file)
 //
@@ -2238,7 +2238,13 @@ func (l *lowerer) subscriptIR(t *SubscriptE) (map[string]any, error) {
 		if err != nil {
 			return nil, err
 		}
-		return call("arrayIndex", []any{st(name.Name), key}), nil
+		// A1 `Index` expr node — the contract's rich array-element read
+		// ({"type":"Index","var":V,"key":K}), the canonical form of the
+		// `arrayIndex` call (core request py-sh-go-20260814-125405; the
+		// ESTree renderer's IrExpr::Index arm executes it as
+		// sh2.arrayIndex(V, K)). Keys lower as full exprs: Int/Str
+		// literals, getVar calls, ...
+		return map[string]any{"type": "Index", "var": name.Name, "key": key}, nil
 	}
 	// slice a[i:j] → param("slice", a, start, len)
 	start := "0"
