@@ -95,9 +95,9 @@ four phases. Two notes:
 | Feature | Verdict | Reason |
 |---|---|---|
 | Simple commands | **SUPPORT** (v1) | — |
-| Pipelines `a \| b` | **SUPPORT** (v2) | The A1 `pipeline` Call is the core's exact bash `a \| b` shape (verified). Runs all stages in parallel — same as cmd. Core corpus utility. Carry the caret-tripling rule (§3) with it. |
+| Pipelines `a \| b` | **SUPPORT** (v1.2 — landed) | The A1 `pipeline` Call is the core's exact bash `a \| b` shape (verified). Runs all stages in parallel — same as cmd. Core corpus utility. Carry the caret-tripling rule (§3) with it. |
 | `&` unconditional conjunction | **SUPPORT** (v1) | Already landed (split on first top-level `&`; the spaced-`&` echo quirk pinned). |
-| `&&` / `\|\|` | **SUPPORT** (v2) | The A1 `BinOp And/Or` shape is byte-identical to the core's bash conjunction (verified). cmd's exit-code semantics match POSIX. Very common in real scripts. |
+| `&&` / `\|\|` | **SUPPORT** (v1.2 — landed) | The A1 `BinOp And/Or` shape is byte-identical to the core's bash conjunction (verified). cmd's exit-code semantics match POSIX. Very common in real scripts. |
 | `&`-chain error level = last command's | **SUPPORT** (v2) | The runtime's natural sequential-execution exit status; pin it in the conjunction test. |
 | Parenthesized compound `( ... )` | **SUPPORT** (v1) | Already landed (blocks, multi-line). |
 | `@echo off` / `echo on/off` | **SUPPORT** (v1) | Echo-control directive; no-op in the compiled output. |
@@ -181,7 +181,7 @@ be more capable where the *source* never depended on the limitation.
 | Feature | Verdict | Reason |
 |---|---|---|
 | `%0`–`%9`, `%*` | **SUPPORT** (v1) | Landed. |
-| `shift` | **SUPPORT** (v2) | The canonical "loop over all args" idiom (`:argloop … shift … goto`) is the most common pattern in real batches after echo/set/if. The runtime has the `shift` builtin and a positional stack; probe the core's bash `shift` emission and reproduce it. `%*` unaffected by shift — trivially true. |
+| `shift` | **SUPPORT** (v1.2 — landed) | The canonical "loop over all args" idiom (`:argloop … shift … goto`) is the most common pattern in real batches after echo/set/if. The runtime has the `shift` builtin and a positional stack; probe the core's bash `shift` emission and reproduce it. `%*` unaffected by shift — trivially true. |
 | Argument separators (space, comma, `;`, `=`, tab; runs collapse) | **SUPPORT** (v2) | This is cmd's *invocation* parsing. It matters where the frontend binds args: `call :label a,b;c` and the runtime's argv binding. Pin the exact separator set and run-collapsing. |
 | Quoted args keep their quotes | **SUPPORT** (v1) | The `%~1` family strips them (§14). |
 | No-space internal-command forms (`echo.`, `cd..`, `cd\`, `dir/b/s`) | **SUPPORT** (v1.1/2) | `echo.`/`echo:`/`echo\` landed (v1.1). `cd..`, `cd\`, `dir/b/s` need per-builtin pins (the `.`/`\` is an argument separator for internal commands only — `tree.` must still fail as an unknown command). |
@@ -200,9 +200,13 @@ hands the patterns to `ren`'s own matcher.
 - Mapped builtins that must NOT glob (**echo, set, type…**): single-quote
   wildcard arguments so the POSIX shell leaves them literal. `echo *.txt`
   must keep printing `*.txt`.
-- `ren *.cxx *.cpp` (destination pattern interpreted by ren itself) | **REFUSE**
-  | cp/mv do not translate destination patterns. The bare-file rename (v1.1)
-  stays supported; the pattern form refuses.
+- `ren *.cxx *.cpp` (destination pattern interpreted by ren itself) |
+  **SUPPORT (v1.2 — the extension-change subset)**: `*.EXT` → `*.NEW`
+  lowers to a For loop with a basename capture (see the §26 REN row). The
+  other pattern forms (`ren file?.txt file?.md`, `ren *old* *new*`, a
+  directory-prefixed pattern) REFUSE — cp/mv do not translate destination
+  patterns and the positional-`*`/`?` mapping is not reproduced. The
+  bare-file rename (v1.1) stays supported.
 - `for %%v in (*.txt)` | **SUPPORT** (v1) | The for-wordlist file-match
   behavior is already the v1 semantics; pin the "no match → item dropped"
   rule.
@@ -371,7 +375,7 @@ to do.
 | PROMPT | NO-OP | §7. |
 | RD / RMDIR | SUPPORT (v1.1) | → `rmdir`; `/s /q` → `rm -rf` (PARTIAL — cmd asks once without `/q`; pin the confirmation-free form only). |
 | REM / `::` | SUPPORT (v1) | Comments. The `::`-inside-parens trouble is a cmd quirk the compiled model doesn't have — nothing to reproduce. |
-| REN / RENAME | SUPPORT (v1.1) | → `mv` with the destination-resolved-to-OLD's-dir rule (landed). Pattern form (`ren *.cxx *.cpp`) → REFUSE (§12). |
+| REN / RENAME | SUPPORT (v1.1/1.2) | → `mv` with the destination-resolved-to-OLD's-dir rule (landed). **The `ren *.cxx *.cpp` pattern form is SUPPORT (v1.2)** — the extension-change subset (`*.EXT` → `*.NEW`, both patterns a single leading `*`, no dirs/quotes) lowers to `for f in *.cxx; do mv "$f" "$(basename "$f" .cxx).cpp"; done` (basename strips the LAST suffix — cmd's exact rule). Other wildcard forms (`ren file?.txt file?.md`, `ren *old* *new*`, a dir-prefixed pattern) REFUSE (§12). |
 | SET | SUPPORT (v1) / REFUSE (listing) | §7. |
 | SETLOCAL | SUPPORT (v2) | §15. |
 | SHIFT | SUPPORT (v2) | §11. |
@@ -407,24 +411,26 @@ opaque execs). Per-class notes:
 
 ## Priority roadmap (v2 rungs, in suggested order)
 
-1. **`&&` / `||` + `&`-chain status** — the A1 shape already exists; highest
-   corpus utility. (Verified `BinOp And/Or`.)
-2. **`shift` + the arg-loop idiom** — the runtime builtin exists; the single
-   most common batch pattern after the v1 core.
-3. **Pipelines `|`** (with the caret-tripling rule).
-4. **Inline caret `^`** (meta set; not space/quotes/`%`).
-5. **`set /p` + `<` redirect** (and `set <NUL /p=`).
-6. **Delayed expansion `!var!`** with the EnableDelayedExpansion scope pin and
+Landed with v1.2 (2026-08-14, `make test` 51/51 + cross-target agree):
+**1. `&&`/`||`**, **2. `shift` + the arg-loop idiom**, **3. pipelines `|`**, and the
+**`ren *.EXT *.NEW` pattern form** (the §26 REN row). Each landed with a
+cmd-truth record in `native_limits_bat` (t50–t53) and the live cmd.exe
+oracle wiring (WSL `/mnt/c/Windows/System32/cmd.exe` when present,
+`capture-refs.sh --wsl`). Remaining rungs, still in priority order:
+
+1. **Inline caret `^`** (meta set; not space/quotes/`%`).
+2. **`set /p` + `<` redirect** (and `set <NUL /p=`).
+3. **Delayed expansion `!var!`** with the EnableDelayedExpansion scope pin and
    the same-line `%var%` write-then-read refusal.
-7. **Substring `%a:~i,j%`** (the exact `param("slice", …)` mapping).
-8. **`setlocal`/`endlocal`** (+ the `endlocal & set` pin) and
-   `setlocal EnableDelayedExpansion` (with 6).
-9. **`%~` string forms** (`1`, `n`, `x`, `p`, `dp`, `nx`); fs-dependent forms
+4. **Substring `%a:~i,j%`** (the exact `param("slice", …)` mapping).
+5. **`setlocal`/`endlocal`** (+ the `endlocal & set` pin) and
+   `setlocal EnableDelayedExpansion` (with 3).
+6. **`%~` string forms** (`1`, `n`, `x`, `p`, `dp`, `nx`); fs-dependent forms
    stay REFUSE.
-10. **`set /a` full operator set** with the 32-bit mask pin (the `--true64`
-    twin, on the small side).
-11. **`for /r` / `for /d`**, `if` numeric comparisons, `pushd`/`popd`,
-    `findstr`→`grep`, `timeout`→`sleep`, per-builtin switch pins.
+7. **`set /a` full operator set** with the 32-bit mask pin (the `--true64`
+   twin, on the small side).
+8. **`for /r` / `for /d`**, `if` numeric comparisons, `pushd`/`popd`,
+   `findstr`→`grep`, `timeout`→`sleep`, per-builtin switch pins.
 
 ## Never list (final)
 

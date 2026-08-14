@@ -84,11 +84,50 @@ Shared (do NOT fork): `frontends/shir-emit-go/` (the A1 JSON emitter),
   (outside double quotes); cmd ECHOES the trailing space before a spaced
   `&`, so `echo a&echo b` is the portable form
 
-Deliberately NOT in v1 (refuse loud, documented as worker items):
-- `call other.bat`, `setlocal`/`endlocal`, `shift`, `pause`, `start`,
+## v1.2 additions (landed 2026-08-14)
+
+- `cmd1 && cmd2` / `cmd1 || cmd2` — the A1 `BinOp And/Or` conjunction
+  shape (byte-identical to the core's `a && b` / `a || b` emission, probed
+  with `debashc --shir`). Both operands must be plain single commands
+  (no redirects/blocks/pipelines — refuse > guess); `a & b && c` mixes
+  correctly (`b && c` folds, `a` runs first). The estree renderer lowers
+  And/Or to a lastExit check, the sh renderer to `&&`/`||`.
+- `a | b` pipelines — the A1 `pipeline` Call (the core's `a | b` shape).
+  Each stage must be one plain command; `for /f %i in ('a | b')` keeps its
+  pipe inside the single quotes (the /f command delimiter).
+- `shift` — the core's own `shift` is an exec Call of the shift builtin;
+  the estree runner shifts the CALL-scoped positional array (a
+  `call :label` pushes a fresh scope), so the canonical arg-loop
+  (`:next / if -%1-==-- goto :eof / echo %1 / shift / goto :next`) works.
+  The `-%1-==--` positional test lowers via `-\$1-==--` (positionals now
+  convert in if-conditions too).
+- `ren *.cxx *.cpp` — the EXTENSION-CHANGE pattern form. Both arguments
+  must match `*.EXT` (a single leading `*`, then `.EXT`, no further
+  wildcards, no dir prefix, no quotes); anything else refuses. Lowers to
+  `for f in <SH2GLOB *.cxx>; do mv "$f" "$(basename "$f" .cxx).cpp"; done`
+  — basename strips the LAST suffix, cmd's exact rule (`a.cxx.cxx` ->
+  `a.cxx.cpp`, where a first-occurrence replace would diverge).
+- `find "text"` mapping fix: the leading quoted search term is stripped
+  of its quotes (cmd strips them building the argv) — `find "beta"` ->
+  `grep -F beta`, not `grep -F "beta"` (which matched the quote chars).
+- Core fixes that landed with v1.2 (in the sh2perl submodule):
+  (1) `fix_control_flow` now runs on the A1-ingress path
+  (`--shir-in-estree`), and its return-conversion is keyed on LOOP-BODY
+  arrows only — a bare `return` inside a whileLoop body arrow exited the
+  callback and the loop spun forever (bat t51 exposed it; bash's own
+  `if c; then return; fi` in a loop had the same latent bug); frontend
+  VALUE-returning arrows (zig `__fn_f`, the py ArrayComp IIFE, C fnValue)
+  keep native returns via the `sh2.functions.set` / loop-helper
+  recognition. (2) `handle_bare_goto`'s backward splice used pre-drain
+  indices and panicked for any non-empty loop body — the batch
+  `:loop ... goto loop` idiom is the first real backward-bare-goto user.
+
+Deliberately NOT in v1/v1.2 (refuse loud, documented as worker items):
+- `call other.bat`, `setlocal`/`endlocal`, `pause`, `start`,
   `pushd`/`popd`, `set /p`, `for /d /r`, `for /f` with skip=/eol=/usebackq
-  or token sets not starting at 1, `|` pipes, delayed expansion `!var!`,
-  `%cmdline%`
+  or token sets not starting at 1, delayed expansion `!var!`, `%cmdline%`,
+  inline `^` escapes (only the end-of-line continuation form), `ren`
+  patterns beyond `*.EXT` (a `?` pattern, a mid-name `*`, a dir prefix).
 
 ## Semantics notes
 

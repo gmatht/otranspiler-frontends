@@ -3,13 +3,16 @@
 #
 # The bat gate's recorded expectations (native_limits_bat) are hand-authored;
 # the SOURCE-LANGUAGE TRUTH for batch is cmd.exe, which is Windows-only.
-# This script stages the corpus so the real oracle can run once on the
-# Windows host:
+# This script stages the corpus so the real oracle can run — on a Windows
+# host, or directly through WSL interop:
 #
 #   1. ./capture-refs.sh            # stage refs/corpus + refs/capture.cmd
-#   2. (on Windows) refs\capture.cmd # runs each .bat under cmd.exe, writes
-#                                     refs\ref\<name>.out
-#   3. copy refs/ref back, then
+#   2. (Windows) refs\capture.cmd   # runs each .bat under cmd.exe, writes
+#                                    # refs\ref\<name>.out
+#      (WSL)     ./capture-refs.sh --wsl   # the same, driving the Windows
+#                                    # cmd.exe at /mnt/c/Windows/System32/
+#                                    # cmd.exe directly — no host round trip
+#   3. copy refs/ref back (Windows flow only), then
 #      ./capture-refs.sh --verify   # cmd.exe truth vs the transpiled stdout
 #
 # --verify diffs ref/<name>.out (cmd.exe) against the transpiled run
@@ -27,38 +30,7 @@ refs="$dir/refs"
 debashc="$root/sh2perl/target/debug/debashc"
 runner="$root/harness/estree-runner.mjs"
 
-case "${1:-}" in
-  --verify)
-    [ -d "$refs/ref" ] || { echo "refs/ref missing — run capture.cmd on Windows first" >&2; exit 2; }
-    total=0; fail=0
-    for out in "$refs"/ref/*.out; do
-      [ -f "$out" ] || continue
-      bn=$(basename "$out" .out)
-      f="$dir/testdata/$bn.bat"
-      [ -f "$f" ] || { echo "SKIP $bn (no testdata)"; continue; }
-      total=$((total+1))
-      # a frontend REFUSAL (unsupported construct) is not a semantics bug —
-      # report SKIP and move on, so --verify only flags true mismatches
-      if ! "$dir/bat-sh-go" --shir "$f" --raw 2>/dev/null \
-          | "$debashc" --shir-in-estree - 2>/dev/null > /tmp/refs_estree.json; then
-        echo "SKIP $bn (frontend refuses — unsupported construct)"
-        continue
-      fi
-      node "$runner" /tmp/refs_estree.json --source "$f" 2>/dev/null > /tmp/refs_trans.out || true
-      # cmd.exe writes CRLF stdout — normalize both sides before diffing
-      tr -d '\r' < "$out" > /tmp/refs_cmd.out
-      if diff -q /tmp/refs_cmd.out /tmp/refs_trans.out >/dev/null 2>&1; then
-        echo "OK   $bn (cmd.exe == transpiled)"
-      else
-        echo "DIFF $bn (cmd.exe vs transpiled — a real batch-semantics bug)"
-        diff "$out" /tmp/refs_trans.out | head -6 || true
-        fail=$((fail+1))
-      fi
-    done
-    echo "cmd-reference verify: $((total-fail))/$total match"
-    [ "$fail" -eq 0 ] || exit 1
-    ;;
-  *)
+stage_refs() {
     # stage: corpus copies + capture.cmd + empty ref/
     # cmd.exe REQUIRES CRLF line endings in batch files (LF-only files
     # fail with "(echo was unexpected at this time." and friends) — the
@@ -93,9 +65,62 @@ CMD
     echo "    capture.cmd   $(md5sum "$refs/capture.cmd" | cut -d' ' -f1)"
     echo "  all files are CRLF (cmd.exe requires it — LF-only batch files"
     echo "  fail with \"(echo was unexpected at this time.\")"
+}
+
+verify_refs() {
+    [ -d "$refs/ref" ] || { echo "refs/ref missing — run capture.cmd on Windows first (or ./capture-refs.sh --wsl on a WSL box)" >&2; exit 2; }
+    total=0; fail=0
+    for out in "$refs"/ref/*.out; do
+      [ -f "$out" ] || continue
+      bn=$(basename "$out" .out)
+      f="$dir/testdata/$bn.bat"
+      [ -f "$f" ] || { echo "SKIP $bn (no testdata)"; continue; }
+      total=$((total+1))
+      # a frontend REFUSAL (unsupported construct) is not a semantics bug —
+      # report SKIP and move on, so --verify only flags true mismatches
+      if ! "$dir/bat-sh-go" --shir "$f" --raw 2>/dev/null \
+          | "$debashc" --shir-in-estree - 2>/dev/null > /tmp/refs_estree.json; then
+        echo "SKIP $bn (frontend refuses — unsupported construct)"
+        continue
+      fi
+      node "$runner" /tmp/refs_estree.json --source "$f" 2>/dev/null > /tmp/refs_trans.out || true
+      # cmd.exe writes CRLF stdout — normalize both sides before diffing
+      tr -d '\r' < "$out" > /tmp/refs_cmd.out
+      if diff -q /tmp/refs_cmd.out /tmp/refs_trans.out >/dev/null 2>&1; then
+        echo "OK   $bn (cmd.exe == transpiled)"
+      else
+        echo "DIFF $bn (cmd.exe vs transpiled — a real batch-semantics bug)"
+        diff "$out" /tmp/refs_trans.out | head -6 || true
+        fail=$((fail+1))
+      fi
+    done
+    echo "cmd-reference verify: $((total-fail))/$total match"
+    [ "$fail" -eq 0 ] || exit 1
+}
+
+case "${1:-}" in
+  --verify)
+    verify_refs
+    ;;
+  --wsl)
+    # WSL-interop capture: stage the corpus and run capture.cmd DIRECTLY
+    # through the Windows cmd.exe at the standard WSL mount path — no
+    # Windows-host round trip needed. Produces refs/ref/*.out from the
+    # REAL cmd.exe, then verifies against the transpiled runs.
+    cmdbin=/mnt/c/Windows/System32/cmd.exe
+    [ -x "$cmdbin" ] || { echo "cmd.exe not found at $cmdbin — is this a WSL box with Windows installed?" >&2; exit 2; }
+    stage_refs
+    (cd "$refs" && timeout 600 "$cmdbin" /c "call capture.cmd") < /dev/null || {
+      echo "capture.cmd failed under WSL cmd.exe" >&2; exit 2; }
+    echo "capture done: $(ls "$refs/ref"/*.out 2>/dev/null | wc -l) ref outputs from real cmd.exe"
+    verify_refs
+    ;;
+  *)
+    stage_refs
     echo "next: sync-refs.cmd to-d (robocopy /MIR workspace refs -> D:\\Misc\\refs),"
-    echo "      run refs\\capture.cmd on Windows (D:\\Misc\\refs), then"
-    echo "      sync-refs.cmd from-d (robocopy the captured ref\\ back), and"
+    echo "      run refs\\capture.cmd on Windows (D:\\Misc\\refs) — or, on a WSL"
+    echo "      box, simply run ./capture-refs.sh --wsl (drives the Windows"
+    echo "      cmd.exe at /mnt/c/Windows/System32/cmd.exe directly) — then"
     echo "      ./capture-refs.sh --verify"
     ;;
 esac
