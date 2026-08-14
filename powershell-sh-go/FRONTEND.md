@@ -4,7 +4,7 @@ PowerShell (.ps1) source -> A1 shIR JSON — **the bat sibling**
 (workspace-side dir; no git worktree; the object pipeline is a stated
 TEXT approximation for v1; see PLAN_POWERSHELL_F.md).
 
-**Status: WORKER-IMPLEMENTED, t20 + t21 landed (gate green).** The parser is
+**Status: WORKER-IMPLEMENTED, t22 landed (gate green).** The parser is
 wharflab/tree-sitter-powershell (vendored under
 `grammars/tree-sitter-powershell/`, loaded via smacker/go-tree-sitter
 cgo) — the plan's choice, empirically verified. The emitter produces A1
@@ -362,6 +362,35 @@ line) — now the worker's fixes, not records):
   RHS, chained `??`, and a cast-nested paren all refuse. The
   executed-stdout oracle matches live pwsh by construction (both
   print "d" then "7").
+- t22_param_block: the param_block node — the script-level `param(...)`
+  parameter declaration (the grammar's program rule is
+  `[using/requires] [param_block] statement_list`, so the node sits
+  BETWEEN the directives and the statement_list as a direct child of
+  program; `param($alpha, $beta)` = a `param` keyword + `(` + optional
+  parameter_list of script_parameter children + `)`. The SAME node
+  also hosts the param-block form of function bodies, which refuse on
+  the function itself — functions are the function rung, refused in
+  v1 (the t11 return pin). Live pwsh 7.6.4 (verified 2026-08-16):
+  with NO arguments the block leaves every parameter $null — EXACTLY
+  like an undeclared variable — so within the v1 text-closed subset
+  (the transpiled program is always run with an empty argv; v1 has no
+  script-arguments channel: `$args` refuses, assignment refuses) the
+  declaration has NO runtime effect. Lowering: ZERO statements — the
+  node is dropped exactly like the t18 label (pure spelling with no
+  runtime effect in the subset; the t04 invocation-operator
+  precedent), so the emitted program is byte-identical to the same
+  program without the param line. Reads of the parameters lower
+  through the usual getVar slots and interpolate as "" (the t09/t10
+  consistent edge), so the executed-stdout oracle matches live pwsh
+  by construction (both print "alpha= beta=" then "done"). The
+  value-changing forms REFUSE, pinned `testdata_refuse/t22_*`: a
+  script_parameter_default (`param($a = "d")` — pwsh binds the
+  default when no argument is passed, divergent output; the
+  assignment rung lands it) and an attribute_list (`param([string]$a)`
+  / `[CmdletBinding()]` / `[Parameter()]` — the plan's `Param()`
+  advanced-attribute refusal). `param()` (the childless form) and the
+  t02 braced spelling `param(${name})` are the same node and express
+  the same way.
 - Comments, comment-only files (empty Program), and the REFUSE table
   (refuse.go): anything outside the subset errors loudly — including
   .NET member access (`$x.Length`), assignment, `|` pipelines, unknown

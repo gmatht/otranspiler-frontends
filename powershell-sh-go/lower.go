@@ -44,6 +44,11 @@ import (
 //	      the `-parallel` foreach_parameter REFUSES)
 //	    empty_statement                 (t08 — a lone `;`, a NO-OP: dropped,
 //	                                      emitting ZERO statements)
+//	    param_block                     (t22 — the script-level `param(...)`
+//	                                      declaration, BETWEEN the directives
+//	                                      and the statement_list; plain
+//	                                      variables only → dropped, the
+//	                                      t18-label pure-spelling precedent)
 //	    assignment_expression / …          (REFUSE until pinned)
 
 // lowerProgram — walk the CST root and lower the v1 subset to A1
@@ -56,6 +61,14 @@ func lowerProgram(root *sitter.Node, src []byte) ([]any, error) {
 		switch ch.Type() {
 		case "comment":
 			continue
+		case "param_block":
+			// the script-level `param(...)` block — validates the v1
+			// subset (plain variables only) and lowers to ZERO
+			// statements: the declaration is dropped (see
+			// lowerParamBlock).
+			if err := lowerParamBlock(ch, src); err != nil {
+				return nil, err
+			}
 		case "statement_list":
 			s, err := lowerStatementList(ch, src)
 			if err != nil {
@@ -67,6 +80,77 @@ func lowerProgram(root *sitter.Node, src []byte) ([]any, error) {
 		}
 	}
 	return stmts, nil
+}
+
+// lowerParamBlock — the param_block node: the script-level `param(...)`
+// parameter declaration. The grammar's program rule is
+// `[using/requires] [param_block] statement_list`, so the node sits
+// BETWEEN the directives and the statement_list as a direct child of
+// program (the same node also hosts the param-block form of FUNCTION
+// bodies — `function name { param($a) … }` — which refuses on the
+// function itself: functions are the function rung, refused in v1).
+//
+// Semantics within the v1 text-closed subset (verified against live
+// pwsh 7.6.4): the transpiled program is ALWAYS run with NO arguments
+// (the oracle runs `pwsh -NoProfile -File` / the ESTree runner with an
+// empty argv), and v1 has no script-arguments channel ($args refuses;
+// assignment refuses) — so a param block with plain variables and NO
+// defaults leaves every parameter $null, EXACTLY like an undeclared
+// variable: reads of the parameters lower through the usual getVar
+// slots and interpolate as "" (the t09/t10 consistent edge), and the
+// declaration itself has no runtime effect. Lowering: ZERO statements
+// — the node is dropped exactly like the t18 label (a label has no
+// runtime effect unless a break/continue targets it, and v1 refuses
+// break/continue; the t04 invocation-operator precedent), so the
+// emitted program is byte-identical to the same program without the
+// param line and the executed-stdout oracle matches live pwsh by
+// construction.
+//
+// The pinned subset is PLAIN VARIABLES only: `param($a, $b)` / `param()`
+// (the parameter_list is optional — `param()` parses as a childless
+// param_block) / the t02 braced spelling `param(${a})`. The two
+// child/parameter forms that would change the observable output REFUSE:
+//
+//   - attribute_list (param_block-level `[CmdletBinding()]` or
+//     per-parameter `[string]$a` / `[Parameter()]`) — the plan's
+//     "`Param()` advanced attributes" refusal (PLAN_POWERSHELL_F.md §1
+//     pinned refusals); metadata that affects binding, unpinned.
+//   - script_parameter_default (`param($a = "d")`) — pwsh binds the
+//     DEFAULT when no argument is passed (a real assignment), so the
+//     reads would print the default where the A1 store reads "" —
+//     divergent output; the assignment rung lands it (refuse > guess).
+func lowerParamBlock(n *sitter.Node, src []byte) error {
+	for i := 0; i < int(n.NamedChildCount()); i++ {
+		ch := n.NamedChild(i)
+		switch ch.Type() {
+		case "attribute_list":
+			return refuse(ch, src, "param attribute_list %q (the `Param()` advanced-attribute refusal — PLAN_POWERSHELL_F.md §1 pinned refusals)", ch.Content(src))
+		case "parameter_list":
+			for j := 0; j < int(ch.NamedChildCount()); j++ {
+				sp := ch.NamedChild(j)
+				if sp.Type() != "script_parameter" {
+					return refuse(sp, src, "parameter_list element %q", sp.Type())
+				}
+				for k := 0; k < int(sp.NamedChildCount()); k++ {
+					pc := sp.NamedChild(k)
+					switch pc.Type() {
+					case "variable":
+						// a plain `$name` / `${name}` parameter — the
+					// t02 brace precedent; the declaration is dropped.
+					case "attribute_list":
+						return refuse(pc, src, "param attribute_list %q (the `Param()` advanced-attribute refusal — PLAN_POWERSHELL_F.md §1 pinned refusals)", pc.Content(src))
+					case "script_parameter_default":
+						return refuse(pc, src, "param default %q (pwsh binds the default when no argument is passed — divergent output; the assignment rung lands it)", pc.Content(src))
+					default:
+						return refuse(pc, src, "script_parameter part %q", pc.Type())
+					}
+				}
+			}
+		default:
+			return refuse(ch, src, "param_block part %q", ch.Type())
+		}
+	}
+	return nil
 }
 
 // lowerStatementList — the statements of one statement_list.
