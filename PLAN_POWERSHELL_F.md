@@ -1,9 +1,32 @@
 # PLAN_POWERSHELL_F — a PowerShell frontend on the bat precedent
 
-**Status: IN PROGRESS — t29 landed (gate green).** The
+**Status: IN PROGRESS — t30 landed (gate green).** The
 proposal is implemented as described; revision history below.
 
 ## 0. Revision history
+
+- 2026-08-20 (t30_sub_expression, gate green): the sub_expression node
+  lands — the `$(…)` subexpression inside an expandable string
+  (`Write-Output "a $(Write-Output b) c"`; the grammar reaches the
+  node as a named child of expandable_string_literal /
+  expandable_here_string_literal — the t01 string rung's interior —
+  the plan's `"str $x $(expr)"` interpolation row, which the §1 table
+  has always mapped to "the A1 Interpolate/template"). Verified
+  against live pwsh 7.6.4: the subexpression evaluates its statements
+  and interpolates their OUTPUT — `Write-Output "a $(Write-Output b)
+  c"` prints `a b c` — EXACTLY the core's bash command-substitution
+  semantics, so the lowering is the A1 capture Call, byte-identical
+  to the core's `echo "a $(echo b) c"` emission (`func "capture",
+  args [Arrow body], purity Spawn` — verified against `debashc --shir
+  --raw`); the A1→ESTree renderer lowers that shape to a runtime
+  capture and the executed-stdout oracle matches live pwsh by
+  construction. The subset pins the body as exactly ONE plain command
+  (the t26 chainOperand precedent); a multi-statement body (`"$(a;
+  b)"`) REFUSES (its capture-join semantics are unpinned — refuse >
+  guess). The here-string twin lowers through the SAME capture shape
+  (the t10 fold is shared). The bare `Write-Output $(…)`
+  command-element form and a `$(…)` concatenated-argument piece stay
+  REFUSED (the t05 machinery).
 
 - 2026-08-20 (t29_stop_parsing, gate green): the stop_parsing token
   lands — the pwsh stop-parsing `--%` (the grammar's stop_parsing

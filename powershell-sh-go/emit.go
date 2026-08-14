@@ -85,6 +85,25 @@ func arrayExpr(elements []any) any {
 	return map[string]any{"type": "Array", "elements": elements}
 }
 
+// arrowExpr — the A1 Arrow body of a capture Call (the `$(…)`
+// subexpression shape, the t30 rung).
+func arrowExpr(body []any) any {
+	return map[string]any{"type": "Arrow", "body": body}
+}
+
+// captureExpr — the A1 capture Call: the `$(…)` subexpression inside
+// an expandable string. Live pwsh 7.6.4 (verified 2026-08-20): the
+// subexpression evaluates its statements and interpolates their
+// output — `Write-Output "a $(Write-Output b) c"` prints `a b c` —
+// EXACTLY the core's bash command-substitution semantics, so the
+// lowering is the core's capture shape, byte-identical to `echo "a
+// $(echo b) c"` (verified against `debashc --shir --raw`):
+// {"func":"capture","args":[{"type":"Arrow","body":[...]}],
+// "purity":"Spawn","type":"Call"}.
+func captureExpr(body []any) any {
+	return callExpr("capture", []any{arrowExpr(body)}, "Spawn")
+}
+
 // ifStmt — the A1 If statement (the t07 rung: `if ($c) { B } else { E }`
 // — the plan's "If / else-if chain" row). Shape mirrors the core's
 // shir_json.rs emission exactly: cond/then/elsifs/else, no runs field.

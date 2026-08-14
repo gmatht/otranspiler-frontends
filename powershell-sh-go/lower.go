@@ -2470,6 +2470,19 @@ func lowerExpandableStringParts(n *sitter.Node, src []byte) ([]any, error) {
 			}
 			parts = append(parts, exprPart(getVarCall(variableName(ch, src))))
 			pos = ch.EndByte()
+		case "sub_expression":
+			// the `$(…)` subexpression — the t30 rung. The interior
+			// text before it is a lit part; the subexpression lowers to
+			// the A1 capture Call (see lowerSubExpression).
+			if txt := string(src[pos:ch.StartByte()]); txt != "" {
+				parts = append(parts, litPart(txt))
+			}
+			cap, err := lowerSubExpression(ch, src)
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, exprPart(cap))
+			pos = ch.EndByte()
 		default:
 			return nil, refuse(ch, src, "%q inside a double-quoted string", ch.Type())
 		}
@@ -2559,6 +2572,19 @@ func lowerExpandableHereStringParts(n *sitter.Node, src []byte) ([]any, error) {
 			}
 			parts = append(parts, exprPart(getVarCall(variableName(ch, src))))
 			pos = ch.EndByte()
+		case "sub_expression":
+			// the `$(…)` subexpression — the t30 rung, the here-string
+			// twin of the double-quoted case (the t10 fold is shared
+			// with lowerExpandableStringParts).
+			if txt := string(src[pos:ch.StartByte()]); txt != "" {
+				parts = append(parts, litPart(txt))
+			}
+			cap, err := lowerSubExpression(ch, src)
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, exprPart(cap))
+			pos = ch.EndByte()
 		default:
 			return nil, refuse(ch, src, "%q inside a here-string", ch.Type())
 		}
@@ -2567,6 +2593,52 @@ func lowerExpandableHereStringParts(n *sitter.Node, src []byte) ([]any, error) {
 		parts = append(parts, litPart(txt))
 	}
 	return parts, nil
+}
+
+// lowerSubExpression — the `$(…)` subexpression (the sub_expression
+// node: `$(` + statement_list + `)`), reached ONLY inside an expandable
+// string / here-string (the t30 rung; other positions — a bare command
+// element, a concatenated-argument piece — stay REFUSED: the t05 pin
+// and lowerCommandElement's default). Live pwsh 7.6.4 (verified
+// 2026-08-20): the subexpression evaluates its statements and
+// interpolates their OUTPUT — `Write-Output "a $(Write-Output b) c"`
+// prints `a b c` — EXACTLY the core's bash command-substitution
+// semantics, so the lowering is the A1 capture Call: the core emits
+// `echo "a $(echo b) c"` as exec echo with an Interpolate part whose
+// expr is `{"func":"capture","args":[{"type":"Arrow","body":
+// [Expr echo b]}],"purity":"Spawn","type":"Call"}` (verified
+// against `debashc --shir --raw`), and the A1→ESTree renderer lowers
+// that shape to a runtime capture (the executed-stdout oracle matches
+// live pwsh by construction: both print `a b c`). The t30 subset pins
+// the body as exactly ONE plain command (the t26 chainOperand
+// precedent): a multi-statement body would emit several statements
+// whose capture-join semantics are unpinned (refuse > guess), and the
+// body statement goes through the usual pipeline → command lowering
+// (the t01 echo whitelist).
+func lowerSubExpression(n *sitter.Node, src []byte) (any, error) {
+	var sl *sitter.Node
+	for i := 0; i < int(n.NamedChildCount()); i++ {
+		ch := n.NamedChild(i)
+		if ch.Type() != "statement_list" {
+			return nil, refuse(ch, src, "sub_expression part %q", ch.Type())
+		}
+		sl = ch
+	}
+	if sl == nil {
+		return nil, refuse(n, src, "sub_expression without a statement_list")
+	}
+	stmts, err := lowerStatementList(sl, src)
+	if err != nil {
+		return nil, err
+	}
+	if len(stmts) != 1 {
+		return nil, refuse(sl, src, "sub_expression body with %d statements (the t30 subset pins exactly ONE plain command — the multi-statement join semantics are unpinned)", len(stmts))
+	}
+	st, ok := stmts[0].(map[string]any)
+	if !ok || st["type"] != "Expr" {
+		return nil, refuse(sl, src, "sub_expression body %q (the t30 subset pins a plain command — the t01 echo whitelist)", st["type"])
+	}
+	return captureExpr(stmts), nil
 }
 
 // variableName — `$x` → "x" and `${x}` → "x": the braces are pure

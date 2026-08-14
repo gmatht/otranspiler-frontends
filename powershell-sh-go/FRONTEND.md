@@ -618,6 +618,36 @@ line) — now the worker's fixes, not records):
   enumeration would miscompile; the join form is unpinned) all
   REFUSE (refuse > guess). Zero new A1 surface: the two objects are
   Str arguments of the same exec-echo Call every rung uses.
+- t30_sub_expression: the sub_expression node — the `$(…)` subexpression
+  inside an expandable string (`Write-Output "a $(Write-Output b) c"`;
+  the grammar reaches the node as a named child of
+  expandable_string_literal / expandable_here_string_literal — the t01
+  string rung's interior — and in other positions it stays REFUSED: a
+  bare `Write-Output $(…)` is a command-element expression and a
+  `$(…)` piece inside a concatenated_command_argument refuses on the
+  t05 machinery). Live pwsh 7.6.4 (verified 2026-08-20): the
+  subexpression evaluates its statements and interpolates their
+  OUTPUT — `Write-Output "a $(Write-Output b) c"` prints `a b c` —
+  EXACTLY the core's bash command-substitution semantics, so the
+  lowering is the A1 capture Call: the core emits `echo "a $(echo b)
+  c"` as exec echo with an Interpolate part whose expr is the capture
+  (`{"func":"capture","args":[{"type":"Arrow","body":[Expr echo
+  b]}],"purity":"Spawn","type":"Call"}` — verified byte-identical
+  against `debashc --shir --raw`), the A1→ESTree renderer lowers that
+  shape to a runtime capture, and the executed-stdout oracle matches
+  live pwsh by construction (both print `a b c`). The t30 subset pins
+  the body as exactly ONE plain command (the t26 chainOperand
+  precedent): a multi-statement body (`"$(a; b)"`) would emit several
+  statements whose capture-join semantics are unpinned — refuse >
+  guess — and the body statement goes through the usual pipeline →
+  command lowering (the t01 echo whitelist). The here-string twin
+  (`@"a $(…) c"@` — pwsh interpolates identically, verified) lowers
+  through the SAME capture shape (the t10 fold is shared with the
+  double-quoted path). The t29-ledger `$(…)` refusals in the
+  concatenated-argument context stay: the t05 pin's byte-span pieces
+  are a different tokenizer shape (the subexpression would be a
+  separate pipeline object, the multi-object output outside the v1
+  single-object echo mapping).
 
 Comments, comment-only files (empty Program), and the REFUSE table
   (refuse.go): anything outside the subset errors loudly — including
