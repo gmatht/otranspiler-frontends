@@ -85,7 +85,7 @@ ledger- and noise-filtered; powershell's tree-sitter-powershell is now such a
 grammar), falling back to the A1-node proxy where no external grammar exists
 (zig included — the A1 proxy is its only signal until tree-sitter-zig lands).
 
-Each gap gets ONE of three dispositions (the prompt tells pi which):
+Each gap gets ONE of four dispositions (the prompt tells pi which):
 
 1. **expressible** → pi creates a testdata example; the gate validates and
 the hook commits it.
@@ -99,6 +99,14 @@ request to `core-requests/<lang>-<ts>.md`; the hook records the gap in
 the estree worker implements the request. When the request is completed
 (moved to `core-requests/done/`), the hook prunes the pending entry and the
 gap is retried.
+4. **re-check (refused-refresh)** — at the idle point (fresh gaps
+exhausted) the refused ledger becomes the next source: entries are
+re-proposed against the CURRENT frontend, rate-limited (one per
+`REFUSE_REFRESH_INTERVAL`, default 1 day) and cursor-rotated, so the lists
+can SHRINK as the frontends grow. A re-check that now EMITs drops the entry
+from `refused-<lang>.txt` (the shrink); one that still refuses stays;
+escalations migrate refused → core-pending; oracle mismatches migrate
+refused → bugs. See REFUSED-REFRESH.md.
 
 Requires java/javac + the antlr4 jar (downloaded on demand to
 `.antlr4.jar`, gitignored). Java parser generated into `.work/`

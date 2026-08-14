@@ -34,6 +34,11 @@ lang="$1"
 # known-refused/known-bug exclusions (worker-appended)
 excl="$DIR/refused-$lang.txt $DIR/bugs-$lang.txt"
 exclude() {  # read stdin, drop lines matching the exclusion files
+  # COVERAGE_NO_EXCLUDE=1: the refused-refresh pass (worker-coverage-step.sh)
+  # needs the RAW unexercised set (what the detectors would report without
+  # the ledgers) to tell "still unexercised" (candidate) from "now
+  # exercised" (stale). Opt-in pass-through; the fresh chain is unchanged.
+  [ -n "${COVERAGE_NO_EXCLUDE:-}" ] && cat && return 0
   # join every source's pattern with '|' — the old plain concatenation
   # glued the refused-ledger's last entry to the core-pending ledger's
   # first (e.g. "A1 node RawExprA1 node Int"), a dead alternation branch

@@ -39,6 +39,11 @@ esac
 # known-refused / known-bug / core-pending exclusions (same as coverage-gap.sh)
 excl="$DIR/refused-$lang.txt $DIR/bugs-$lang.txt"
 exclude() {
+  # COVERAGE_NO_EXCLUDE=1: the refused-refresh pass (worker-coverage-step.sh)
+  # needs the RAW unexercised set (what the detectors would report without
+  # the ledgers) to tell "still unexercised" (candidate) from "now
+  # exercised" (stale). Opt-in pass-through; the fresh chain is unchanged.
+  [ -n "${COVERAGE_NO_EXCLUDE:-}" ] && cat && return 0
   local pat="" p=""
   for e in $excl; do
     if [ -f "$e" ]; then

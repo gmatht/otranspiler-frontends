@@ -26,6 +26,11 @@ lang="$1"
 # lines may be rule names OR free-text bug descriptions containing regex
 # metacharacters like $#, so regex alternation would corrupt the filter)
 exclude() {
+  # COVERAGE_NO_EXCLUDE=1: the refused-refresh pass (worker-coverage-step.sh)
+  # needs the RAW unexercised set (what the detectors would report without
+  # the ledgers) to tell "still unexercised" (candidate) from "now
+  # exercised" (stale). Opt-in pass-through; the fresh chain is unchanged.
+  [ -n "${COVERAGE_NO_EXCLUDE:-}" ] && cat && return 0
   local tmp; tmp=$(mktemp); cat > "$tmp"
   for e in "$DIR/refused-$lang.txt" "$DIR/bugs-$lang.txt"; do
     [ -f "$e" ] || continue
