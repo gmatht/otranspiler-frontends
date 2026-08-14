@@ -817,6 +817,7 @@ func lowerCommand(n *sitter.Node, src []byte) ([]any, error) {
 	var redirects []any
 	seenList := false
 	seenParenCoalesce := false
+	seenParenRange := false
 	if elems := n.ChildByFieldName("command_elements"); elems != nil {
 		for i := 0; i < int(elems.NamedChildCount()); i++ {
 			e := elems.NamedChild(i)
@@ -871,6 +872,34 @@ func lowerCommand(n *sitter.Node, src []byte) ([]any, error) {
 				stmts = append(stmts, cs...)
 				seenParenCoalesce = true
 				continue
+			}
+			if rs, handled, err := lowerParenRange(e, src); err != nil {
+				return nil, err
+			} else if handled {
+				// the t25 rung: `Write-Output (1 .. 3)` — the
+				// parenthesized RANGE command element: the paren's range
+				// elements are SEPARATE pipeline objects (live pwsh
+				// 7.6.4: `Write-Output (1 .. 3)` prints 1, 2, 3 on THREE
+				// lines), so the command lowers to ONE echo per element
+				// (the t24 fold, shared through lowerRange) and the t25
+				// subset pins the paren as the command's ONLY element — a
+				// further argument would be another pipeline object (the
+				// t21 precedent; refuse > guess).
+				if len(redirects) > 0 {
+					return nil, refuse(e, src, "parenthesized range combined with a redirection (the t25 subset pins a plain command)")
+				}
+				if len(argExprs) != 0 {
+					return nil, refuse(e, src, "parenthesized range with %d preceding argument(s) (the t25 subset pins `Write-Output (1 .. 3)` — the paren is the command's only element)", len(argExprs))
+				}
+				stmts = append(stmts, rs...)
+				seenParenRange = true
+				continue
+			}
+			if seenParenRange {
+				if e.Type() == "command_argument_sep" {
+					continue
+				}
+				return nil, refuse(e, src, "element after a parenthesized range (the t25 subset pins the paren as the command's only element; a further argument would be another pipeline object — refuse > guess)")
 			}
 			if seenParenCoalesce {
 				if e.Type() == "command_argument_sep" {
@@ -969,7 +998,7 @@ func lowerArgumentList(n *sitter.Node, src []byte) ([]any, error) {
 			if i != int(list.NamedChildCount())-1 {
 				return nil, refuse(c, src, "element after a range argument (the t24 subset pins `head(1..3)` with the range as the only list element; a comma-list is the array rung)")
 			}
-			rs, err := lowerRangeArg(c, src)
+			rs, err := lowerRange(c, src)
 			if err != nil {
 				return nil, err
 			}
@@ -1179,6 +1208,48 @@ func lowerParenCoalesce(e *sitter.Node, src []byte) ([]any, bool, error) {
 	return cs, true, nil
 }
 
+// lowerParenRange — a parenthesized RANGE command element:
+// `unary_expression` → `parenthesized_expression` whose single
+// pipeline_chain is a range_expression (`Write-Output (1 .. 3)` — the
+// t25 rung, the parenthesized twin of the t24 range_argument_expression;
+// the grammar reaches the range_expression node in this parenthesized
+// command element and in bare statement position, which stays REFUSED —
+// the t17 statement-level precedent). In this position the `..` must
+// lex as its OWN token, so the range needs the SPACED spelling `1 .. 3`:
+// the unspaced `(1..3)` lexes the whole text as ONE command_name token
+// and parses as a `command` node instead (verified against the CST —
+// the t24 note's unspaced `1..3` claim holds for the argument_list
+// position only). The range's elements are SEPARATE pipeline objects
+// (live pwsh 7.6.4: `Write-Output (1 .. 3)` prints 1, 2, 3 on THREE
+// lines), so the element lowers to ONE echo per element — the t24
+// fold (the shared lowerRange), matching the executed-stdout oracle
+// by construction. The caller (lowerCommand) intercepts the shape and
+// appends the echoes to its statement list. Returns (stmts, true,
+// nil) for the range shape, (nil, false, nil) for any other element /
+// parenthesized content (the caller falls through to the t17
+// expression path), and refuses a malformed paren.
+func lowerParenRange(e *sitter.Node, src []byte) ([]any, bool, error) {
+	if e.Type() != "unary_expression" || e.NamedChildCount() != 1 {
+		return nil, false, nil
+	}
+	pe := e.NamedChild(0)
+	if pe.Type() != "parenthesized_expression" {
+		return nil, false, nil
+	}
+	chain, err := parenPipelineChain(pe, src)
+	if err != nil {
+		return nil, false, err
+	}
+	if chain.NamedChildCount() != 1 || chain.NamedChild(0).Type() != "range_expression" {
+		return nil, false, nil
+	}
+	rs, err := lowerRange(chain.NamedChild(0), src)
+	if err != nil {
+		return nil, false, err
+	}
+	return rs, true, nil
+}
+
 // lowerCoalesce — the `??` null-coalescing operator, shared by the TWO
 // grammar nodes that reach it (verified identical child structure
 // against the CST — unary_expression, `??`, unary_expression):
@@ -1189,6 +1260,7 @@ func lowerParenCoalesce(e *sitter.Node, src []byte) ([]any, bool, error) {
 //     "d")` — reached via lowerParenCoalesce; the argument-list and
 //     parenthesized spellings parse as DIFFERENT nodes, verified
 //     against the CST).
+//
 // Live pwsh 7.6.4: the head argument and the coalesced value are
 // SEPARATE pipeline objects — `Write-Output foo($x ?? "d")` with $x
 // unset prints `foo` then `d` (the t20 form, verified 2026-08-15) —
@@ -1262,31 +1334,43 @@ func lowerCoalesce(n *sitter.Node, src []byte) ([]any, error) {
 	return []any{ifStmt(cond, []any{exprStmt(execCall("echo", []any{cond}))}, []any{exprStmt(execCall("echo", []any{def}))})}, nil
 }
 
-// lowerRangeArg — the range_argument_expression node: `LHS .. RHS` in
-// an argument_list (`head(1..3)`; the grammar reaches this node ONLY
-// inside an argument_list — the argument_expression alternative at the
-// bottom of the precedence chain, the t14/t20 host — verified against
-// the CST; a parenthesized `Write-Output (1..3)` parses as the
-// DIFFERENT range_expression node, still refused). The `..` range
-// operator (the plan's array rung sibling) evaluates to an ARRAY —
-// live pwsh 7.6.4 (verified 2026-08-17): `Write-Output foo(1..3)`
-// prints `foo`, `1`, `2`, `3` on FOUR lines — the range's elements
-// are enumerated as SEPARATE pipeline objects, so the argument lowers
-// to ONE echo statement PER ELEMENT (the t14 one-object-per-argument
-// rule, extended: the range is an ARRAY of objects, not one object).
-// The t24 subset pins an ALL-LITERAL range: both bounds are bare
+// lowerRange — the `..` range operator's compile-time fold, shared by
+// the TWO grammar nodes that reach it (verified identical child
+// structure against the CST — unary_expression, `..`, unary_expression):
+//   - range_argument_expression (the t24 rung): inside an argument_list,
+//     as an argument_expression child (`head(1..3)` — the unspaced
+//     spelling; the grammar reaches this node ONLY inside an
+//     argument_list);
+//   - range_expression (the t25 rung): inside a parenthesized_expression
+//     command element (`Write-Output (1 .. 3)` — reached via
+//     lowerParenRange; in THIS position the `..` must lex as its own
+//     token, so the range needs the SPACED spelling — the unspaced
+//     `(1..3)` lexes as ONE command_name token and parses as a
+//     `command` node instead, verified against the CST; the
+//     argument-list and parenthesized spellings parse as DIFFERENT
+//     nodes, the t20/t21 precedent).
+//
+// The `..` range operator (the plan's array rung sibling) evaluates to
+// an ARRAY — live pwsh 7.6.4 (verified 2026-08-14): `Write-Output
+// foo(1..3)` prints `foo`, `1`, `2`, `3` on FOUR lines and
+// `Write-Output (1 .. 3)` prints `1`, `2`, `3` on THREE lines — the
+// range's elements are enumerated as SEPARATE pipeline objects, so the
+// range lowers to ONE echo statement PER ELEMENT (the t14
+// one-object-per-argument rule, extended: the range is an ARRAY of
+// objects, not one object).
+// The t24/t25 subsets pin an ALL-LITERAL range: both bounds are bare
 // decimal integers, so the element list is a COMPILE-TIME constant
 // (the t14 fold precedent) — ascending `1..3` emits 1 2 3, descending
 // `3..1` emits 3 2 1 (both verified against live pwsh) — and each
 // element lowers to its own A1 echo Str, so the executed-stdout
 // oracle matches live pwsh by construction. A variable / non-decimal
 // bound (`$a..3`), a chained range (`1..3..5` — a nested
-// range_argument_expression LHS), a span beyond the fold cap (the A1
-// would otherwise blow up one echo per element) and a following
-// comma-list element all REFUSE (the runtime array rung is a later
-// milestone — the A1 Range bounded-iterable node is the shape that
-// rung needs; refuse > guess).
-func lowerRangeArg(n *sitter.Node, src []byte) ([]any, error) {
+// range_argument_expression / range_expression LHS), a span beyond the
+// fold cap (the A1 would otherwise blow up one echo per element) and,
+// in the t24 argument-list form, a following comma-list element all
+// REFUSE (the runtime array rung is a later milestone — the A1 Range
+// bounded-iterable node is the shape that rung needs; refuse > guess).
+func lowerRange(n *sitter.Node, src []byte) ([]any, error) {
 	var lhs, rhs *sitter.Node
 	for i := 0; i < int(n.ChildCount()); i++ {
 		ch := n.Child(i)

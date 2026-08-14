@@ -1,17 +1,45 @@
 # PLAN_POWERSHELL_F — a PowerShell frontend on the bat precedent
 
-**Status: IN PROGRESS — t24 landed (gate green).** The
+**Status: IN PROGRESS — t25 landed (gate green).** The
 proposal is implemented as described; revision history below.
 
 ## 0. Revision history
 
+- 2026-08-14 (t25_range_expression, gate green): the range_expression
+  node lands — the `..` range operator in a parenthesized command
+  argument (`Write-Output (1 .. 3)`; the grammar reaches this node
+  inside a parenthesized_expression — the parenthesized twin of the
+  t24 range_argument_expression, which the grammar reaches ONLY inside
+  an argument_list; in the paren the `..` must lex as its OWN token,
+  so the range needs the SPACED spelling `1 .. 3` — the unspaced
+  `(1..3)` lexes the whole text as ONE command_name token and parses
+  as a `command` node instead, verified against the CST). Verified
+  against live pwsh 7.6.4: the paren evaluates the range to an ARRAY
+  whose elements are enumerated as SEPARATE pipeline objects
+  (`Write-Output (1 .. 3)` prints `1`, `2`, `3` on three lines), so
+  the argument lowers to ONE echo statement PER ELEMENT — the t24
+  fold, shared through lowerRange (the t14 one-object-per-argument
+  rule, extended). The t25 subset pins the SAME all-literal fold as
+  t24: both bounds bare decimal integers, the element list a
+  COMPILE-TIME constant — ascending `(1 .. 3)` emits 1 2 3,
+  descending `(3 .. 1)` emits 3 2 1, each element its own A1 echo Str
+  — the executed-stdout oracle matches live pwsh by construction
+  (zero new A1 surface: the A1 Range bounded-iterable node stays for
+  the runtime array rung), and the paren is the command's ONLY
+  element (the t21 precedent; a head/tail argument refuses). The t24
+  refuse edges carry over by construction (the shared lowerRange): a
+  variable / non-decimal bound (pinned
+  `testdata_refuse/t25_range_expression_var_bound.ps1`), a chained
+  range (`(1 .. 3 .. 5)`) and a span beyond the fold cap all REFUSE.
 - 2026-08-17 (t24_range, gate green): the range_argument_expression
   node lands — the `..` range operator in an argument list
   (`head(1..3)`; the grammar reaches this node ONLY inside an
   argument_list, the argument_expression alternative at the bottom of
   the precedence chain — the t14/t20 host; the parenthesized
-  `Write-Output (1..3)` is the DIFFERENT range_expression node, still
-  refused). Verified against live pwsh 7.6.4: the range evaluates to
+  `Write-Output (1..3)` is the DIFFERENT range_expression node — the
+  t25 rung lands it 2026-08-14 (the spaced `1 .. 3` spelling; the
+  unspaced `(1..3)` lexes as a command node instead)). Verified
+  against live pwsh 7.6.4: the range evaluates to
   an ARRAY whose elements are enumerated as SEPARATE pipeline objects
   (`Write-Output foo(1..3)` prints `foo`, `1`, `2`, `3` on four
   lines), so the argument lowers to ONE echo statement PER ELEMENT —

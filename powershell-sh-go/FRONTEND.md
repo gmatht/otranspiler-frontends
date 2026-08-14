@@ -4,7 +4,7 @@ PowerShell (.ps1) source -> A1 shIR JSON — **the bat sibling**
 (workspace-side dir; no git worktree; the object pipeline is a stated
 TEXT approximation for v1; see PLAN_POWERSHELL_F.md).
 
-**Status: WORKER-IMPLEMENTED, t24 landed (gate green).** The parser is
+**Status: WORKER-IMPLEMENTED, t25 landed (gate green).** The parser is
 wharflab/tree-sitter-powershell (vendored under
 `grammars/tree-sitter-powershell/`, loaded via smacker/go-tree-sitter
 cgo) — the plan's choice, empirically verified. The emitter produces A1
@@ -420,7 +420,9 @@ line) — now the worker's fixes, not records):
   node ONLY inside an argument_list — the argument_expression
   alternative at the bottom of the precedence chain, the t14/t20 host;
   a parenthesized `Write-Output (1..3)` parses as the DIFFERENT
-  range_expression node, still refused). Live pwsh 7.6.4 (verified
+  range_expression node — landed as t25 (the spaced `1 .. 3`
+  spelling; the unspaced `(1..3)` lexes as a command node instead)).
+  Live pwsh 7.6.4 (verified
   2026-08-17): the range evaluates to an ARRAY whose elements are
   enumerated as SEPARATE pipeline objects — `Write-Output foo(1..3)`
   prints `foo`, `1`, `2`, `3` on FOUR lines — so the argument lowers
@@ -440,6 +442,38 @@ line) — now the worker's fixes, not records):
   later milestone, and the A1 Range bounded-iterable node is the shape
   that rung needs (zero contract surface landed here: the fold needs
   only the echo statements every rung uses).
+- t25_range_expression: the range_expression node — the `..` range
+  operator in a PARENTHESIZED command argument (`Write-Output (1 ..
+  3)`; the grammar reaches this node inside a parenthesized_expression
+  — the parenthesized twin of the t24 range_argument_expression, which
+  the grammar reaches ONLY inside an argument_list; in the paren the
+  `..` must lex as its OWN token, so the range needs the SPACED
+  spelling `1 .. 3` — the unspaced `(1..3)` lexes the whole text as
+  ONE command_name token and parses as a `command` node instead,
+  verified against the CST — the t24 note's unspaced-`1..3` claim
+  holds for the argument_list position only). Live pwsh 7.6.4
+  (verified 2026-08-14): the paren evaluates the range to an ARRAY
+  whose elements are enumerated as SEPARATE pipeline objects —
+  `Write-Output (1 .. 3)` prints `1`, `2`, `3` on THREE lines — so the
+  argument lowers to ONE echo statement PER ELEMENT (the t24 fold,
+  shared through lowerRange — the t14 one-object-per-argument rule,
+  extended: the range is an array of objects, not one object). The
+  t25 subset pins the SAME all-literal fold as t24 — both bounds bare
+  decimal integers, the element list a COMPILE-TIME constant (the t14
+  fold precedent): ascending `(1 .. 3)` emits 1 2 3, descending
+  `(3 .. 1)` emits 3 2 1 (both verified against live pwsh), each
+  element its own A1 echo Str — the executed-stdout oracle matches
+  live pwsh by construction (both print 1/2/3 then 3/2/1) — and the
+  paren is the command's ONLY element (the t21 precedent: a further
+  argument would be another pipeline object; refuse > guess). The t24
+  refuse edges carry over by construction (the shared lowerRange): a
+  variable / non-decimal bound (`(1 .. $x)` — pinned
+  `testdata_refuse/t25_range_expression_var_bound.ps1`), a chained
+  range (`(1 .. 3 .. 5)`), a span beyond the fold cap and a head/tail
+  argument all REFUSE — the runtime array rung is a later milestone,
+  and the A1 Range bounded-iterable node is the shape that rung needs
+  (zero contract surface landed here: the fold needs only the echo
+  statements every rung uses).
 
 Comments, comment-only files (empty Program), and the REFUSE table
   (refuse.go): anything outside the subset errors loudly — including
