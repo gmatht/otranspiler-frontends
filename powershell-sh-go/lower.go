@@ -1899,8 +1899,14 @@ func lowerExpr(n *sitter.Node, src []byte) (any, error) {
 		return lowerStringLiteral(n, src)
 	case "variable":
 		return getVarCall(variableName(n, src)), nil
-	case "integer_literal":
-		// `Write-Output 5` — the core's `echo 5` emits a Str.
+	case "integer_literal", "real_literal":
+		// `Write-Output 5` / `Write-Output 1.5` — the core's `echo 5` /
+		// `echo 1.5` emits a Str. The real_literal spelling passes
+		// through raw like the t16 hex form: argument-mode pwsh does
+		// NOT evaluate the literal — `Write-Output 1.50` prints the
+		// text `1.50` and `Write-Output 1.5e3` prints `1.5e3`
+		// (verified against live pwsh 7.6.4), so the raw byte content
+		// IS the argument text (the t27 pin).
 		return strExpr(n.Content(src), "DoubleQuoted"), nil
 	case "expression_with_unary_operator":
 		// PowerShell wraps a leading cast (or -not / ! / ++ / --) in this

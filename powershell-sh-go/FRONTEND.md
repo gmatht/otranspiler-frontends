@@ -4,7 +4,7 @@ PowerShell (.ps1) source -> A1 shIR JSON — **the bat sibling**
 (workspace-side dir; no git worktree; the object pipeline is a stated
 TEXT approximation for v1; see PLAN_POWERSHELL_F.md).
 
-**Status: WORKER-IMPLEMENTED, t26 landed (gate green).** The parser is
+**Status: WORKER-IMPLEMENTED, t27 landed (gate green).** The parser is
 wharflab/tree-sitter-powershell (vendored under
 `grammars/tree-sitter-powershell/`, loaded via smacker/go-tree-sitter
 cgo) — the plan's choice, empirically verified. The emitter produces A1
@@ -513,6 +513,29 @@ line) — now the worker's fixes, not records):
   REFUSES loudly (the t08 text-pipe rung), pinned
   `testdata_refuse/t26_pipeline.ps1` (FRONTEND.md's "`|` pipelines …
   pinned" claim is now actually true).
+- t27_real_literal: the real_literal node — the decimal real-number
+  token (`\p{Nd}+ \. \p{Nd}+` plus the optional `[eE][+-]?…`
+  exponent), the floating-point sibling of the integer_literal token
+  pinned since t11/t16 (the grammar's `_literal` rule is a CHOICE of
+  integer_literal / string_literal / real_literal, and the node reaches
+  the lowerer as the unary_expression operand of a command element —
+  `Write-Output 1.5` — verified against the CST). Live pwsh 7.6.4
+  argument-mode behavior (verified 2026-08-19): a real-literal argument
+  is NOT evaluated — `Write-Output 1.50` prints the text `1.50` (a
+  parsed double would format as `1.5`) and `Write-Output 1.5e3` prints
+  `1.5e3` (a parsed double would print `1500`) — exactly like a
+  bareword, the t16 hex-literal precedent. Lowering: the real_literal
+  case joins the integer_literal case in lowerExpr — the raw byte
+  content passes through as a Str (the core's `echo 1.5` emission,
+  byte-identical, verified against `debashc --shir --raw`), so the
+  executed-stdout oracle matches live pwsh by construction (both print
+  the four spellings: `1.5`, `1.50`, `1.5e3`, `0.5e-1`). The token's
+  suffix forms (`1.5d` / `1.5kb`) stay unpinned — the vendored grammar
+  over-accepts them (pwsh treats them as barewords); the non-argument
+  positions keep their bare-decimal-integer pins: `exit 1.5` and the
+  t14 format args / t24-t25 range bounds refuse on the
+  integer_literal-only checks (lowerExitCode / literalArgText /
+  rangeBound — the t11/t14/t24 subsets, unchanged).
 
 Comments, comment-only files (empty Program), and the REFUSE table
   (refuse.go): anything outside the subset errors loudly — including
