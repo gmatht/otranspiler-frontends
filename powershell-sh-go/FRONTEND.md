@@ -4,7 +4,7 @@ PowerShell (.ps1) source -> A1 shIR JSON — **the bat sibling**
 (workspace-side dir; no git worktree; the object pipeline is a stated
 TEXT approximation for v1; see PLAN_POWERSHELL_F.md).
 
-**Status: WORKER-IMPLEMENTED, t22 landed (gate green).** The parser is
+**Status: WORKER-IMPLEMENTED, t23 landed (gate green).** The parser is
 wharflab/tree-sitter-powershell (vendored under
 `grammars/tree-sitter-powershell/`, loaded via smacker/go-tree-sitter
 cgo) — the plan's choice, empirically verified. The emitter produces A1
@@ -362,6 +362,31 @@ line) — now the worker's fixes, not records):
   RHS, chained `??`, and a cast-nested paren all refuse. The
   executed-stdout oracle matches live pwsh by construction (both
   print "d" then "7").
+- t23_path_command_name: the path_command_name node — the command-name
+  variant reached when the name's text needs the path token
+  (letters/digits/_/?/-/.//: the plain command_name token set EXCLUDES
+  `-`, so a dash forces this node). The grammar reaches it ONLY under
+  the invocation operator: the `command` rule's second branch is
+  command_invocation_operator + command_name_expr + command_elements,
+  and command_name_expr = command_name | path_command_name |
+  _primary_expression — a bare `Write-Output "x"` at statement level
+  parses as the plain command_name (t01); under `&` / `.` the
+  whitelisted dash-names `Write-Output` / `Write-Host` parse as
+  path_command_name. Live pwsh 7.6.4 (verified 2026-08-16): `&
+  Write-Output "one two"` prints `one two`, `. Write-Output "three"`
+  prints `three` — observationally identical to plain invocation, so
+  the lowering needs no special case: lowerCommand reads the
+  command_name FIELD child's text (the path_command_name node) and the
+  t04 whitelist matches it case-insensitively, the operator lowers away
+  (the t04 invocation-spelling precedent) and the emit is
+  byte-identical to the un-prefixed form. A REAL path (`& ./echo`,
+  `& sub/echo`, `. ./file.ps1`) parses as plain command_name (the
+  compiled token set admits `.` and `/` — the dash is the
+  distinguishing character) and REFUSES on the whitelist, as do the
+  variable/string forms (`& $cmd`, `& "script.ps1"`) — the t04 note's
+  "the command_name_expr text is not in the whitelist" refusals stay
+  pinned (refuse > guess: the subset never guesses what the operator
+  targets).
 - t22_param_block: the param_block node — the script-level `param(...)`
   parameter declaration (the grammar's program rule is
   `[using/requires] [param_block] statement_list`, so the node sits
