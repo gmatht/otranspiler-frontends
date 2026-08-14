@@ -392,19 +392,33 @@ func lowerCondPipeline(pipeline *sitter.Node, src []byte) (any, error) {
 		return nil, refuse(chain, src, "condition chain with %d children", chain.NamedChildCount())
 	}
 	op := chain.NamedChild(0)
+	return lowerCondVar(op, src, "condition")
+}
+
+// lowerCondVar — a condition operand as a bare variable read (the
+// unary_expression → variable tail of the t06/t07 condition subset,
+// shared by the while/do/if conditions AND the t20 null-coalesce LHS —
+// the coalesce lowers through the SAME condition semantics: `??` is a
+// NULL check, and in the pinned subset (variables are never assigned)
+// an unset variable reads $null in pwsh / "" from the A1 store — both
+// FALSY — so the condition-position null edge is CONSISTENT there too
+// (the t06/t07 precedent; the t02 PRINT edge stays outside the subset).
+// `what` names the construct in the refusal messages ("condition" /
+// "null-coalesce left operand").
+func lowerCondVar(op *sitter.Node, src []byte, what string) (any, error) {
 	if op.Type() != "unary_expression" {
-		return nil, refuse(op, src, "condition %q (the t06 subset pins a bare variable read)", op.Type())
+		return nil, refuse(op, src, "%s %q (the t06 subset pins a bare variable read)", what, op.Type())
 	}
 	if op.NamedChildCount() != 1 {
-		return nil, refuse(op, src, "condition unary_expression with %d children", op.NamedChildCount())
+		return nil, refuse(op, src, "%s unary_expression with %d children", what, op.NamedChildCount())
 	}
 	inner := op.NamedChild(0)
 	if inner.Type() != "variable" {
-		return nil, refuse(inner, src, "condition operand %q (the t06 subset pins a bare variable read)", inner.Type())
+		return nil, refuse(inner, src, "%s operand %q (the t06 subset pins a bare variable read)", what, inner.Type())
 	}
 	name := variableName(inner, src)
 	if name == "true" {
-		return nil, refuse(inner, src, "`$true` in a condition: pwsh reads a TRUTHY automatic while the A1 getVar read is \"\" (falsy) — the branches DIVERGE (a while condition would loop forever, an if condition would take the wrong branch); the t06/t07 subset pins unset-user-variable conditions")
+		return nil, refuse(inner, src, "`$true` in a %s: pwsh reads a TRUTHY automatic while the A1 getVar read is \"\" (falsy) — the branches DIVERGE (a while condition would loop forever, an if condition would take the wrong branch); the t06/t07 subset pins unset-user-variable conditions", what)
 	}
 	return getVarCall(name), nil
 }
@@ -808,6 +822,18 @@ func lowerArgumentList(n *sitter.Node, src []byte) ([]any, error) {
 			// echo statement (the one-object-per-argument rule).
 			out = append(out, exprStmt(execCall("echo", []any{v})))
 			i = consumed
+		case "null_coalesce_argument_expression":
+			// the t20 rung: `head($x ?? "d")` — the coalesce must be the
+			// ONLY list element (a following comma-list is the plain
+			// argument-list / array rung — refuse > guess).
+			if i != int(list.NamedChildCount())-1 {
+				return nil, refuse(c, src, "element after a null-coalesce argument (the t20 subset pins `head($x ?? \"d\")` with the coalesce as the only list element; a comma-list is the array rung)")
+			}
+			cs, err := lowerCoalesceArg(c, src)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, cs...)
 		default:
 			return nil, refuse(c, src, "%q in an argument list (the t14 subset pins the `-f` format operator; a plain argument list is unpinned)", c.Type())
 		}
@@ -974,6 +1000,82 @@ func lowerFormatExpr(n *sitter.Node, src []byte) (any, error) {
 		return nil, err
 	}
 	return strExpr(folded, "DoubleQuoted"), nil
+}
+
+// lowerCoalesceArg — the null_coalesce_argument_expression node: the
+// `??` null-coalescing operator in an argument_list (`head($x ?? "d")`
+// — the grammar reaches this node ONLY inside an argument_list, as an
+// argument_expression child; a parenthesized `Write-Output ($x ?? "d")`
+// parses as the DIFFERENT null_coalesce_expression node). Live pwsh
+// 7.6.4 (verified 2026-08-15): the head argument and the coalesced
+// value are SEPARATE pipeline objects — `Write-Output foo($x ?? "d")`
+// with $x unset prints `foo` then `d`, with `$x = "abc"` it prints
+// `foo` then `abc`. The t20 subset pins the t06/t07 condition shape:
+// the LHS is a bare variable read (UNSET in the subset — variables are
+// never assigned in v1) and the RHS is a literal string / decimal
+// integer — a NON-null constant — so `??` (a NULL check) lowers
+// through the SAME condition semantics as if/while: pwsh reads $null
+// (FALSY) and the A1 store reads "" (FALSY), both take the default:
+// `LHS ?? RHS` → `if (LHS) { echo LHS } else { echo RHS }` — the t07
+// If shape, ONE pipeline object → the A1 If (the t14 one-object-per-
+// argument rule; the then-branch echo is dead within the subset, where
+// every variable reads falsy). Truthy pwsh automatics (`$true`) and a
+// variable RHS DIVERGE and REFUSE (both pinned in testdata_refuse/):
+// `$true ?? "d"` prints True in pwsh vs the falsy-lowering's d (the
+// t06 `$true` refusal), and `$x ?? $y` with both unset coalesces to
+// $null — `Write-Output` of a bare $null prints NOTHING vs the A1
+// echo's blank line (the t02 PRINT edge).
+func lowerCoalesceArg(n *sitter.Node, src []byte) ([]any, error) {
+	var lhs, rhs *sitter.Node
+	for i := 0; i < int(n.ChildCount()); i++ {
+		ch := n.Child(i)
+		switch ch.Type() {
+		case "unary_expression":
+			if lhs == nil {
+				lhs = ch
+			} else if rhs == nil {
+				rhs = ch
+			} else {
+				return nil, refuse(ch, src, "null-coalesce argument with more than two operands")
+			}
+		case "??":
+			// the operator itself — structure only
+		default:
+			return nil, refuse(ch, src, "null-coalesce argument part %q", ch.Type())
+		}
+	}
+	if lhs == nil || rhs == nil {
+		return nil, refuse(n, src, "null-coalesce argument without both operands")
+	}
+	cond, err := lowerCondVar(lhs, src, "null-coalesce left operand")
+	if err != nil {
+		return nil, err
+	}
+	// the default: a literal string / decimal integer — a NON-null
+	// constant (a variable RHS would coalesce to $null for an unset
+	// variable → the t02 bare-$null PRINT edge; refuse > guess).
+	if rhs.NamedChildCount() != 1 {
+		return nil, refuse(rhs, src, "null-coalesce right operand with %d children", rhs.NamedChildCount())
+	}
+	op := rhs.NamedChild(0)
+	var def any
+	switch op.Type() {
+	case "string_literal":
+		def, err = lowerStringLiteral(op, src)
+	case "integer_literal":
+		def = strExpr(op.Content(src), "DoubleQuoted")
+	default:
+		return nil, refuse(op, src, "null-coalesce right operand %q (the t20 subset pins a literal string / decimal integer default)", op.Type())
+	}
+	if err != nil {
+		return nil, err
+	}
+	// the coalesce is ONE pipeline object → the A1 If with an echo per
+	// branch; the unset-variable subset takes the default on BOTH
+	// oracles, so the executed-stdout gate matches live pwsh by
+	// construction (the t07 shape: cond/then/elsifs/else, byte-identical
+	// to the core's if emission).
+	return []any{ifStmt(cond, []any{exprStmt(execCall("echo", []any{cond}))}, []any{exprStmt(execCall("echo", []any{def}))})}, nil
 }
 
 // literalStringText — a string_literal node whose interior is EXACTLY

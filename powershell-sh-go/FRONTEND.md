@@ -4,7 +4,7 @@ PowerShell (.ps1) source -> A1 shIR JSON — **the bat sibling**
 (workspace-side dir; no git worktree; the object pipeline is a stated
 TEXT approximation for v1; see PLAN_POWERSHELL_F.md).
 
-**Status: WORKER-IMPLEMENTED, t19 landed (gate green).** The parser is
+**Status: WORKER-IMPLEMENTED, t20 landed (gate green).** The parser is
 wharflab/tree-sitter-powershell (vendored under
 `grammars/tree-sitter-powershell/`, loaded via smacker/go-tree-sitter
 cgo) — the plan's choice, empirically verified. The emitter produces A1
@@ -307,6 +307,36 @@ line) — now the worker's fixes, not records):
   The `redirections` (plural) pipeline_chain wrapper stays a gap:
   it wraps only non-command statement expressions, which
   lowerPipeline refuses anyway.
+- t20_null_coalesce: the null_coalesce_argument_expression node — the
+  `??` null-coalescing operator in an argument_list (`head($x ??
+  "d")`; the grammar reaches this node ONLY inside an argument_list
+  — a parenthesized `Write-Output ($x ?? "d")` parses as the
+  DIFFERENT null_coalesce_expression node, still refused, and a bare
+  `??` in argument position is a command_parameter). Live pwsh 7.6.4
+  (verified 2026-08-15): the head argument and the coalesced value
+  are SEPARATE pipeline objects (`Write-Output foo($x ?? "d")`
+  prints `foo` then `d` with $x unset), so the command lowers to ONE
+  echo per object (the t14 one-object-per-argument rule; the head
+  flush is the t14 machinery). `??` is a NULL check, and the t20
+  subset pins the t06/t07 condition shape — a bare variable read LHS
+  (UNSET in the subset: variables are never assigned in v1) and a
+  literal string / decimal integer RHS (a NON-null constant) — so
+  `LHS ?? RHS` lowers through the SAME condition semantics as
+  if/while, `if (LHS) { echo LHS } else { echo RHS }` (the t07 If
+  shape, byte-identical to the core's if emission; the then-branch
+  echo is dead within the subset): pwsh reads $null (FALSY) and the
+  A1 store reads "" (FALSY), both take the default, so the
+  executed-stdout oracle matches live pwsh by construction. Truthy
+  pwsh automatics (`$true`) and a variable RHS DIVERGE and REFUSE
+  (pinned testdata_refuse/t20_null_coalesce_true_lhs.ps1 — `$true
+  ?? "d"` prints True in pwsh vs the falsy-lowering's d, the t06
+  `$true` precedent — and t20_null_coalesce_var_rhs.ps1 — `$x ??
+  $y` with both unset coalesces to $null and a bare `Write-Output`
+  of $null prints NOTHING, the t02 PRINT edge), as do a nested
+  `$x ?? $y ?? "d"` and a comma-list after the coalesce (the array
+  rung). The LHS refusal shares lowerCondVar with the t06/t07
+  conditions (extracted from lowerCondPipeline when the rung
+  landed).
 - Comments, comment-only files (empty Program), and the REFUSE table
   (refuse.go): anything outside the subset errors loudly — including
   .NET member access (`$x.Length`), assignment, `|` pipelines, unknown
