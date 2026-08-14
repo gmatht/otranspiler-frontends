@@ -63,6 +63,14 @@ const maxRangeSpan = 1000
 //	                                      and the statement_list; plain
 //	                                      variables only → dropped, the
 //	                                      t18-label pure-spelling precedent)
+//	    requires_directive_list         (t28 — the top-of-file `#requires`
+//	                                      directive lines; met requirements
+//	                                      only → dropped, the t22 precedent;
+//	                                      a mid-file `#requires` parses as a
+//	                                      COMMENT — pwsh enforces it there
+//	                                      too, so the comment REFUSES)
+//	    using_directive_list               (by-design refusal — the plan's
+//	                                      "`using` / modules" row)
 //	    assignment_expression / …          (REFUSE until pinned)
 
 // lowerProgram — walk the CST root and lower the v1 subset to A1
@@ -74,6 +82,20 @@ func lowerProgram(root *sitter.Node, src []byte) ([]any, error) {
 		ch := root.NamedChild(i)
 		switch ch.Type() {
 		case "comment":
+			// a `#requires`-prefixed comment is NOT a plain comment: live
+			// pwsh 7.6.4 enforces `#requires` in ANY position (verified
+			// 2026-08-19: a mid-file `#requires -Version 99` after a
+			// Write-Output fails the run BEFORE the first statement
+			// prints) while the vendored grammar builds
+			// requires_directive_list only at the top of the file and
+			// parses a mid-file `#requires` as a comment (the t19
+			// grammar-over-accepts precedent: refuse > guess — a silent
+			// drop would miscompile). `# requires` (a space after the
+			// #) is a REAL comment (verified: pwsh ignores it) and
+			// stays dropped.
+			if requiresComment(ch, src) {
+				return nil, refuse(ch, src, "`#requires` outside the top-of-file directive list %q (pwsh 7.6.4 enforces it in any position while the vendored grammar parses it as a comment — refuse > guess)", ch.Content(src))
+			}
 			continue
 		case "param_block":
 			// the script-level `param(...)` block — validates the v1
@@ -81,6 +103,14 @@ func lowerProgram(root *sitter.Node, src []byte) ([]any, error) {
 			// statements: the declaration is dropped (see
 			// lowerParamBlock).
 			if err := lowerParamBlock(ch, src); err != nil {
+				return nil, err
+			}
+		case "requires_directive_list":
+			// the top-of-file `#requires` directive lines — validates the
+			// v1 subset (met requirements only) and lowers to ZERO
+			// statements: the directives are dropped (see
+			// lowerRequiresDirectiveList).
+			if err := lowerRequiresDirectiveList(ch, src); err != nil {
 				return nil, err
 			}
 		case "statement_list":
@@ -165,6 +195,286 @@ func lowerParamBlock(n *sitter.Node, src []byte) error {
 		}
 	}
 	return nil
+}
+
+// requiresMaxMinor — the t28 requires subset's major-7 minor ceiling:
+// the executed-stdout oracle is pinned to LIVE pwsh 7.6.4 (the
+// FRONTEND.md pin: the direct snap binary), and the subset accepts
+// only requirements that oracle SATISFIES. `-Version` is NOT a numeric
+// comparison in pwsh — it is a WHITELIST of the real PowerShell
+// release lines (see requiresVersionOK); the major-7 line reaches the
+// oracle's own minor, 6.
+const requiresMaxMinor = 6
+
+// lowerRequiresDirectiveList — the requires_directive_list node: the
+// script-level `#requires` directive lines, the SECOND of the grammar's
+// program-level directive lists (the program rule is
+// `[using/requires] [param_block] statement_list`, so the node sits at
+// the TOP of the file, BEFORE the param_block / statement_list — the
+// t22 param_block's sibling; the `using` form stays a by-design
+// refusal, the plan's "`using` / modules" row). The node is a repeat
+// of requires_statement children, each a requires_keyword token + one
+// requires_argument_group per argument (each group wraps ONE
+// requires_argument — a command_parameter / generic_token /
+// integer_literal / real_literal / string_literal /
+// hash_literal_expression — verified against the CST).
+//
+// Live pwsh 7.6.4 (verified 2026-08-19): `#requires` is a script-level
+// REQUIREMENT check enforced at startup in -File mode — an unmet
+// requirement fails the run BEFORE any statement prints (a mid-file
+// `#requires -Version 99` after a Write-Output still fails without
+// printing it). The v1 subset pins ONLY requirements the pinned oracle
+// is GUARANTEED to satisfy, so within the subset the directive has NO
+// runtime effect and the lowering is ZERO statements: the node is
+// dropped exactly like the t22 param_block (the t18-label pure-
+// spelling precedent), byte-identical to the same program without the
+// directive lines, and the executed-stdout oracle matches live pwsh by
+// construction. The accepted requirements:
+//
+//   - `-Version M.m` — a real_literal decimal version on a real
+//     PowerShell release line the oracle accepts (verified against
+//     live pwsh 7.6.4: `#requires -Version 5.1` and `-Version 5` run
+//     clean) or `-Version M` — an integer_literal (the t11
+//     decimal-integer precedent). The acceptance is the ORACLE'S OWN
+//     whitelist, NOT a numeric comparison (PSVersionInfo.
+//     IsValidPSVersion, verified 2026-08-19 against live pwsh):
+//     majors 1-4 accept minor 0 only, major 5 accepts 0/1, major 6
+//     accepts 0-2, major 7 accepts 0-6 (the oracle's minor), build
+//     parts are ignored — `-Version 6.2` runs clean while `-Version
+//     6.3` / `5.2` / `7.7` / `99` all fail the run (a numeric ≤ 7.6
+//     check would have ACCEPTED 6.3 — a silent miscompile, pinned
+//     testdata_refuse/t28_requires_version_high_minor.ps1).
+//
+// EACH parameter may appear ONCE per script: pwsh binds the whole
+// directive list into ONE parameter set (verified 2026-08-19:
+// `#requires -Version 5.1` + `#requires -Version 5` — even on
+// SEPARATE lines — fails the run with "Cannot bind parameter because
+// parameter 'version' is specified more than once"), so a duplicate
+// REFUSES (pinned testdata_refuse/t28_requires_duplicate.ps1). The
+// integer-literal and multi-argument statement forms share the
+// pairwise group validation but cannot coexist with the example's
+// `-Version` in ONE script — the once-per-script binding (both are
+// exercised by the probes that pinned this rung).
+//   - `-PSEdition Core` — a generic_token whose text is "Core"
+//     (case-insensitive): pwsh IS the Core edition (verified:
+//     `-PSEdition Desktop` fails the run — "does not match the
+//     currently running PowerShell Core edition").
+//
+// The other forms REFUSE (pinned testdata_refuse/t28_*): `-Modules`
+// (module presence is environment-dependent — the plan's "`using` /
+// modules" refusal), `-RunAsAdministrator` (elevation-dependent),
+// `-ShellId` (pwsh 7.6.4 rejects it — "must specify a required
+// PowerShell snap-in"), a parameter with no value / a value with no
+// parameter (pwsh parse errors), string / hash values, a comma-list
+// group and multi-dot versions (`5.1.1` parses as a generic_token —
+// the t27 unpinned-shape precedent).
+//
+// The vendored grammar OVER-ACCEPTS two shapes, both guarded here
+// (refuse > guess — a silent drop would miscompile):
+//
+//   - a bare `#requires` (no arguments) makes the requires_statement
+//     rule SWALLOW the following statements as argument groups
+//     (verified against the CST: `#requires\nWrite-Output "ran"`
+//     parses the echo as argument groups, no statement_list at all).
+//     The swallowed text usually refuses on the group validation, but
+//     `#requires\n-Version 5.1` would accidentally validate — so a
+//     requires_statement's content must be a SINGLE LINE (a legit
+//     directive is one line; the swallow always spans a newline).
+//   - `#requires-Version 5.1` (NO space after the keyword) parses as
+//     a directive while live pwsh 7.6.4 rejects it at parse time
+//     (verified: ParserError). The guard: the bytes between the
+//     requires_keyword and the first argument group must be non-empty
+//     space/tab whitespace.
+func lowerRequiresDirectiveList(n *sitter.Node, src []byte) error {
+	// pwsh binds the WHOLE directive list into one parameter set: each
+	// parameter may appear once per script (a duplicate is a parse
+	// error — "Cannot bind parameter because parameter 'x' is
+	// specified more than once", verified 2026-08-19).
+	seen := map[string]bool{}
+	for i := 0; i < int(n.NamedChildCount()); i++ {
+		stmt := n.NamedChild(i)
+		if stmt.Type() != "requires_statement" {
+			return refuse(stmt, src, "requires_directive_list element %q", stmt.Type())
+		}
+		// guard: a legit directive is a single line; the bare-`#requires`
+		// swallow spans the following statements (and their newline).
+		if strings.ContainsRune(stmt.Content(src), '\n') {
+			return refuse(stmt, src, "#requires across lines %q (the grammar's bare-`#requires` swallow — live pwsh parses `#requires` only on its own line; refuse > guess)", stmt.Content(src))
+		}
+		var kw *sitter.Node
+		var groups []*sitter.Node
+		for j := 0; j < int(stmt.NamedChildCount()); j++ {
+			c := stmt.NamedChild(j)
+			switch c.Type() {
+			case "requires_keyword":
+				kw = c
+			case "requires_argument_group":
+				groups = append(groups, c)
+			default:
+				return refuse(c, src, "requires_statement part %q", c.Type())
+			}
+		}
+		if kw == nil || len(groups) == 0 {
+			return refuse(stmt, src, "#requires with no arguments %q (the bare form is unpinned — the grammar swallows the following statements)", stmt.Content(src))
+		}
+		// guard: live pwsh needs whitespace after the `#requires` keyword
+		// (`#requires-Version 5.1` is a ParserError in pwsh 7.6.4 while
+		// the vendored grammar over-accepts it as a directive).
+		gap := src[kw.EndByte():groups[0].StartByte()]
+		if len(gap) == 0 || len(bytes.Trim(gap, " \t")) != 0 {
+			return refuse(kw, src, "#requires keyword %q (live pwsh needs whitespace after `#requires`; the no-space form is a pwsh ParserError — refuse > guess)", kw.Content(src))
+		}
+		// validate the argument groups pairwise: a whitelisted parameter
+		// consumes the FOLLOWING group as its value (the pwsh semantics
+		// — `-Version 5.1 -PSEdition Core` in ONE statement is four
+		// groups).
+		g := 0
+		for g < len(groups) {
+			v, err := requiresArgument(groups[g], src)
+			if err != nil {
+				return err
+			}
+			if v.Type() != "command_parameter" {
+				return refuse(v, src, "requires argument %q (a value with no parameter — the grammar's bare-`#requires` swallow?)", v.Content(src))
+			}
+			p := strings.ToLower(v.Content(src))
+			if seen[p] {
+				return refuse(v, src, "duplicate #requires parameter %q (pwsh 7.6.4 binds the whole directive list into ONE parameter set — a repeat is a parse error; refuse > guess)", p)
+			}
+			seen[p] = true
+			switch p {
+			case "-version":
+				g++
+				if g >= len(groups) {
+					return refuse(v, src, "#requires -Version with no version value (pwsh 7.6.4 parse-errors too)")
+				}
+				if err := checkRequiresVersion(groups[g], src); err != nil {
+					return err
+				}
+			case "-psedition":
+				g++
+				if g >= len(groups) {
+					return refuse(v, src, "#requires -PSEdition with no edition value (pwsh 7.6.4 parse-errors too)")
+				}
+				e, err := requiresArgument(groups[g], src)
+				if err != nil {
+					return err
+				}
+				if e.Type() != "generic_token" || !strings.EqualFold(e.Content(src), "core") {
+					return refuse(e, src, "#requires -PSEdition value %q (the subset pins \"Core\" — pwsh IS the Core edition; \"Desktop\" fails the oracle run)", e.Content(src))
+				}
+			default:
+				return refuse(v, src, "#requires parameter %q (the v1 subset pins -Version on a release line the oracle accepts and -PSEdition Core; the %s forms are environment-dependent / unpinned — refuse > guess)", v.Content(src), p)
+			}
+			g++
+		}
+	}
+	return nil
+}
+
+// requiresArgument — the single argument node inside a
+// requires_argument_group (the grammar: `requires_argument (","
+// requires_argument)*` — a comma-list group is an unpinned shape, so
+// the group must wrap EXACTLY one argument). Returns the inner
+// argument node (the command_parameter / literal / token).
+func requiresArgument(g *sitter.Node, src []byte) (*sitter.Node, error) {
+	if g.Type() != "requires_argument_group" || g.NamedChildCount() != 1 ||
+		g.NamedChild(0).Type() != "requires_argument" || g.NamedChild(0).NamedChildCount() != 1 {
+		return nil, refuse(g, src, "requires argument group %q (the subset pins a single plain argument per group)", g.Content(src))
+	}
+	return g.NamedChild(0).NamedChild(0), nil
+}
+
+// checkRequiresVersion — the `-Version` requirement value: a bare
+// decimal version the pinned oracle pwsh 7.6.4 satisfies. Accepts
+// real_literal `M.m` and integer_literal `M` ON THE ORACLE'S OWN
+// release-line whitelist (requiresVersionOK — both forms verified
+// against live pwsh: `-Version 5.1` / `-Version 5` run clean). Any
+// version OFF the whitelist fails the oracle run (verified: `-Version
+// 99` / `-Version 6.3` / `-Version 5.2` → "does not match the
+// currently running version of PowerShell 7.6.4") while the
+// transpiled drop would run — divergent, so it REFUSES (pinned
+// testdata_refuse/t28_requires_version_*). The other shapes REFUSE
+// too: a multi-dot `5.1.1` parses as a generic_token (the t27
+// unpinned-shape precedent — pwsh ignores build parts, but the
+// two-part spelling is the pinned surface) and a string value is
+// unpinned.
+func checkRequiresVersion(g *sitter.Node, src []byte) error {
+	v, err := requiresArgument(g, src)
+	if err != nil {
+		return err
+	}
+	text := v.Content(src)
+	switch v.Type() {
+	case "real_literal":
+		maj, min, ok := decimalVersion(text)
+		if !ok || !requiresVersionOK(maj, min) {
+			return refuse(v, src, "#requires -Version value %q (the subset pins a PowerShell release-line version the oracle 7.6.4 accepts — an off-whitelist version fails the native run where the transpiled drop would run)", text)
+		}
+	case "integer_literal":
+		n, err := strconv.Atoi(text)
+		if err != nil || !requiresVersionOK(n, 0) {
+			return refuse(v, src, "#requires -Version value %q (the subset pins a PowerShell release-line version the oracle 7.6.4 accepts — an off-whitelist version fails the native run where the transpiled drop would run)", text)
+		}
+	default:
+		return refuse(v, src, "#requires -Version value %q (the subset pins a bare decimal version — the multi-dot / string / bareword forms are unpinned)", text)
+	}
+	return nil
+}
+
+// requiresVersionOK — the pwsh `#requires -Version` acceptance
+// whitelist, replicated from the ORACLE'S OWN check
+// (PSVersionInfo.IsValidPSVersion in the PowerShell source, verified
+// empirically 2026-08-19 against live pwsh 7.6.4): majors 1-4 accept
+// minor 0 ONLY, major 5 accepts 0/1, major 6 accepts 0-2, major 7
+// accepts 0..requiresMaxMinor (the oracle's minor, 6). The check is
+// NOT a numeric comparison — `-Version 6.2` runs clean while `-Version
+// 6.3` / `-Version 5.2` fail the run, and build parts are ignored
+// (`-Version 7.6.99` runs clean). Every accepted value is a version
+// the pinned oracle satisfies; everything else REFUSES (refuse >
+// guess).
+func requiresVersionOK(maj, min int) bool {
+	switch {
+	case maj >= 1 && maj <= 4:
+		return min == 0
+	case maj == 5:
+		return min == 0 || min == 1
+	case maj == 6:
+		return min >= 0 && min <= 2
+	case maj == 7:
+		return min >= 0 && min <= requiresMaxMinor
+	}
+	return false
+}
+
+// decimalVersion — parse a real_literal text as a two-part decimal
+// version `M.m`. Rejects exponents (`5.1e3`), sign forms and missing
+// digits: the accepted subset is the plain `\p{Nd}+\.\p{Nd}+` token
+// form. Leading zeros parse numerically (Atoi), matching the [version]
+// parse pwsh uses — `-Version 7.06` and `-Version 5.001` run clean in
+// live pwsh and both accept here, while `-Version 5.02` (minor 2, off
+// the 5.x line) refuses on the whitelist.
+func decimalVersion(text string) (int, int, bool) {
+	parts := strings.Split(text, ".")
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	maj, err1 := strconv.Atoi(parts[0])
+	min, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil || maj < 0 || min < 0 {
+		return 0, 0, false
+	}
+	return maj, min, true
+}
+
+// requiresComment — whether a comment node is REALLY a `#requires`
+// directive: live pwsh 7.6.4 treats ANY comment starting with
+// `#requires` (case-insensitive, no space — `#requiresx` too, verified
+// 2026-08-19) as a requires statement, wherever it appears. The
+// vendored grammar builds requires_directive_list only at the top of
+// the file, so mid-file the directive is a comment node.
+func requiresComment(n *sitter.Node, src []byte) bool {
+	return strings.HasPrefix(strings.ToLower(n.Content(src)), "#requires")
 }
 
 // lowerStatementList — the statements of one statement_list.

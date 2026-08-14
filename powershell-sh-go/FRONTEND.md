@@ -4,7 +4,7 @@ PowerShell (.ps1) source -> A1 shIR JSON — **the bat sibling**
 (workspace-side dir; no git worktree; the object pipeline is a stated
 TEXT approximation for v1; see PLAN_POWERSHELL_F.md).
 
-**Status: WORKER-IMPLEMENTED, t27 landed (gate green).** The parser is
+**Status: WORKER-IMPLEMENTED, t28 landed (gate green).** The parser is
 wharflab/tree-sitter-powershell (vendored under
 `grammars/tree-sitter-powershell/`, loaded via smacker/go-tree-sitter
 cgo) — the plan's choice, empirically verified. The emitter produces A1
@@ -536,6 +536,60 @@ line) — now the worker's fixes, not records):
   t14 format args / t24-t25 range bounds refuse on the
   integer_literal-only checks (lowerExitCode / literalArgText /
   rangeBound — the t11/t14/t24 subsets, unchanged).
+- t28_requires_directive: the requires_directive_list node — the
+  script-level `#requires` directive lines, the SECOND of the grammar's
+  program-level directive lists (the program rule is `[using/requires]
+  [param_block] statement_list`, so the node sits at the TOP of the
+  file, BEFORE the param_block / statement_list — the t22 sibling; the
+  `using` form stays a by-design refusal, the plan's "`using` /
+  modules" row). Live pwsh 7.6.4 (verified 2026-08-19): `#requires` is
+  a script-level REQUIREMENT check enforced at startup in -File mode —
+  an unmet requirement fails the run BEFORE any statement prints (a
+  mid-file `#requires -Version 99` after a Write-Output still fails
+  without printing it, contradicting the Microsoft docs' "statements
+  before it run first" claim). The v1 subset pins ONLY requirements
+  the pinned oracle (pwsh 7.6.4) is GUARANTEED to satisfy, so within
+  the subset the directive has NO runtime effect and the lowering is
+  ZERO statements — the node is dropped exactly like the t22
+  param_block (the t18-label pure-spelling precedent), byte-identical
+  to the same program without the directive lines, and the
+  executed-stdout oracle matches live pwsh by construction. The
+  accepted requirements: `-Version M.m` (real_literal) / `-Version M`
+  (integer_literal, the t11 precedent) ON THE ORACLE'S OWN
+  release-line whitelist — pwsh's `-Version` is NOT a numeric
+  comparison (PSVersionInfo.IsValidPSVersion): majors 1-4 accept
+  minor 0 only, major 5 accepts 0/1, major 6 accepts 0-2, major 7
+  accepts 0-6, build parts ignored (`-Version 6.2` runs clean while
+  `-Version 6.3` / `5.2` / `7.7` / `99` fail the run — a naive "≤
+  7.6" check would have ACCEPTED 6.3, a silent miscompile, pinned
+  `testdata_refuse/t28_requires_version_high_minor.ps1`) — and
+  `-PSEdition Core` (a generic_token; pwsh IS the Core edition, while
+  `-PSEdition Desktop` fails the run). EACH parameter appears ONCE
+  per script: pwsh binds the whole directive list into ONE parameter
+  set (`-Version` twice — even on separate lines — is a parse error,
+  pinned `testdata_refuse/t28_requires_duplicate.ps1`; the
+  integer-literal and multi-argument `-Version 5.1 -PSEdition Core`
+  statement forms share the pairwise group validation but cannot
+  coexist with the example's `-Version`). The other forms REFUSE
+  (pinned `testdata_refuse/t28_*`): `-Modules` (module presence is
+  environment-dependent — the plan's "`using` / modules" refusal),
+  `-RunAsAdministrator` (elevation-dependent), `-ShellId` (pwsh
+  rejects it), a parameter with no value / a value with no parameter
+  (pwsh parse errors), string / hash values, comma-list groups and
+  multi-dot versions (`5.1.1` parses as a generic_token — the t27
+  unpinned-shape precedent; pwsh ignores build parts, the two-part
+  spelling is the pinned surface). The vendored grammar OVER-ACCEPTS
+  two shapes, both guarded (refuse > guess): a BARE `#requires` makes
+  the requires_statement rule SWALLOW the following statements as
+  argument groups (`#requires` + a `-Version 5.1` line would
+  accidentally validate — the single-line statement guard refuses,
+  pinned `testdata_refuse/t28_requires_swallow.ps1`) and
+  `#requires-Version 5.1` (no space after the keyword) parses as a
+  directive while pwsh parse-errors (the keyword-gap guard); a
+  MID-FILE `#requires` is enforced by pwsh in any position but parses
+  as a comment — the comment case now REFUSES `#requires`-prefixed
+  text (pinned `testdata_refuse/t28_requires_midfile.ps1`; `#
+  requires` with a space is a real comment and stays dropped).
 
 Comments, comment-only files (empty Program), and the REFUSE table
   (refuse.go): anything outside the subset errors loudly — including
