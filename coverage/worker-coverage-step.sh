@@ -5,15 +5,20 @@
 #
 # If the frontend's parser features are not fully covered by its testdata
 # examples, ask pi (scoped) to create ONE testdata example covering an
-# uncovered aspect. Gap source: the EXTERNAL-GRAMMAR rule gaps first
-# (rules-gap.sh — grammars-v4 rules / POSIX subset / PPI classes; the
-# official parsers are the source of truth for hand-rolled frontends),
-# falling back to the A1-node proxy / syn node kinds (coverage-gap.sh)
-# where no external grammar exists. Commit only if the gate stays green
-# WITH the new example; otherwise discard the example and record the
-# construct as known-refused (so future cycles skip it) or as a lowering
-# bug. The gate is the arbiter: an example that refuses by design must
-# never land.
+# uncovered aspect. Gap source chain, EXTERNAL-GRAMMAR truth FIRST:
+#   1. rules-gap.sh        — grammars-v4 rules (go/c/py) / POSIX subset
+#                            (posix-sh) / PPI classes (perl);
+#   2. ts-node-gap.sh      — tree-sitter NODE-TYPE coverage for the
+#                            tree-sitter-backed languages (c/cpp/powershell:
+#                            node types the grammar defines minus the node
+#                            types the testdata parse trees exercise);
+#   3. coverage-gap.sh     — the A1-node proxy / syn node kinds, only where
+#                            no external grammar exists (zsh/fish/bat/zig)
+#                            or it reports none.
+# Commit only if the gate stays green WITH the new example; otherwise
+# discard the example and record the construct as known-refused (so future
+# cycles skip it) or as a lowering bug. The gate is the arbiter: an example
+# that refuses by design must never land.
 set -u
 lang="$1"; LOG="$2"
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
@@ -22,10 +27,15 @@ TS="[$(date +%FT%T)]"
 
 # gap source — EXTERNAL-GRAMMAR rule gaps first (the official parsers'
 # features: grammars-v4 rules for go/c/py, the custom POSIX subset for
-# posix-sh, PPI node classes for perl — see PARSER_GAPS.md); fall back to
-# the A1-node proxy / syn node kinds (coverage-gap.sh) where no external
-# grammar exists (zsh/fish/bat/zig/powershell/cpp) or it reports none.
+# posix-sh, PPI node classes for perl — see PARSER_GAPS.md); then the
+# tree-sitter NODE-TYPE gaps for the tree-sitter-backed languages
+# (c/cpp/powershell); fall back to the A1-node proxy / syn node kinds
+# (coverage-gap.sh) where no external grammar exists (zsh/fish/bat/zig)
+# or it reports none.
 gaps=$(bash "$ROOT/frontends/coverage/rules-gap.sh" "$lang" 2>/dev/null)
+if [ -z "$gaps" ]; then
+  gaps=$(bash "$ROOT/frontends/coverage/ts-node-gap.sh" "$lang" 2>/dev/null)
+fi
 if [ -z "$gaps" ]; then
   gaps=$(bash "$ROOT/frontends/coverage/coverage-gap.sh" "$lang" 2>/dev/null)
 fi

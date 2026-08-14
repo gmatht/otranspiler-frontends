@@ -16,7 +16,9 @@
 #       the testdata emits (stmt/expr/arith "type" fields) and report the
 #       A1 vocabulary types none of them produce. Documented proxy — the
 #       worker's pi reads the frontend's FRONTEND.md subset to judge which
-#       are expressible (the gate is the final arbiter).
+#       are expressible (the gate is the final arbiter). NOTE: the
+#       tree-sitter-backed frontends (c/cpp/powershell) are handled by
+#       ts-node-gap.sh first — the A1 proxy is only their fallback.
 #
 # Exclusions: one construct per line in frontends/coverage/refused-<lang>.txt
 # (worker-appended when a proposed example for that gap was refused by the

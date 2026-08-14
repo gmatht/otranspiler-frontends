@@ -11,7 +11,8 @@
 # by-design refusal or a lowering bug there and must not retry it).
 #
 # Exit 0 with EMPTY output on any failure or where no external grammar
-# exists — the worker hook then falls back to the A1-node proxy
+# exists — the worker hook then falls back to ts-node-gap.sh (the
+# tree-sitter node-type coverage) and finally the A1-node proxy
 # (coverage-gap.sh). See PARSER_GAPS.md for the per-frontend status.
 set -u
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
