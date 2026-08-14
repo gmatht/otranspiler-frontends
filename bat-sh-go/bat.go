@@ -145,6 +145,9 @@ func splitSections(lines []string) (main []string, subs [][2]string, gotoTargets
 	// after the main flow's own `goto :eof` (t51 shift test).
 	start := 0
 	for bi, b := range bounds {
+		if start >= len(joined) {
+			break // a called section swallowed through EOF — nothing left
+		}
 		main = append(main, joined[start:b]...)
 		name := names[bi]
 		sectionEnd := len(joined)
@@ -158,6 +161,10 @@ func splitSections(lines []string) (main []string, subs [][2]string, gotoTargets
 			for end < len(bounds) && gotoTargets[names[end]] {
 				end++
 			}
+			// end == len(bounds) means the function swallows to EOF —
+			// RESET the earlier bounds[bi+1] default (the bug that left
+			// :loopargs' body empty when its loop label is the LAST section)
+			sectionEnd = len(joined)
 			if end < len(bounds) {
 				sectionEnd = bounds[end]
 			}
@@ -175,7 +182,6 @@ func splitSections(lines []string) (main []string, subs [][2]string, gotoTargets
 		main = append(main, bodyLines...)
 		start = sectionEnd
 	}
-	fmt.Fprintf(os.Stderr, "DBG bounds=%v names=%v called=%v gotoTargets=%v\n", bounds, names, called, gotoTargets)
 	if len(bounds) == 0 {
 		main = joined
 	} else {
