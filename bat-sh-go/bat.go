@@ -545,8 +545,18 @@ case "setlocal", "endlocal", "pause", "start", "pushd", "popd":
 			}
 			w = mapped
 		} else if wl == "find" && rest != "" {
-			// batch `find "text" files...` (literal-string search) -> grep -F
-			word, rest = "grep", "-F "+rest
+			// batch `find "text" files...` (literal-string search) -> grep -F.
+			// cmd strips the enclosing quotes from the search term when it
+			// builds the argv (`find "beta"` searches beta) — strip a
+			// leading quoted segment here too, or grep would match the
+			// literal quote characters and find nothing (t52 pipeline).
+			t := strings.TrimSpace(rest)
+			if strings.HasPrefix(t, "\"") {
+				if qe := strings.Index(t[1:], "\""); qe >= 0 {
+					t = t[1:1+qe] + t[1+qe+1:]
+				}
+			}
+			word, rest = "grep", "-F "+t
 		} else if wl == "robocopy" {
 			// robocopy SRC DST [file...] [options] — an approximation (like
 			// xcopy): /S /E -> cp -r; /MIR /PURGE -> rsync -a --delete
