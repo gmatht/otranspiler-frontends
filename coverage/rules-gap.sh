@@ -30,7 +30,17 @@ exclude() {
     [ -f "$e" ] || continue
     while IFS= read -r pat; do
       [ -n "$pat" ] || continue
-      grep -vF "$pat" "$tmp" > "$tmp.2" && mv "$tmp.2" "$tmp"
+      # grep exits 1 when the filter EMPTIES the list (no lines selected);
+      # `&& mv` would then discard the (empty) result and resurrect the
+      # pattern as a phantom gap every cycle (the last ledgered refusal
+      # could never be excluded — c-sh-go toplevelAsmArgument was
+      # re-issued 6 times despite 6 ledger entries). Apply the filter
+      # whenever grep wrote output, empty or not.
+      if grep -vF "$pat" "$tmp" > "$tmp.2" 2>/dev/null; then
+        mv -f "$tmp.2" "$tmp"
+      elif [ ! -s "$tmp.2" ]; then
+        mv -f "$tmp.2" "$tmp"
+      fi
     done < "$e"
   done
   # escalated contract gaps: skipped while the core-request is pending
