@@ -187,8 +187,10 @@ stdout example (t58–t68):
 - **Compound assignments** `*= /= %= <<= >>= &= |= ^=` (v1 had
   only `=`/`+=`/`-=`); also in for headers and function bodies.
 - **Prefix `++i` / `--i`** in statements and for headers (statement
-  position discards the value, so the lowering is `i = i +/- 1`;
-  prefix in EXPRESSION position still refuses).
+  position discards the value — the statement forms and the for-header
+  postfix now emit the A1 arith `IncDec` node directly (prefix/postfix
+  x +/-1, verified t94: gcc == estree); the for-header PREFIX and the
+  EXPRESSION-position forms keep the assignment/hoist lowering).
 - **Char literals** `'x'` — a 1-char STRING in the store (multi-char
   refuses). Char comparisons use the STRING test operators
   (`=`/`!=` via charVars + operandIsString) — `-eq` would coerce

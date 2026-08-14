@@ -589,6 +589,28 @@ func assignStmt(name string, expr any) map[string]any {
 	}
 }
 
+// incdecStmt — the A1 statement form of `i++` / `++i` / `i--` / `--i`:
+// a bare Expr(Arith(IncDec)) statement. The statement's value is
+// discarded, so the delta/prefix fields carry the whole semantics (the
+// core's ESTree renderer emits the native JS update expression; the sh
+// renderer rewrites via assignment). The expression-position forms
+// (printf args, conditions) still hoist to an increment statement +
+// plain var read — this is the faithful statement-level node.
+func incdecStmt(name string, delta int64, prefix bool) map[string]any {
+	return map[string]any{
+		"type": "Expr",
+		"expr": map[string]any{
+			"type": "Arith",
+			"ast": map[string]any{
+				"type":   "IncDec",
+				"var":    name,
+				"delta":  delta,
+				"prefix": prefix,
+			},
+		},
+	}
+}
+
 // valueNodeTyped — valueNode with the C 64-bit lowering: a 64-bit-
 // typed expression renders as the structured Arith node (BigInt in the
 // ESTree path) so printf %d/%lld args and assignments keep exact 64-bit
@@ -3984,8 +4006,10 @@ func (p *parser) forHeaderAssign() (any, error) {
 	}
 	name := p.next().text
 	if p.isOp("++") || p.isOp("--") {
-		// i++ / i-- — postfix increment, lowered to i = i +/- 1; a heap
-		// pointer advances its runtime position handle instead (slice 2)
+		// i++ / i-- — postfix increment, emitted as the A1 arith IncDec
+		// node (prefix:false — the value is the OLD value, irrelevant in
+		// statement position); a heap pointer advances its runtime
+		// position handle instead (slice 2)
 		op := p.next().text
 		if hp, ok := heapPtrs[name]; ok {
 			d := "1"
@@ -3994,11 +4018,11 @@ func (p *parser) forHeaderAssign() (any, error) {
 			}
 			return p.ptrAdvanceStmt(name, hp, d), nil
 		}
-		return p.buildAssign(name, "=", &expr{
-			kind: "bin", op: op[:1],
-			l: &expr{kind: "id", name: name},
-			r: &expr{kind: "num", num: "1"},
-		})
+		delta := int64(1)
+		if op == "--" {
+			delta = -1
+		}
+		return incdecStmt(name, delta, false), nil
 	}
 	if p.isAssignOp() {
 		op := p.next().text
@@ -4083,8 +4107,10 @@ func (p *parser) buildAssign(name, op string, e *expr) (any, error) {
 func (p *parser) simpleAssign() (any, error) {
 	if p.isOp("++") || p.isOp("--") {
 		// ++i / --i — prefix increment (v2; statement position discards
-		// the expression value, so the lowering is the same i = i +/- 1
-		// as the postfix statement form)
+		// the expression value). Emitted as the A1 arith IncDec node
+		// (prefix:true — the value is the NEW value, irrelevant here);
+		// the for-header and expression-position forms keep the
+		// assignment/hoist lowering.
 		op := p.next().text
 		nm := p.next()
 		if nm == nil || nm.kind != "id" {
@@ -4093,11 +4119,11 @@ func (p *parser) simpleAssign() (any, error) {
 		if err := p.expectOp(";"); err != nil {
 			return nil, err
 		}
-		return p.buildAssign(nm.text, "=", &expr{
-			kind: "bin", op: op[:1],
-			l: &expr{kind: "id", name: nm.text},
-			r: &expr{kind: "num", num: "1"},
-		})
+		delta := int64(1)
+		if op == "--" {
+			delta = -1
+		}
+		return incdecStmt(nm.text, delta, true), nil
 	}
 	if p.isOp("*") {
 		// *p = v — a store through the handle
@@ -4150,8 +4176,10 @@ func (p *parser) simpleAssign() (any, error) {
 	}
 	name := p.next().text
 	if p.isOp("++") || p.isOp("--") {
-		// x++ / x-- — postfix increment (lowered to x = x +/- 1); a heap
-		// pointer advances its runtime position handle instead (slice 2)
+		// x++ / x-- — postfix increment, emitted as the A1 arith IncDec
+		// node (prefix:false — the value is the OLD value, irrelevant in
+		// statement position); a heap pointer advances its runtime
+		// position handle instead (slice 2)
 		op := p.next().text
 		if err := p.expectOp(";"); err != nil {
 			return nil, err
@@ -4163,11 +4191,11 @@ func (p *parser) simpleAssign() (any, error) {
 			}
 			return p.ptrAdvanceStmt(name, hp, d), nil
 		}
-		return p.buildAssign(name, "=", &expr{
-			kind: "bin", op: op[:1],
-			l: &expr{kind: "id", name: name},
-			r: &expr{kind: "num", num: "1"},
-		})
+		delta := int64(1)
+		if op == "--" {
+			delta = -1
+		}
+		return incdecStmt(name, delta, false), nil
 	}
 	if p.isOp(".") {
 		// p.x = v — a struct member write (flattened dotted scalar; the
