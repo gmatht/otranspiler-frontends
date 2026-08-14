@@ -2,6 +2,21 @@
 
 C source -> A1 shIR JSON (the shell-flavored subset of C).
 
+## v5.1 — loop-carried div/mod accumulators on typed ints (2026-08-14), 99/99
+
+Gate fix for t47_digit_sum.c (a `while` loop carrying `sum = sum + n % 10`
+printed EMPTY instead of `30`). The core's i53 BigInt escalation
+(`analyze_big_i53`) widens a loop-carried var whose bound moves outward to
+the full ±i64 domain, so the Int32 `sum` was homed as BigInt; the `%` keeps
+the statement off the numeric lift, and the store path rendered pure BigInt
+arithmetic inside the runtime's `arithEval` boundary — which only accepted
+finite Numbers and corrupted the BigInt result to `''`. Fixed in the shared
+runtime: `arithEval` now stringifies BigInt values exactly (`String(6n)` =
+`"6"`; only NaN/±Infinity — the bash zero-divisor abort — map to `''`).
+The same fix landed independently for fish-sh-go (harness/sh2-namespace.mjs,
+commit 07b95f9f). Verified: c-sh-go 99/99, py-sh-go 77/77, go-sh 86/86,
+cpp-sh-go 10/17 (C-invariant green).
+
 ## v5 — typed integers: int / long long / unsigned / sizeof (2026-08-12), 80/80
 
 C's integer types no longer collapse into the widthless `Int`: the frontend
