@@ -26,7 +26,7 @@ var allowedKinds = map[string]bool{
 	// preprocessor (dropped for clib, like the tokenizer's behavior)
 	"preproc_include": true, "preproc_call": true, "preproc_def": true,
 	"preproc_if": true, "preproc_ifdef": true, "preproc_defined": true,
-	"preproc_elif": true, "preproc_else": true, "preproc_arg": true, "preproc_function_def": true,
+	"preproc_elif": true, "preproc_elifdef": true, "preproc_else": true, "preproc_arg": true, "preproc_function_def": true,
 	"preproc_params": true, "preproc_directive": true,
 	"system_lib_string": true, "string_content": true, "escape_sequence": true,
 	// declarations
