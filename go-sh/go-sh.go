@@ -1877,7 +1877,7 @@ func (p *parser) parseIf() []map[string]any {
 		p.skipNL()
 		cond = p.parseExpr() // err == nil / err != nil
 		neg := false
-		// err != nil → `test ! -f path` (the negated stat test). The
+		// err != nil → `test ! -e path` (the negated stat test). The
 		// condTestString prefix sniff alone would miss this polarity:
 		// `err != nil` renders as `"$?" -ne 0`, which has no "! "
 		// prefix, and the then-body would run on EXISTING files — the
