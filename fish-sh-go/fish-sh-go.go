@@ -1031,6 +1031,20 @@ func (p *parser) parseStage() ([]map[string]any, error) {
 		}
 		return []map[string]any{{"type": "Break"}}, nil
 	}
+	if name == "continue" {
+		// fish `continue` — skip the rest of the current iteration of the
+		// innermost loop. fish 3.x rejects any argument (`continue N` ->
+		// "unknown option"); bare `continue` is the whole construct.
+		// Lowered to the core's FIRST-CLASS A1 `Continue` node — the
+		// legacy `exec("continue")` Call form renders to a runtime
+		// CONTINUE throw that escapes the signal-catching loop helper
+		// (crash); the `Continue` node renders to sh2.continue(), which
+		// whileLoop/forLoop catch and turn into a skip.
+		if len(args) > 1 {
+			return nil, fmt.Errorf("line %d: continue: unknown option %q", args[1].line, args[1].text)
+		}
+		return []map[string]any{{"type": "Continue"}}, nil
+	}
 	// fish builtins with no external binary: lower to core A1 shapes (the
 	// bash analogs — see the header) or fall back to the generic exec.
 	if name == "math" || name == "string" || name == "count" {
