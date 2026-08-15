@@ -159,6 +159,11 @@ func lex(src string) ([]tok, error) {
 				two = src[i : i+2]
 			}
 			switch {
+			case three == "...":
+				// variadic marker — `int sum(int n, ...)`: one op, like
+				// clib's lexer (three separate `.` tokens would reassemble
+				// as `. . .` and break the user-func signature parse)
+				out = append(out, tok{"op", "..."}); i += 3
 			case three == "<=>":
 				out = append(out, tok{"op", "<=>"}); i += 3
 			case two == "::" || two == "->" || two == "<<=" || two == ">>=":
