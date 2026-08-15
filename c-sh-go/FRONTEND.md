@@ -2,6 +2,45 @@
 
 C source -> A1 shIR JSON (the shell-flavored subset of C).
 
+## v5.3 — phantom FAIL-FRONTEND-EMIT escalation + worker restore (2026-08-16), 103/103
+
+No frontend change: the 02:32 "failing to build" pi invocation was a
+PHANTOM escalation, not a regression. The gate passed 103/103 at 01:00
+and again at 02:31/02:36; every direct emit of the "failing" examples
+t76_prefix_expr.c / t79_switch_midbreak.c passes (including the exact
+triage emit path: --shir --raw → outparam transform → debashc ingress).
+
+Root cause chain (all outside this dir, fixed in harness/triage.sh):
+
+- The estree worker's pair-verification calls ran the triage single-pair
+  mode with the ARGS SWAPPED (`triage.sh <fe> <backend> <example>`), so
+  the "example" path resolved to `testdata/<backend>` (no such file) and
+  the emit "failure" recorded FAIL-FRONTEND-EMIT rows in a SWAPPED
+  layout (fe, ex, be instead of fe, be, ex) — c-sh-go t76/t79, cpp-sh-go
+  t04, powershell-sh-go t02/t10/t26, zig-sh-go t01/t03/t13, at
+  02:26/02:44/02:57 on 2026-08-16.
+- The sweep's stale-refusal self-heal purge keys on the example in $3,
+  so the swapped rows could NEVER be purged by any successful sweep
+  (each sweep re-emitted the examples fine — t76/t79 were even
+  re-classified PASS), and the cycle diff kept seeing the phantom keys
+  as status changes → `--pi-fix-frontend c-sh-go`.
+- Compounding: the c-sh-go worker + its supervisor (pid 747085) died
+  ~01:00 right after the 00:58 gate PASS (no GREEN logged), so no
+  worker was running when the escalation fired; the triage takeover
+  skips gates with no scope changes.
+
+Hardening (harness/triage.sh, both directions):
+
+- Single-pair mode now REFUSES a nonexistent example file (exit 2, no
+  row written) — the wrong-arg-order call can never poison verdicts.tsv
+  again.
+- The sweep's purge also matches the swapped legacy layout ($2==ex), so
+  any pre-existing artifact rows self-heal on the next successful emit.
+- The 35 swapped-schema rows were removed from triage/verdicts.tsv;
+  c-sh-go now has zero FAIL-FRONTEND-EMIT rows and the newest t76/t79
+  rows are PASS. The worker supervisor was restored (03:22) and the
+  gate re-verified 103/103.
+
 ## v5.2 — system-wide transient gate guard (2026-08-15), 103/103
 
 No frontend change: the 17:23 gate FAIL (0/103 match, every transpiled
