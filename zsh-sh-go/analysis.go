@@ -605,6 +605,10 @@ func walkExprN(e Expr, ctx *liftCtx) {
 		for _, st := range t.Body {
 			walkStmtN(st, ctx)
 		}
+	case *CaptureE:
+		// mirror the core's numeric/string lift walk_expr Capture arm:
+		// the captured command's body is walked with in_copy unchanged
+		walkExprN(t.Expr, ctx)
 	case *InterpE:
 		for _, p := range t.Parts {
 			if !p.IsLit {
@@ -947,6 +951,12 @@ func stringLiftVars(stmts []Stmt, numeric map[string]bool) map[string]bool {
 							ok = true
 						}
 					}
+				case *CaptureE:
+					// `x=$(cmd)` — command substitution ALWAYS yields a string
+					// (mirror the core's string-lift Capture arm)
+					if _, ok2 := t.Expr.(*ArrowE); ok2 {
+						ok = true
+					}
 				}
 				if !ok {
 					allString = false
@@ -1001,6 +1011,9 @@ func loopVarRefs(stmts []Stmt, num, str map[string]bool) (map[string]bool, map[s
 			if !containsStr(stack, t.Name) {
 				external[t.Name] = true
 			}
+		case *CaptureE:
+			// capture is a COPY region (mirror ref_expr: in_copy = true)
+			refExpr(t.Expr, stack, true)
 		case *CallE:
 			if t.Func == "getVar" && len(t.Args) == 1 {
 				if n, ok := t.Args[0].(*StrE); ok && !containsStr(stack, n.Value) {
@@ -1300,6 +1313,8 @@ func rewriteExprArithIdent(e Expr, var_ *string) {
 		for _, a := range t.Args {
 			rewriteExprArithIdent(a, var_)
 		}
+	case *CaptureE:
+		rewriteExprArithIdent(t.Expr, var_)
 	case *ArrayE:
 		for _, el := range t.Elems {
 			rewriteExprArithIdent(el, var_)
@@ -1549,6 +1564,10 @@ func exprStrLen(e Expr, lens map[string]*uint64, cap uint64) *uint64 {
 			return nil
 		}
 		return nil
+	case *CaptureE:
+		// a capture's bound depends on the CAPTURED COMMAND (mirror the
+		// core's expr_len Capture arm → capture_bound)
+		return captureBound(t.Expr, lens, cap)
 	case *BinOpE:
 		switch t.Op {
 		case "Concat": // a . b = max(a)+max(b)
@@ -2006,6 +2025,8 @@ func walkExprConst(e Expr, acc *varConstAcc, multiRun bool) {
 		for _, st := range t.Body {
 			walkStmtConst(st, acc, multiRun)
 		}
+	case *CaptureE:
+		walkExprConst(t.Expr, acc, multiRun)
 	case *CallE:
 		if t.Func == "setVar" || t.Func == "setArray" {
 			if len(t.Args) == 2 {
@@ -2378,6 +2399,10 @@ func walkExprLife(e Expr, pos int, acc *lifetimeAcc, inClosure bool) {
 				walkExprLife(p.Expr, pos, acc, inClosure)
 			}
 		}
+	case *CaptureE:
+		// the captured command runs in a child process; its arg vars
+		// are uses (alive at the call), not escapes (mirror lifetime.rs)
+		walkExprLife(t.Expr, pos, acc, inClosure)
 	case *ArrayE:
 		for _, el := range t.Elems {
 			walkExprLife(el, pos, acc, inClosure)
@@ -2449,6 +2474,8 @@ func markVarsEscape(e Expr, acc *lifetimeAcc) {
 	case *ArrowE:
 		// a closure stores its whole environment
 		markStmtsVarsEscape(t.Body, acc)
+	case *CaptureE:
+		markVarsEscape(t.Expr, acc)
 	case *ArrayE:
 		for _, el := range t.Elems {
 			markVarsEscape(el, acc)
@@ -2856,18 +2883,16 @@ func nospaceExpr(e Expr, verdicts map[string]bool) bool {
 			return false
 		case "arith":
 			return true // the numeric result
-		case "capture":
-			// command substitution: provably whitespace-free output
-			if len(t.Args) > 0 {
-				if a, ok := t.Args[0].(*ArrowE); ok {
-					return lastStageTrDeletesIFS(a.Body)
-				}
-			}
-			return false
 		case "param":
 			// ${x}, ${x:-d}, … — the result is built from the var value
 			// and the literal/default parts; tag only the pure-read forms
 			return paramNospace(t.Args, verdicts)
+		}
+		return false
+	case *CaptureE:
+		// command substitution: provably whitespace-free output
+		if a, ok := t.Expr.(*ArrowE); ok {
+			return lastStageTrDeletesIFS(a.Body)
 		}
 		return false
 	}
@@ -3050,6 +3075,8 @@ func foldExpr(e Expr) Expr {
 		return out
 	case *ArrowE:
 		return &ArrowE{Body: foldStmts(t.Body)}
+	case *CaptureE:
+		return &CaptureE{Expr: foldExpr(t.Expr), Native: t.Native}
 	}
 	return e
 }
@@ -3127,6 +3154,12 @@ func exprJSON(e Expr) map[string]interface{} {
 		return map[string]interface{}{
 			"type": "BinOp", "op": t.Op,
 			"lhs": exprJSON(t.Lhs), "rhs": exprJSON(t.Rhs),
+		}
+	case *CaptureE:
+		return map[string]interface{}{
+			"type":   "Capture",
+			"expr":   exprJSON(t.Expr),
+			"native": t.Native,
 		}
 	}
 	return map[string]interface{}{"type": "Unsupported"}
@@ -3231,6 +3264,10 @@ func stmtJSON(s Stmt) map[string]interface{} {
 			v = exprJSON(t.Value)
 		}
 		return map[string]interface{}{"type": "Return", "value": v}
+	case *BreakS:
+		return map[string]interface{}{"type": "Break", "runs": provablyRunningLoops[s]}
+	case *ContinueS:
+		return map[string]interface{}{"type": "Continue", "runs": provablyRunningLoops[s]}
 	case *CaseS:
 		var clauses []interface{}
 		for _, cl := range t.Clauses {

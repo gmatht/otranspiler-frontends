@@ -42,6 +42,16 @@ type BinOpE struct {
 	Lhs, Rhs Expr
 }
 
+// CaptureE — the first-class A1 Capture node (mirror IrExpr::Capture;
+// core request zsh-sh-go-20260814-230503): `$(...)`/backticks lower to
+// `Capture { expr: Arrow, native: false }` instead of the opaque
+// `call("capture")` — the contract node whose analysis arms all exist
+// in the core (expr_len, nospace, lifetimes, lifts, ...).
+type CaptureE struct {
+	Expr   Expr
+	Native bool
+}
+
 type Stmt interface{}
 
 type AssignS struct {
@@ -86,6 +96,14 @@ type FunctionS struct {
 	Name string
 	Body []Stmt
 }
+
+// BreakS / ContinueS — first-class A1 nodes (core requests
+// zsh-sh-go-20260814-225040 / zsh-sh-go-20260815-015459 [Break] and
+// zsh-sh-go-20260813-003026 [Continue]): statement-position `break` /
+// `continue` lower to these instead of the opaque `call("break")` /
+// `call("continue")` forms (which remain only in expression context).
+type BreakS struct{}
+type ContinueS struct{}
 type ReturnS struct{ Value Expr } // nil → null
 type CaseS struct {
 	Disc    Expr
@@ -1108,13 +1126,13 @@ func partIR(part *Part, cmds map[string][]*Command) Expr {
 		return arithWordIR(part.ArithRaw)
 	case part.CSRaw != "":
 		if part.CSCmd != nil {
-			return call("capture", []Expr{&ArrowE{Body: commandArrowStmts([]*Command{part.CSCmd})}})
+			return &CaptureE{Expr: &ArrowE{Body: commandArrowStmts([]*Command{part.CSCmd})}, Native: false}
 		}
 		body, ok := parseCmdList(part.CSRaw)
 		if !ok {
 			return st("$(" + part.CSRaw + ")")
 		}
-		return call("capture", []Expr{&ArrowE{Body: commandArrowStmts(body)}})
+		return &CaptureE{Expr: &ArrowE{Body: commandArrowStmts(body)}, Native: false}
 	case part.MapKind == "access":
 		if slice, ok := zshSliceKey(part.MapName, part.MapKey); ok {
 			return call("join", []Expr{slice})
@@ -1323,13 +1341,13 @@ func wordIR(w *Word, cmds map[string][]*Command) Expr {
 func wordIRQuoted(w *Word, cmds map[string][]*Command) Expr {
 	if w.Kind == "cs" {
 		if w.CSCmd != nil {
-			return call("capture", []Expr{&ArrowE{Body: commandArrowStmts([]*Command{w.CSCmd})}})
+			return &CaptureE{Expr: &ArrowE{Body: commandArrowStmts([]*Command{w.CSCmd})}, Native: false}
 		}
 		body, ok := parseCmdList(w.Raw)
 		if !ok {
 			body = echoPlaceholder(w.Raw)
 		}
-		return call("capture", []Expr{&ArrowE{Body: commandArrowStmts(body)}})
+		return &CaptureE{Expr: &ArrowE{Body: commandArrowStmts(body)}, Native: false}
 	}
 	return wordIR(w, cmds)
 }
@@ -2177,7 +2195,7 @@ func commandArrowStmts(cmds []*Command) []Stmt {
 	for _, c := range cmds {
 		switch c.Kind {
 		case "simple", "builtin", "test", "redirect", "pipeline", "and", "or",
-			"not", "assign", "arith", "break", "continue":
+			"not", "assign", "arith":
 			out = append(out, &ExprS{Expr: commandToIR(c)})
 		default:
 			if s := stmtForCommand(c); s != nil {
@@ -2254,6 +2272,12 @@ func commandToIR(cmd *Command) Expr {
 		return notIR(commandToIR(cmd.BodyCmds[0]))
 	case "assign":
 		return assignmentExprIR(cmd)
+	case "break":
+		// expression context (an `&&`/`||`/`!` operand): the core keeps
+		// the opaque call forms here (command_to_ir Break/Continue arms)
+		return call("break", []Expr{})
+	case "continue":
+		return call("continue", []Expr{})
 	case "arith":
 		// (( expr )) — mirror command_to_ir: an Assignment loses the
 		// side effect in expression context (assignment_expr_ir — the
@@ -2282,9 +2306,15 @@ func stmtForCommand(cmd *Command) Stmt {
 		}
 		return &RedirectS{Inner: []Stmt{&ExprS{Expr: e}}, Redirects: redirectsIR(cmd.Redirect)}
 	case "break":
-		return &ExprS{Expr: call("break", []Expr{})}
+		// first-class A1 nodes (core requests zsh-sh-go-20260814-225040 /
+		// zsh-sh-go-20260815-015459 [Break] and zsh-sh-go-20260813-003026
+		// [Continue]): every renderer lowers IrStmt::Break/IrStmt::Continue
+		// to the SAME runtime calls as the legacy call forms; the level
+		// argument is dropped exactly as before (the A1 nodes have no
+		// level field)
+		return &BreakS{}
 	case "continue":
-		return &ExprS{Expr: call("continue", []Expr{})}
+		return &ContinueS{}
 	case "return":
 		var val Expr
 		if cmd.RetVal != nil {

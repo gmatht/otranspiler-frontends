@@ -36,6 +36,13 @@ zsh-specific coverage beyond the POSIX-shaped core of the corpus:
 - `f() {` function bodies (whitespace before the brace)
 - heredocs (`cat <<EOF`, `<<-`, `<<<`, quoted delimiters)
 - `export X=v`, `local y=5`, positional `$1`, `$?`, multi-assign
+- first-class A1 nodes where the core has them: `$(...)`/backticks lower
+  to `Capture { expr: Arrow, native: false }` (core request
+  zsh-sh-go-20260814-230503), and statement-position `break`/`continue`
+  to the `Break`/`Continue` stmt nodes (requests -20260814-225040 /
+  -20260815-015459 / -20260813-003026) — `&&`/`||`/`!` operands keep
+  the opaque `call("break")`/`call("continue")` forms, mirroring the
+  core's expression-context arms
 
 `make test` is the BYTE-EQUALITY ORACLE vs the core (the A1 contract);
 the shir-emit-go package (frontends/shir-emit-go/) is the shared emitter.
