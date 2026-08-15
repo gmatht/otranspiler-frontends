@@ -1018,6 +1018,19 @@ func (p *parser) parseStage() ([]map[string]any, error) {
 		}
 		return []map[string]any{{"type": "Return", "value": value}}, nil
 	}
+	if name == "break" {
+		// fish `break` — halt the innermost loop. fish 3.x rejects any
+		// argument (`break N` -> "unknown option"); bare `break` is the
+		// whole construct. Lowered to the core's FIRST-CLASS A1 `Break`
+		// node — the legacy `exec("break")` Call form renders to
+		// sh2.builtin("break"), whose BREAK throw escapes a native JS
+		// while (crash); the `Break` node renders to sh2.break() and the
+		// loop renderer switches to the signal-catching runtime helper.
+		if len(args) > 1 {
+			return nil, fmt.Errorf("line %d: break: unknown option %q", args[1].line, args[1].text)
+		}
+		return []map[string]any{{"type": "Break"}}, nil
+	}
 	// fish builtins with no external binary: lower to core A1 shapes (the
 	// bash analogs — see the header) or fall back to the generic exec.
 	if name == "math" || name == "string" || name == "count" {
