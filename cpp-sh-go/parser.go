@@ -33,6 +33,7 @@ var allowedKinds = map[string]bool{
 	"declaration": true, "init_declarator": true, "function_definition": true,
 	"declaration_list": true, "field_declaration": true,
 	"field_declaration_list": true, "field_identifier": true,
+	"static_assert_declaration": true, // compile-time only — dropped before clib sees it (main.go dropStaticAssert)
 	// types
 	"primitive_type": true, "sized_type_specifier": true, "type_identifier": true,
 	"struct_specifier": true, "pointer_declarator": true, "array_declarator": true,

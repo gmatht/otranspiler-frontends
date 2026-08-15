@@ -219,6 +219,12 @@ func translate(toks []tok) ([]tok, error) {
 			}
 			out = append(out, n...)
 			i = ni
+		case "static_assert":
+			ti, err := dropStaticAssert(toks, i)
+			if err != nil {
+				return nil, err
+			}
+			i = ti
 		default:
 			out = append(out, t)
 			i++
@@ -285,6 +291,40 @@ func desugarNew(toks []tok, i int) ([]tok, int, error) {
 	}
 	out := []tok{{"id", "malloc"}, {"op", "("}, {"id", "sizeof"}, {"op", "("}, {"id", typ}, {"op", ")"}, {"op", ")"}}
 	return out, j, nil
+}
+
+// dropStaticAssert — `static_assert(cond[, "msg"]);` is a compile-time
+// assertion: it has NO runtime effect (the program only compiles when
+// the condition holds), so the declaration is dropped from the token
+// stream before clib sees the C text — exactly like the preprocessor
+// lines the lexer skips (t20–t26): the runtime program carries no
+// trace, and clib must never see the keyword (it is not C). Tokens are
+// safe to scan: strings are single tokens, so a `;` inside the message
+// cannot end the scan early. `ti` is the index just past the `;`.
+func dropStaticAssert(toks []tok, i int) (int, error) {
+	j := i + 1
+	if j >= len(toks) || toks[j].text != "(" {
+		return 0, fmt.Errorf("unsupported C++: malformed static_assert")
+	}
+	depth := 0
+	for ; j < len(toks); j++ {
+		switch toks[j].text {
+		case "(":
+			depth++
+		case ")":
+			depth--
+			if depth == 0 {
+				j++
+				goto closed
+			}
+		}
+	}
+	return 0, fmt.Errorf("unsupported C++: unterminated static_assert")
+closed:
+	if j < len(toks) && toks[j].text == ";" {
+		return j + 1, nil
+	}
+	return 0, fmt.Errorf("unsupported C++: malformed static_assert (missing ;)")
 }
 
 // desugarDelete — `delete[] p` / `delete p` → `free(p)`.
