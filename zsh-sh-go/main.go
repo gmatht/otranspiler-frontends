@@ -993,6 +993,27 @@ func parsePEContent(content string) *Word {
 			if sp := strings.Index(rest, ":"); sp >= 0 {
 				return &Word{Kind: "pe", PEVar: content[:cp], PEOp: "slice", PEExtra: []string{rest[:sp], rest[sp+1:]}}
 			}
+			// zsh `:modifier` forms (t70/t71): a bare single letter with NO
+			// length is a zsh case/path modifier — `${x:l}` lowercase,
+			// `${x:u}` uppercase, `${x:t}` basename, `${x:h}` dirname — never
+			// a bash slice. Emit the core's unambiguous ops (`^^`/`,,` from
+			// bash `${x^^}`/`${x,,}`, the `##*/`/`%/*` basename/dirname ops)
+			// so EVERY backend renders zsh semantics: the A1 must not depend
+			// on the JS runtime's zsh-mode source-extension hack (triage's
+			// estree reference runs without --source and mis-renders
+			// `param("slice", x, "l", "")` — the t70/t71 FAIL-FRONTEND
+			// escalations). Byte-equality vs the core's bash parse (slice)
+			// is waived for these files (harness/zsh-subscript.ere).
+			switch rest {
+			case "l":
+				return peWord(content[:cp], ",,")
+			case "u":
+				return peWord(content[:cp], "^^")
+			case "t":
+				return peWord(content[:cp], "basename")
+			case "h":
+				return peWord(content[:cp], "dirname")
+			}
 			return &Word{Kind: "pe", PEVar: content[:cp], PEOp: "slice", PEExtra: []string{rest, ""}}
 		}
 	}
