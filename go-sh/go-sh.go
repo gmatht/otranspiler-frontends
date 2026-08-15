@@ -264,10 +264,18 @@ func arithVar(name string) map[string]any {
 	return map[string]any{"type": "Var", "name": name}
 }
 func arithBin(lhs map[string]any, op string, rhs map[string]any) map[string]any {
-	return map[string]any{
-		"type": "Arith",
-		"ast":  map[string]any{"type": "Bin", "lhs": lhs, "op": op, "rhs": rhs},
-	}
+	// a BARE Bin node — the core's Arith ast tree has bare children
+	// (`ast.Bin.lhs/rhs` are Num/Bin/Var nodes, not nested Arith
+	// wrappers); the single top-level "Arith" wrapper is applied by
+	// arithWrap at the expression boundary
+	return map[string]any{"type": "Bin", "lhs": lhs, "op": op, "rhs": rhs}
+}
+
+// arithWrap: the one top-level wrapper the A1 contract expects
+// (`{"type":"Arith","ast":<bare tree>}`) — deserializer rejects an
+// "Arith" nested inside a Bin's lhs/rhs.
+func arithWrap(ast map[string]any) map[string]any {
+	return map[string]any{"type": "Arith", "ast": ast}
 }
 func paramCall(args ...string) map[string]any {
 	a := make([]any, len(args))
@@ -1377,7 +1385,7 @@ func (p *parser) parseAssignStmt() []map[string]any {
 		}
 		p.registerVar(targets[0], "Int")
 		return []map[string]any{assignStmt(targets[0],
-			arithBin(arithVar(targets[0]), "+", arithNum(1)))}
+			arithWrap(arithBin(arithVar(targets[0]), "+", arithNum(1))))}
 	}
 	op := ""
 	switch {
@@ -1629,7 +1637,7 @@ func (p *parser) parseAssignStmt() []map[string]any {
 	if op == "+=" {
 		p.registerVar(targets[0], "Int")
 		return []map[string]any{assignStmt(targets[0],
-			arithBin(arithVar(targets[0]), "+", p.exprToArith(rhs)))}
+			arithWrap(arithBin(arithVar(targets[0]), "+", p.exprToArith(rhs))))}
 	}
 	// inside a func: `name := lit` on a fresh var → local name=lit
 	if p.inFunc && op == ":=" && !p.fnParams[targets[0]] && !p.outer[targets[0]] && !p.fnLocals[targets[0]] {
@@ -1857,7 +1865,7 @@ func (p *parser) parseFor() []map[string]any {
 		postName := p.expect(tIdent, "").text
 		p.expect(tPunct, "++")
 		post := []map[string]any{assignStmt(postName,
-			arithBin(arithVar(postName), "+", arithNum(1)))}
+			arithWrap(arithBin(arithVar(postName), "+", arithNum(1))))}
 		body := p.parseBlockStmts()
 		// `i := N; i <= M; i++` (or `i < M`) → the core's ForInit shape
 		// (byte-identical to the `for ((i=N; i<=M; i++))` lowering in
@@ -2523,7 +2531,7 @@ func (p *parser) arithOrConcat(e *expr) map[string]any {
 		p.addConcatParts(e, &parts)
 		return interpParts(parts)
 	}
-	return p.exprToArith(e)
+	return arithWrap(p.exprToArith(e))
 }
 
 // addHasString: does this add chain involve a string anywhere? (An
