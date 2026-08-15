@@ -38,6 +38,7 @@ var allowedKinds = map[string]bool{
 	"primitive_type": true, "sized_type_specifier": true, "type_identifier": true,
 	"struct_specifier": true, "pointer_declarator": true, "array_declarator": true,
 	"function_declarator": true, "parameter_list": true, "parameter_declaration": true,
+	"variadic_parameter_declaration": true, "variadic_declarator": true, // `int ...` typed variadic — the type word is dropped before clib sees it (main.go translate)
 	"parenthesized_declarator": true, "abstract_pointer_declarator": true,
 	"type_qualifier": true, "storage_class_specifier": true,
 	// statements

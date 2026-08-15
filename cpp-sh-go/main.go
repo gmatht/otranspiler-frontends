@@ -231,11 +231,34 @@ func translate(toks []tok) ([]tok, error) {
 			}
 			i = ti
 		default:
+			// typed variadic parameter — `int ...` (tree-sitter's
+			// variadic_parameter_declaration; the GNU-extension form g++
+			// accepts, pinned by t33_variadic_param.cc): the type
+			// specifier is redundant — the shared clib lowering knows
+			// only the bare `...` varargs marker — so drop a scalar type
+			// keyword that directly precedes the marker and let the
+			// reconstructed C text match t32's plain form.
+			if isScalarTypeWord(t) && i+1 < len(toks) && toks[i+1].text == "..." {
+				i++
+				continue
+			}
 			out = append(out, t)
 			i++
 		}
 	}
 	return out, nil
+}
+
+// isScalarTypeWord — the scalar type keywords clib's signature parser
+// accepts (c-sh-go main.go). Only these are dropped before a `...`
+// marker: a non-type identifier before `...` is never valid syntax, and
+// the drop stays bounded to type words.
+func isScalarTypeWord(t tok) bool {
+	switch t.text {
+	case "int", "char", "double", "float", "void", "long", "unsigned", "signed", "short":
+		return true
+	}
+	return false
 }
 
 // desugarNew — `new T` → `malloc(sizeof(T))`, `new T[N]` → `malloc(N *
