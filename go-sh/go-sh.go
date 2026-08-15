@@ -998,6 +998,30 @@ func (p *parser) parseTopLevel() []map[string]any {
 			p.fnParams, p.fnParamOrd, p.fnLocals, p.inFunc = saveParams, saveOrd, saveLocals, saveIn
 			p.fnNames[nm] = true
 			out = append(out, map[string]any{"type": "Function", "name": nm, "body": body})
+		case p.atIdent("type"):
+			// `type Name interface{}` — an EMPTY interface type decl:
+			// compile-time only, erased under the type-position erasure
+			// contract (t80/t82/t84/t85 — shell has no interface values;
+			// the app's `type Expr interface{}` AST-node declarations).
+			// A non-empty interface body (method dispatch) and other type
+			// decls (structs — the core-requests
+			// go-sh-dogfood-20260815 §3 boundary) stay refused loudly.
+			p.pos++
+			p.skipNL()
+			p.expect(tIdent, "") // Name
+			p.skipNL()
+			if p.atIdent("interface") {
+				p.pos++
+				p.skipNL()
+				p.expect(tPunct, "{")
+				p.skipNL()
+				if p.atPunct("}") {
+					p.pos++
+					break
+				}
+				p.failf("interface methods unsupported (v2) — method dispatch is a contract boundary")
+			}
+			p.failf("type decls are outside the subset (v2) — struct/interface types have no A1 shape")
 		default:
 			out = append(out, p.parseStmt()...)
 		}
@@ -1087,6 +1111,23 @@ func (p *parser) parseVarDecl() []map[string]any {
 		// name may be followed by `=` (the initializer) or end the line.
 		if t.kind == tIdent && (p.toks[p.pos+1].kind != tPunct || p.toks[p.pos+1].text == "=") {
 			p.pos++ // plain type ident
+			continue
+		}
+		// `interface{}` — the empty interface type (the erasure contract
+		// t80/t82/t84/t85: shell has no interface values; the type is
+		// erased and the value is only ever nil-checked or stored as its
+		// underlying value). A non-empty body (methods) is method
+		// dispatch — refused.
+		if t.kind == tIdent && t.text == "interface" {
+			p.pos++
+			p.skipNL()
+			p.expect(tPunct, "{")
+			p.skipNL()
+			if !p.atPunct("}") {
+				p.failf("interface methods unsupported (v2) — method dispatch is a contract boundary")
+			}
+			p.pos++ // }
+			p.skipNL()
 			continue
 		}
 		if t.kind == tPunct && (t.text == "[" || t.text == "*") {
@@ -2382,11 +2423,23 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 			// Join(arr[lo:hi], " ") → ${arr[@]:lo:len} joined with a space
 			// — exactly the A1 join(param("slice", …)) shape (the runtime
 			// joins arrays with " ", matching Go's space separator).
-			if len(e.args) == 2 && e.args[1].kind == "str" && e.args[1].text == " " &&
-				e.args[0].kind == "slice" && e.args[0].target != nil && e.args[0].target.kind == "var" {
-				return p.sliceWord(e.args[0])
+			if len(e.args) == 2 && e.args[1].kind == "str" && e.args[1].text == " " {
+				if e.args[0].kind == "slice" && e.args[0].target != nil && e.args[0].target.kind == "var" {
+					return p.sliceWord(e.args[0])
+				}
+				// Join(arr, " ") on a FULL array → the `${arr[@]}` join
+				// shape (join(param("slice", name, "@", "")) — the runtime's
+				// arrayItems + space join; the app's
+				// `strings.Join(redirects, " ")` form).
+				if e.args[0].kind == "var" && p.varTypes[e.args[0].name] == "Array" {
+					return joinCall(paramCall("slice", e.args[0].name, "@", ""))
+				}
 			}
-			p.failf(`strings.Join needs (arr[lo:hi], " ") (v2)`)
+			// Any other separator ("\n" — the app's dominant form,
+			// bat-sh-go's `strings.Join(bodyLines, "\n")`) has no
+			// separator arg on the A1 join — declared boundary
+			// (core-requests go-sh-dogfood-20260815 §8); refuse loudly.
+			p.failf(`strings.Join needs (arr[lo:hi]|arr, " ") (v2)`)
 		case "filepath.Dir", "filepath.Ext":
 			// Pure path ops on string literals — folded at emit time with
 			// exact Go stdlib semantics (t55).
@@ -2431,7 +2484,29 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 			if w, ok := foldPureLiteralCall(e.callee, e.args); ok {
 				return strExpr(w)
 			}
-			p.failf("fmt.Sprintf needs literal args (v2)")
+			// Var-arg Sprintf with a LITERAL format → the command-
+			// substitution shape `$(printf FMT ARGS...)` —
+			// capture(Arrow[exec printf …]): the value twin of the
+			// fmt.Printf statement path (printfStmt delegates the same
+			// format verbs to the runtime printf; t46), and the A1's
+			// capture of an Emulable printf is the shell-flavored
+			// formatted-string value. A NON-literal format (a var
+			// format, `args...` variadics — the app's go-sh.go failf)
+			// stays refused: the format string is the verb contract.
+			if len(e.args) >= 2 && e.args[0].kind == "str" {
+				var words []map[string]any
+				words = append(words, interpLit(e.args[0].raw))
+				for _, a := range e.args[1:] {
+					words = append(words, p.exprToWord(a))
+				}
+				inner := execStmt("printf", words, "Emulable")
+				return map[string]any{
+					"type": "Call", "func": "capture",
+					"args":   []any{map[string]any{"type": "Arrow", "body": []any{inner}}},
+					"purity": "Spawn",
+				}
+			}
+			p.failf("fmt.Sprintf needs a literal format (v2)")
 		}
 		// sc.Text() inside a scanner read-loop → the read var
 		if strings.HasSuffix(e.callee, ".Text") {
