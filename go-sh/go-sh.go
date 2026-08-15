@@ -1007,6 +1007,15 @@ func (p *parser) parseStmt() []map[string]any {
 	case "return":
 		p.pos++
 		return []map[string]any{p.returnToStmt(p.parseExpr())}
+	case "continue":
+		// A1 Continue node (mirrors Command::Continue(None) in the core):
+		// a bare `continue` inside a loop body. Labeled `continue L` is
+		// refused (the A1 node has no label/level field).
+		p.pos++
+		if p.tok().kind == tIdent {
+			p.failf("labeled continue unsupported (v2)")
+		}
+		return []map[string]any{{"type": "Continue"}}
 	case "go":
 		return p.parseGo()
 	case "var":
