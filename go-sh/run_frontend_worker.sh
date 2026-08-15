@@ -1,5 +1,16 @@
 #!/usr/bin/env bash
-# go-sh scoped worker — FAILURE-DRIVEN.
+# go-sh scoped worker — FAILURE-DRIVEN (TRANSLATE_ONE_APPLICATION playbook:
+# source-frontend worker for the Go→JS dog-food).
+#   gate    = make test (A1-ingress + frontend-stdout oracle) AND
+#             fail-go --gate (the standing Go→JS end-to-end gate over the
+#             corpus ladder; --rust verdicts and --app integration on the
+#             same oracle)
+#   red     → setup_backends.sh --pi-fix-frontend go-sh (cheap fast agent,
+#             scoped prompt, xhigh thinking)
+#   3 reds  → --worker-trapped go-sh frontend (structured core request) +
+#             sleep; never bless a regression (the whole gate re-runs
+#             before any commit)
+#   commit  = frontends/go-sh/ + harness/ + fail-go + templates/go/ only.
 set -euo pipefail
 cd "$(dirname "$0")"
 WORKSPACE="$(cd ../.. && pwd)"
@@ -12,16 +23,16 @@ fail_count=0
 while true; do
   bash "$WORKSPACE/setup_backends.sh" --wait >> "$LOG" 2>&1 || true
   echo "[$(date +%FT%T)] go-sh: gate run" >> "$LOG"
-  if make test >> "$LOG" 2>&1; then
+  if make test >> "$LOG" 2>&1 && bash "$WORKSPACE/fail-go" --gate >> "$LOG" 2>&1; then
     fail_count=0
     changes=$(git -C "$WORKSPACE" status --porcelain 2>/dev/null \
               | awk '/^.. /{print $2}' \
-              | awk -v d="${PWD#$WORKSPACE/}" '$0 ~ "^"d"/" || $0 ~ /^harness\//' || true)
+              | awk -v d="${PWD#$WORKSPACE/}" '$0 ~ "^"d"/" || $0 ~ /^harness\// || $0 ~ /^fail-go$/ || $0 ~ /^templates\/go\//' || true)
     if [ -n "$changes" ]; then
       git -C "$WORKSPACE" add $changes 2>/dev/null || true
       git -C "$WORKSPACE" commit -m "frontend go-sh: gate green" >> "$LOG" 2>&1 || true
     fi
-    echo "[$(date +%FT%T)] go-sh: gate GREEN" >> "$LOG"
+    echo "[$(date +%FT%T)] go-sh: gate GREEN (make test + fail-go)" >> "$LOG"
     bash "$WORKSPACE/frontends/coverage/worker-coverage-step.sh" go-sh "$LOG" >> "$LOG" 2>&1 || true
   else
     fail_count=$((fail_count+1))
