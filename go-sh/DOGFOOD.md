@@ -18,8 +18,21 @@ native behavior (`go run`). The gates:
 |---|---|
 | corpus Go→JS (`fail-go`) | **88/88** |
 | corpus Go→Rust (`fail-go --rust`) | 41/88 (rust backend `sh2.*` stubs: assoc arrays, argv, etc. — backend gap, per-target) |
-| golib construct ladder (mined, 16 probes) | 15/16 (1 documented nondeterministic) |
+| Go idiom ladder (46 templates, mined from the app + seeded) | 41/46 (4 contract boundaries + 1 documented nondeterministic) |
 | app integration (the CLI, `fail-go --app`) | red — EMIT-FAIL (frontier, see below) |
+
+### New idioms mined from the app (this pass)
+
+From the go-sh frontend's own code (`break` ×21, `strings.Builder` ×2,
+`err`-target Atoi, nil checks, return values, continue): **6 atoms went
+PASS** after in-scope frontend fixes (go-sh.go): `break` → A1 Break node,
+`strings.Builder` → the buffer accumulator (mirroring bytes.Buffer),
+`n, err := strconv.Atoi(...)` → the `err` target skipped. Probes:
+`break_loop`, `builder`, `continue_loop`, `err_check`, `nil_check`,
+`return_val` — all green, in the ladder. Four constructs are contract
+boundaries escalated to `core-requests/go-sh-dogfood-20260815-contract-boundaries.md`:
+index+value range (`for i, s := range` — needs an index-binding For),
+higher-order funcs, structs/methods, `strings.Index` position values.
 
 ## The app's construct footprint
 
