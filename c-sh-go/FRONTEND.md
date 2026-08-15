@@ -2,6 +2,27 @@
 
 C source -> A1 shIR JSON (the shell-flavored subset of C).
 
+## v5.2 — system-wide transient gate guard (2026-08-15), 103/103
+
+No frontend change: the 17:23 gate FAIL (0/103 match, every transpiled
+stdout EMPTY) was a system-wide transient, not a regression. It overlapped
+the estree worker's concurrent core rebuild (`sh2perl/src/shir.rs` saved
+17:23:10, binary relinked 17:27:20 — the gate ran 17:23:47–17:26:39, 172s
+vs the usual 41–53s): the multi-GB rustc starved/OOM-killed EVERY node
+execution in the executed-stdout phase, so the per-test retry could not
+help (the whole window was affected). c-sh-go sources were untouched since
+the previous green gate; the gate passes 103/103 standalone.
+
+Hardened in `harness/frontend-stdout.sh` (shared, all frontends):
+
+- `run_estree` captures node stderr to a per-test file; a DIFF with EMPTY
+transpiled stdout now surfaces its head ("Killed" OOM, "FATAL ERROR: …",
+"Cannot find module") instead of an opaque `>` row.
+- Whole-phase retry: if EVERY test in the phase failed (fails == total),
+sleep 45s (letting a concurrent relink finish) and re-run the entire phase
+once. A deterministic regression fails the retry too — the gate still
+FAILs; partial failures are never masked.
+
 ## v5.1 — loop-carried div/mod accumulators on typed ints (2026-08-14), 99/99
 
 Gate fix for t47_digit_sum.c (a `while` loop carrying `sum = sum + n % 10`
