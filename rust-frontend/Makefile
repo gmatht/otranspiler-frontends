@@ -10,6 +10,28 @@
 #   2. ingress acceptance (the core deserializer accepts the emitted A1)
 #   3. executed-stdout oracle (native rustc vs the A1->ESTree->JS run)
 DEBASHC ?= $(abspath ../../sh2perl/target/debug/debashc)
+# Per-gate oracle snapshot (see harness/snapshot-debashc.sh): concurrent
+# workers rebuild target/debug/debashc mid-gate (estree worker core
+# changes; other gates' self-heal rules), and a torn binary wedges ONE
+# test with a misleading FAIL. 2026-08-15: the rust-frontend gate failed
+# right as the estree worker relinked debashc (core mediation round
+# 177255ec, binary dated 18:43; gate failure ~18:46) — the ingress stage
+# was invoking the SHARED binary directly, so a relink tear read as
+# "FAIL <file> (emit is not valid A1 shIR — the gap the worker fixes)"
+# and escalated to pi as a frontend build failure. The zsh-sh-go gate
+# already runs every oracle phase on a verified snapshot (t71_var_name_mods
+# incident, 2026-08-12 20:55:24); this gate now does the same: stages 2
+# and 3 run the stable verified copy below, never the shared binary.
+# GATE_TMP is created LAZILY — only the test/worker goals need the
+# oracle snapshot. An eager `$(shell mktemp -d …)` at parse time made
+# EVERY make invocation (build/all/clean) leak one ~20MB dir. $(if)
+# expands only the taken branch, so a non-test goal never runs mktemp.
+GATE_TMP := $(if $(filter test worker,$(MAKECMDGOALS)),$(shell mktemp -d /tmp/rust-frontend-gate.XXXXXX),/nonexistent-gate-tmp)
+GATE_DEBASHC := $(GATE_TMP)/debashc
+
+$(GATE_DEBASHC): $(DEBASHC)
+	@bash "$(abspath ../../harness/snapshot-debashc.sh)" $(DEBASHC) $@ \
+	  || { echo "FAIL: no verified debashc snapshot (concurrent rebuild?)"; exit 1; }
 
 .PHONY: all build test worker clean
 
@@ -20,36 +42,44 @@ build:
 
 # Self-heal the ingress oracle: a missing core debashc binary wedges the
 # gate as a confusing "FAIL (emit is not valid A1 shIR)". Build it on
-# demand; the oracle is read-only here.
+# demand; the oracle is read-only here (the snapshot rule then verifies
+# a stable copy of it).
 $(DEBASHC):
 	cd $(abspath ../../sh2perl) && cargo build --bin debashc
 
-test: build $(DEBASHC)
-	@echo "--- refusal pins (the emit MUST fail: REFUSE > GUESS) ---"
-	@for f in testdata/*_refuse.rs; do \
+test: build $(GATE_DEBASHC)
+	# GATE_TMP is a per-invocation mktemp dir; without a trap the worker's
+	# 5-min gate loop leaks one ~20MB debashc snapshot per run (~5.8GB/day;
+	# when /tmp fills, mktemp fails and the gate wedges with a spurious
+	# FAIL). Clean it on exit (success or failure) from ONE shell covering
+	# all three phases.
+	@trap 'rm -rf $(GATE_TMP)' EXIT; \
+	echo "--- refusal pins (the emit MUST fail: REFUSE > GUESS) ---"; \
+	for f in testdata/*_refuse.rs; do \
 	  bn=$$(basename "$$f"); \
 	  if ./target/debug/rust-frontend --shir "$$f" --raw > /dev/null 2>&1; then \
 	    echo "FAIL $$bn (should refuse)"; exit 1; \
 	  fi; \
 	  echo "OK   $$bn (refused)"; \
-	done
-	@echo "--- ingress acceptance (the core deserializer accepts the emitted A1) ---"
-	@for f in testdata/*.rs; do \
+	done; \
+	echo "--- ingress acceptance (the core deserializer accepts the emitted A1) ---"; \
+	for f in testdata/*.rs; do \
 	  bn=$$(basename "$$f"); \
 	  case "$$bn" in *_refuse.rs) continue;; esac; \
 	  ./target/debug/rust-frontend --shir "$$f" --raw > /tmp/$$bn.a1.json 2>/dev/null || { echo "FAIL $$bn (frontend emit)"; exit 1; }; \
-	  if $(DEBASHC) --shir-in-estree /tmp/$$bn.a1.json > /dev/null 2>&1; then \
+	  if $(GATE_DEBASHC) --shir-in-estree /tmp/$$bn.a1.json > /dev/null 2>&1; then \
 	    echo "OK   $$bn (valid A1 shIR — the core deserializer accepts it)"; \
 	  else \
 	    echo "FAIL $$bn (emit is not valid A1 shIR — the gap the worker fixes)"; \
 	    exit 1; \
 	  fi; \
-	done
-	@echo "--- executed-stdout comparison (native rustc vs JS/ESTree) ---"
-	@bash "$(abspath ../../harness/frontend-stdout.sh)" rust ./target/debug/rust-frontend testdata "$(DEBASHC)" || exit 1
+	done; \
+	echo "--- executed-stdout comparison (native rustc vs JS/ESTree) ---"; \
+	bash "$(abspath ../../harness/frontend-stdout.sh)" rust ./target/debug/rust-frontend testdata "$(GATE_DEBASHC)" || exit 1
 
 worker: test
 	@echo "rust-frontend worker gate: refusals + ingress acceptance + executed-stdout passed"
 
 clean:
 	cargo clean
+	rm -rf $(GATE_TMP)

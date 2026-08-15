@@ -55,7 +55,13 @@ Load hardening: the worker's `make test` holds the workspace
 7edd76e) so the gate never races another worker's cargo build, and the
 harness's rust native path retries a starved/OOM'd `rustc` compile
 (2026-08-12 14:49: t01's native side came back empty on a concurrent
-build, transpiled side correct, rest green).
+build, transpiled side correct, rest green). Oracle-tear hardening:
+both oracle phases (ingress acceptance + stdout harness) run a
+`snapshot-debashc.sh`-verified copy of debashc taken once per gate run,
+never the shared binary — a concurrent estree-worker relink used to
+read as a misleading "FAIL (emit is not valid A1 shIR)" and escalate
+to pi as a build failure (2026-08-15, core round 177255ec; the
+zsh-sh-go t71_var_name_mods precedent, 2026-08-12 20:55).
 
 ## Worker
 
