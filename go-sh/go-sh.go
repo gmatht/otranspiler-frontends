@@ -798,6 +798,17 @@ func (p *parser) parsePrimary() *expr {
 			p.expect(tPunct, ")")
 			return e
 		}
+		// []byte(x) conversion (grammar conversion): identity — the A1
+		// is strings-only, so the byte-slice conversion is a no-op
+		// (mirrors the `string(x)` arm above).
+		if t.text == "[" && p.byteConvAhead() {
+			p.pos += 4 // [ ] byte (
+			p.skipNL()
+			e := p.parseExpr()
+			p.skipNL()
+			p.expect(tPunct, ")")
+			return e
+		}
 	}
 	p.failf("unexpected token %q in expression", t.text)
 	return nil
@@ -1420,6 +1431,29 @@ func (p *parser) parseAssignStmt() []map[string]any {
 			"body": fn.body,
 		}}
 	}
+	// []byte(x) conversion → identity (strings ARE bytes in the A1 —
+	// the `string(x)` twin already lowers as identity; the A1 has no
+	// byte type, so the conversion is a parse-level no-op).
+	if p.atPunct("[") && p.byteConvAhead() {
+		if len(targets) > 1 {
+			p.failf("[]byte conversion with multiple targets (v2)")
+		}
+		p.pos += 4 // [ ] byte (
+		p.skipNL()
+		arg := p.parseExpr()
+		p.skipNL()
+		p.expect(tPunct, ")")
+		w := p.exprToWord(arg)
+		p.registerVar(targets[0], p.wordType(w))
+		return []map[string]any{assignStmt(targets[0], w)}
+	}
+	// []byte{...} byte-slice COMPOSITE literal: refused (Refuse >
+	// guess) — an escaped char element ('\n') would silently lower as
+	// its raw two-char text, and the shell-flavored A1 has no byte
+	// array; the conversion form above is the supported shape.
+	if p.atPunct("[") && p.byteSliceLitAhead() {
+		p.failf("[]byte{...} byte-slice literal unsupported (v2) — use []byte(\"...\") conversion")
+	}
 	// array literal: name := []T{...}
 	if p.atPunct("[") {
 		elems, typ := p.parseArrayLiteral()
@@ -1675,6 +1709,27 @@ func localVal(w map[string]any) string {
 
 // parseArrayLiteral parses `[]T{ e1, e2, ... }` and returns the element
 // words plus the element type.
+// byteConvAhead: the token stream at pos is `[ ] byte (` — the
+// []byte(x) conversion (grammar conversion; identity in the A1's
+// strings-are-bytes model).
+func (p *parser) byteConvAhead() bool {
+	return p.pos+3 < len(p.toks) &&
+		p.toks[p.pos].kind == tPunct && p.toks[p.pos].text == "[" &&
+		p.toks[p.pos+1].kind == tPunct && p.toks[p.pos+1].text == "]" &&
+		p.toks[p.pos+2].kind == tIdent && p.toks[p.pos+2].text == "byte" &&
+		p.toks[p.pos+3].kind == tPunct && p.toks[p.pos+3].text == "("
+}
+
+// byteSliceLitAhead: the token stream at pos is `[ ] byte {` — the
+// []byte{...} byte-slice composite literal (refused, see parseAssignStmt).
+func (p *parser) byteSliceLitAhead() bool {
+	return p.pos+3 < len(p.toks) &&
+		p.toks[p.pos].kind == tPunct && p.toks[p.pos].text == "[" &&
+		p.toks[p.pos+1].kind == tPunct && p.toks[p.pos+1].text == "]" &&
+		p.toks[p.pos+2].kind == tIdent && p.toks[p.pos+2].text == "byte" &&
+		p.toks[p.pos+3].kind == tPunct && p.toks[p.pos+3].text == "{"
+}
+
 func (p *parser) parseArrayLiteral() ([]map[string]any, string) {
 	p.expect(tPunct, "[")
 	p.skipNL()
@@ -2348,7 +2403,24 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 				}
 			}
 			p.failf("strings.HasPrefix needs (str, str) literals (v2)")
-		case "strings.ToUpper", "strings.ToLower", "strings.Contains", "strings.HasSuffix":
+		case "strings.ToUpper", "strings.ToLower":
+			// var arg → the `${s,,}` / `${s^^}` param ops
+			// (LowercaseAll/UppercaseAll — byte-identical to the core's
+			// `param(",," name)` / `param("^^" name)` lowering of the
+			// shell expansions; the runtime folds to toLowerCase /
+			// toUpperCase). Literals keep folding at emit time (t71).
+			if len(e.args) == 1 && e.args[0].kind == "var" {
+				op := ",,"
+				if e.callee == "strings.ToUpper" {
+					op = "^^"
+				}
+				return paramCall(op, e.args[0].name)
+			}
+			if w, ok := foldPureLiteralCall(e.callee, e.args); ok {
+				return strExpr(w)
+			}
+			p.failf("%s needs (var|str) args (v2)", e.callee)
+		case "strings.Contains", "strings.HasSuffix":
 			if w, ok := foldPureLiteralCall(e.callee, e.args); ok {
 				return strExpr(w)
 			}
