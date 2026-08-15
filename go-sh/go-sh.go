@@ -1024,6 +1024,15 @@ func (p *parser) parseStmt() []map[string]any {
 			p.failf("labeled continue unsupported (v2)")
 		}
 		return []map[string]any{{"type": "Continue"}}
+	case "break":
+		// A1 Break node (shir_json_in "Break" -> IrStmt::Break — the
+		// core contract already has it; the estree/C renderers emit
+		// `break;`). Labeled `break L` is refused, like continue.
+		p.pos++
+		if p.tok().kind == tIdent {
+			p.failf("labeled break unsupported (v2)")
+		}
+		return []map[string]any{{"type": "Break"}}
 	case "go":
 		return p.parseGo()
 	case "var":
@@ -1058,7 +1067,7 @@ func (p *parser) parseVarDecl() []map[string]any {
 			pkg := p.next().text
 			p.next() // .
 			typ := p.expect(tIdent, "").text
-			if pkg == "bytes" && typ == "Buffer" {
+			if (pkg == "bytes" && typ == "Buffer") || (pkg == "strings" && typ == "Builder") {
 				isBuf = true
 			}
 			continue
@@ -1557,7 +1566,7 @@ func (p *parser) parseAssignStmt() []map[string]any {
 		}
 		name := ""
 		for _, tg := range targets {
-			if tg == "_" {
+			if tg == "_" || tg == "err" {
 				continue
 			}
 			if name != "" {
