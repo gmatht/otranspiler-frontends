@@ -19,6 +19,44 @@
    "type": "enum[Int,Str]"
   }
  },
+ "embed_block": {
+  "type": "object",
+  "fields": {
+   "type": "str",
+   "span": "embed_span",
+   "construct": "enum[backtick,system,popen]",
+   "semantics": "embed_semantics",
+   "host_scope": "str[]",
+   "host_imports": "embed_imports",
+   "mode": "embed_mode"
+  }
+ },
+ "embed_span": {
+  "fields": {
+   "start": "int",
+   "end": "int"
+  }
+ },
+ "embed_semantics": {
+  "fields": {
+   "status_used": "bool",
+   "context": "enum[list,scalar]"
+  }
+ },
+ "embed_imports": {
+  "fields": {
+   "english": "bool",
+   "open3": "bool",
+   "subprocess": "bool",
+   "os": "bool"
+  }
+ },
+ "embed_mode": {
+  "fields": {
+   "backtick_newlines": "bool",
+   "english_names": "bool"
+  }
+ },
  "sub": {
   "type": "Sub",
   "fields": {
