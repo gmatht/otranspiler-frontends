@@ -55,7 +55,7 @@ var allowedKinds = map[string]bool{
 	"pointer_expression": true, "cast_expression": true,
 	"sizeof_expression": true, "conditional_expression": true,
 	"char_literal": true, "number_literal": true, "string_literal": true,
-	"concatenated_string": true, "true": true, "false": true, "nullptr": true,
+	"concatenated_string": true, "true": true, "false": true, "null": true, // `null` is the tree-sitter-c node for nullptr (and NULL); the desugar maps nullptr → 0 (FRONTEND.md)
 	// the C++-surface expressible set (desugar targets)
 	"new_expression": true, "delete_expression": true, "type_descriptor": true,
 	"new_declarator": true, "initializer_list": true, "field_initializer": true,
