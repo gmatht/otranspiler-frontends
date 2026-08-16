@@ -1710,8 +1710,9 @@ func (p *parser) parseAssignStmt() []map[string]any {
 	// length, matching sliceWord). The runtime's setArray SPLICES the
 	// param-slice array into the array store, so len(args)/args[i] read
 	// off the store. Computed bounds stay refused; `range args` over the
-	// result stays refused too (the A1 For iter is a STATIC element
-	// list — a runtime-loaded array has no iter shape; Refuse > guess).
+	// result lowers to the `${arr[@]}` For-iter shape (ONE array-valued
+	// param("slice", name, "@", "") element, flattened by forLoop — see
+	// parseFor; templates/go/range_args.go).
 	if rhs.kind == "slice" && rhs.target != nil && rhs.target.kind == "member" &&
 		rhs.target.name == "os.Args" {
 		if rhs.idx1e != nil || rhs.idx2e != nil {
@@ -2016,11 +2017,32 @@ func (p *parser) parseFor() []map[string]any {
 			if rv.kind != "var" {
 				p.failf("range over a non-var (v2)")
 			}
-			info, ok := p.arrays[rv.name]
-			if !ok {
+			if info, ok := p.arrays[rv.name]; ok {
+				iter, typ = info.elems, info.typ
+			} else if p.varTypes[rv.name] == "Array" {
+				// Runtime-loaded array (e.g. `args := os.Args[1:]` → the
+				// setArray param-slice; `a = append(a, …)`): the A1 For
+				// iter is a STATIC element list, but its elements are
+				// EXPRESSIONS — the contract's `${arr[@]}` shape is ONE
+				// array-valued param("slice", name, "@", "") element,
+				// which the runtime's forLoop FLATTENS (the core emits
+				// exactly this for `for x in "${arr[@]}"`; setArray has
+				// spliced the positional slice into the array store, so
+				// the iter reads the store). Loop vars are Str elements.
+				// Untyped vars stay a loud refusal (Refuse > guess).
+				body := p.parseBlockStmts()
+				p.registerVar(v, "Str")
+				return []map[string]any{{
+					"type": "For",
+					"var":  v,
+					"iter": map[string]any{"type": "Array", "elements": []any{
+						paramCall("slice", rv.name, "@", ""),
+					}},
+					"body": body,
+				}}
+			} else {
 				p.failf("range over unknown array %q (v2)", rv.name)
 			}
-			iter, typ = info.elems, info.typ
 		}
 		body := p.parseBlockStmts()
 		p.registerVar(v, typ)
