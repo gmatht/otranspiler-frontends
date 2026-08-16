@@ -54,8 +54,20 @@ lowers to split(getVar(x)) in shir.rs), so the literal-only refusal was
 a frontend self-restriction, not a contract boundary: var elements now
 lower through exprToWord (`getVar` after resolve) — one element per
 appended VALUE, no field-splitting (Go semantics). Probe `append_var`,
-green; the CLI's frontier moved past line 20 to the next documented gap
-(`fmt.Fprintln(os.Stderr, …)`, main.go:24).
+green; the CLI's frontier moved past line 20 to `fmt.Fprintln(os.Stderr,
+…)` (main.go:24).
+
+**Landed this pass (probe `fprintln_stderr`, green):**
+`fmt.Fprintln(os.Stderr, …)` — the CLI's usage-message construct
+(main.go:24). Fprintln writes space-separated operands + "\n" to fd 2;
+the frontend now lowers it to the A1 fd-dup Redirect shape the core
+emits for `echo … >&2` (`Redirect{fd:1, mode:"w", target:"&2"}` — the
+runtime dups fd 1 onto fd 2, so echo's stdout writes land on stderr),
+reusing the Println operand-separation logic (extracted to
+`printlnWords`). Probe `fprintln_stderr`, green; the wrapper's `os`
+import detection gained `Stderr` (fail-go wrap_go +
+translate_one_application.sh run_native). The CLI's frontier moved past
+line 24 to the next documented gap (`os.Exit(2)`, main.go:25).
 
 ## The app's construct footprint
 
@@ -94,8 +106,9 @@ Fixes landed in this effort (in-scope surface only):
 Remaining app-construct gaps (classified, queued):
 
 - **(b) frontend gaps to grow next**: `os.ReadFile`, `os.Stdout.Write`,
-  `fmt.Fprintln(os.Stderr, …)`, `os.Exit(code)`, `string([]byte)`
-  conversions. LANDED this pass (probe `range_args`, green):
+  `os.Exit(code)`, `string([]byte)` conversions. LANDED this pass
+  (probe `fprintln_stderr`, green): `fmt.Fprintln(os.Stderr, …)` —
+  see the Status section. LANDED this pass (probe `range_args`, green):
   `for _, a := range args` over a runtime-loaded array (`args :=
   os.Args[1:]` — the CLI's argv filter loop) now lowers to the
   `${arr[@]}` For-iter shape, ONE array-valued
