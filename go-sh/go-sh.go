@@ -432,6 +432,8 @@ type parser struct {
 	pos  int
 	// semantic side-state (the Go subset's shell-shaped meanings)
 	varTypes   map[string]string // name -> "Int" | "Str" | "Array" | "Map"
+	consts     map[string]int    // evaluated int const values (const refs)
+	constStrs  map[string]string // evaluated string const values
 	arrays     map[string]arrayInfo
 	maps       map[string]bool    // m := map[K]V{...} — assoc-array name
 	bufs       map[string]string  // b := bytes.Buffer — accumulated contents
@@ -1038,6 +1040,13 @@ func (p *parser) parseTopLevel() []map[string]any {
 				break
 			}
 			p.failf("type decls are outside the subset (v2) — struct/interface types have no A1 shape")
+		case p.atIdent("const"):
+			// `const x = expr` / `const ( specs )` — Go compile-time
+			// constants (FRONTEND-GAP: the old path fell through to
+			// parseStmt and died on `tEOF tokKind = iota` → "unexpected
+			// token tokKind after expression"). Each name lowers to an
+			// Assign of its evaluated value — see parseConstDecl.
+			out = append(out, p.parseConstDecl()...)
 		default:
 			out = append(out, p.parseStmt()...)
 		}
@@ -1088,6 +1097,8 @@ func (p *parser) parseStmt() []map[string]any {
 		return p.parseGo()
 	case "var":
 		return p.parseVarDecl()
+	case "const":
+		return p.parseConstDecl()
 	case "case", "default":
 		p.failf("'%s' outside switch", t.text)
 	}
@@ -1095,6 +1106,187 @@ func (p *parser) parseStmt() []map[string]any {
 		return p.parseDottedStmt()
 	}
 	return p.parseAssignStmt()
+}
+
+// parseConstDecl: `const x = expr` / `const ( specs )` — Go compile-time
+// constants. The A1 contract has no const/iota node, so each name lowers
+// to an Assign of its EVALUATED value — the same shape as `var x =
+// literal` (the A1 is dynamically typed; a tokKind value is a plain
+// scalar). iota counts specs inside the ConstDecl starting at 0; a spec
+// without an expression repeats the previous spec's expression with the
+// current iota substituted (Go ConstSpec semantics). Supported RHS:
+// iota, integer literals (with unary - and + - * / folding), and string
+// literals — anything else refuses loudly (Refuse > guess).
+func (p *parser) parseConstDecl() []map[string]any {
+	p.expect(tIdent, "const")
+	var out []map[string]any
+	if p.atPunct("(") {
+		p.pos++
+		var prev *expr
+		for iotaIdx := 0; ; iotaIdx++ {
+			p.skipNL()
+			if p.atPunct(")") {
+				p.pos++
+				return out
+			}
+			if p.tok().kind == tEOF {
+				p.failf("unterminated const block")
+			}
+			prev = p.parseConstSpec(iotaIdx, prev, &out)
+		}
+	}
+	// single spec: `const x = expr` (iota is 0; nothing to repeat)
+	p.parseConstSpec(0, nil, &out)
+	return out
+}
+
+// parseConstSpec: one `Name [Type] [= expr]` spec. The optional type
+// position is erased (like every type position); the expression is
+// evaluated via constWord and emitted as an Assign. Returns the spec's
+// expression so a following `Name` (no `=`) can repeat it with iota.
+func (p *parser) parseConstSpec(iotaIdx int, prev *expr, out *[]map[string]any) *expr {
+	name := p.expect(tIdent, "").text
+	if p.atPunct(",") {
+		p.failf("const spec with multiple names (v2)")
+	}
+	// optional type: pkg.Ident | plain ident | []T | *T — the same sweep
+	// as parseVarDecl (the erasure contract: a tokKind VALUE is untyped
+	// in the A1, so the type position is dropped).
+	for {
+		t := p.tok()
+		if t.kind == tIdent && p.toks[p.pos+1].kind == tPunct && p.toks[p.pos+1].text == "." {
+			p.next() // pkg
+			p.next() // .
+			p.expect(tIdent, "")
+			continue
+		}
+		if t.kind == tIdent && (p.toks[p.pos+1].kind != tPunct || p.toks[p.pos+1].text == "=") {
+			p.pos++ // plain type ident
+			continue
+		}
+		if t.kind == tPunct && (t.text == "[" || t.text == "*") {
+			p.pos++
+			p.skipNL()
+			for p.tok().kind == tIdent {
+				p.next()
+			}
+			p.skipNL()
+			continue
+		}
+		break
+	}
+	p.skipNL()
+	if p.atPunct("=") {
+		p.pos++
+		p.skipNL()
+		prev = p.parseExpr()
+	} else if prev == nil {
+		p.failf("const %q has no expression and nothing to repeat (v2)", name)
+	}
+	w, typ := p.constWord(prev, iotaIdx)
+	p.registerVar(name, typ)
+	// record the evaluated value so a later spec can reference the const
+	// (`e = c + 1` — Go resolves consts in declaration order).
+	if v := p.constValue(prev, iotaIdx); v.ok {
+		if v.isStr {
+			p.constStrs[name] = v.s
+		} else {
+			p.consts[name] = v.n
+		}
+	}
+	*out = append(*out, assignStmt(name, w))
+	return prev
+}
+
+// constWord: compile-time evaluation of a const RHS (Go consts are
+// compile-time). `iota` → the spec's index; integer literals (with unary
+// - and + - * / folding); string literals; and references to earlier
+// consts in the same program. Anything else refuses loudly — an
+// un-evaluated const would silently mis-lower (Refuse > guess).
+func (p *parser) constWord(e *expr, iotaVal int) (map[string]any, string) {
+	v := p.constValue(e, iotaVal)
+	if !v.ok {
+		p.failf("unsupported const expression (v2): %s", p.constExprDesc(e))
+	}
+	if v.isStr {
+		return interpLit(v.s), "Str"
+	}
+	return strExpr(strconv.Itoa(v.n)), "Int"
+}
+
+// constVal: an evaluated const value — an int (n) or a string (s).
+// ok=false means the expression is outside the const subset.
+type constVal struct {
+	n     int
+	s     string
+	isStr bool
+	ok    bool
+}
+
+// constValue: fold a const RHS to its value.
+func (p *parser) constValue(e *expr, iotaVal int) constVal {
+	switch e.kind {
+	case "var":
+		if e.name == "iota" {
+			return constVal{n: iotaVal, ok: true}
+		}
+		if n, ok := p.consts[e.name]; ok {
+			return constVal{n: n, ok: true}
+		}
+		if s, ok := p.constStrs[e.name]; ok {
+			return constVal{s: s, isStr: true, ok: true}
+		}
+	case "num":
+		if n, err := strconv.ParseInt(e.text, 0, 64); err == nil {
+			return constVal{n: int(n), ok: true}
+		}
+	case "str":
+		return constVal{s: e.text, isStr: true, ok: true}
+	case "rawstr":
+		return constVal{s: e.text, isStr: true, ok: true}
+	case "neg":
+		if l := p.constValue(e.lhs, iotaVal); l.ok && !l.isStr {
+			return constVal{n: -l.n, ok: true}
+		}
+	case "add", "mul":
+		l := p.constValue(e.lhs, iotaVal)
+		r := p.constValue(e.rhs, iotaVal)
+		if !l.ok || !r.ok || l.isStr || r.isStr {
+			return constVal{}
+		}
+		switch e.op {
+		case "+":
+			return constVal{n: l.n + r.n, ok: true}
+		case "-":
+			return constVal{n: l.n - r.n, ok: true}
+		case "*":
+			return constVal{n: l.n * r.n, ok: true}
+		case "/":
+			if r.n != 0 {
+				return constVal{n: l.n / r.n, ok: true}
+			}
+		}
+	}
+	return constVal{}
+}
+
+// constExprDesc: a human-readable description of an expression, for
+// refusal messages.
+func (p *parser) constExprDesc(e *expr) string {
+	if e == nil {
+		return "<nil>"
+	}
+	switch e.kind {
+	case "var":
+		return e.name
+	case "num", "str", "rawstr":
+		return e.text
+	case "neg":
+		return "-" + p.constExprDesc(e.lhs)
+	case "add", "mul":
+		return p.constExprDesc(e.lhs) + " " + e.op + " " + p.constExprDesc(e.rhs)
+	}
+	return e.kind
 }
 
 // parseVarDecl: `var a, b [type] [= init]` — bare declarations register
@@ -3072,16 +3264,18 @@ func Shir(src string) ([]byte, error) {
 		return nil, err
 	}
 	p := &parser{
-		toks:     toks,
-		varTypes: map[string]string{},
-		arrays:   map[string]arrayInfo{},
-		maps:     map[string]bool{},
-		bufs:     map[string]string{},
-		cmds:     map[string][]*expr{},
-		stdinRdr: map[string]bool{},
-		fnNames:  map[string]bool{},
-		outer:    map[string]bool{},
-		varAlias: map[string]string{},
+		toks:      toks,
+		varTypes:  map[string]string{},
+		consts:    map[string]int{},
+		constStrs: map[string]string{},
+		arrays:    map[string]arrayInfo{},
+		maps:      map[string]bool{},
+		bufs:      map[string]string{},
+		cmds:      map[string][]*expr{},
+		stdinRdr:  map[string]bool{},
+		fnNames:   map[string]bool{},
+		outer:     map[string]bool{},
+		varAlias:  map[string]string{},
 	}
 	stmts, err := p.run()
 	if err != nil {

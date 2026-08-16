@@ -34,6 +34,17 @@ boundaries escalated to `core-requests/go-sh-dogfood-20260815-contract-boundarie
 index+value range (`for i, s := range` — needs an index-binding For),
 higher-order funcs, structs/methods, `strings.Index` position values.
 
+**Landed this pass (probe `const_iota`, green):** `const` clauses —
+Go compile-time constants. The app's own token-kind block
+(`tEOF tokKind = iota` + implicit repeats) used to die in the parser
+("unexpected token tokKind after expression"); the frontend now parses
+`const x = expr` / `const ( specs )` and lowers each name to an Assign of
+its EVALUATED value (the A1 has no const/iota node — a tokKind value is
+a plain scalar). iota counts specs per block; a spec without `=` repeats
+the previous expression with iota substituted; RHS supported: iota,
+integer literals (±, + − × ÷ folding), string literals, and references
+to earlier consts. Anything else refuses loudly (Refuse > guess).
+
 ## The app's construct footprint
 
 `mine frontends/go-sh/go-sh.go` fires 32 of the 36 seeded templates
