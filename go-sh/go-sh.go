@@ -1962,10 +1962,22 @@ func (p *parser) parseAssignStmt() []map[string]any {
 		}
 		var elems []any
 		for _, a := range rhs.args[1:] {
-			if a.kind != "str" && a.kind != "num" {
-				p.failf("append elements must be literals (v2)")
+			switch a.kind {
+			case "str", "num", "rawstr":
+				elems = append(elems, strExpr(a.text))
+			case "var":
+				// s = append(s, v) with a VARIABLE element — the dogfood
+				// CLI's argv filter (`filtered = append(filtered, a)`) and
+				// the golib's `tas = append(tas, item)`. The A1
+				// setArrayAppend element contract is an EXPRESSION (shell
+				// `arr+=(x)` lowers to split(getVar(x)) in shir.rs) — the
+				// literal-only refusal was self-imposed. Lower through
+				// exprToWord (getVar after resolve): one element per
+				// appended VALUE, no field-splitting (Go semantics).
+				elems = append(elems, p.exprToWord(a))
+			default:
+				p.failf("append elements must be literals or vars (v2)")
 			}
-			elems = append(elems, strExpr(a.text))
 		}
 		p.registerVar(rhs.args[0].name, "Array")
 		return []map[string]any{assignStmt(rhs.args[0].name, map[string]any{

@@ -16,9 +16,9 @@ native behavior (`go run`). The gates:
 
 | gate | green |
 |---|---|
-| corpus Go→JS (`fail-go`) | **88/88** |
+| corpus Go→JS (`fail-go`) | **93/93** |
 | corpus Go→Rust (`fail-go --rust`) | 41/88 (rust backend `sh2.*` stubs: assoc arrays, argv, etc. — backend gap, per-target) |
-| Go idiom ladder (46 templates, mined from the app + seeded) | 41/46 (4 contract boundaries + 1 documented nondeterministic) |
+| Go idiom ladder (47 templates, mined from the app + seeded) | 42/47 (4 contract boundaries + 1 documented nondeterministic) |
 | app integration (the CLI, `fail-go --app`) | red — EMIT-FAIL (frontier, see below) |
 
 ### New idioms mined from the app (this pass)
@@ -44,6 +44,18 @@ a plain scalar). iota counts specs per block; a spec without `=` repeats
 the previous expression with iota substituted; RHS supported: iota,
 integer literals (±, + − × ÷ folding), string literals, and references
 to earlier consts. Anything else refuses loudly (Refuse > guess).
+
+**Landed this pass (probe `append_var`, green):** `s = append(s, v)` with
+a VARIABLE element — the CLI's argv filter (`filtered = append(filtered,
+a)`, main.go:20, the loop that used to die "append elements must be
+literals (v2)") and the golib's `tas = append(tas, item)`. The A1
+`setArrayAppend` element contract is an EXPRESSION (shell `arr+=(x)`
+lowers to split(getVar(x)) in shir.rs), so the literal-only refusal was
+a frontend self-restriction, not a contract boundary: var elements now
+lower through exprToWord (`getVar` after resolve) — one element per
+appended VALUE, no field-splitting (Go semantics). Probe `append_var`,
+green; the CLI's frontier moved past line 20 to the next documented gap
+(`fmt.Fprintln(os.Stderr, …)`, main.go:24).
 
 ## The app's construct footprint
 
