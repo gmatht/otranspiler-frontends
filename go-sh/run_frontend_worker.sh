@@ -22,6 +22,11 @@ echo "[$(date +%FT%T)] frontend go-sh worker started (pid=$$)" >> "$LOG"
 fail_count=0
 while true; do
   bash "$WORKSPACE/setup_backends.sh" --wait >> "$LOG" 2>&1 || true
+  # /tmp hygiene: the gate and go build die with ENOSPC when scratch from
+  # other loops accumulates (rustgate_* checkouts, pi output captures).
+  # Prune aggressively-but-safely before every gate run (non-fatal).
+  rm -rf /tmp/rustgate_* /tmp/zshlog.bin 2>/dev/null || true
+  find /tmp -maxdepth 1 -name 'pi-bash-*.log' -mtime +1 -delete 2>/dev/null || true
   echo "[$(date +%FT%T)] go-sh: gate run" >> "$LOG"
   if make test >> "$LOG" 2>&1 && bash "$WORKSPACE/fail-go" --gate >> "$LOG" 2>&1; then
     fail_count=0

@@ -25,14 +25,22 @@ build:
 	$(GO) build -o go-sh ./cmd/go-sh
 
 test: build
-	@for f in testdata/*.go; do \
+	@mkdir -p .test-tmp && trap 'rm -rf .test-tmp' EXIT; \
+	for f in testdata/*.go; do \
 	  bn=$$(basename $$f); \
-	  ./go-sh --shir $$f --raw > /tmp/$$bn.mine 2>/dev/null || { echo "FAIL $$bn (frontend emit)"; exit 1; }; \
+	  ./go-sh --shir $$f --raw > .test-tmp/$$bn.mine 2>/dev/null || { echo "FAIL $$bn (frontend emit)"; exit 1; }; \
 	  # Ingress acceptance: the core consumes SHELL, not go source, so \
 	  # byte-equality vs debashc --shir is impossible. The progress signal \
 	  # is: the emitted A1 shIR JSON is VALID (the core's deserializer \
 	  # accepts it via --shir-in-estree). \
-	  if $(DEBASHC) --shir-in-estree /tmp/$$bn.mine > /dev/null 2>&1; then \
+	  # A non-empty emit is required: an empty/truncated file (e.g. a full \
+	  # scratch disk) must report "frontend emit", never a misleading \
+	  # "not valid A1 shIR". The corpus dir is repo-local so a full /tmp \
+	  # can't fake a deserializer rejection. \
+	  if [ ! -s .test-tmp/$$bn.mine ]; then \
+	    echo "FAIL $$bn (frontend emit — empty/truncated output)"; exit 1; \
+	  fi; \
+	  if $(DEBASHC) --shir-in-estree .test-tmp/$$bn.mine > /dev/null 2>&1; then \
 	    echo "OK $$bn (valid A1 shIR — the core deserializer accepts it)"; \
 	  else \
 	    echo "FAIL $$bn (emit is not valid A1 shIR — the gap the worker fixes)"; \
@@ -46,4 +54,4 @@ worker: test
 	@echo "go-sh worker gate: ingress acceptance + executed-stdout passed"
 
 clean:
-	rm -f go-sh /tmp/*.mine /tmp/*.core
+	rm -f go-sh && rm -rf .test-tmp
