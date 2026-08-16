@@ -38,10 +38,14 @@ while true; do
       git -C "$WORKSPACE" commit -m "frontend go-sh: gate green" >> "$LOG" 2>&1 || true
     fi
     echo "[$(date +%FT%T)] go-sh: gate GREEN (make test + fail-go)" >> "$LOG"
+    mkdir -p "$WORKSPACE/gate-reports"
+    printf '%s frontend-go-sh: gate GREEN (make test + fail-go)\n' "$(date +%FT%T)" >> "$WORKSPACE/gate-reports/frontend-go-sh.report"
     bash "$WORKSPACE/frontends/coverage/worker-coverage-step.sh" go-sh "$LOG" >> "$LOG" 2>&1 || true
   else
     fail_count=$((fail_count+1))
     echo "[$(date +%FT%T)] go-sh: gate FAILED ($fail_count/3) — invoking pi" >> "$LOG"
+    mkdir -p "$WORKSPACE/gate-reports"
+    printf '%s frontend-go-sh: gate RED (make test + fail-go)\n' "$(date +%FT%T)" >> "$WORKSPACE/gate-reports/frontend-go-sh.report"
     bash "$WORKSPACE/setup_backends.sh" --pi-fix-frontend go-sh >> "$LOG" 2>&1 || true
     if [ "$fail_count" -ge 3 ]; then
       echo "[$(date +%FT%T)] go-sh: TRAPPED — escalating to core request and sleeping" >> "$LOG"
