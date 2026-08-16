@@ -1398,6 +1398,8 @@ func (p *parser) parseDottedStmt() []map[string]any {
 	switch first + "." + method {
 	case "fmt.Println", "fmt.Print":
 		return p.printlnStmt()
+	case "fmt.Fprintln":
+		return p.fprintlnStmt()
 	case "fmt.Printf":
 		return p.printfStmt()
 	case "os.WriteFile":
@@ -1480,11 +1482,15 @@ func (p *parser) printlnStmt() []map[string]any {
 		}
 		return []map[string]any{execStmtTA(args[0].callee, words, "Spawn", args[0].typeArgs)}
 	}
+	return []map[string]any{execStmt("echo", p.printlnWords(args), "Emulable")}
+}
+
+// printlnWords: Println/Print/Fprintln operand separation — Go separates
+// operands with a space, which IS shell word separation — one word per
+// operand (t40 fixes the old interpParts concat that printed "$i$j").
+func (p *parser) printlnWords(args []*expr) []map[string]any {
 	var words []map[string]any
 	if len(args) > 1 {
-		// fmt.Println(a, b) → echo "$a" "$b": Go separates operands with a
-		// space, which IS shell word separation — one word per operand
-		// (t40 fixes the old interpParts concat that printed "$i$j").
 		allStr := true
 		for _, a := range args {
 			if a.kind != "str" {
@@ -1504,7 +1510,42 @@ func (p *parser) printlnStmt() []map[string]any {
 	} else {
 		words = []map[string]any{p.exprToWord(args[0])}
 	}
-	return []map[string]any{execStmt("echo", words, "Emulable")}
+	return words
+}
+
+// fprintlnStmt: fmt.Fprintln(os.Stderr, args...) → the `echo … >&2` shape
+// (the CLI's usage message, cmd/go-sh/main.go:24 — the dogfood frontier).
+// Fprintln writes space-separated operands + "\n" to fd 2 — exactly
+// `echo "$a" "$b" >&2`. The A1 redirect is the fd-dup form the core
+// emits for `>&2` (Redirect{fd:1, mode:"w", target:"&2"}): the runtime
+// dups fd 1 onto fd 2, so echo's stdout writes land on stderr. The first
+// arg must be os.Stderr — any other writer refuses loudly (Refuse >
+// guess); the trailing newline comes from echo itself.
+func (p *parser) fprintlnStmt() []map[string]any {
+	p.expect(tPunct, "(")
+	p.skipNL()
+	p.expect(tIdent, "os")
+	p.expect(tPunct, ".")
+	p.expect(tIdent, "Stderr")
+	if !p.acceptPunct(",") {
+		p.failf("Fprintln needs os.Stderr as the first arg (v2)")
+	}
+	p.skipNL()
+	args := p.parseArgs()
+	if len(args) == 0 {
+		p.failf("Fprintln with no args (v2)")
+	}
+	echo := execStmt("echo", p.printlnWords(args), "Emulable")
+	return []map[string]any{{
+		"type":  "Redirect",
+		"inner": []any{echo},
+		"redirects": []any{map[string]any{
+			"fd":          1,
+			"mode":        "w",
+			"interpolate": true,
+			"target":      strExpr("&2"),
+		}},
+	}}
 }
 
 // printfStmt: one %s + trailing \n → the echo-interpolation shape
