@@ -60,6 +60,9 @@ Fixes landed in this effort (in-scope surface only):
   (`any`, not `interface{}`), `array_slice` (`strings.Join`, the
   supported slice form), plus the oracle wrapper's duplicate `"os"`
   import and missing `os/exec`/`strconv`/`filepath`/… detections.
+  The wrapper's `os`-import detection also now covers `os.Args`/
+  `os.ReadFile` (translate_one_application.sh `run_native`,
+  aligned with fail-go's wrap_go).
 - **(d) documented, not forced**: `go_stmt` (`go func(){…}()` + the
   immediate `fmt.Println` — native Go races; the translated JS is
   deterministic `bg|main`. The oracle itself is unstable — the probe
@@ -67,10 +70,18 @@ Fixes landed in this effort (in-scope surface only):
 
 Remaining app-construct gaps (classified, queued):
 
-- **(b) frontend gaps to grow next**: `os.Args` (positional argv —
-  `cmd/go-sh/main.go` line 13 `os.Args[1:]` is today's refuse point),
-  `os.ReadFile`, `os.Stdout.Write`, `fmt.Fprintln(os.Stderr, …)`,
-  `os.Exit(code)`, `string([]byte)` conversions.
+- **(b) frontend gaps to grow next**: `os.ReadFile`, `os.Stdout.Write`,
+  `fmt.Fprintln(os.Stderr, …)`, `os.Exit(code)`, `string([]byte)`
+  conversions. LANDED this pass (probe `range_args`, green):
+  `for _, a := range args` over a runtime-loaded array (`args :=
+  os.Args[1:]` — the CLI's argv filter loop) now lowers to the
+  `${arr[@]}` For-iter shape, ONE array-valued
+  `param("slice", name, "@", "")` element that the runtime's
+  forLoop flattens (the core emits exactly this for
+  `for x in "${arr[@]}"` — the A1 For iter is a static element
+  list whose elements are EXPRESSIONS, so the runtime-array form was
+  never a contract boundary; go-sh.go parseFor). `for i, s := range`
+  (index+value) still REFUSED — the index-binding For boundary (§1).
 - **(a)/(d) contract boundary**: structs, methods, interfaces,
   `encoding/json`, `sort` — no A1 shape; the CLI's behavior depends on
   the golib's JSON marshaler, so the full app cannot translate until the
