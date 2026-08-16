@@ -3319,6 +3319,27 @@ func (p *parser) condOperandQ(e *expr) string {
 		// (the statement-position lowering at emitExpr uses the same
 		// shape via join(param("slice", "#arr", "@", ""))).
 		return `"${#` + p.resolveVar(e.target.name) + `[@]}"`
+	case "index":
+		// a[0] → the quoted `${a[0]}` array-element word — the CLI's
+		// `filtered[0] != "--shir"` argv gate (frontends/go-sh/cmd/
+		// go-sh/main.go:24; the refusal surfaced with the line
+		// attribution of the NEXT statement, `inp := filtered[1]`,
+		// because condToJSON runs after the if-body parse — the same
+		// attribution trap as the arrlen operand). Same mechanism as
+		// the arrlen case above: the core's try_native_test falls back
+		// to sh2.test for non-plain operands, and the runtime's
+		// tokenizeTest expands the quoted word via expandWord
+		// (arrayIndex) inside a quoted test word.
+		if e.idx1e != nil {
+			p.failf("index key must be a number literal (v2)")
+		}
+		if e.target != nil && e.target.kind == "var" {
+			if p.maps[e.target.name] {
+				p.failf("map key in comparison unsupported (v2)")
+			}
+			return `"${` + p.resolveVar(e.target.name) + `[` + e.idx1 + `]}"`
+		}
+		p.failf("index target must be a var (v2)")
 	}
 	p.failf("unsupported comparison operand (v2): %s", e.kind)
 	return ""
@@ -3338,6 +3359,21 @@ func (p *parser) condOperandArg(e *expr) string {
 		// (e.g. `"${#arr[@]}" -gt 1`; a bare ${#arr[@]} would need the
 		// word-splitting the quoted form avoids).
 		return `"${#` + p.resolveVar(e.target.name) + `[@]}"`
+	case "index":
+		// a[0] in a numeric comparison — the quoted element word
+		// (`[ "${a[0]}" -gt 1 ]`; bare would need the word-splitting
+		// the quoted form avoids). Literal keys only, like the
+		// statement-position lowering (exprToWord).
+		if e.idx1e != nil {
+			p.failf("index key must be a number literal (v2)")
+		}
+		if e.target != nil && e.target.kind == "var" {
+			if p.maps[e.target.name] {
+				p.failf("map key in comparison unsupported (v2)")
+			}
+			return `"${` + p.resolveVar(e.target.name) + `[` + e.idx1 + `]}"`
+		}
+		p.failf("index target must be a var (v2)")
 	}
 	p.failf("unsupported comparison operand (v2): %s", e.kind)
 	return ""
