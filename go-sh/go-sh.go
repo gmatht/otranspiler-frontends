@@ -1406,6 +1406,8 @@ func (p *parser) parseDottedStmt() []map[string]any {
 		return p.writeFileStmt()
 	case "os.Setenv":
 		return p.setenvStmt()
+	case "os.Exit":
+		return p.exitStmt()
 	}
 	// b.WriteString(...) on a bytes.Buffer → append to the accumulator
 	// (the literal-only contract keeps the contents statically known).
@@ -1632,6 +1634,32 @@ func (p *parser) heredocStmt(content string) map[string]any {
 }
 
 // setenvStmt: os.Setenv("K", "v") → the export shape (`X=v` + `export X`).
+// exitStmt: os.Exit(N) → the A1 Exit statement ({"type":"Exit","value":N})
+// — the `exit` builtin's shape, so all backends terminate with bash's
+// exit code semantics (the CLI's `os.Exit(2)` on usage errors).
+func (p *parser) exitStmt() []map[string]any {
+	p.expect(tPunct, "(")
+	p.skipNL()
+	var value map[string]any
+	switch p.tok().kind {
+	case tNum:
+		n, _ := strconv.Atoi(p.next().text)
+		value = map[string]any{"type": "Num", "value": n}
+	case tIdent:
+		name := p.next().text
+		if n, ok := p.paramNumber(name); ok {
+			value = map[string]any{"type": "Num", "value": n}
+		} else {
+			value = getVarExpr(name)
+		}
+	default:
+		value = map[string]any{"type": "Num", "value": 0}
+	}
+	p.skipNL()
+	p.expect(tPunct, ")")
+	return []map[string]any{{"type": "Exit", "value": value}}
+}
+
 func (p *parser) setenvStmt() []map[string]any {
 	p.expect(tPunct, "(")
 	p.skipNL()
