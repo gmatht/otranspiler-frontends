@@ -1700,6 +1700,52 @@ func (p *parser) parseAssignStmt() []map[string]any {
 	// generic RHS
 	rhs := p.parseExpr()
 
+	// args := os.Args[1:] — argv with argv0 stripped, the shell's `"$@"`
+	// (the array-valued positional slice `${@:off:len}`, which the core
+	// lowers to the runtime's native positional list). Go's os.Args is
+	// 0-based with argv0 at [0]; bash `${@:off}` is 1-BASED over the
+	// positionals (`${@:1}` = all params; `${@:0}` = [argv0, ...params])
+	// and is ARRAY-valued — so os.Args[i:] ↔ param("slice", "@", i, "")
+	// and os.Args[i:j] ↔ param("slice", "@", i, j-i) (the exclusive-end
+	// length, matching sliceWord). The runtime's setArray SPLICES the
+	// param-slice array into the array store, so len(args)/args[i] read
+	// off the store. Computed bounds stay refused; `range args` over the
+	// result stays refused too (the A1 For iter is a STATIC element
+	// list — a runtime-loaded array has no iter shape; Refuse > guess).
+	if rhs.kind == "slice" && rhs.target != nil && rhs.target.kind == "member" &&
+		rhs.target.name == "os.Args" {
+		if rhs.idx1e != nil || rhs.idx2e != nil {
+			p.failf("os.Args slice bounds must be literal (v2)")
+		}
+		if len(targets) > 1 {
+			p.failf("os.Args slice with multiple targets (v2)")
+		}
+		lo := rhs.idx1
+		if lo == "" {
+			lo = "0"
+		}
+		length := ""
+		if rhs.idx2 != "" {
+			loN, err1 := strconv.Atoi(lo)
+			hiN, err2 := strconv.Atoi(rhs.idx2)
+			if err1 != nil || err2 != nil || hiN < loN {
+				p.failf("invalid os.Args slice bounds (v2)")
+			}
+			length = strconv.Itoa(hiN - loN)
+		}
+		p.registerVar(targets[0], "Array")
+		return []map[string]any{assignStmt(targets[0], map[string]any{
+			"type": "Call", "func": "setArray",
+			"args": []any{strExpr(targets[0]), map[string]any{
+				"type": "Array",
+				"elements": []any{
+					paramCall("slice", "@", lo, length),
+				},
+			}},
+			"purity": "Emulable",
+		})}
+	}
+
 	// a = append(a, "c", "d") → setArrayAppend (the `arr+=(c d)` shape)
 	if rhs.kind == "call" && rhs.callee == "append" {
 		if len(rhs.args) < 2 || rhs.args[0].kind != "var" {
