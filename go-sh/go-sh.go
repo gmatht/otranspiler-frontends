@@ -3314,6 +3314,11 @@ func (p *parser) condOperandQ(e *expr) string {
 		return `"` + e.text + `"`
 	case "num":
 		return `"` + e.text + `"`
+	case "arrlen":
+		// len(arr) → the `${#arr[@]}` length word, quoted like `"$x"`
+		// (the statement-position lowering at emitExpr uses the same
+		// shape via join(param("slice", "#arr", "@", ""))).
+		return `"${#` + p.resolveVar(e.target.name) + `[@]}"`
 	}
 	p.failf("unsupported comparison operand (v2): %s", e.kind)
 	return ""
@@ -3328,6 +3333,11 @@ func (p *parser) condOperandArg(e *expr) string {
 		return `"` + e.text + `"`
 	case "num":
 		return e.text
+	case "arrlen":
+		// len(arr) in a numeric comparison — the quoted length word
+		// (e.g. `"${#arr[@]}" -gt 1`; a bare ${#arr[@]} would need the
+		// word-splitting the quoted form avoids).
+		return `"${#` + p.resolveVar(e.target.name) + `[@]}"`
 	}
 	p.failf("unsupported comparison operand (v2): %s", e.kind)
 	return ""
