@@ -421,6 +421,10 @@ type expr struct {
 	// func literal (lowered body, params in args)
 	body   []map[string]any
 	params []string
+	// raw A1 cond JSON (if-init forms lower their cond directly,
+	// bypassing condTestString — the assign-Capture shape has no
+	// test-string form)
+	rawJSON map[string]any
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -2188,6 +2192,68 @@ func (p *parser) parseArrayLiteral() ([]map[string]any, string) {
 
 // ── compound statements ─────────────────────────────────────────────
 
+// ifInitReadFileAhead: `if <name>, err := os.ReadFile(` — the if-init
+// form of the whole-file read with a NAMED first target (the
+// `if _, err := os.Stat(` arm above handles the underscore path-test
+// form; the statement form `b, _ := os.ReadFile(p)` lowers in
+// parseAssignStmt). Returns the target name. Everything else falls
+// through to the generic expression cond.
+func (p *parser) ifInitReadFileAhead() (string, bool) {
+	if p.tok().kind != tIdent || p.atIdent("_") || p.atIdent("err") {
+		return "", false
+	}
+	name := p.tok().text
+	t := p.toks
+	i := p.pos + 1
+	if i+6 >= len(t) {
+		return "", false
+	}
+	if t[i].kind != tPunct || t[i].text != "," ||
+		t[i+1].kind != tIdent || t[i+1].text != "err" ||
+		t[i+2].kind != tOp || t[i+2].text != ":=" ||
+		t[i+3].kind != tIdent || t[i+3].text != "os" ||
+		t[i+4].kind != tPunct || t[i+4].text != "." ||
+		t[i+5].kind != tIdent || t[i+5].text != "ReadFile" ||
+		t[i+6].kind != tPunct || t[i+6].text != "(" {
+		return "", false
+	}
+	return name, true
+}
+
+// readFileIfCond: the `if b, err := os.ReadFile(p); err (==|!=) nil`
+// cond — byte-identical to the core's `if b=$(cat p); then` /
+// `if ! b=$(cat p); then` lowering (verified against `debashc file
+// --shir`): Call{func:"assign", args:[Str(name), Str("="),
+// Capture{native:false, expr:Arrow{body:[Expr exec cat …]}}]}, wrapped
+// in the Not BinOp for err != nil (lhs+rhs both carry the assign,
+// matching the core's shape). cat is an Emulable sync builtin; the
+// []byte result is a string in the A1's strings-are-bytes model (same
+// as the statement form).
+func (p *parser) readFileIfCond(name string, path map[string]any, neg bool) map[string]any {
+	assignCall := map[string]any{
+		"type": "Call", "func": "assign",
+		"args": []any{
+			strExpr(name),
+			strExpr("="),
+			map[string]any{
+				"type": "Capture", "native": false,
+				"expr": map[string]any{
+					"type": "Arrow",
+					"body": []any{execStmt("cat", []map[string]any{path}, "Emulable")},
+				},
+			},
+		},
+		"purity": "Emulable",
+	}
+	if neg {
+		return map[string]any{
+			"type": "BinOp", "op": "Not",
+			"lhs": assignCall, "rhs": assignCall,
+		}
+	}
+	return assignCall
+}
+
 func (p *parser) parseIf() []map[string]any {
 	p.expect(tIdent, "if")
 	p.skipNL()
@@ -2228,6 +2294,42 @@ func (p *parser) parseIf() []map[string]any {
 			arg = "! -e " + decodeGoStr(pathTok.raw)
 		}
 		cond = &expr{kind: "cond", text: arg}
+	} else if name, ok := p.ifInitReadFileAhead(); ok {
+		// if b, err := os.ReadFile(path); err == nil { — the if-init
+		// whole-file read: the read's SUCCESS is the branch condition,
+		// the `if b=$(cat p); then` shape (Call func=assign wrapping a
+		// Capture — byte-identical to the core's own lowering of the
+		// shell form, verified against debashc file --shir). err == nil
+		// → the assign cond; err != nil → the core's `if ! b=$(cat p)`
+		// Not BinOp (lhs+rhs both carry the assign). Any other
+		// condition refuses loudly (Refuse > guess).
+		p.pos++ // <name>
+		p.expect(tPunct, ",")
+		p.expect(tIdent, "err")
+		p.expect(tOp, ":=")
+		p.expect(tIdent, "os")
+		p.expect(tPunct, ".")
+		p.expect(tIdent, "ReadFile")
+		p.expect(tPunct, "(")
+		p.skipNL()
+		path := p.parseExpr()
+		p.skipNL()
+		p.expect(tPunct, ")")
+		p.skipNL()
+		p.expect(tPunct, ";")
+		p.skipNL()
+		c := p.parseExpr()
+		errEqNil := c.kind == "binop" && c.BOp == "==" &&
+			c.lhs.kind == "var" && c.lhs.name == "err" &&
+			c.rhs.kind == "var" && c.rhs.name == "nil"
+		neg := c.kind == "binop" && c.BOp == "!=" &&
+			c.lhs.kind == "var" && c.lhs.name == "err" &&
+			c.rhs.kind == "var" && c.rhs.name == "nil"
+		if !errEqNil && !neg {
+			p.failf("unsupported if-init os.ReadFile condition (v2)")
+		}
+		p.registerVar(name, "Str")
+		cond = &expr{kind: "rawjson", rawJSON: p.readFileIfCond(name, p.exprToWord(path), neg)}
 	} else {
 		cond = p.parseExpr()
 	}
@@ -3207,6 +3309,9 @@ func (p *parser) switchPattern(e *expr) string {
 func (p *parser) condToJSON(c *expr) map[string]any {
 	if c.kind == "cond" {
 		return testCall(c.text)
+	}
+	if c.kind == "rawjson" {
+		return c.rawJSON
 	}
 	if c.kind == "not" {
 		return testCall("! " + strings.TrimSpace(p.condTestString(c.lhs)))
