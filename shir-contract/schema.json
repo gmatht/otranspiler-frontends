@@ -457,6 +457,12 @@
     "flags": "str"
    }
   },
+  "Splice": {
+   "fields": {
+    "type": "str",
+    "expr": "expr"
+   }
+  },
   "Str": {
    "fields": {
     "type": "str",
