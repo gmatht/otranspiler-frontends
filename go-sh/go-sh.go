@@ -1003,9 +1003,10 @@ func (p *parser) parseTopLevel() []map[string]any {
 			// compile-time only, erased under the type-position erasure
 			// contract (t80/t82/t84/t85 — shell has no interface values;
 			// the app's `type Expr interface{}` AST-node declarations).
-			// A non-empty interface body (method dispatch) and other type
-			// decls (structs — the core-requests
-			// go-sh-dogfood-20260815 §3 boundary) stay refused loudly.
+			// A non-empty interface body (method dispatch) and composite
+			// underlying types (structs — the core-requests
+			// go-sh-dogfood-20260815 §3 boundary; map/[]/*/func/chan) stay
+			// refused loudly.
 			p.pos++
 			p.skipNL()
 			p.expect(tIdent, "") // Name
@@ -1020,6 +1021,21 @@ func (p *parser) parseTopLevel() []map[string]any {
 					break
 				}
 				p.failf("interface methods unsupported (v2) — method dispatch is a contract boundary")
+			}
+			// `type Name int` (string/bool/float64/…, or another named
+			// type) — a named SCALAR type: compile-time only, erased under
+			// the same type-position erasure contract as the empty
+			// interface above. The A1 is dynamically typed, so a tokKind
+			// VALUE is a plain int — no shape needed (go-sh.go's own
+			// `type tokKind int`, fish-sh-go's tokKind, perl-sh-go's
+			// `type tokKind string`). Type positions (params, struct
+			// fields, var decls) already erase; a VALUE-position use
+			// (conversion `tokKind(x)`) stays refused loudly by the
+			// word-position call gate — no silent mis-lower.
+			if p.tok().kind == tIdent && !p.atIdent("struct") &&
+				!p.atIdent("func") && !p.atIdent("map") && !p.atIdent("chan") {
+				p.pos++
+				break
 			}
 			p.failf("type decls are outside the subset (v2) — struct/interface types have no A1 shape")
 		default:
