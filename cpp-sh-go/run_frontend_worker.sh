@@ -6,6 +6,14 @@
 # automatic key rotation). After 3 consecutive failures, TRAP: escalate
 # to a core request (core-requests/) and SLEEP until the estree worker
 # removes core-requests/sleeping-cpp-sh-go.
+
+# ROUTE BY TYPE (PLAN §11 / core-requests/README.md): a NEW shIR node -> a
+# contract-gen SPEC (core-requests/contracts/<node>.json); a NEW transform
+# -> an .rs offer with the §11.4 manifest
+# (core-requests/transforms/offered/<name>.rs); a NEW NODE + its lowering
+# transforms -> a bundle (core-requests/bundles/<name>/); only a genuine
+# shared-analysis bug -> an .md request (core-requests/<lang>-<ts>.md).
+# NEVER a blind 'inspect my log' escalation — diagnose first.
 # Fix surface: this dir + harness/* + c-requests/ (NEVER c-sh-go-owned
 # files, NEVER the core). The c-sh-go worker implements c-requests.
 set -euo pipefail
