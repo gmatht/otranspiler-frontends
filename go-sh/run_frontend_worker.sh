@@ -24,8 +24,15 @@ while true; do
   bash "$WORKSPACE/setup_backends.sh" --wait >> "$LOG" 2>&1 || true
   # /tmp hygiene: the gate and go build die with ENOSPC when scratch from
   # other loops accumulates (rustgate_* checkouts, pi output captures).
-  # Prune aggressively-but-safely before every gate run (non-fatal).
-  rm -rf /tmp/rustgate_* /tmp/zshlog.bin 2>/dev/null || true
+  # Prune aggressively-but-safely before every gate run (non-fatal). The
+  # shared bin-dir/scratch lives on the same fs as /tmp, so a full /tmp
+  # is a full disk: also sweep rustrepro_* (orphan repro checkouts — no
+  # producer script; the newest is stale by hours) and this harness's own
+  # per-test scratch (estree-runner leaves sh2estree-run-* when a node
+  # child is killed before its finally runs; mktemp -d dirs from
+  # interrupted fail-go runs). These are all >1 day stale or unproduced.
+  rm -rf /tmp/rustgate_* /tmp/rustrepro_* /tmp/zshlog.bin 2>/dev/null || true
+  find /tmp -maxdepth 1 \( -name 'sh2estree-run-*' -o -name 'rustrepro_*' -o -name 'rustgate_*' -o -name 'tmp.*' \) -mtime +1 -delete 2>/dev/null || true
   find /tmp -maxdepth 1 -name 'pi-bash-*.log' -mtime +1 -delete 2>/dev/null || true
   echo "[$(date +%FT%T)] go-sh: gate run" >> "$LOG"
   if make test >> "$LOG" 2>&1 && bash "$WORKSPACE/fail-go" --gate >> "$LOG" 2>&1; then
