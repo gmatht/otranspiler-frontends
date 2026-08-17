@@ -6,7 +6,13 @@
 # (the old change-driven loop idled forever on a clean-but-broken tree).
 # Green -> commit any scoped changes. Red -> invoke pi (opencode-go +
 # deepseek-v4-flash, automatic key rotation); after 3 consecutive
-# failures, TRAP: escalate to a core request (core-requests/) and SLEEP
+# failures, TRAP: escalate by TYPE (PLAN §11 / core-requests/README.md): a NEW
+# shIR node -> a contract-gen SPEC (core-requests/contracts/<node>.json); a
+# NEW transform -> an .rs offer with the §11.4 manifest
+# (core-requests/transforms/offered/<name>.rs); only a genuine shared-analysis
+# bug -> an .md request (core-requests/<lang>-<ts>.md). NEVER a blind
+# 'inspect my log' escalation — diagnose first, then file the concrete
+# artifact. Then SLEEP
 # until the estree worker removes core-requests/sleeping-zsh-sh-go.
 # Fix surface: this dir + harness/* (NEVER the core src/*).
 set -euo pipefail
