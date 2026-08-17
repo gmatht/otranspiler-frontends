@@ -8,11 +8,39 @@
 
 ANTLR4 ?= antlr4
 DEBASHC ?= $(abspath ../../sh2perl/target/debug/debashc)
+BUILD_LOCK ?= $(abspath ../../harness/build-lock.sh)
 GO ?= /snap/go/current/bin/go
 
-.PHONY: all gen build test worker clean
+.PHONY: all gen build test debashc-oracle worker clean
 
 all: build
+
+# The A1-ingress oracle. The main checkout's target dir is SHARED with
+# the core/estree/sh workers (build-lock.sh default), and they churn or
+# wipe it (cargo clean, rebuilds, lockfile revert/stale serde caches);
+# the binary can be absent or unbuildable at gate time. Rebuild it
+# through the sanctioned choke point (backend role: waits up to 1800s,
+# never preempts) instead of redding on a missing oracle — a missing
+# oracle must report "oracle unavailable", never a misleading "emit is
+# not valid A1 shIR". Known stale-cache failure (serde 1.0.229 artifacts
+# vs a reverted 1.0.226 lockfile) is retried once after cleaning just
+# those packages; a genuinely broken core tree still fails honestly.
+debashc-oracle:
+	@if [ -x "$(DEBASHC)" ]; then :; else \
+	  echo "oracle $$(basename $(DEBASHC)) missing — rebuilding via build-lock.sh"; \
+	  if "$(BUILD_LOCK)" --role backend -- cargo build --manifest-path "$(abspath ../../sh2perl/Cargo.toml)" --bin debashc; then \
+	    echo "oracle rebuilt"; \
+	  else \
+	    echo "oracle build failed — stale serde cache? cleaning serde artifacts and retrying once"; \
+	    if "$(BUILD_LOCK)" --role backend -- cargo clean --manifest-path "$(abspath ../../sh2perl/Cargo.toml)" -p serde_derive -p serde -p serde_core \
+	        && "$(BUILD_LOCK)" --role backend -- cargo build --manifest-path "$(abspath ../../sh2perl/Cargo.toml)" --bin debashc; then \
+	      echo "oracle rebuilt after serde cache clean"; \
+	    else \
+	      echo "FAIL (oracle unavailable — could not build debashc; the core tree may be mid-WIP)"; \
+	      exit 1; \
+	    fi; \
+	  fi; \
+	fi
 
 # TODO: generate the Go parser from grammars/GoLexer.g4 + GoParser.g4
 # (the worker wires this via pi/deepseek-v4-flash). The stub in go-sh.go
@@ -24,7 +52,7 @@ gen:
 build:
 	$(GO) build -o go-sh ./cmd/go-sh
 
-test: build
+test: build debashc-oracle
 	@mkdir -p .test-tmp && trap 'rm -rf .test-tmp' EXIT; \
 	for f in testdata/*.go; do \
 	  bn=$$(basename $$f); \
