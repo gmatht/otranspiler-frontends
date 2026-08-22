@@ -74,7 +74,7 @@ type token struct {
 	line int
 }
 
-var multiOps = []string{":=", "==", "!=", "<=", ">=", "&&", "||", "+=", "++"}
+var multiOps = []string{"...", ":=", "==", "!=", "<=", ">=", "&&", "||", "+=", "++"}
 
 func lex(src string) ([]token, error) {
 	var toks []token
@@ -592,6 +592,15 @@ func (p *parser) parseUnary() *expr {
 		p.pos++
 		return &expr{kind: "neg", lhs: p.parseUnary()}
 	}
+	// &x / *x — address-of and dereference have no shell-flavored A1
+	// meaning (the IR passes values, never storage locations); refuse
+	// loudly at the construct instead of mis-lowering.
+	if p.atPunct("&") {
+		p.failf("unsupported address-of operator '&' (v2)")
+	}
+	if p.atPunct("*") {
+		p.failf("unsupported pointer dereference '*' (v2)")
+	}
 	return p.parsePostfix()
 }
 
@@ -604,6 +613,13 @@ func (p *parser) parsePostfix() *expr {
 			args := p.parseArgs()
 			e = &expr{kind: "call", callee: callName(e), args: args}
 		case p.atPunct("["):
+			// `map[K]V{…}` composite literal in EXPRESSION position (e.g.
+			// `return map[string]any{…}`): a whole dict value has no A1
+			// shape (maps exist only as named assoc-arrays mutated by
+			// assocSet) — refuse loudly rather than mis-parse as indexing.
+			if callName(e) == "map" {
+				p.failf("unsupported map composite literal in expression position (v2)")
+			}
 			// generic instantiation call `Name[TypeList](args)` (grammar rule
 			// typeArgs): the type arguments ride on the Call (A1 erasure
 			// contract, core request go-sh-typeargs — validated string array,
@@ -646,8 +662,19 @@ func (p *parser) parsePostfix() *expr {
 			}
 		case p.atPunct("."):
 			p.pos++
+			if p.atPunct("(") {
+				// x.(T) type assertion — the A1 is dynamically typed with
+				// no type tags to test; the comma-ok idiom's false branch
+				// would be unreachable in a mis-lowering. Refuse loudly.
+				p.failf("unsupported type assertion %s.(T) (v2)", callName(e))
+			}
 			nm := p.expect(tIdent, "").text
 			e = &expr{kind: "member", name: callName(e) + "." + nm}
+		case p.atPunct("..."):
+			// f(args...) variadic spread — passing a slice as individual
+			// args has no drop-in A1 word shape (a word is one value);
+			// refuse loudly rather than silently dropping elements.
+			p.failf("unsupported variadic spread %s... (v2)", callName(e))
 		case p.atPunct("++"):
 			p.pos++
 			e = &expr{kind: "incr", target: e}
@@ -829,22 +856,8 @@ func (p *parser) parseFuncLit() *expr {
 	p.expect(tIdent, "func")
 	p.expect(tPunct, "(")
 	params := p.parseFuncParams()
-	p.skipNL()
-	// optional return type: ident | (a, b) | []T | *T
-	for p.tok().kind == tIdent && p.tok().text != "{" {
-		p.pos++
-		p.skipNL()
-	}
-	for p.atPunct("(") || p.atPunct("[") || p.atPunct("*") {
-		p.pos++
-		p.skipNL()
-		for p.tok().kind == tIdent {
-			p.pos++
-		}
-		p.skipNL()
-	}
-	p.skipNL()
-	// function scope
+	// optional return type: T | pkg.T | []T | *T | (T, U) — erased
+	p.skipReturnType()
 	saveParams, saveOrd, saveLocals, saveIn := p.fnParams, p.fnParamOrd, p.fnLocals, p.inFunc
 	p.fnParams = map[string]bool{}
 	p.fnParamOrd = nil
@@ -859,27 +872,200 @@ func (p *parser) parseFuncLit() *expr {
 	return &expr{kind: "func", params: params, body: body}
 }
 
+// skipType consumes one Go type expression in its entirety (balanced):
+// ident | pkg.T | *T | [N]T | []T | map[K]V | chan/<-chan/chan<- T |
+// func(params) ret | (T) | interface{…} | struct{…} | …T. Newlines
+// inside are consumed too (multi-line struct/param lists).
+//
+// This is the type-position ERASURE contract's workhorse: Go types are
+// compile-time only and have zero runtime statements in the A1, so a
+// parsed-and-dropped type IS the faithful lowering (the same rule the
+// empty-interface/scalar-alias/type-param erasures already pin).
+func (p *parser) skipType() {
+	p.skipNL()
+	switch {
+	case p.atPunct("*"): // pointer type *T
+		p.pos++
+		p.skipType()
+	case p.atPunct("..."): // variadic ...T
+		p.pos++
+		p.skipType()
+	case p.atPunct("<-"): // <-chan T
+		p.pos++
+		p.skipNL()
+		if p.atIdent("chan") {
+			p.pos++
+			p.skipNL()
+			if !p.atPunct("(") && !p.atPunct("{") && !p.atPunct(",") &&
+				!p.atPunct(")") && !p.atPunct("]") && !p.atPunct("}") &&
+				p.tok().kind != tNL && p.tok().kind != tEOF {
+				p.skipType()
+			}
+		} else {
+			p.skipType()
+		}
+	case p.atPunct("("): // parenthesized type / multi-value return list
+		p.skipBalanced("(", ")")
+	case p.atPunct("["): // []T | [N]T | [...]T
+		p.skipBalanced("[", "]")
+		p.skipNL()
+		// an element type follows unless we're at an expr boundary
+		if !p.atBoundary() {
+			p.skipType()
+		}
+	case p.tok().kind == tIdent:
+		switch p.tok().text {
+		case "map": // map[K]V
+			p.pos++
+			p.skipNL()
+			p.skipBalanced("[", "]")
+			p.skipNL()
+			p.skipType()
+		case "chan": // chan T | chan<- T
+			p.pos++
+			p.skipNL()
+			if p.atPunct("<-") {
+				p.pos++
+				p.skipNL()
+			}
+			if !p.atBoundary() {
+				p.skipType()
+			}
+		case "interface", "struct": // interface{…} | struct{…}
+			p.pos++
+			p.skipNL()
+			p.skipBalanced("{", "}")
+		case "func": // func(params) ret
+			p.pos++
+			p.skipNL()
+			if p.atPunct("(") {
+				p.skipBalanced("(", ")")
+			}
+			p.skipNL()
+			// optional result type
+			if !p.atBoundary() {
+				p.skipType()
+			}
+		default: // ident | pkg.T | pkg.T[T]
+			p.next()
+			p.skipNL()
+			for p.atPunct(".") && p.toks[p.pos+1].kind == tIdent {
+				p.pos += 2
+				p.skipNL()
+			}
+			if p.atPunct("[") {
+				p.skipBalanced("[", "]")
+			}
+		}
+	default:
+		p.failf("expected a type, got %q", p.tok().text)
+	}
+}
+
+// atBoundary reports whether the cursor sits where a type cannot start
+// (statement/expression boundaries after a complete type or receiver).
+func (p *parser) atBoundary() bool {
+	t := p.tok()
+	if t.kind == tNL || t.kind == tEOF {
+		return true
+	}
+	switch t.text {
+	case "{", "}", ")", "]", ",", ";", ":", "=", ":=":
+		return true
+	}
+	return false
+}
+
+// skipBalanced consumes from the opening punct through its matching
+// close (nesting-aware over () [] {}).
+func (p *parser) skipBalanced(open, close string) {
+	p.skipNL()
+	if !p.acceptPunct(open) {
+		p.failf("expected %q, got %q", open, p.tok().text)
+	}
+	depth := 1
+	for depth > 0 {
+		t := p.next()
+		if t.kind == tEOF {
+			p.failf("unterminated %q…%q group", open, close)
+		}
+		if t.kind == tPunct {
+			switch t.text {
+			case "(", "[", "{":
+				depth++
+			case ")", "]", "}":
+				depth--
+			}
+		}
+	}
+}
+
+// skipReturnType consumes an optional Go result type in return position
+// (after a parameter list): none | T | (T, U) | ([]byte, error) etc.
+func (p *parser) skipReturnType() {
+	p.skipNL()
+	if p.atPunct("{") || p.atBoundary() {
+		return
+	}
+	p.skipType()
+}
+
 func (p *parser) parseFuncParams() []string {
 	var params []string
 	p.skipNL()
 	for !p.atPunct(")") {
+		if p.tok().kind == tEOF {
+			p.failf("unterminated parameter list")
+		}
 		if p.atPunct("(") {
 			p.pos++
 			params = append(params, p.parseFuncParams()...)
+			p.skipNL()
 			continue
 		}
-		nm := p.expect(tIdent, "").text
-		// skip the type (ident, possibly bracketed/pointer)
-		for p.tok().kind == tIdent {
-			p.pos++
-		}
-		for p.atPunct("[") || p.atPunct("*") || p.atPunct("]") || p.atPunct(",") || p.atPunct("(") || p.atPunct(")") {
+		// Grouped spec `a, b string` and unnamed types (*T, []any,
+		// ...any): collect leading idents, then erase one shared type.
+		names := []string{}
+		for {
+			if p.tok().kind == tIdent {
+				names = append(names, p.next().text)
+				p.skipNL()
+				if !p.acceptPunct(",") {
+					break
+				}
+				p.skipNL()
+				continue
+			}
 			break
 		}
-		params = append(params, nm)
-		if p.acceptPunct(",") {
-			p.skipNL()
+		if len(names) > 0 && (p.atPunct(")") || p.atPunct(",")) {
+			// bare idents with no following type (e.g. `(a, b)` style)
+			if p.acceptPunct(",") {
+				p.skipNL()
+				for _, nm := range names {
+					params = append(params, nm)
+				}
+				continue
+			}
+			for _, nm := range names {
+				params = append(params, nm)
+			}
+			break
 		}
+		// the (possibly shared) type — erased under the A1 erasure
+		// contract; only the NAMES become $N params
+		if len(names) > 0 {
+			p.skipType()
+		} else {
+			// unnamed param: the token IS the type
+			p.skipType()
+		}
+		params = append(params, names...)
+		p.skipNL()
+		if !p.acceptPunct(",") {
+			break
+		}
+		p.skipNL()
 	}
 	p.expect(tPunct, ")")
 	return params
@@ -975,20 +1161,9 @@ func (p *parser) parseTopLevel() []map[string]any {
 			}
 			p.expect(tPunct, "(")
 			params := p.parseFuncParams()
-			p.skipNL()
-			// optional return type: ident | (a, b) | []T | *T
-			for p.tok().kind == tIdent && p.tok().text != "{" {
-				p.pos++
-				p.skipNL()
-			}
-			for p.atPunct("(") || p.atPunct("[") || p.atPunct("*") {
-				p.pos++
-				p.skipNL()
-				for p.tok().kind == tIdent {
-					p.pos++
-				}
-				p.skipNL()
-			}
+			// optional return type: T | []T | *T | (T, error) — erased
+			// under the same type-position contract as the params
+			p.skipReturnType()
 			p.skipNL()
 			// function scope (mirrors parseFuncLit)
 			saveParams, saveOrd, saveLocals, saveIn := p.fnParams, p.fnParamOrd, p.fnLocals, p.inFunc
@@ -1005,45 +1180,34 @@ func (p *parser) parseTopLevel() []map[string]any {
 			p.fnNames[nm] = true
 			out = append(out, map[string]any{"type": "Function", "name": nm, "body": body})
 		case p.atIdent("type"):
-			// `type Name interface{}` — an EMPTY interface type decl:
-			// compile-time only, erased under the type-position erasure
-			// contract (t80/t82/t84/t85 — shell has no interface values;
-			// the app's `type Expr interface{}` AST-node declarations).
-			// A non-empty interface body (method dispatch) and composite
-			// underlying types (structs — the core-requests
-			// go-sh-dogfood-20260815 §3 boundary; map/[]/*/func/chan) stay
-			// refused loudly.
+			// `type Name <underlying>` — a TYPE DECLARATION: compile-time
+			// only, zero runtime statements. The faithful A1 lowering is
+			// ERASURE (parse the full underlying type, emit nothing) — the
+			// same contract already pinned for empty interfaces (t80/t82/
+			// t84/t85), scalar aliases (`type tokKind int`) and generic
+			// type parameters. Supported underlying forms:
+			//   interface{…}   — empty OR method-set body (a method SPEC is
+			//                    itself compile-time only; method DISPATCH
+			//                    on values stays refused at its use sites)
+			//   struct{…}      — field list, erased field by field
+			//   T | pkg.T      — scalar/named alias
+			// Composite value-shapes (map/[]/*/func/chan underlying types)
+			// also erase here — the DECLARATION is inert; only a VALUE of
+			// such a type needs a runtime shape, and those stay gated at
+			// their use sites (Refuse > guess). Also `type ( … )` groups.
 			p.pos++
 			p.skipNL()
-			p.expect(tIdent, "") // Name
-			p.skipNL()
-			if p.atIdent("interface") {
-				p.pos++
-				p.skipNL()
-				p.expect(tPunct, "{")
-				p.skipNL()
-				if p.atPunct("}") {
-					p.pos++
-					break
-				}
-				p.failf("interface methods unsupported (v2) — method dispatch is a contract boundary")
-			}
-			// `type Name int` (string/bool/float64/…, or another named
-			// type) — a named SCALAR type: compile-time only, erased under
-			// the same type-position erasure contract as the empty
-			// interface above. The A1 is dynamically typed, so a tokKind
-			// VALUE is a plain int — no shape needed (go-sh.go's own
-			// `type tokKind int`, fish-sh-go's tokKind, perl-sh-go's
-			// `type tokKind string`). Type positions (params, struct
-			// fields, var decls) already erase; a VALUE-position use
-			// (conversion `tokKind(x)`) stays refused loudly by the
-			// word-position call gate — no silent mis-lower.
-			if p.tok().kind == tIdent && !p.atIdent("struct") &&
-				!p.atIdent("func") && !p.atIdent("map") && !p.atIdent("chan") {
-				p.pos++
+			if p.atPunct("(") { // grouped decls: every spec erases
+				p.skipBalanced("(", ")")
 				break
 			}
-			p.failf("type decls are outside the subset (v2) — struct/interface types have no A1 shape")
+			p.expect(tIdent, "") // Name
+			p.skipNL()
+			if p.tok().kind == tIdent {
+				p.skipType()
+				break
+			}
+			p.failf("unsupported type declaration (v2) — expected a type after %q", "name")
 		case p.atIdent("const"):
 			// `const x = expr` / `const ( specs )` — Go compile-time
 			// constants (FRONTEND-GAP: the old path fell through to
@@ -1078,7 +1242,16 @@ func (p *parser) parseStmt() []map[string]any {
 		return p.parseSwitch()
 	case "return":
 		p.pos++
-		return []map[string]any{p.returnToStmt(p.parseExpr())}
+		// `return w1[, w2…]` — the A1 lowers return to echo (a shell sub
+		// returns via stdout), so multiple result values map to multiple
+		// echo WORDS — the same channel a shell function uses to hand
+		// back several values.
+		words := []map[string]any{p.exprToWord(p.parseExpr())}
+		for p.acceptPunct(",") {
+			p.skipNL()
+			words = append(words, p.exprToWord(p.parseExpr()))
+		}
+		return []map[string]any{execStmt("echo", words, "Emulable")}
 	case "continue":
 		// A1 Continue node (mirrors Command::Continue(None) in the core):
 		// a bare `continue` inside a loop body. Labeled `continue L` is
@@ -1297,15 +1470,45 @@ func (p *parser) constExprDesc(e *expr) string {
 // the names (""), bytes.Buffer registers a buffer accumulator (t56).
 func (p *parser) parseVarDecl() []map[string]any {
 	p.expect(tIdent, "var")
+	p.skipNL()
+	// var group: `var ( \n x int \n s = "hi" \n )` — each spec is a
+	// full var decl; the type position still erases.
+	if p.atPunct("(") {
+		p.pos++
+		var out []map[string]any
+		for {
+			p.skipNL()
+			if p.atPunct(")") {
+				p.pos++
+				return out
+			}
+			if p.tok().kind == tEOF {
+				p.failf("unterminated var group")
+			}
+			out = append(out, p.parseVarSpec()...)
+		}
+	}
+	return p.parseVarSpec()
+}
+
+// parseVarSpec parses one `name[, name…] [type] [= expr]` spec (the
+// shared body of single and grouped var decls). The optional type is
+// erased under the A1 erasure contract; the initializer lowers as an
+// ordinary assignment. Composite-literal initializers reuse the array/
+// map literal lowerings from the := path.
+func (p *parser) parseVarSpec() []map[string]any {
 	var names []string
 	for {
-		p.skipNL()
 		names = append(names, p.expect(tIdent, "").text)
 		if !p.acceptPunct(",") {
 			break
 		}
+		p.skipNL()
 	}
 	// optional type: pkg.Ident (bytes.Buffer) | plain ident | []T | *T
+	// | map[K]V | interface{…} — ERASED under the A1 type-position
+	// contract (same rule as params/returns). bytes.Buffer /
+	// strings.Builder additionally arm the buffer side-state.
 	p.skipNL()
 	isBuf := false
 	for {
@@ -1319,39 +1522,11 @@ func (p *parser) parseVarDecl() []map[string]any {
 			}
 			continue
 		}
-		// plain type ident — `var x int = 5` / `var x any = "hi"`: a type
-		// name may be followed by `=` (the initializer) or end the line.
-		if t.kind == tIdent && (p.toks[p.pos+1].kind != tPunct || p.toks[p.pos+1].text == "=") {
-			p.pos++ // plain type ident
-			continue
-		}
-		// `interface{}` — the empty interface type (the erasure contract
-		// t80/t82/t84/t85: shell has no interface values; the type is
-		// erased and the value is only ever nil-checked or stored as its
-		// underlying value). A non-empty body (methods) is method
-		// dispatch — refused.
-		if t.kind == tIdent && t.text == "interface" {
-			p.pos++
-			p.skipNL()
-			p.expect(tPunct, "{")
-			p.skipNL()
-			if !p.atPunct("}") {
-				p.failf("interface methods unsupported (v2) — method dispatch is a contract boundary")
-			}
-			p.pos++ // }
-			p.skipNL()
-			continue
-		}
-		if t.kind == tPunct && (t.text == "[" || t.text == "*") {
-			p.pos++
-			p.skipNL()
-			for p.tok().kind == tIdent {
-				p.next()
-			}
-			p.skipNL()
-			continue
-		}
 		break
+	}
+	if t := p.tok(); !(t.kind == tNL || t.kind == tEOF ||
+		(t.kind == tPunct && (t.text == "=" || t.text == ")"))) {
+		p.skipType()
 	}
 	var out []map[string]any
 	for _, n := range names {
@@ -1361,15 +1536,38 @@ func (p *parser) parseVarDecl() []map[string]any {
 		}
 		out = append(out, assignStmt(n, strExpr("")))
 	}
-	// optional initializer: var b = expr
+	// optional initializer: var b = expr — composite-literal forms
+	// reuse the same drop-in lowerings as the := path (assocSet pairs
+	// for maps, setArray for slices).
 	p.skipNL()
 	if p.atPunct("=") {
 		p.pos++
 		p.skipNL()
-		rhs := p.parseExpr()
 		if len(names) != 1 {
 			p.failf("var decl initializer with multiple targets (v2)")
 		}
+		if p.atIdent("map") {
+			// consume the map[K]V header, then share the assocSet body
+			p.pos++ // map
+			p.skipNL()
+			p.skipBalanced("[", "]")
+			for p.tok().kind == tIdent {
+				p.next() // value type
+			}
+			return p.parseMapLiteralBody(names[0])
+		}
+		if p.atPunct("[") && !p.byteSliceLitAhead() {
+			elems, typ := p.parseArrayLiteral()
+			p.arrays[names[0]] = arrayInfo{elems: elems, typ: typ}
+			p.registerVar(names[0], "Array")
+			return []map[string]any{assignStmt(names[0],
+				map[string]any{
+					"type": "Call", "func": "setArray",
+					"args":   []any{strExpr(names[0]), map[string]any{"type": "Array", "elements": elems}},
+					"purity": "Emulable",
+				})}
+		}
+		rhs := p.parseExpr()
 		w := p.exprToWord(rhs)
 		p.registerVar(names[0], p.wordType(w))
 		return []map[string]any{assignStmt(names[0], w)}
@@ -1682,6 +1880,58 @@ func (p *parser) setenvStmt() []map[string]any {
 
 // ── assignments and calls ───────────────────────────────────────────
 
+// parseMapLiteralBody parses `map[K]V{ k: v, … }` (the `map` keyword
+// and key/value type already consumed by the caller) for target `name`,
+// lowering each pair to an assocSet Call (the drop-in A1 shape; t54).
+func (p *parser) parseMapLiteralBody(name string) []map[string]any {
+	p.skipNL()
+	p.expect(tPunct, "{")
+	p.maps[name] = true
+	p.registerVar(name, "Map")
+	var body []map[string]any
+	for {
+		p.skipNL()
+		if p.atPunct("}") {
+			p.pos++
+			break
+		}
+		key := p.parseExpr()
+		if key.kind != "str" && key.kind != "num" && key.kind != "rawstr" {
+			p.failf("unsupported map key %q (v2) — keys must be literals", key.text)
+		}
+		p.expect(tPunct, ":")
+		p.skipNL()
+		if p.atPunct("{") {
+			// nested struct/composite literal value — no A1 shape for a
+			// positional struct value inside an assoc-array
+			p.failf("unsupported composite literal value in map literal (v2)")
+		}
+		val := p.parseExpr()
+		if val.kind == "var" && (val.name == "true" || val.name == "false") {
+			// Go bool literal → its textual form (fmt prints bools
+			// as true/false — byte-faithful under the echo return)
+			val = &expr{kind: "str", text: val.name}
+		}
+		if val.kind != "str" && val.kind != "num" && val.kind != "rawstr" {
+			p.failf("unsupported map value %q (v2) — keys/values must be literals", val.text)
+		}
+		body = append(body, map[string]any{
+			"type": "Expr",
+			"expr": map[string]any{
+				"type": "Call", "func": "assocSet",
+				"args":   []any{strExpr(name), strExpr(key.text), strExpr(val.text)},
+				"purity": "Emulable",
+			},
+		})
+		if !p.acceptPunct(",") {
+			p.skipNL()
+			p.expect(tPunct, "}")
+			break
+		}
+	}
+	return []map[string]any{{"type": "Block", "body": body}}
+}
+
 func (p *parser) parseAssignStmt() []map[string]any {
 	var targets []string
 	targets = append(targets, p.next().text)
@@ -1792,7 +2042,8 @@ func (p *parser) parseAssignStmt() []map[string]any {
 			})}
 	}
 	// map literal: name := map[K]V{ k: v, ... } → one assocSet per pair
-	// (the runtime's by-name associative-array store; t54).
+	// (the runtime's by-name associative-array store; t54). The body
+	// parser is shared with the `var m = map[K]V{…}` initializer path.
 	if p.atIdent("map") {
 		p.pos++
 		p.expect(tPunct, "[")
@@ -1803,45 +2054,10 @@ func (p *parser) parseAssignStmt() []map[string]any {
 		for p.tok().kind == tIdent {
 			p.next()
 		}
-		p.skipNL()
-		p.expect(tPunct, "{")
 		if len(targets) > 1 {
 			p.failf("map literal with multiple targets (v2)")
 		}
-		p.maps[targets[0]] = true
-		p.registerVar(targets[0], "Map")
-		var body []map[string]any
-		for {
-			p.skipNL()
-			if p.atPunct("}") {
-				p.pos++
-				break
-			}
-			key := p.parseExpr()
-			if key.kind != "str" && key.kind != "num" && key.kind != "rawstr" {
-				p.failf("map keys must be literals (v2)")
-			}
-			p.expect(tPunct, ":")
-			p.skipNL()
-			val := p.parseExpr()
-			if val.kind != "str" && val.kind != "num" && val.kind != "rawstr" {
-				p.failf("map values must be literals (v2)")
-			}
-			body = append(body, map[string]any{
-				"type": "Expr",
-				"expr": map[string]any{
-					"type": "Call", "func": "assocSet",
-					"args":   []any{strExpr(targets[0]), strExpr(key.text), strExpr(val.text)},
-					"purity": "Emulable",
-				},
-			})
-			if !p.acceptPunct(",") {
-				p.skipNL()
-				p.expect(tPunct, "}")
-				break
-			}
-		}
-		return []map[string]any{{"type": "Block", "body": body}}
+		return p.parseMapLiteralBody(targets[0])
 	}
 	// cmd := exec.Command(a, b) [.Output()|.Run()]  /  x, _ := ....Output()
 	if p.atIdent("exec") {
@@ -1980,6 +2196,39 @@ func (p *parser) parseAssignStmt() []map[string]any {
 
 	// generic RHS
 	rhs := p.parseExpr()
+
+	// q, _ := f(args) — a call to a DEFINED sub as the RHS: the shell
+	// shape is `q=$(f args)` — the sub's echo IS its return channel,
+	// captured into the target (mirrors the os.ReadFile capture below).
+	// Multiple non-_ targets would need IFS word-splitting to distribute
+	// the echo words — refused (Refuse > guess).
+	if rhs.kind == "call" && p.fnNames[rhs.callee] {
+		var words []map[string]any
+		for _, a := range rhs.args {
+			words = append(words, p.exprToWord(a))
+		}
+		name := ""
+		for _, tg := range targets {
+			if tg == "_" {
+				continue
+			}
+			if name != "" {
+				p.failf("unsupported multi-target capture of sub %s (v2)", rhs.callee)
+			}
+			name = tg
+		}
+		if name == "" {
+			return nil // f(args) bare call as RHS of `_ :=` — pure side effect
+		}
+		inner := execStmtTA(rhs.callee, words, "Spawn", rhs.typeArgs)
+		capture := map[string]any{
+			"type": "Call", "func": "capture",
+			"args":   []any{map[string]any{"type": "Arrow", "body": []any{inner}}},
+			"purity": "Spawn",
+		}
+		p.registerVar(name, "Str")
+		return []map[string]any{assignStmt(name, capture)}
+	}
 
 	// args := os.Args[1:] — argv with argv0 stripped, the shell's `"$@"`
 	// (the array-valued positional slice `${@:off:len}`, which the core
@@ -2330,6 +2579,25 @@ func (p *parser) parseIf() []map[string]any {
 		}
 		p.registerVar(name, "Str")
 		cond = &expr{kind: "rawjson", rawJSON: p.readFileIfCond(name, p.exprToWord(path), neg)}
+	} else if p.tok().kind == tIdent &&
+		((p.toks[p.pos+1].kind == tPunct && p.toks[p.pos+1].text == ",") ||
+			(p.toks[p.pos+1].kind == tOp && p.toks[p.pos+1].text == ":=")) {
+		// generic if-init assignment: `if x, ok := expr; cond {` — the
+		// init lowers as ordinary assignment statements; only the COND
+		// gates the branch. Constructs the init cannot lower (type
+		// assertions, unsupported calls) refuse loudly from their own
+		// sites instead of dying as raw parse errors.
+		for {
+			pre = append(pre, p.parseAssignStmt()...)
+			p.skipNL()
+			if p.acceptPunct(";") {
+				break
+			}
+			if !p.acceptPunct(",") {
+				break
+			}
+		}
+		cond = p.parseExpr()
 	} else {
 		cond = p.parseExpr()
 	}
@@ -2816,6 +3084,11 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 		if e.name == "nil" {
 			return strExpr("")
 		}
+		if e.name == "true" || e.name == "false" {
+			// Go bool literal in VALUE position — its textual form (fmt
+			// prints bools as true/false; byte-faithful under echo)
+			return strExpr(e.name)
+		}
 		name := p.resolveVar(e.name)
 		if n, ok := p.paramNumber(name); ok {
 			return getVarExpr(strconv.Itoa(n))
@@ -2842,7 +3115,7 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 				}
 			}
 		}
-		p.failf("bare member %q (v2)", e.name)
+		p.failf("unsupported bare member %q (v2)", e.name)
 	case "add", "mul", "neg":
 		return p.arithOrConcat(e)
 	case "index":
@@ -2865,7 +3138,7 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 			}
 		}
 		if e.idx1e != nil {
-			p.failf("index key must be a number literal (v2)")
+			p.failf("unsupported index key (v2) — must be a number literal")
 		}
 		if e.target != nil && e.target.kind == "var" {
 			return joinCall(paramCall("", e.target.name+"["+e.idx1+"]"))
@@ -3034,7 +3307,7 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 		}
 		p.failf("unsupported call %q in word position (v2)", e.callee)
 	case "binop":
-		p.failf("comparison in word position (v2)")
+		p.failf("unsupported comparison in word position (v2)")
 	}
 	p.failf("unsupported expression %q (v2 subset)", e.kind)
 	return nil
@@ -3436,7 +3709,7 @@ func (p *parser) condOperandQ(e *expr) string {
 		// tokenizeTest expands the quoted word via expandWord
 		// (arrayIndex) inside a quoted test word.
 		if e.idx1e != nil {
-			p.failf("index key must be a number literal (v2)")
+			p.failf("unsupported index key (v2) — must be a number literal")
 		}
 		if e.target != nil && e.target.kind == "var" {
 			if p.maps[e.target.name] {
@@ -3470,7 +3743,7 @@ func (p *parser) condOperandArg(e *expr) string {
 		// the quoted form avoids). Literal keys only, like the
 		// statement-position lowering (exprToWord).
 		if e.idx1e != nil {
-			p.failf("index key must be a number literal (v2)")
+			p.failf("unsupported index key (v2) — must be a number literal")
 		}
 		if e.target != nil && e.target.kind == "var" {
 			if p.maps[e.target.name] {
