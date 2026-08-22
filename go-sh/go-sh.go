@@ -1245,11 +1245,30 @@ func (p *parser) parseStmt() []map[string]any {
 		// `return w1[, w2…]` — the A1 lowers return to echo (a shell sub
 		// returns via stdout), so multiple result values map to multiple
 		// echo WORDS — the same channel a shell function uses to hand
-		// back several values.
-		words := []map[string]any{p.exprToWord(p.parseExpr())}
-		for p.acceptPunct(",") {
+		// back several values. TRAILING empty results (the idiomatic
+		// `, nil` error return) drop entirely: an echoed empty word would
+		// leave a stray blank inside a capture (`q=$(f …)` diverging from
+		// native stdout byte-for-byte).
+		var rexprs []*expr
+		for {
+			rexprs = append(rexprs, p.parseExpr())
+			if !p.acceptPunct(",") {
+				break
+			}
 			p.skipNL()
-			words = append(words, p.exprToWord(p.parseExpr()))
+		}
+		for len(rexprs) > 1 {
+			last := rexprs[len(rexprs)-1]
+			empty := (last.kind == "var" && last.name == "nil") ||
+				((last.kind == "str" || last.kind == "rawstr") && last.text == "")
+			if !empty {
+				break
+			}
+			rexprs = rexprs[:len(rexprs)-1]
+		}
+		var words []map[string]any
+		for _, e := range rexprs {
+			words = append(words, p.exprToWord(e))
 		}
 		return []map[string]any{execStmt("echo", words, "Emulable")}
 	case "continue":
