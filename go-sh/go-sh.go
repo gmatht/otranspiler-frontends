@@ -27,7 +27,23 @@
 // type names — core request go-sh-20260813-154009), func literals
 // (params -> $1.., fresh vars -> `local`), go-func background,
 // raw-string heredocs, comments, shebang.
-//
+// TYPE ASSERTION x.(T) and its comma-ok form (`v, ok := x.(T)`): the
+// drop-in TypeAssert ext node (checked passthrough; kind vocabulary =
+// the sh2.typeOf strings). The comma-ok BOOLEAN is the frontend's
+// `typeof(x) == kind` comparison — ok stores "true"/"false" and a bare
+// Bool var condition lowers to `"$ok" = true`. Unknown/named assertion
+// types still refuse loudly (the dynamic kind is not knowable).
+// ADDRESS-OF / DEREFERENCE &x / *p: the AddressOf/Deref ext-node pair
+// (SNAPSHOT semantics on the value-only JS backend — reads pass the
+// current value through; writes through a pointer refuse loudly).
+// VARIADIC SPREAD f(args...): the Spread ext node, valid in direct
+// call-argument position (array-typed vars only), rendered natively as
+// an ESTree SpreadElement.
+// COMPOSITE LITERALS IN EXPRESSION POSITION (`return map[K]V{…}`, an
+// anonymous dict VALUE): the MapLiteral ext node (parallel keys/values),
+// read back through ElementRead (computed coll[key]) — TRANSIENT values:
+// assignment/return of a whole dict keeps refusing (named maps stay
+// assocSet-based).//
 // Top-level func decls `func name[typeParams](params) [ret] { body }`
 // lower to the same Function subs as func literals. Go GENERICS (grammar
 // typeParameters / typeArgs, core request go-sh-typeargs): a generic
@@ -393,7 +409,8 @@ func execCond(cmd string, words []map[string]any) map[string]any {
 
 // expr kinds: "str" "num" "rawstr" "var" "binop" (comparisons/logical)
 // "not" "add" "mul" "neg" (arith-or-concat) "index" "slice" "strlen"
-// "arrlen" "call" "func".
+// "arrlen" "call" "func" — plus the drop-in-node kinds "addr" (AddressOf)
+// "deref" (Deref) "assert" (TypeAssert) "maplit" (MapLiteral).
 type expr struct {
 	kind string
 	// str/num
@@ -401,6 +418,16 @@ type expr struct {
 	raw  string // printf-format raw text
 	// var
 	name string
+	// type assertion x.(T): raw assertion type text (goTypeKind maps it
+	// to the generic kind vocabulary at lowering)
+	typeName string
+	// variadic spread f(args...): the arg carries the spread flag; the
+	// lowering wraps its word in the Spread ext node
+	spread bool
+	// map[K]V{…} composite literal in expression position: parallel
+	// key/value expression lists (MapLiteral node)
+	keys []*expr
+	vals []*expr
 	// arith / concat / binop
 	op  string
 	lhs *expr
@@ -449,6 +476,10 @@ type parser struct {
 	fnParamOrd []string           // ordered param names -> $1..
 	fnLocals   map[string]bool
 	inFunc     bool
+	// variadic decl param (`parts ...string`) — excluded from the fixed
+	// $N positional mapping; the function-entry prelude splices the tail
+	// positionals (${@:N}) into a real array var so reads/spreads work.
+	variadicParam string
 	// type-switch guard aliases: `switch v := x.(type)` binds v to x in
 	// every arm (core request go-sh-20260813-154009) — reads of the guard
 	// var resolve to the guarded var (getVar x), matching the contract's
@@ -592,14 +623,17 @@ func (p *parser) parseUnary() *expr {
 		p.pos++
 		return &expr{kind: "neg", lhs: p.parseUnary()}
 	}
-	// &x / *x — address-of and dereference have no shell-flavored A1
-	// meaning (the IR passes values, never storage locations); refuse
-	// loudly at the construct instead of mis-lowering.
+	// &x / *x — the AddressOf/Deref ext-node pair. The IR passes values;
+	// reference-capable backends render true references, value-only
+	// backends use snapshot semantics (reads pass through; WRITES
+	// through a pointer refuse at the assignment site — parseAssignStmt).
 	if p.atPunct("&") {
-		p.failf("unsupported address-of operator '&' (v2)")
+		p.pos++
+		return &expr{kind: "addr", lhs: p.parseUnary()}
 	}
 	if p.atPunct("*") {
-		p.failf("unsupported pointer dereference '*' (v2)")
+		p.pos++
+		return &expr{kind: "deref", lhs: p.parseUnary()}
 	}
 	return p.parsePostfix()
 }
@@ -663,18 +697,28 @@ func (p *parser) parsePostfix() *expr {
 		case p.atPunct("."):
 			p.pos++
 			if p.atPunct("(") {
-				// x.(T) type assertion — the A1 is dynamically typed with
-				// no type tags to test; the comma-ok idiom's false branch
-				// would be unreachable in a mis-lowering. Refuse loudly.
-				p.failf("unsupported type assertion %s.(T) (v2)", callName(e))
+				// x.(T) type assertion — the drop-in TypeAssert ext node
+				// (checked passthrough; kind vocabulary = sh2.typeOf).
+				// x.(type) is the TYPE-SWITCH form: only legal as a switch
+				// discriminant, where peekTypeSwitch consumes it textually —
+				// reaching here means a stray form.
+				p.pos++
+				tn := p.parseAssertionType()
+				p.expect(tPunct, ")")
+				if tn == "type" {
+					p.failf("x.(type) is only valid in a type switch (v2)")
+				}
+				e = &expr{kind: "assert", lhs: e, typeName: tn}
+				continue
 			}
 			nm := p.expect(tIdent, "").text
 			e = &expr{kind: "member", name: callName(e) + "." + nm}
 		case p.atPunct("..."):
-			// f(args...) variadic spread — passing a slice as individual
-			// args has no drop-in A1 word shape (a word is one value);
-			// refuse loudly rather than silently dropping elements.
-			p.failf("unsupported variadic spread %s... (v2)", callName(e))
+			// f(args...) variadic spread — mark the arg expr; the call-site
+			// word lowering wraps it in the Spread ext node (ESTree
+			// SpreadElement; array-typed vars only — see argToWord).
+			p.pos++
+			e.spread = true
 		case p.atPunct("++"):
 			p.pos++
 			e = &expr{kind: "incr", target: e}
@@ -687,6 +731,78 @@ func (p *parser) parsePostfix() *expr {
 func callName(e *expr) string {
 	if e.kind == "member" || e.kind == "var" {
 		return e.name
+	}
+	return ""
+}
+
+// parseAssertionType consumes the raw type text inside x.( T ) — a
+// single-line Go type expression (idents, dots, pointer/slice marks).
+// Balanced-bracket types ([]T, chan) ride on the same punct set.
+func (p *parser) parseAssertionType() string {
+	var b strings.Builder
+	depth := 0
+	for {
+		t := p.tok()
+		if t.kind == tEOF {
+			p.failf("unterminated type assertion")
+		}
+		if t.kind == tPunct || t.kind == tOp {
+			switch t.text {
+			case "[", "{", "(":
+				depth++
+			case "]", "}", ")":
+				if t.text == ")" && depth == 0 {
+					return strings.TrimSpace(b.String())
+				}
+				depth--
+			}
+			b.WriteString(t.text)
+			p.pos++
+			continue
+		}
+		if t.kind == tIdent || t.kind == tNum {
+			b.WriteString(t.text)
+			p.pos++
+			continue
+		}
+		p.failf("unexpected token %q in type assertion", t.text)
+	}
+}
+
+// goTypeKind maps an assertion type's text to the GENERIC kind
+// vocabulary the TypeAssert node carries (= the sh2.typeOf strings:
+// string|int|float|bool|array). Pointer marks strip to the element;
+// slice/variadic forms are arrays. A NAMED type (StrE, *sitter.Tree)
+// has no knowable dynamic kind at this layer — refused loudly (Refuse >
+// guess), not guessed.
+func goTypeKind(tn string) string {
+	t := strings.TrimSpace(tn)
+	for {
+		t = strings.TrimSpace(t)
+		if strings.HasPrefix(t, "*") {
+			t = t[1:]
+			continue
+		}
+		if strings.HasPrefix(t, "[]") || strings.HasPrefix(t, "...") {
+			return "array"
+		}
+		break
+	}
+	base := t
+	if i := strings.LastIndex(base, "."); i >= 0 {
+		base = base[i+1:]
+	}
+	switch base {
+	case "string":
+		return "string"
+	case "byte", "rune",
+		"int", "int8", "int16", "int32", "int64",
+		"uint", "uint8", "uint16", "uint32", "uint64", "uintptr":
+		return "int"
+	case "float32", "float64":
+		return "float"
+	case "bool":
+		return "bool"
 	}
 	return ""
 }
@@ -819,6 +935,42 @@ func (p *parser) parsePrimary() *expr {
 		case "true", "false", "nil":
 			p.pos++
 			return &expr{kind: "var", name: t.text}
+		case "map":
+			// map[K]V{ k: v, … } composite literal in EXPRESSION position
+			// (e.g. `return map[string]any{…}`) — the drop-in MapLiteral
+			// ext node (parallel keys/values; read back via ElementRead).
+			// A TRANSIENT value: assigning/returning one to a named var
+			// stays on the assocSet path (parseAssignStmt) — a whole-dict
+			// anonymous value flowing through the string-typed capture
+			// protocol is not representable (documented gap).
+			if p.toks[p.pos+1].kind == tPunct && p.toks[p.pos+1].text == "[" {
+				p.pos++ // map
+				p.skipType() // [K]V — balanced type erasure, incl. map forms
+				p.skipNL()
+				p.expect(tPunct, "{")
+				var keys, vals []*expr
+				for {
+					p.skipNL()
+					if p.atPunct("}") {
+						p.pos++
+						break
+					}
+					k := p.parseExpr()
+					p.skipNL()
+					p.expect(tPunct, ":")
+					p.skipNL()
+					v := p.parseExpr()
+					keys = append(keys, k)
+					vals = append(vals, v)
+					p.skipNL()
+					if !p.acceptPunct(",") {
+						p.skipNL()
+						p.expect(tPunct, "}")
+						break
+					}
+				}
+				return &expr{kind: "maplit", keys: keys, vals: vals}
+			}
 		}
 		p.pos++
 		return &expr{kind: "var", name: t.text}
@@ -856,6 +1008,10 @@ func (p *parser) parseFuncLit() *expr {
 	p.expect(tIdent, "func")
 	p.expect(tPunct, "(")
 	params := p.parseFuncParams()
+	if p.variadicParam != "" {
+		p.variadicParam = ""
+		p.failf("variadic func literal unsupported (v2) — use a top-level func decl")
+	}
 	// optional return type: T | pkg.T | []T | *T | (T, U) — erased
 	p.skipReturnType()
 	saveParams, saveOrd, saveLocals, saveIn := p.fnParams, p.fnParamOrd, p.fnLocals, p.inFunc
@@ -1030,6 +1186,13 @@ func (p *parser) parseFuncParams() []string {
 			if p.tok().kind == tIdent {
 				names = append(names, p.next().text)
 				p.skipNL()
+				if p.atPunct("...") {
+					// `name ...T` variadic marker — the name is NOT a fixed
+					// $N positional; the type still erases below ("..." rides
+					// into skipType's variadic form).
+					p.variadicParam = names[len(names)-1]
+					names = names[:len(names)-1]
+				}
 				if !p.acceptPunct(",") {
 					break
 				}
@@ -1161,6 +1324,15 @@ func (p *parser) parseTopLevel() []map[string]any {
 			}
 			p.expect(tPunct, "(")
 			params := p.parseFuncParams()
+			// variadic tail param (`parts ...string`): splice the remaining
+			// positionals into a real array var at function entry so reads,
+			// len(), indexing and f(parts...) spreads all see a genuine
+			// array (the ${@:N} positional slice)
+			vari := ""
+			if p.variadicParam != "" {
+				vari = p.variadicParam
+				p.variadicParam = ""
+			}
 			// optional return type: T | []T | *T | (T, error) — erased
 			// under the same type-position contract as the params
 			p.skipReturnType()
@@ -1175,7 +1347,19 @@ func (p *parser) parseTopLevel() []map[string]any {
 				p.fnParams[prm] = true
 				p.fnParamOrd = append(p.fnParamOrd, prm)
 			}
-			body := p.parseBlockStmts()
+			body := []map[string]any{}
+			if vari != "" {
+				p.registerVar(vari, "Array")
+				body = append(body, assignStmt(vari, map[string]any{
+					"type": "Call", "func": "setArray",
+					"args": []any{strExpr(vari), map[string]any{
+						"type":     "Array",
+						"elements": []any{paramCall("slice", "@", strconv.Itoa(len(params)+1), "")},
+					}},
+					"purity": "Emulable",
+				}))
+			}
+			body = append(body, p.parseBlockStmts()...)
 			p.fnParams, p.fnParamOrd, p.fnLocals, p.inFunc = saveParams, saveOrd, saveLocals, saveIn
 			p.fnNames[nm] = true
 			out = append(out, map[string]any{"type": "Function", "name": nm, "body": body})
@@ -1701,7 +1885,7 @@ func (p *parser) printlnStmt() []map[string]any {
 	if len(args) == 1 && args[0].kind == "call" && p.fnNames[args[0].callee] {
 		var words []map[string]any
 		for _, a := range args[0].args {
-			words = append(words, p.exprToWord(a))
+			words = append(words, p.argToWord(a))
 		}
 		return []map[string]any{execStmtTA(args[0].callee, words, "Spawn", args[0].typeArgs)}
 	}
@@ -1727,7 +1911,7 @@ func (p *parser) printlnWords(args []*expr) []map[string]any {
 			}
 		} else {
 			for _, a := range args {
-				words = append(words, p.exprToWord(a))
+				words = append(words, p.argToWord(a))
 			}
 		}
 	} else {
@@ -1952,6 +2136,13 @@ func (p *parser) parseMapLiteralBody(name string) []map[string]any {
 }
 
 func (p *parser) parseAssignStmt() []map[string]any {
+	// writes through a reference (*p = v / &x = …) have no snapshot-
+	// semantics lowering — refuse loudly instead of silently assigning
+	// to the wrong storage (the AddressOf/Deref contract, address_of.node).
+	if (p.tok().kind == tPunct || p.tok().kind == tOp) &&
+		(p.tok().text == "*" || p.tok().text == "&") {
+		p.failf("unsupported write through %q (v2) — references are read-only snapshots", p.tok().text)
+	}
 	var targets []string
 	targets = append(targets, p.next().text)
 	for p.acceptPunct(",") {
@@ -1984,7 +2175,7 @@ func (p *parser) parseAssignStmt() []map[string]any {
 		args := p.parseArgs()
 		var words []map[string]any
 		for _, a := range args {
-			words = append(words, p.exprToWord(a))
+			words = append(words, p.argToWord(a))
 		}
 		return []map[string]any{execStmt(targets[0], words, "Spawn")}
 	}
@@ -2224,7 +2415,7 @@ func (p *parser) parseAssignStmt() []map[string]any {
 	if rhs.kind == "call" && p.fnNames[rhs.callee] {
 		var words []map[string]any
 		for _, a := range rhs.args {
-			words = append(words, p.exprToWord(a))
+			words = append(words, p.argToWord(a))
 		}
 		name := ""
 		for _, tg := range targets {
@@ -2335,6 +2526,42 @@ func (p *parser) parseAssignStmt() []map[string]any {
 			return []map[string]any{p.execFromArgs(args)}
 		}
 		p.failf("unknown command %q (v2)", base)
+	}
+
+	// comma-ok type assertion: v, ok := x.(T) — the TypeAssert ext node
+	// for the value (checked passthrough), and the ok BOOLEAN as the
+	// frontend's typeof comparison (`typeof(x) == kind` → "true"/"false";
+	// a bare Bool var condition lowers to `"$ok" = true`, condTestString).
+	if len(targets) == 2 && rhs.kind == "assert" {
+		k := goTypeKind(rhs.typeName)
+		if k == "" {
+			p.failf("unsupported type assertion to %q (v2)", rhs.typeName)
+		}
+		w := p.exprToWord(rhs)
+		vName, okName := targets[0], targets[1]
+		p.registerVar(vName, "Str")
+		p.registerVar(okName, "Bool")
+		return []map[string]any{
+			assignStmt(vName, w),
+			// ok ← typeof(x) == kind ? "true" : "false" as a branch pair
+			// (the A1 BinOp Eq renders natively on every backend; the
+			// textual "true"/"false" match Go's fmt bool printing).
+			{
+				"type": "If",
+				"cond": map[string]any{
+					"type": "BinOp", "op": "Eq",
+					"lhs": map[string]any{
+						"type": "Call", "func": "typeof",
+						"args":   []any{p.exprToWord(rhs.lhs)},
+						"purity": "PureCpu",
+					},
+					"rhs": strExpr(k),
+				},
+				"then":   []any{assignStmt(okName, strExpr("true"))},
+				"elsifs": []any{},
+				"else":   []any{assignStmt(okName, strExpr("false"))},
+			},
+		}
 	}
 
 	// multi-assign: a, b := x, y → Block of Assigns (A=x B=y shape)
@@ -3086,8 +3313,31 @@ func (p *parser) wordType(w map[string]any) string {
 		return "Str"
 	case "Arith":
 		return "Int"
+	case "MapLiteral":
+		return "Map"
 	}
 	return "Str"
+}
+
+// argToWord lowers a CALL ARGUMENT: a spread-marked arg (f(args...))
+// wraps its word in the Spread ext node — valid only for ARRAY-typed
+// vars (the runtime expands the elements as individual positionals;
+// a scalar spread would silently vanish). Other args pass through.
+func (p *parser) argToWord(e *expr) map[string]any {
+	if e.spread {
+		if e.kind != "var" || p.varTypes[p.resolveVar(e.name)] != "Array" {
+			p.failf("variadic spread needs an array-typed var (v2)")
+		}
+		name := p.resolveVar(e.name)
+		return map[string]any{
+			"type": "Spread",
+			"expr": map[string]any{
+				"type": "Call", "func": "arrayItems",
+				"args": []any{strExpr(name)}, "purity": "PureCpu",
+			},
+		}
+	}
+	return p.exprToWord(e)
 }
 
 // exprToWord lowers an expression to its A1 word JSON.
@@ -3137,6 +3387,38 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 		p.failf("unsupported bare member %q (v2)", e.name)
 	case "add", "mul", "neg":
 		return p.arithOrConcat(e)
+	case "addr":
+		// AddressOf ext node — snapshot passthrough on value-only
+		// backends; Perl renders a true reference.
+		return map[string]any{
+			"type": "AddressOf", "operand": p.exprToWord(e.lhs),
+		}
+	case "deref":
+		// Deref ext node — matching read side of AddressOf.
+		return map[string]any{
+			"type": "Deref", "pointer": p.exprToWord(e.lhs),
+		}
+	case "assert":
+		// TypeAssert ext node — checked passthrough; kind vocabulary =
+		// sh2.typeOf strings. Named/unknown types refuse (goTypeKind).
+		k := goTypeKind(e.typeName)
+		if k == "" {
+			p.failf("unsupported type assertion to %q (v2) — named types have no knowable dynamic kind", e.typeName)
+		}
+		return map[string]any{
+			"type": "TypeAssert", "expr": p.exprToWord(e.lhs), "kind": k,
+		}
+	case "maplit":
+		// MapLiteral ext node — parallel keys/values lists (transient
+		// anonymous dict VALUE; read back via ElementRead).
+		var keys, vals []any
+		for i := range e.keys {
+			keys = append(keys, p.exprToWord(e.keys[i]))
+			vals = append(vals, p.exprToWord(e.vals[i]))
+		}
+		return map[string]any{
+			"type": "MapLiteral", "keys": keys, "values": vals,
+		}
 	case "index":
 		// m["key"] on a map var → assocGet (the runtime's by-name
 		// associative-array read; t54).
@@ -3157,10 +3439,32 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 			}
 		}
 		if e.idx1e != nil {
-			p.failf("unsupported index key (v2) — must be a number literal")
+			// a COMPOSITE VALUE target (map literal / assertion result)
+			// may take a literal STRING key — the ElementRead ext node.
+			compositeTarget := e.target != nil &&
+				(e.target.kind == "maplit" || e.target.kind == "assert")
+			if !(compositeTarget && e.idx1e.kind == "str") {
+				p.failf("unsupported index key (v2) — must be a number literal")
+			}
 		}
 		if e.target != nil && e.target.kind == "var" {
 			return joinCall(paramCall("", e.target.name+"["+e.idx1+"]"))
+		}
+		// indexing a COMPOSITE VALUE (a map literal, an assertion result):
+		// the ElementRead ext node — computed coll[key] on the native
+		// surface. Literal keys only (the frontend's word contract).
+		if e.target != nil && (e.target.kind == "maplit" || e.target.kind == "assert") {
+			key := ""
+			if e.idx1e != nil {
+				key = e.idx1e.text
+			} else {
+				key = e.idx1
+			}
+			return map[string]any{
+				"type": "ElementRead",
+				"coll":  p.exprToWord(e.target),
+				"key":   strExpr(key),
+			}
 		}
 		p.failf("index target must be a var (v2)")
 	case "slice":
@@ -3299,7 +3603,7 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 				var words []map[string]any
 				words = append(words, interpLit(e.args[0].raw))
 				for _, a := range e.args[1:] {
-					words = append(words, p.exprToWord(a))
+					words = append(words, p.argToWord(a))
 				}
 				inner := execStmt("printf", words, "Emulable")
 				return map[string]any{
@@ -3308,7 +3612,28 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 					"purity": "Spawn",
 				}
 			}
-			p.failf("fmt.Sprintf needs a literal format (v2)")
+			// VAR format (`fmt.Sprintf(format, args...)` — the variadic
+			// helper idiom): the runtime printf evaluates the verbs at run
+			// time, so the same capture(printf) shape works with the
+			// format as a getVar word and a Spread for `args...`. Caveat
+			// (documented in FRONTEND.md): shell printf interprets
+			// backslash escapes in the FORMAT — Go's Sprintf does not —
+			// so var formats must be escape-free; %v/%t verbs render via
+			// the runtime's printf verb table.
+			if len(e.args) >= 2 && e.args[0].kind == "var" {
+				var words []map[string]any
+				words = append(words, getVarExpr(p.resolveVar(e.args[0].name)))
+				for _, a := range e.args[1:] {
+					words = append(words, p.argToWord(a))
+				}
+				inner := execStmt("printf", words, "Emulable")
+				return map[string]any{
+					"type": "Call", "func": "capture",
+					"args":   []any{map[string]any{"type": "Arrow", "body": []any{inner}}},
+					"purity": "Spawn",
+				}
+			}
+			p.failf("unsupported fmt.Sprintf form (v2) — needs (literal|var, args...) with at least one arg")
 		}
 		// sc.Text() inside a scanner read-loop → the read var
 		if strings.HasSuffix(e.callee, ".Text") {
@@ -3665,6 +3990,11 @@ func (p *parser) condTestString(c *expr) string {
 	}
 	if c.kind == "not" {
 		return "! " + strings.TrimSpace(p.condTestString(c.lhs))
+	}
+	// a bare BOOL var (the comma-ok `if ok {` idiom): the stored textual
+	// "true"/"false" compared against "true"
+	if c.kind == "var" && p.varTypes[p.resolveVar(c.name)] == "Bool" {
+		return `"$` + p.resolveVar(c.name) + `"="true"`
 	}
 	if c.kind != "binop" {
 		p.failf("unsupported condition (v2): %s", c.kind)

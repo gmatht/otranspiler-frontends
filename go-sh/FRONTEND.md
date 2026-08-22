@@ -67,3 +67,56 @@ Corpus state after this change (frontends/coverage/parser-coverage.sh):
 121 real .go files → EMIT 99 (81.8%), REFUSE 22, PARSE-ERR 0, CRASH 0 —
 100% parser engagement (every file either fully lowers or is refused at
 a named construct).
+
+---
+
+## Drop-in shIR nodes for the no-A1-shape constructs (2026-08-23)
+
+The four headline REFUSE gaps above now lower to GENERIC ext nodes
+declared in the core's `shir_nodes/*.node` DSL (build.rs-discovered —
+new node + one handler file per construct, zero edits to shared core
+beyond the ingress/lift dispatch wiring). Node names are deliberately
+non-Go so Zig/Java/etc. frontends can reuse them; any Go-specific
+residue lives in THIS frontend's lowering, documented inline.
+
+**Supported now (testdata t100–t103, executed stdout == native go run):**
+- Type assertion `x.(T)` → `TypeAssert{expr, kind}` — checked
+  passthrough; `kind` ∈ sh2.typeOf vocabulary (string|int|float|bool|
+  array) derived by `goTypeKind` (pointer marks strip, slices/variadic →
+  array). Comma-ok `v, ok := x.(T)` assigns v ← TypeAssert and lowers ok
+  as a typeof comparison branch pair (`"$ok"="true"` gates conditions;
+  bare Bool-var conds supported). Named types (`x.(*StrE)`) still refuse:
+  their dynamic kind is not knowable at this layer.
+- Address-of `&x` / dereference `*p` → `AddressOf`/`Deref` pair.
+  SNAPSHOT semantics on value-only backends (reads pass through);
+  reference-capable backends may render true references. WRITES through
+  a pointer refuse loudly. Nil checks keep working (`p == nil` ⇔ empty).
+- Variadic spread `f(args...)` → `Spread{expr}` (ESTree
+  SpreadElement), valid in direct call-arg position over ARRAY-typed
+  vars. Callee side: a variadic decl param (`parts ...string`) splices
+  the tail positionals into a real array at function entry
+  (`setArray(parts, ${@@:N})`), so reads/len/index/Join all see a
+  genuine array. Variadic func LITERALS still refuse.
+- Composite literals in EXPRESSION position (`return map[string]any{…}`)
+  → `MapLiteral{keys[], values[]}` (parallel lists), read back via
+  `ElementRead{coll, key}` (computed coll[key]) with literal string
+  keys. TRANSIENT values only: assigning/returning a whole dict to a
+  name keeps the assocSet path or refuses (the capture protocol is
+  string-typed). Positional struct literals (`{"a", b}` map values)
+  still refuse.
+- `fmt.Sprintf(varFormat, args...)`: dynamic-format printf capture (the
+  runtime evaluates verbs at run time). Caveat: shell printf interprets
+  backslash escapes in the FORMAT — Go's Sprintf does not — so var
+  formats must be escape-free.
+
+**Still-open gaps (each refuses with "unsupported …"):** named-type
+assertions; pointer writes; struct VALUES/member access on values
+(`prog.Imports`, positional struct literals); computed array indexes
+(`src[p.pos]`); user-fn calls in condition position (bool-returning
+predicates need a status-return protocol); comparisons in word
+position; zero-value reads; unsupported stdlib constructors.
+
+Corpus state (frontends/coverage/parser-coverage.sh): 125 .go files →
+EMIT 103 (82.4%, was 99/121 = 81.8%), REFUSE 22, PARSE-ERR 0, CRASH 0 —
+no previously-passing file regressed; every refusal is at a named
+construct.
