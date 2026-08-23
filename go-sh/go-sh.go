@@ -588,8 +588,6 @@ func (p *parser) parseExpr() *expr {
 	if t.kind == tNL || t.kind == tEOF || exprBoundary[t.text] {
 		return e
 	}
-	for k := p.pos - 4; k < p.pos+1 && k >= 0 && k < len(p.toks); k++ {
-	}
 	p.failf("unexpected token %q after expression", t.text)
 	return nil
 }
@@ -4629,6 +4627,41 @@ if info, ok := p.arrays[rv.name]; ok {
 			"body": body,
 		}}
 	}
+	// for ; cond; post { — header form with EMPTY init
+	if p.atPunct(";") {
+		p.pos++
+		p.skipNL()
+		cond := p.parseExpr()
+		p.expect(tPunct, ";")
+		p.skipNL()
+		var post []map[string]any
+		if !p.atPunct("{") {
+			postName := p.expect(tIdent, "").text
+			postOp := "+"
+			delta := 1
+			if p.acceptPunct("--") {
+				postOp = "-"
+				delta = -1
+			} else if p.acceptPunct("+=") {
+				p.skipNL()
+				rhs := p.parseExpr()
+				post = []map[string]any{assignStmt(postName,
+					arithWrap(arithBin(arithVar(postName), "+", p.exprToArith(rhs))))}
+				p.expect(tPunct, "{")
+				body := p.parseBlockStmts()
+				_ = body
+				return []map[string]any{{"type": "ForInit",
+					"init": []map[string]any{}, "cond": p.condToJSON(cond), "step": post, "body": body}}
+			} else {
+				p.expect(tPunct, "++")
+			}
+			post = []map[string]any{assignStmt(postName,
+				arithWrap(arithBin(arithVar(postName), postOp, arithNum(delta))))}
+			body := p.parseBlockStmts()
+			return []map[string]any{{"type": "ForInit",
+				"init": []map[string]any{}, "cond": p.condToJSON(cond), "step": post, "body": body}}
+		}
+	}
 	// for i := 1; i <= 2; i++ {  — header form
 	if p.tok().kind == tIdent && p.toks[p.pos+1].text == ":=" {
 		initName := p.next().text
@@ -5469,6 +5502,15 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 				}
 			}
 			p.failf("strconv.Atoi needs one arg (v2)")
+		case "strings.ContainsRune":
+			if len(e.args) == 2 {
+				return map[string]any{
+					"type": "Call", "func": "strContainsRune",
+					"args":   []any{p.exprToWord(e.args[0]), p.exprToWord(e.args[1])},
+					"purity": "PureCpu",
+				}
+			}
+			p.failf("strings.ContainsRune needs (str, rune) (v2)")
 		case "strings.LastIndex":
 			if len(e.args) == 2 {
 				return map[string]any{
@@ -6289,8 +6331,12 @@ func (p *parser) condOperandA1WordInner(e *expr) (map[string]any, bool) {
 	case "fieldof":
 		return p.valueWord(e), true
 	case "call":
-		if w := p.stringsHelperWord(e); w != nil {
-			return w, true
+		if e.callee == "strings.ContainsRune" && len(e.args) == 2 {
+			return map[string]any{
+				"type": "Call", "func": "strContainsRune",
+				"args":   []any{p.exprToWord(e.args[0]), p.exprToWord(e.args[1])},
+				"purity": "PureCpu",
+			}, true
 		}
 		callee := e.callee
 		var args []*expr
