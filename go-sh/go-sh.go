@@ -2192,15 +2192,6 @@ func (p *parser) parseConstSpec(iotaIdx int, prev *expr, out *[]map[string]any) 
 func (p *parser) constWord(e *expr, iotaVal int) (map[string]any, string) {
 	v := p.constValue(e, iotaVal)
 	if !v.ok {
-		ctxD := ""
-		for k := p.pos - 5; k < p.pos+2 && k >= 0 && k < len(p.toks); k++ {
-			if p.toks[k].kind == tNL {
-				ctxD += "¶"
-			} else {
-				ctxD += p.toks[k].text + " "
-			}
-		}
-		println("DBG CONST ctx=[", ctxD, "] @line", p.tok().line)
 		p.failf("unsupported const expression (v2): %s", p.constExprDesc(e))
 	}
 	if v.isStr {
@@ -6456,6 +6447,9 @@ func (p *parser) condOperandA1WordInner(e *expr) (map[string]any, bool) {
 	case "var":
 		if rn := p.resolveVar(e.name); p.varStruct[rn] != "" {
 			return p.structIDWord(e.name), true
+		}
+		if n, ok := p.consts[e.name]; ok {
+			return strExpr(strconv.Itoa(n)), true
 		}
 		return nil, false
 	case "str":
