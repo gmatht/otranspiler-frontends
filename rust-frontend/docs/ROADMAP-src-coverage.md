@@ -67,6 +67,13 @@ counts over the corpus (top entries):
 
 ## Phased plan (each phase = frontend subset growth + testdata pins, gate green)
 
+1b. DONE v0.3 — user functions: multi-fn programs, positional params,
+    fnValue/fnCall dispatch, native Return, tail-expression returns,
+    no-main library files, inert attrs. t35 pins it. Corpus movement:
+    0/30 -> 11/30 files past the structural wall; remaining first-gap
+    census: 19x non-fn items (struct/enum/impl/mod/macro_rules),
+    8x expression kinds (method calls/field access), 2x qualified call
+    target (String::from etc.), 1x {:?} format spec.
 1. DONE v0.2 — program structure basics: use / const / static / typed lets /
    bool literals (t31–t34).
 2. user functions: multi-fn programs; params -> A1 positional protocol,

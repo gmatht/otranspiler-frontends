@@ -97,6 +97,8 @@ fn arith_bin(op: &str, lhs: Value, rhs: Value) -> Value {
 #[derive(Default)]
 struct Cx {
     ints: HashMap<String, i64>,
+    /// names of the program's non-main functions (call targets)
+    fns: Vec<String>,
     /// global assignments (consts/statics), in source order
     globals: Vec<Value>,
 }
@@ -172,8 +174,17 @@ fn main() {
             _ => {}
         }
     }
+    // second pre-pass: register the non-main functions (call targets).
+    let mut fns: Vec<&syn::ItemFn> = Vec::new();
+    for item in &ast.items {
+        if let syn::Item::Fn(f) = item {
+            if f.sig.ident != "main" {
+                cx.fns.push(f.sig.ident.to_string());
+                fns.push(f);
+            }
+        }
+    }
     let mut stmts: Vec<Value> = Vec::new();
-    let mut found_main = false;
     for item in &ast.items {
         match item {
             // `use` imports name things for the TYPE CHECKER only — they
@@ -181,12 +192,11 @@ fn main() {
             syn::Item::Use(_) => {}
             // consts/statics were collected in the pre-pass above.
             syn::Item::Const(_) | syn::Item::Static(_) => {}
+            // non-main fns were collected just above and lower below.
+            syn::Item::Fn(f) if f.sig.ident != "main" => {}
             syn::Item::Fn(f) => {
-                if f.sig.ident != "main" {
-                    refuse("functions other than `main`", f.sig.ident.span());
-                }
-                if !f.attrs.is_empty() {
-                    refuse("attributes on `fn main`", f.attrs[0].span());
+                if let Some(a) = first_semantic_attr(&f.attrs) {
+                    refuse("semantic attribute on `fn main`", a.span());
                 }
                 if !f.sig.inputs.is_empty() {
                     refuse("`main` with arguments", f.sig.ident.span());
@@ -197,16 +207,20 @@ fn main() {
                 if f.sig.asyncness.is_some() || f.sig.unsafety.is_some() || f.sig.constness.is_some() {
                     refuse("non-plain `fn main` (async/unsafe/const)", f.sig.ident.span());
                 }
-                found_main = true;
-                lower_block(&f.block, &cx, &mut stmts);
+                lower_block(&f.block, &cx, false, &mut stmts);
             }
             other => refuse("items other than `fn`/`use`/`const`/`static`", other.span()),
         }
     }
-    if !found_main {
-        refuse("no `main` function", proc_macro2::Span::call_site());
-    }
+    // NOTE: no `main` is LEGAL for library-style sources (definitions
+    // only) — the program body is then empty. The stdout oracle never
+    // sees such a file (testdata examples are all runnable).
     let mut all_stmts = std::mem::take(&mut cx.globals);
+    // function definitions FIRST — runtime def-before-use order (the A1
+    // Function statement lowers to a definition executed in stmt order).
+    for f in &fns {
+        all_stmts.push(fn_def(f, &cx));
+    }
     all_stmts.append(&mut stmts);
 
     let prog = json!({
@@ -227,18 +241,18 @@ fn main() {
 
 // ── statements ──────────────────────────────────────────────────────
 
-fn lower_block(block: &syn::Block, cx: &Cx, out: &mut Vec<Value>) {
+fn lower_block(block: &syn::Block, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) {
     for stmt in &block.stmts {
-        if let Some(v) = lower_stmt(stmt, cx) {
+        if let Some(v) = lower_stmt(stmt, cx, in_fn) {
             out.push(v);
         }
     }
 }
 
-fn lower_stmt(stmt: &syn::Stmt, cx: &Cx) -> Option<Value> {
+fn lower_stmt(stmt: &syn::Stmt, cx: &Cx, in_fn: bool) -> Option<Value> {
     match stmt {
         syn::Stmt::Local(local) => lower_local(local, cx),
-        syn::Stmt::Expr(e, _semi) => lower_expr_stmt(e, cx),
+        syn::Stmt::Expr(e, _semi) => lower_expr_stmt(e, cx, in_fn),
         syn::Stmt::Item(item) => refuse("nested item declarations", item.span()),
         syn::Stmt::Macro(m) => Some(lower_print_macro(&m.mac, cx)),
     }
@@ -265,7 +279,7 @@ fn lower_local(local: &syn::Local, cx: &Cx) -> Option<Value> {
     Some(assign_stmt(&name, value_expr(&init.expr, cx)))
 }
 
-fn lower_expr_stmt(e: &syn::Expr, cx: &Cx) -> Option<Value> {
+fn lower_expr_stmt(e: &syn::Expr, cx: &Cx, in_fn: bool) -> Option<Value> {
     match e {
         syn::Expr::Macro(m) => Some(lower_print_macro(&m.mac, cx)),
         syn::Expr::Assign(a) => Some(plain_assign(a, cx)),
@@ -281,17 +295,42 @@ fn lower_expr_stmt(e: &syn::Expr, cx: &Cx) -> Option<Value> {
                 refuse("binary-operator statement (only compound assigns)", b.op.span())
             }
         }
-        syn::Expr::If(ie) => Some(if_stmt(ie, cx)),
-        syn::Expr::While(w) => Some(while_stmt(w, cx)),
-        syn::Expr::ForLoop(fl) => Some(for_stmt(fl, cx)),
+        syn::Expr::If(ie) => Some(if_stmt(ie, cx, in_fn)),
+        syn::Expr::While(w) => Some(while_stmt(w, cx, in_fn)),
+        syn::Expr::ForLoop(fl) => Some(for_stmt(fl, cx, in_fn)),
         syn::Expr::Return(r) => {
-            if r.expr.is_some() {
-                refuse("`return` with a value", r.span());
+            if in_fn {
+                // inside a user function: a NATIVE return carries the
+                // value back through fnValue (the c-sh-go t58 protocol).
+                let v = match &r.expr {
+                    Some(e) => value_expr(e, cx),
+                    None => serde_json::Value::Null,
+                };
+                Some(json!({"type": "Return", "value": v}))
+            } else {
+                if r.expr.is_some() {
+                    refuse("`return` with a value", r.span());
+                }
+                // `return;` in main ENDS the program — native rustc stops
+                // there. Not a no-op (the coverage gate caught this:
+                // dropping it ran the rest of main). Lower to A1 Exit.
+                Some(json!({"type": "Exit", "value": null}))
             }
-            // `return;` in main ENDS the program — native rustc stops there.
-            // Not a no-op (the coverage gate caught this: dropping it ran
-            // the rest of main). Lower to the A1 Exit statement.
-            Some(json!({"type": "Exit", "value": null}))
+        }
+        syn::Expr::Call(c) => {
+            // statement-position call: the VOID dispatch (fnCall). Any
+            // returned value is discarded.
+            let Some(syn::Expr::Path(p)) = Some(c.func.as_ref()) else {
+                refuse("call target path", c.func.span());
+            };
+            let Some(name) = single_path(p) else {
+                refuse("qualified call target", p.span());
+            };
+            let name = name.to_string();
+            if !cx.fns.iter().any(|f| *f == name) {
+                refuse(&format!("call to unknown function `{name}`"), c.func.span());
+            }
+            Some(expr_stmt(fn_call_expr(&name, &c.args, "fnCall", cx)))
         }
         syn::Expr::Path(p) => {
             // bare `x;` — evaluates the variable, no side effect (c-sh-go
@@ -302,7 +341,7 @@ fn lower_expr_stmt(e: &syn::Expr, cx: &Cx) -> Option<Value> {
                 refuse("bare path statement", e.span());
             }
         }
-        syn::Expr::Paren(p) => lower_expr_stmt(&p.expr, cx),
+        syn::Expr::Paren(p) => lower_expr_stmt(&p.expr, cx, in_fn),
         other => refuse("statement form", other.span()),
     }
 }
@@ -338,21 +377,21 @@ fn compound_assign(b: &syn::ExprBinary, cx: &Cx) -> Value {
     assign_stmt(&name, arith_bin(op, arith_var(&name), arith_expr(&b.right, cx)))
 }
 
-fn if_stmt(ie: &syn::ExprIf, cx: &Cx) -> Value {
+fn if_stmt(ie: &syn::ExprIf, cx: &Cx, in_fn: bool) -> Value {
     let cond = test_call(&test_string(&ie.cond, cx));
     let mut then = Vec::new();
-    lower_block(&ie.then_branch, cx, &mut then);
+    lower_block(&ie.then_branch, cx, in_fn, &mut then);
     let else_stmts: Vec<Value> = match &ie.else_branch {
         None => vec![],
         Some((_, inner)) => match &**inner {
             // `else if` lowers to a NESTED If in the else position — the
             // exact shape the shell frontend emits for elif chains (the
             // `elsifs` field stays empty).
-            syn::Expr::If(inner_if) => vec![if_stmt(inner_if, cx)],
+            syn::Expr::If(inner_if) => vec![if_stmt(inner_if, cx, in_fn)],
             // `else { ... }`
             syn::Expr::Block(blk) => {
                 let mut v = Vec::new();
-                lower_block(&blk.block, cx, &mut v);
+                lower_block(&blk.block, cx, in_fn, &mut v);
                 v
             }
             other => refuse("else form", other.span()),
@@ -361,17 +400,17 @@ fn if_stmt(ie: &syn::ExprIf, cx: &Cx) -> Value {
     json!({"cond": cond, "then": then, "elsifs": [], "else": else_stmts, "type": "If"})
 }
 
-fn while_stmt(w: &syn::ExprWhile, cx: &Cx) -> Value {
+fn while_stmt(w: &syn::ExprWhile, cx: &Cx, in_fn: bool) -> Value {
     if w.label.is_some() {
         refuse("labeled while", w.span());
     }
     let cond = test_call(&test_string(&w.cond, cx));
     let mut body = Vec::new();
-    lower_block(&w.body, cx, &mut body);
+    lower_block(&w.body, cx, in_fn, &mut body);
     json!({"cond": cond, "body": body, "type": "While"})
 }
 
-fn for_stmt(fl: &syn::ExprForLoop, cx: &Cx) -> Value {
+fn for_stmt(fl: &syn::ExprForLoop, cx: &Cx, in_fn: bool) -> Value {
     if fl.label.is_some() {
         refuse("labeled for", fl.span());
     }
@@ -397,7 +436,7 @@ fn for_stmt(fl: &syn::ExprForLoop, cx: &Cx) -> Value {
         other => refuse("for-loop iterator (only `0..N` / `0..=N` ranges)", other.span()),
     };
     let mut body = Vec::new();
-    lower_block(&fl.body, cx, &mut body);
+    lower_block(&fl.body, cx, in_fn, &mut body);
     let end = if inclusive { end } else { end - 1 };
     json!({
         "body": body,
@@ -406,6 +445,125 @@ fn for_stmt(fl: &syn::ExprForLoop, cx: &Cx) -> Value {
         "type": "For",
         "var": name
     })
+}
+
+/// Inert attributes: compile-time-only metadata with NO runtime effect
+/// (`#[test]` defs are ordinary functions outside `cargo test`;
+/// `#[macro_export]`/doc/allow/inline/deprecated are compiler bookkeeping).
+/// Dropped silently; ANY other attribute refuses (cfg/cfg_attr are
+/// compile-time CONFIG — they select code, so dropping them guesses).
+fn first_semantic_attr<'a>(attrs: &'a [syn::Attribute]) -> Option<&'a syn::Attribute> {
+    attrs.iter().find(|a| {
+        let name = a.path().segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
+        !matches!(name.as_str(), "test" | "macro_export" | "allow" | "inline" | "deprecated" | "doc")
+    })
+}
+
+/// A user-fn call node — `func` is "fnCall" (statement/void) or "fnValue"
+/// (value position); args lower as values (the c-sh-go protocol).
+fn fn_call_expr(
+    name: &str,
+    args: &syn::punctuated::Punctuated<syn::Expr, syn::Token![,]>,
+    func: &str,
+    cx: &Cx,
+) -> Value {
+    json!({
+        "args": [
+            str_lit(name),
+            json!({"elements": args.iter().map(|a| value_expr(a, cx)).collect::<Vec<_>>(), "type": "Array"}),
+        ],
+        "func": func, "purity": "Emulable", "type": "Call"
+    })
+}
+
+/// Control-flow tails are UNIT unless proven otherwise (no type info yet):
+/// an `if`/`match` tail of a value-returning fn REFUSES rather than
+/// silently dropping its value (REFUSE > GUESS).
+fn unit_tail(e: &syn::Expr) -> bool {
+    matches!(
+        e,
+        syn::Expr::If(_)
+            | syn::Expr::While(_)
+            | syn::Expr::ForLoop(_)
+            | syn::Expr::Loop(_)
+            | syn::Expr::Match(_)
+            | syn::Expr::Block(_)
+    )
+}
+
+/// Lower a non-main `fn` item to the A1 Function statement — the
+/// c-sh-go protocol: positional params copied from getVar("1")... at
+/// entry; calls dispatch via fnCall (void) / fnValue (value).
+fn fn_def(f: &syn::ItemFn, cx: &Cx) -> Value {
+    if let Some(a) = first_semantic_attr(&f.attrs) {
+        refuse("semantic attribute on a function", a.span());
+    }
+    if !f.sig.generics.params.is_empty() {
+        refuse("generic function", f.sig.generics.params.span());
+    }
+    if f.sig.asyncness.is_some() || f.sig.unsafety.is_some() || f.sig.constness.is_some() {
+        refuse("non-plain `fn` (async/unsafe/const)", f.sig.ident.span());
+    }
+    if f.sig.variadic.is_some() {
+        refuse("variadic function", f.sig.variadic.span());
+    }
+    let returns_value = !matches!(f.sig.output, syn::ReturnType::Default);
+    let mut body: Vec<Value> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for (i, input) in f.sig.inputs.iter().enumerate() {
+        let pt = match input {
+            syn::FnArg::Typed(pt) => pt,
+            syn::FnArg::Receiver(r) => {
+                refuse("method receiver (`self`) — impl blocks not supported yet", r.span())
+            }
+        };
+        let pat: &syn::Pat = match &*pt.pat {
+            syn::Pat::Type(inner) => &inner.pat,
+            p => p,
+        };
+        let syn::Pat::Ident(pi) = pat else {
+            refuse("parameter pattern (only plain identifiers)", pat.span());
+        };
+        let pname = pi.ident.to_string();
+        if seen.contains(&pname) {
+            refuse("duplicate parameter name", pi.ident.span());
+        }
+        seen.push(pname.clone());
+        // positional binding: param i <- getVar("i+1")
+        body.push(assign_stmt(&pname, get_var(&(i + 1).to_string())));
+    }
+    // Body statements; a SEMI-LESS tail expression RETURNS ITS VALUE when
+    // the signature declares a return type (Rust tail-expression return).
+    let n = f.block.stmts.len();
+    for (i, stmt) in f.block.stmts.iter().enumerate() {
+        if i + 1 == n {
+            if let syn::Stmt::Expr(e, None) = stmt {
+                if unit_tail(e) {
+                    if returns_value {
+                        refuse(
+                            "tail control-flow expression in a value-returning fn \
+                             (if/match-as-value not yet supported)",
+                            e.span(),
+                        );
+                    }
+                    if let Some(v) = lower_stmt(stmt, cx, true) {
+                        body.push(v);
+                    }
+                    continue;
+                }
+                if returns_value {
+                    body.push(json!({"type": "Return", "value": value_expr(e, cx)}));
+                } else if let Some(v) = lower_stmt(stmt, cx, true) {
+                    body.push(v);
+                }
+                continue;
+            }
+        }
+        if let Some(v) = lower_stmt(stmt, cx, true) {
+            body.push(v);
+        }
+    }
+    json!({"body": body, "name": f.sig.ident.to_string(), "type": "Function"})
 }
 
 // ── print!/println! (the only supported macros) ─────────────────────
@@ -545,6 +703,23 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
         syn::Expr::Binary(b) => arith_from_binary(b, cx),
         syn::Expr::Unary(u) => arith_from_unary(u, cx),
         syn::Expr::Paren(p) => value_expr(&p.expr, cx),
+        syn::Expr::Call(c) => {
+            // value-position call: the VALUE-returning dispatch (fnValue,
+            // c-sh-go t58). NOTE: calls inside ARITHMETIC refuse — the A1
+            // arith AST has no call operand (hoisting to temporaries is a
+            // later, semantics-preserving frontend step).
+            let Some(syn::Expr::Path(p)) = Some(c.func.as_ref()) else {
+                refuse("call target path", c.func.span());
+            };
+            let Some(name) = single_path(p) else {
+                refuse("qualified call target", p.span());
+            };
+            let name = name.to_string();
+            if !cx.fns.iter().any(|f| *f == name) {
+                refuse(&format!("call to unknown function `{name}`"), c.func.span());
+            }
+            fn_call_expr(&name, &c.args, "fnValue", cx)
+        }
         other => refuse("expression", other.span()),
     }
 }

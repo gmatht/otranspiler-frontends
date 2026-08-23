@@ -62,6 +62,30 @@ Added (each pinned by testdata t31-t34):
   rendered by the core to a native JS boolean (prints like Rust `{}`);
   literal-bool CONDITIONS fold to always-true/false numeric tests
 
+## v0.3 additions — user functions
+
+- multiple `fn` items: non-main fns lower to A1 `Function` statements
+  (the c-sh-go protocol), emitted BEFORE the main body in source order
+  (runtime def-before-use). Params bind positionally at fn entry
+  (`p_i <- getVar("i+1")`); value-returning calls dispatch `fnValue`,
+  statement-position (void) calls dispatch `fnCall`; explicit
+  `return e;` lowers to the native A1 `Return`.
+- tail expressions: a semi-less final expression of a value-returning
+  fn returns its value (`fn twice(n: i64) -> i64 { n * 2 }`). Control-
+  flow tails of value-returning fns REFUSE (if/match-as-value is a later
+  phase — refuse > silently dropping the value).
+- no-main sources are legal (library-style definition-only files): empty
+  program body.
+- inert attributes dropped on fns (`#[test]`, `#[macro_export]`, doc/
+  allow/inline/deprecated — compile-time-only metadata); any other
+  attribute refuses (cfg/cfg_attr select code).
+- STILL refused: calls inside arithmetic (A1 arith has no call operand;
+  hoisting to temporaries comes with if-as-expression), generics,
+  receivers/impl blocks, closures.
+
+Pinned by t35_functions.rs; t14_fn_refuse moved to the generic-fn
+refusal boundary.
+
 Refused loudly (testdata/*_refuse.rs — the emit MUST fail, t13–t23):
 borrows `&x`, user functions, `String::from`/method calls, `match`,
 `vec!`, `eprintln!`/`dbg!`, floats, `{:?}`/named/width format specs,
