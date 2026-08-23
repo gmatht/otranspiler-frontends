@@ -1066,33 +1066,49 @@ func (p *parser) parsePrimary() *expr {
 	return nil
 }
 
-// parseBraceMapLit parses an ANONYMOUS brace map literal `{k: v, ...}`
-// (string/ident keys) as a maplit expr; nil when the braces aren't a
-// keyed map (caller falls through).
+// parseBraceMapLit parses an ANONYMOUS brace composite `{ ... }` —
+// either a KEYED map literal ({k: v, ...}) or a POSITIONAL struct-style
+// list ({v1, v2, ...}); the caller's context decides which applies, and
+// both lower to an object allocation (keys synthetic for positional).
 func (p *parser) parseBraceMapLit() *expr {
 	p.expect(tPunct, "{")
 	var keys, vals []*expr
+	positional := false
+	first := true
 	for {
 		p.skipNL()
 		if p.atPunct("}") {
 			p.pos++
 			break
 		}
-		var k *expr
-		if p.tok().kind == tStr || p.tok().kind == tRawStr {
-			tk := p.next()
-			k = &expr{kind: "str", text: decodeGoStr(tk.raw)}
-		} else if p.tok().kind == tIdent {
-			k = &expr{kind: "str", text: p.next().text}
-		} else {
-			p.failf("unsupported brace-map key (v2)")
+		keyedHere := (p.tok().kind == tStr || p.tok().kind == tIdent) &&
+			p.toks[p.pos+1].kind == tPunct && p.toks[p.pos+1].text == ":"
+		if first {
+			positional = !keyedHere
 		}
-		p.skipNL()
-		p.expect(tPunct, ":")
-		p.skipNL()
-		v := p.parseExpr()
-		keys = append(keys, k)
-		vals = append(vals, v)
+		first = false
+		if keyedHere && !positional {
+			var k *expr
+			if p.tok().kind == tStr || p.tok().kind == tRawStr {
+				tk := p.next()
+				k = &expr{kind: "str", text: decodeGoStr(tk.raw)}
+			} else {
+				k = &expr{kind: "str", text: p.next().text}
+			}
+			p.skipNL()
+			p.expect(tPunct, ":")
+			p.skipNL()
+			v := p.parseExpr()
+			keys = append(keys, k)
+			vals = append(vals, v)
+		} else if positional {
+			v := p.parseExpr()
+			idx := len(vals)
+			keys = append(keys, &expr{kind: "num", text: strconv.Itoa(idx)})
+			vals = append(vals, v)
+		} else {
+			p.failf("mixed keyed/positional brace literal (v2)")
+		}
 		p.skipNL()
 		if !p.acceptPunct(",") {
 			p.skipNL()
@@ -2032,6 +2048,15 @@ func (p *parser) parseStmt() []map[string]any {
 		lbl := p.expect(tIdent, "").text
 		return []map[string]any{map[string]any{"type": "Goto", "name": lbl}}
 	case "break":
+		// A1 Break node; labeled break lowers to Goto when a matching
+		// label exists (goto/Label contract)
+		p.pos++
+		if p.tok().kind == tIdent {
+			lbl := p.next().text
+			return []map[string]any{map[string]any{"type": "Goto", "name": lbl}}
+		}
+		return []map[string]any{{"type": "Break"}}
+	case "__break_legacy__":
 		// A1 Break node (shir_json_in "Break" -> IrStmt::Break — the
 		// core contract already has it; the estree/C renderers emit
 		// `break;`). Labeled `break L` is refused, like continue.
@@ -3706,7 +3731,13 @@ func (p *parser) parseAssignStmt() []map[string]any {
 				// computed elements ride as words (captures/reads)
 				elems = append(elems, p.exprToWord(a))
 			default:
-				p.failf("append elements must be literals or vars (v2)")
+				if a.spread {
+					// slice spread (`append(out, other...)`) — the Spread
+					// node expands the list at the runtime boundary
+					elems = append(elems, p.argToWord(a))
+				} else {
+					p.failf("append elements must be literals or vars (v2)")
+				}
 			}
 		}
 		p.registerVar(rhs.args[0].name, "Array")
@@ -5164,6 +5195,12 @@ func (p *parser) noteCallResultType(target, callee string, args []*expr) {
 // a scalar spread would silently vanish). Other args pass through.
 func (p *parser) argToWord(e *expr) map[string]any {
 	if e.spread {
+		if e.kind == "slice" && e.target != nil && e.target.kind == "var" {
+			// toks[j+1:k]... — the computed-bound param-slice word rides
+			// inside a Spread node (runtime expands at the boundary)
+			sw := p.exprToWord(e)
+			return map[string]any{"type": "Spread", "expr": sw}
+		}
 		if e.kind != "var" || p.varTypes[p.resolveVar(e.name)] != "Array" {
 			p.failf("variadic spread needs an array-typed var (v2)")
 		}

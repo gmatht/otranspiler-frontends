@@ -147,11 +147,17 @@ construct.
   comma-ok map reads (`v, ok := m[k]`); strings.TrimSpace/Split/
   LastIndex/Index helpers; dynamic bytes.Buffer writes
 
-**Self-hosting status:** go-sh now parses its own source past line ~1300
-of 3880 before refusing. Remaining walls (each needing design work):
-maps-in-structs coherence between the assoc-array and object-store
-models; defer/recover; interface{} boxing of object ids; the JSON emit
-library (external package, stubbed). Full-file emit NOT yet achieved.
+**Self-hosting status:** go-sh now parses its own source past line ~2158
+of 3880 (goto/Label, empty-init and optional-cond/post C-style for,
+ContainsRune, forward struct prescan all landed) before hitting the
+pointer-out-param wall (`*out = append(*out, ...)`). Remaining walls
+(each needing design work): pointer-out-param writes (needs an
+indirection/box model or source refactor), maps-in-structs coherence
+between the assoc-array and object-store models, defer/recover stubs,
+interface{} boxing of object ids, cross-file package references
+(cpp-sh-go's treeCheck lives in parser.go — single-file frontend cannot
+resolve), the JSON emit library (external package, stubbed). Full-file
+emit NOT yet achieved.
 
 Corpus unchanged: EMIT 103/125, REFUSE 22, PARSE-ERR 0 — zero
 regressions.
