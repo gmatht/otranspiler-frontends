@@ -137,6 +137,46 @@ unproven methods x6 (iterators: collect/chars/iter...), receivers x4,
 unknown call targets x3, if-tail-value, {:?}, lazy_static!,
 wasm_bindgen, `?`, tuple.
 
+## v0.6 additions — receiver methods & field reads
+
+- inherent impl methods with receivers lower via the mangled
+  `Type_method` def: `self` binds from the FIRST positional
+  (`self <- getVar("1")`); all three receiver forms share one exact
+  lowering (JS objects are references: `&mut self` writes through —
+  true; `&self` can't mutate — true; by-value moves are rustc-checked).
+- method dispatch: `obj.m(args)` on a Struct-typed receiver ->
+  fnValue("Type_m", [obj, args...]); the Ty tracker resolves struct
+  types from declarations, params and struct-literal lets.
+- field reads `p.x` -> the FieldRead drop-in node (core side:
+  shir_nodes/field_read.node + per-backend handlers; merged to main).
+- FIELD READS IN ARITHMETIC hoist their pure reads into fresh
+  temporaries (`self.n * 2` -> `__sh2f1 <- self.n; return __sh2f1*2`) —
+  exact snapshot semantics, backend-neutral.
+- KNOWN GAP (core request rust-frontend-20260823-record-storage.md):
+  STORING a record (`let c = Point{..}`) stringifies at the core's
+  store-write path (`sh2.vars.c = String({...})`), so t45/t46 live in
+  testdata-pending/ until the estree worker lands the one-line fix.
+  Reader-only structs work the moment it lands; mutating methods
+  (`self.n += k`, field WRITES) need a contract shape after that.
+
+Pinned by t46_methods.rs (moved to pending with t45).
+
+## v0.7 additions — if-as-expression
+
+- `let x = if c {A} else {B}` / `x = if ..` bind x in EVERY branch
+  (exact: rustc guarantees all paths produce the value); fn TAILS return
+  per-branch (`Return` in then + deepest else); else-if chains recurse
+  into nested Ifs. Branch statements lower normally first.
+- branch type inference: first provable branch value's Ty.
+- match-as-value / enum variants / write! remain refused (they need the
+  enum-representation + Display tranches — see the ast_words/ir.rs
+  probes in ROADMAP).
+
+Pinned by t48_if_value.rs. Frontier after v0.7: iterator machinery x9,
+match-on-enums x5 (needs enum repr + write!), record .clone() x5,
+`?` x2, singletons (write!, lazy_static, wasm_bindgen, generic impl,
+{:?}, Token::lexer iterators, as_bytes).
+
 Refused loudly (testdata/*_refuse.rs — the emit MUST fail, t13–t23):
 borrows `&x`, user functions, `String::from`/method calls, `match`,
 `vec!`, `eprintln!`/`dbg!`, floats, `{:?}`/named/width format specs,

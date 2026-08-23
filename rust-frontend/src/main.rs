@@ -92,22 +92,28 @@ fn arith_bin(op: &str, lhs: Value, rhs: Value) -> Value {
 /// Minimal receiver types, enough to lower methods WITHOUT guessing:
 /// the store holds JS strings / numbers / booleans / native arrays, and
 /// a method's Rust semantics must map onto the exact JS the core renders.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 enum Ty {
     Int,
     Str,
     Bool,
     Arr,
+    /// a named struct (`Point`) — enables receiver-method dispatch
+    Struct(String),
     Unknown,
 }
 
-fn ty_from_type(t: &syn::Type) -> Ty {
+fn ty_from_type(t: &syn::Type, cx: &Cx) -> Ty {
     match t {
         syn::Type::Path(tp) => {
             let seg = match tp.path.segments.last() {
                 Some(s) => s,
                 None => return Ty::Unknown,
             };
+            let id = seg.ident.to_string();
+            if cx.structs.iter().any(|s| *s == id) {
+                return Ty::Struct(id);
+            }
             match seg.ident.to_string().as_str() {
                 "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32"
                 | "u64" | "u128" | "usize" => Ty::Int,
@@ -118,8 +124,8 @@ fn ty_from_type(t: &syn::Type) -> Ty {
                 _ => Ty::Unknown,
             }
         }
-        syn::Type::Reference(r) => ty_from_type(&r.elem),
-        syn::Type::Slice(s) => Ty::Arr,
+        syn::Type::Reference(r) => ty_from_type(&r.elem, cx),
+        syn::Type::Slice(_) => Ty::Arr,
         _ => Ty::Unknown,
     }
 }
@@ -138,6 +144,10 @@ struct Cx {
     /// functions, re-seeded from params/literals/annotations). RefCell:
     /// type tracking mutates during lowering while Cx travels as &Cx.
     vars: std::cell::RefCell<HashMap<String, Ty>>,
+    /// declared struct names (receiver-method dispatch targets)
+    structs: Vec<String>,
+    /// fresh-temporary counter (field-read hoists)
+    tmp: std::cell::RefCell<u32>,
     /// global assignments (consts/statics), in source order
     globals: Vec<Value>,
 }
@@ -193,6 +203,13 @@ fn main() {
         exit(1);
     });
 
+    let mut cx = Cx::default();
+    // struct registry first — type resolution consults it
+    for item in &ast.items {
+        if let syn::Item::Struct(s) = item {
+            cx.structs.push(s.ident.to_string());
+        }
+    }
     // Flatten inline `mod` blocks into one item list — namespace nesting
     // has no effect on the lowered program (names stay as written;
     // qualified paths resolve only for `Type::method` call targets).
@@ -201,7 +218,6 @@ fn main() {
 
     // pre-pass: collect consts/statics (globals + int-const table) so any
     // later lowering step can const-fold against them.
-    let mut cx = Cx::default();
     for item in &flat {
         match item {
             syn::Item::Const(c) => {
@@ -243,7 +259,7 @@ fn main() {
                     if let syn::ImplItem::Fn(m) = ii {
                         let mangled = format!("{}_{}", ty, m.sig.ident);
                         cx.fns.push(mangled.clone());
-                        fns.push(FnSource::Method(mangled, m));
+                        fns.push(FnSource::Method(mangled, m, ty.clone()));
                     }
                     // non-fn impl items (consts/types) are declaration-only
                 }
@@ -332,10 +348,11 @@ fn main() {
                 &f.attrs,
                 &f.sig,
                 &f.block,
+                None,
                 &cx,
             ),
-            FnSource::Method(name, m) => {
-                function_def(name.clone(), &m.attrs, &m.sig, &m.block, &cx)
+            FnSource::Method(name, m, ty) => {
+                function_def(name.clone(), &m.attrs, &m.sig, &m.block, Some(ty), &cx)
             }
         });
     }
@@ -361,22 +378,22 @@ fn main() {
 
 fn lower_block(block: &syn::Block, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) {
     for stmt in &block.stmts {
-        if let Some(v) = lower_stmt(stmt, cx, in_fn) {
+        if let Some(v) = lower_stmt(stmt, cx, in_fn, out) {
             out.push(v);
         }
     }
 }
 
-fn lower_stmt(stmt: &syn::Stmt, cx: &Cx, in_fn: bool) -> Option<Value> {
+fn lower_stmt(stmt: &syn::Stmt, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) -> Option<Value> {
     match stmt {
-        syn::Stmt::Local(local) => lower_local(local, cx),
-        syn::Stmt::Expr(e, _semi) => lower_expr_stmt(e, cx, in_fn),
+        syn::Stmt::Local(local) => lower_local(local, cx, out),
+        syn::Stmt::Expr(e, _semi) => lower_expr_stmt(e, cx, in_fn, out),
         syn::Stmt::Item(item) => refuse("nested item declarations", item.span()),
         syn::Stmt::Macro(m) => Some(lower_print_macro(&m.mac, cx)),
     }
 }
 
-fn lower_local(local: &syn::Local, cx: &Cx) -> Option<Value> {
+fn lower_local(local: &syn::Local, cx: &Cx, out: &mut Vec<Value>) -> Option<Value> {
     // `let x: i64 = ...` parses as Pat::Type wrapping Pat::Ident — the
     // annotation is type-checker information, erased here (the store is
     // dynamically typed).
@@ -394,8 +411,24 @@ fn lower_local(local: &syn::Local, cx: &Cx) -> Option<Value> {
         // no-op in the store model, exactly like c-sh-go's dropped `int i;`.
         return None;
     };
+    // if-as-value: bind the target in EVERY branch (exact — rustc
+    // guarantees all paths produce the value)
+    if let syn::Expr::If(ie) = &*init.expr {
+        let v = if_value_node(ie, BranchTarget::Var(&name.to_string()), cx, false);
+        let ty = branch_ty(ie, cx);
+        cx.vars.borrow_mut().insert(name.clone(), ty);
+        return Some(v);
+    }
     // NOTE: infer BEFORE taking the write guard (infer_ty reads vars).
     let init_ty = infer_ty(&init.expr, cx);
+    // arithmetic over field reads: hoist the pure reads into temps
+    if arith_contains_field(&init.expr) {
+        let mut ctr = cx.tmp.borrow_mut();
+        let ast = hoisted_arith(&init.expr, cx, out, &mut ctr);
+        drop(ctr);
+        cx.vars.borrow_mut().insert(name.clone(), Ty::Int);
+        return Some(assign_stmt(&name, arith_value(ast)));
+    }
     cx.vars.borrow_mut().insert(name.clone(), init_ty);
     Some(assign_stmt(&name, value_expr(&init.expr, cx)))
 }
@@ -422,17 +455,26 @@ fn infer_ty(e: &syn::Expr, cx: &Cx) -> Ty {
         syn::Expr::Paren(p) => infer_ty(&p.expr, cx),
         syn::Expr::Reference(r) => infer_ty(&r.expr, cx),
         syn::Expr::Array(_) => Ty::Arr,
+        // a struct literal HAS its named record type (receiver dispatch)
+        syn::Expr::Struct(se) => {
+            let seg = se.path.segments.last();
+            match seg {
+                Some(s) => Ty::Struct(s.ident.to_string()),
+                None => Ty::Unknown,
+            }
+        }
+        syn::Expr::Field(_) => Ty::Unknown,
         syn::Expr::Path(p) => single_path(p)
-            .and_then(|id| cx.vars.borrow().get(&id.to_string()).copied())
+            .and_then(|id| cx.vars.borrow().get(&id.to_string()).cloned())
             .unwrap_or(Ty::Unknown),
         _ => Ty::Unknown,
     }
 }
 
-fn lower_expr_stmt(e: &syn::Expr, cx: &Cx, in_fn: bool) -> Option<Value> {
+fn lower_expr_stmt(e: &syn::Expr, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) -> Option<Value> {
     match e {
         syn::Expr::Macro(m) => Some(lower_print_macro(&m.mac, cx)),
-        syn::Expr::Assign(a) => Some(plain_assign(a, cx)),
+        syn::Expr::Assign(a) => Some(plain_assign(a, cx, out)),
         syn::Expr::Binary(b) => {
             // `x += e` parses as Expr::Binary with a compound-assign op
             use syn::BinOp::*;
@@ -467,6 +509,10 @@ fn lower_expr_stmt(e: &syn::Expr, cx: &Cx, in_fn: bool) -> Option<Value> {
                 Some(json!({"type": "Exit", "value": null}))
             }
         }
+        syn::Expr::Field(_) => {
+            // bare `p.x;` — a pure read, discarded (like bare `x;`)
+            None
+        }
         syn::Expr::MethodCall(m) => {
             // statement-position method call: only PURE methods lower at
             // all (the whitelist in value_expr), and a discarded pure
@@ -495,20 +541,32 @@ fn lower_expr_stmt(e: &syn::Expr, cx: &Cx, in_fn: bool) -> Option<Value> {
                 refuse("bare path statement", e.span());
             }
         }
-        syn::Expr::Paren(p) => lower_expr_stmt(&p.expr, cx, in_fn),
+        syn::Expr::Paren(p) => lower_expr_stmt(&p.expr, cx, in_fn, out),
         other => refuse("statement form", other.span()),
     }
 }
 
-fn plain_assign(a: &syn::ExprAssign, cx: &Cx) -> Value {
+fn plain_assign(a: &syn::ExprAssign, cx: &Cx, out: &mut Vec<Value>) -> Value {
     let syn::Expr::Path(p) = &*a.left else {
         refuse("assignment target (only plain variables are supported)", a.left.span());
     };
     let Some(name) = single_path(p) else {
         refuse("assignment target path", p.span());
     };
+    // `x = if c {A} else {B}` — bind x in every branch
+    if let syn::Expr::If(ie) = &*a.right {
+        return if_value_node(ie, BranchTarget::Var(&name.to_string()), cx, false);
+    }
     // NOTE: infer BEFORE taking the write guard (infer_ty reads vars).
     let rhs_ty = infer_ty(&a.right, cx);
+    // arithmetic over field reads: hoist the pure reads into temps
+    if arith_contains_field(&a.right) {
+        let mut ctr = cx.tmp.borrow_mut();
+        let ast = hoisted_arith(&a.right, cx, out, &mut ctr);
+        drop(ctr);
+        cx.vars.borrow_mut().insert(name.to_string(), Ty::Int);
+        return assign_stmt(&name.to_string(), arith_value(ast));
+    }
     cx.vars.borrow_mut().insert(name.to_string(), rhs_ty);
     assign_stmt(&name.to_string(), value_expr(&a.right, cx))
 }
@@ -608,7 +666,7 @@ fn for_stmt(fl: &syn::ExprForLoop, cx: &Cx, in_fn: bool) -> Value {
 /// inherent impl method (lowered under the mangled `Type_method` name).
 enum FnSource<'a> {
     Free(&'a syn::ItemFn),
-    Method(String, &'a syn::ImplItemFn),
+    Method(String, &'a syn::ImplItemFn, String),
 }
 
 /// Flatten inline `mod` blocks into one item list (recursively). File
@@ -672,6 +730,35 @@ fn first_semantic_attr<'a>(attrs: &'a [syn::Attribute]) -> Option<&'a syn::Attri
     })
 }
 
+/// Std constructor calls with EXACT store-native values:
+/// `String::from(x)` is x itself; `String::new()` is ""; `Vec::new()` /
+/// map/set constructors are the empty array. Anything else -> None.
+fn std_ctor_value(
+    p: &syn::ExprPath,
+    args: &syn::punctuated::Punctuated<syn::Expr, syn::Token![,]>,
+    cx: &Cx,
+) -> Option<Value> {
+    if p.qself.is_some() || p.path.segments.len() < 2 {
+        return None;
+    }
+    // match the LAST two segments (`std::collections::HashMap::new`)
+    let t = p.path.segments[p.path.segments.len() - 2].ident.to_string();
+    let f = p.path.segments[p.path.segments.len() - 1].ident.to_string();
+    match (t.as_str(), f.as_str()) {
+        ("String", "from") if args.len() == 1 => Some(value_expr(&args[0], cx)),
+        ("String", "new") if args.is_empty() => Some(str_lit("")),
+        ("String", "with_capacity") if args.len() == 1 => Some(str_lit("")),
+        ("Vec", "new") | ("Vec", "with_capacity") | ("VecDeque", "new")
+        | ("HashMap", "new") | ("BTreeMap", "new")
+        | ("HashSet", "new") | ("BTreeSet", "new")
+            if args.is_empty() =>
+        {
+            Some(json!({"type": "Array", "elements": []}))
+        }
+        _ => None,
+    }
+}
+
 /// Resolve a call target path to a registered lowered-name: a free fn
 /// (`f`) or an inherent impl method (`Type::method` -> `Type_method`).
 /// Returns None for anything else (unknown names, deeper paths,
@@ -711,13 +798,218 @@ fn fn_call_expr(
     func: &str,
     cx: &Cx,
 ) -> Value {
+    let owned: Vec<syn::Expr> = args.iter().cloned().collect();
+    fn_call_expr_values(name, owned, func, cx)
+}
+
+/// The same call node over already-collected argument expressions (the
+/// receiver-method dispatch passes the receiver as first positional).
+fn fn_call_expr_values<I>(name: &str, args: I, func: &str, cx: &Cx) -> Value
+where
+    I: IntoIterator<Item = syn::Expr>,
+{
     json!({
         "args": [
             str_lit(name),
-            json!({"elements": args.iter().map(|a| value_expr(a, cx)).collect::<Vec<_>>(), "type": "Array"}),
+            json!({"elements": args.into_iter().map(|a| value_expr(&a, cx)).collect::<Vec<_>>(), "type": "Array"}),
         ],
         "func": func, "purity": "Emulable", "type": "Call"
     })
+}
+
+/// Does e contain a field read inside its ARITHMETIC spine? Field reads
+/// cannot be Arith operands (the A1 arith AST has no field form), so such
+/// exprs need temporary hoisting.
+fn arith_contains_field(e: &syn::Expr) -> bool {
+    match e {
+        syn::Expr::Binary(b) => {
+            use syn::BinOp::*;
+            if matches!(b.op, Eq(_) | Ne(_) | Lt(_) | Le(_) | Gt(_) | Ge(_) | And(_) | Or(_)) {
+                false // comparison spine lowers via the test grammar
+            } else {
+                arith_contains_field(&b.left) || arith_contains_field(&b.right)
+            }
+        }
+        syn::Expr::Unary(u) => arith_contains_field(&u.expr),
+        syn::Expr::Paren(p) => arith_contains_field(&p.expr),
+        syn::Expr::Field(_) => true,
+        _ => false,
+    }
+}
+
+/// Build the A1 ARITH AST for an arithmetic expression whose field-read
+/// leaves are extracted into fresh temporaries; the hoist assignments are
+/// appended to `stmts` IN ORDER (pure reads => the snapshot is exact).
+/// Returns the raw arith AST json (Num/Var/Bin) — wrap in
+/// {"type":"Arith","ast":..} at the consumption site.
+fn hoisted_arith(
+    e: &syn::Expr,
+    cx: &Cx,
+    stmts: &mut Vec<Value>,
+    ctr: &mut u32,
+) -> Value {
+    match e {
+        syn::Expr::Lit(l) => match &l.lit {
+            syn::Lit::Int(li) => arith_num(int_text(li).parse().unwrap_or_else(|_| {
+                refuse("integer literal out of range", li.span())
+            })),
+            other => refuse("literal in arithmetic", other.span()),
+        },
+        syn::Expr::Path(p) => {
+            let Some(name) = single_path(p) else {
+                refuse("path in arithmetic", p.span());
+            };
+            // named consts fold (mirrors the condition operand rule)
+            if let Some(v) = cx.ints.get(&name.to_string()) {
+                return arith_num(*v);
+            }
+            arith_var(&name.to_string())
+        }
+        syn::Expr::Paren(p) => hoisted_arith(&p.expr, cx, stmts, ctr),
+        syn::Expr::Binary(b) => {
+            use syn::BinOp::*;
+            let op = match b.op {
+                Add(_) => "+",
+                Sub(_) => "-",
+                Mul(_) => "*",
+                Div(_) => "/",
+                Rem(_) => "%",
+                _ => refuse("binary operator in arithmetic", b.op.span()),
+            };
+            json!({
+                "lhs": hoisted_arith(&b.left, cx, stmts, ctr),
+                "op": op,
+                "rhs": hoisted_arith(&b.right, cx, stmts, ctr),
+                "type": "Bin",
+            })
+        }
+        syn::Expr::Unary(u) => match u.op {
+            syn::UnOp::Neg(_) => json!({
+                "lhs": arith_num(0),
+                "op": "-",
+                "rhs": hoisted_arith(&u.expr, cx, stmts, ctr),
+                "type": "Bin",
+            }),
+            _ => refuse("unary operator in arithmetic", u.op.span()),
+        },
+        syn::Expr::Field(f) => {
+            let name = match &f.member {
+                syn::Member::Named(ident) => ident.to_string(),
+                syn::Member::Unnamed(ix) => refuse("tuple-index field read", ix.span()),
+            };
+            *ctr += 1;
+            let temp = format!("__sh2f{}", ctr);
+            stmts.push(assign_stmt(
+                &temp,
+                json!({
+                    "type": "FieldRead",
+                    "object": value_expr(&f.base, cx),
+                    "name": name,
+                }),
+            ));
+            arith_var(&temp)
+        }
+        other => refuse("expression in arithmetic", other.span()),
+    }
+}
+
+/// Wrap a raw arith AST into the A1 Arith VALUE expr.
+fn arith_value(ast: Value) -> Value {
+    json!({"type": "Arith", "ast": ast})
+}
+
+/// A block's VALUE expression: a semi-less trailing Expr, else None
+/// (unit block).
+fn block_value(b: &syn::Block) -> Option<&syn::Expr> {
+    match b.stmts.last()? {
+        syn::Stmt::Expr(e, None) => Some(e),
+        _ => None,
+    }
+}
+
+/// Where an if-expression's per-branch VALUE goes: a variable binding
+/// (assigned in every branch — rustc guarantees all paths produce the
+/// value) or a native return.
+#[derive(Clone, Copy)]
+enum BranchTarget<'a> {
+    Var(&'a str),
+    Ret,
+}
+
+/// A variable's type from an if-expression: the first provable branch
+/// value's type (Rust guarantees both branches unify).
+fn branch_ty(ie: &syn::ExprIf, cx: &Cx) -> Ty {
+    if let Some(v) = block_value(&ie.then_branch) {
+        let t = infer_ty(v, cx);
+        if t != Ty::Unknown {
+            return t;
+        }
+    }
+    match &ie.else_branch {
+        Some((_, inner)) => match &**inner {
+            syn::Expr::Block(blk) => {
+                block_value(&blk.block).map(|v| infer_ty(v, cx)).unwrap_or(Ty::Unknown)
+            }
+            syn::Expr::If(inner) => branch_ty(inner, cx),
+            _ => Ty::Unknown,
+        },
+        None => Ty::Unknown,
+    }
+}
+
+/// Lower `if c {A} else {B}` used as a VALUE into the equivalent A1 If:
+/// each branch lowers its statements then binds/returns the branch value.
+/// else-if chains recurse (nested If in the else position). A missing
+/// else refuses (rustc rejects it too — never reached for valid code).
+fn if_value_node(
+    ie: &syn::ExprIf,
+    target: BranchTarget,
+    cx: &Cx,
+    in_fn: bool,
+) -> Value {
+    fn push_branch(
+        b: &syn::Block,
+        target: BranchTarget,
+        cx: &Cx,
+        in_fn: bool,
+        out: &mut Vec<Value>,
+    ) {
+        let n = b.stmts.len();
+        for (i, s) in b.stmts.iter().enumerate() {
+            if i + 1 == n {
+                if let syn::Stmt::Expr(e, None) = s {
+                    match target {
+                        BranchTarget::Var(name) => {
+                            out.push(assign_stmt(name, value_expr(e, cx)))
+                        }
+                        BranchTarget::Ret => out.push(
+                            json!({"type": "Return", "value": value_expr(e, cx)}),
+                        ),
+                    }
+                    continue;
+                }
+            }
+            if let Some(v) = lower_stmt(s, cx, in_fn, out) {
+                out.push(v);
+            }
+        }
+    }
+    let cond = test_call(&test_string(&ie.cond, cx));
+    let mut then = Vec::new();
+    push_branch(&ie.then_branch, target, cx, in_fn, &mut then);
+    let else_ = match &ie.else_branch {
+        None => refuse("if-expression without else", ie.span()),
+        Some((_, inner)) => match &**inner {
+            syn::Expr::If(inner_if) => vec![if_value_node(inner_if, target, cx, in_fn)],
+            syn::Expr::Block(blk) => {
+                let mut v = Vec::new();
+                push_branch(&blk.block, target, cx, in_fn, &mut v);
+                v
+            }
+            other => refuse("else form in if-expression", other.span()),
+        },
+    };
+    json!({"cond": cond, "then": then, "elsifs": [], "else": else_, "type": "If"})
 }
 
 /// Control-flow tails are UNIT unless proven otherwise (no type info yet):
@@ -744,6 +1036,7 @@ fn function_def(
     attrs: &[syn::Attribute],
     sig: &syn::Signature,
     block: &syn::Block,
+    self_ty: Option<&str>,
     cx: &Cx,
 ) -> Value {
     if let Some(a) = first_semantic_attr(attrs) {
@@ -767,7 +1060,25 @@ fn function_def(
         let pt = match input {
             syn::FnArg::Typed(pt) => pt,
             syn::FnArg::Receiver(r) => {
-                refuse("method receiver (`self`) — impl blocks not supported yet", r.span())
+                // `&self` / `&mut self` / `self` — the receiver object is
+                // the FIRST positional (the dispatch passes it there).
+                // All three forms share one exact lowering: JS objects are
+                // references, so `&mut self` writes through to the caller
+                // (true), `&self` can't mutate (true), and by-value `self`
+                // moves are use-after-move-checked by rustc itself (no
+                // aliasing hazard reaches us).
+                let Some(st) = self_ty else {
+                    refuse("method receiver outside an impl block", r.span())
+                };
+                if seen.contains(&"self".to_string()) {
+                    refuse("duplicate parameter name", r.span());
+                }
+                seen.push("self".to_string());
+                cx.vars
+                    .borrow_mut()
+                    .insert("self".to_string(), Ty::Struct(st.to_string()));
+                body.push(assign_stmt("self", get_var(&(i + 1).to_string())));
+                continue;
             }
         };
         let pat: &syn::Pat = match &*pt.pat {
@@ -782,7 +1093,7 @@ fn function_def(
             refuse("duplicate parameter name", pi.ident.span());
         }
         seen.push(pname.clone());
-        cx.vars.borrow_mut().insert(pname.clone(), ty_from_type(&pt.ty));
+        cx.vars.borrow_mut().insert(pname.clone(), ty_from_type(&pt.ty, cx));
         // positional binding: param i <- getVar("i+1")
         body.push(assign_stmt(&pname, get_var(&(i + 1).to_string())));
     }
@@ -794,26 +1105,43 @@ fn function_def(
             if let syn::Stmt::Expr(e, None) = stmt {
                 if unit_tail(e) {
                     if returns_value {
-                        refuse(
-                            "tail control-flow expression in a value-returning fn \
-                             (if/match-as-value not yet supported)",
-                            e.span(),
-                        );
+                        // an `if` tail IS the function's value on every
+                        // path: If{..Return(branch value)..}. match/loop
+                        // tails still refuse.
+                        let syn::Expr::If(ie) = e else {
+                            refuse(
+                                "tail control-flow expression in a value-returning fn \
+                                 (match-as-value not yet supported)",
+                                e.span(),
+                            );
+                        };
+                        body.push(if_value_node(ie, BranchTarget::Ret, cx, true));
+                        continue;
                     }
-                    if let Some(v) = lower_stmt(stmt, cx, true) {
+                    if let Some(v) = lower_stmt(stmt, cx, true, &mut body) {
                         body.push(v);
                     }
                     continue;
                 }
                 if returns_value {
+                    // arithmetic over field reads hoists its pure reads
+                    // into temporaries first (the arith AST has no
+                    // field operand form)
+                    if arith_contains_field(e) {
+                        let mut ctr = cx.tmp.borrow_mut();
+                        let ast = hoisted_arith(e, cx, &mut body, &mut ctr);
+                        drop(ctr);
+                        body.push(json!({"type": "Return", "value": arith_value(ast)}));
+                        continue;
+                    }
                     body.push(json!({"type": "Return", "value": value_expr(e, cx)}));
-                } else if let Some(v) = lower_stmt(stmt, cx, true) {
+                } else if let Some(v) = lower_stmt(stmt, cx, true, &mut body) {
                     body.push(v);
                 }
                 continue;
             }
         }
-        if let Some(v) = lower_stmt(stmt, cx, true) {
+        if let Some(v) = lower_stmt(stmt, cx, true, &mut body) {
             body.push(v);
         }
     }
@@ -1013,6 +1341,40 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                 "elements": elems.iter().map(|a| value_expr(a, cx)).collect::<Vec<_>>(),
             })
         }
+        syn::Expr::Struct(se) => {
+            // `Point { x: 3, y: 4 }` -> an A1 Object literal (the store's
+            // record value; field shorthand lowers like any path read).
+            // Struct-update rest (`..base`) refuses — field merging is
+            // not representable yet.
+            if let Some(rest) = &se.rest {
+                refuse("struct-update syntax (`..base`)", rest.span());
+            }
+            let mut props: Vec<Value> = Vec::new();
+            for f in &se.fields {
+                let key = match &f.member {
+                    syn::Member::Named(ident) => ident.to_string(),
+                    syn::Member::Unnamed(ix) => {
+                        refuse("tuple-struct positional field", ix.span())
+                    }
+                };
+                props.push(json!({"key": key, "value": value_expr(&f.expr, cx)}));
+            }
+            json!({"type": "Object", "properties": props})
+        }
+        syn::Expr::Field(f) => {
+            // `p.x` -> the FieldRead ext node (shir_nodes/field_read.node:
+            // named field read on a composite value). Tuple reads (`p.0`)
+            // refuse — no tuple contract yet.
+            let name = match &f.member {
+                syn::Member::Named(ident) => ident.to_string(),
+                syn::Member::Unnamed(ix) => refuse("tuple-index field read", ix.span()),
+            };
+            json!({
+                "type": "FieldRead",
+                "object": value_expr(&f.base, cx),
+                "name": name,
+            })
+        }
         syn::Expr::MethodCall(m) => {
             // obj.method(args) -> the A1 MethodCall expr (the contract's
             // generic member call; the ESTree path renders it as a NATIVE
@@ -1023,7 +1385,20 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
             // Vec methods, bool-returning predicates, indexing...
             let recv_ty = infer_ty(&m.receiver, cx);
             let rust_name = m.method.to_string();
-            let js_name = match (recv_ty, rust_name.as_str()) {
+            if let Ty::Struct(ty_name) = &recv_ty {
+                // inherent method dispatch: `obj.m(args)` ->
+                // fnValue("Type_m", [obj, args...]) — the mangled def's
+                // first positional IS the receiver object (its `self`).
+                let target = format!("{}_{}", ty_name, rust_name);
+                if !cx.fns.iter().any(|f| *f == target) {
+                    refuse(&format!("no method `{}` on struct `{}`", rust_name, ty_name),
+                           m.method.span());
+                }
+                let mut call_args: Vec<syn::Expr> = vec![(*m.receiver).clone()];
+                call_args.extend(m.args.iter().cloned());
+                return fn_call_expr_values(&target, call_args, "fnValue", cx);
+            }
+            let js_name = match (&recv_ty, rust_name.as_str()) {
                 (Ty::Str, "contains") => "includes",
                 (Ty::Str, "starts_with") => "startsWith",
                 (Ty::Str, "ends_with") => "endsWith",
@@ -1041,6 +1416,9 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                             Ty::Str => "string ",
                             Ty::Bool => "bool ",
                             Ty::Arr => "array ",
+                            Ty::Struct(ref n) => {
+                                unreachable!("struct receivers dispatched above: {}", n)
+                            }
                             Ty::Unknown => "",
                         }
                     ),
@@ -1063,6 +1441,9 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
             let Some(syn::Expr::Path(p)) = Some(c.func.as_ref()) else {
                 refuse("call target path", c.func.span());
             };
+            if let Some(v) = std_ctor_value(p, &c.args, cx) {
+                return v;
+            }
             let Some(target) = call_target(p, cx) else {
                 refuse("call to unknown function", c.func.span());
             };

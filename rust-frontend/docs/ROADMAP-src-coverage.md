@@ -67,6 +67,9 @@ counts over the corpus (top entries):
 
 ## Phased plan (each phase = frontend subset growth + testdata pins, gate green)
 
+1f. DONE v0.7 — if-as-expression (branch-duplicated binding / per-branch
+    Return; t48). Frontier now: enum matches + write! (x5), iterators x9,
+    record clone x5, `?` x2 — all design-level tranches.
 MILESTONE (v0.6, same day): first FULL-FILE passes — ast.rs, lib.rs,
     variable_analysis.rs emit + ingress clean. 3/30.
 1e. DONE v0.6 — receiver methods (Type_method mangling + self positional),
