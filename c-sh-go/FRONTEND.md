@@ -2,6 +2,38 @@
 
 C source -> A1 shIR JSON (the shell-flavored subset of C).
 
+## v5.4 — all the C in the CPP frontend parses (2026-08-23), 105/105
+
+Goal: the C frontend accepts every C construct the cpp-sh-go corpus
+exercises. All 26 expressible testdata_cpp/*.cc files now emit
+BYTE-IDENTICAL A1 from both frontends (the oracle); t03_new_delete is
+the only refusal and it is justified: `new`/`delete` are C++-only
+sugar the CPP frontend desugars to malloc/free BEFORE clib sees them.
+Three clib changes (all pinned or covered by a gate):
+
+- **bool/true/false/nullptr demotion** (lex): C23/stdbool booleans and
+  the null-pointer constant fold onto the int model — `bool`→`int`,
+  `true`→`1`, `false`→`0`, `nullptr`→`0`. Before, `bool ok = true;`
+  was SILENTLY DROPPED (a bare-id skip in simpleAssign) and `nullptr`
+  parsed as an undefined Var read — both refuse>guess violations.
+  Same demotion the CPP frontend applies; pin: t99_bool.c.
+- **GNU typed varargs** `int ...` in the parameter list: the redundant
+  type is dropped, same varargs state as plain `...`. gcc rejects the
+  form (it is a g++ extension) so it cannot live in this corpus — it
+  is pinned end-to-end by cpp-sh-go's t33_variadic_param.cc (g++
+  oracle) plus the byte-equality check above.
+- **switch default-arm break strip**: the DEFAULT arm's breaks are
+  stripped like every case arm's — a trailing break emitted outside a
+  loop is an uncaught BREAK signal in the runtime. This removes the
+  reason the CPP frontend pre-stripped it at its token level; a direct
+  C parse of the same source is now byte-identical. Pin:
+  t101_switch_default_break.c.
+
+Core dependency: the gate needs the s2p.c worktree's estree-ingress
+fixes (DCE string-operand read scan + ForInit goto restructure,
+commit f29723f1). Until that merges to main, run gates with
+`make test DEBASHC=.../s2p.c/target/debug/debashc`.
+
 ## v5.3 — phantom FAIL-FRONTEND-EMIT escalation + worker restore (2026-08-16), 103/103
 
 No frontend change: the 02:32 "failing to build" pi invocation was a

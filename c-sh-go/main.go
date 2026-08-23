@@ -1665,7 +1665,25 @@ func lex(src string) ([]tok, error) {
 			for j < n && (isIdent(src[j]) || (src[j] >= '0' && src[j] <= '9')) {
 				j++
 			}
-			out = append(out, tok{"id", src[i:j]})
+			w := src[i:j]
+			// C23 boolean / null-pointer keywords fold onto the int model —
+			// the SAME demotion the CPP frontend's desugar applies before
+			// clib sees the tokens (one lowering, two grammars). `bool` is
+			// int-sized here; true/false are the macros stdbool.h defines;
+			// nullptr is the zero constant (a Var("nullptr") read would be
+			// an undefined-variable guess — refuse>guess forbids that).
+			switch w {
+			case "bool":
+				out = append(out, tok{"id", "int"})
+			case "true":
+				out = append(out, tok{"num", "1"})
+			case "false":
+				out = append(out, tok{"num", "0"})
+			case "nullptr":
+				out = append(out, tok{"num", "0"})
+			default:
+				out = append(out, tok{"id", w})
+			}
 			i = j
 		default:
 			three := ""
@@ -3384,6 +3402,16 @@ func (p *parser) stmt() (any, error) {
 							p.next()
 							isPtr = true
 						}
+						if p.isOp("...") {
+							// GNU `int ...` — the typed variadic marker (the form
+							// tree-sitter-cpp parses as variadic_parameter_; g++
+							// accepts it beside the plain `...`). The redundant
+							// type carries no info (the literal-arg fold is
+							// untyped) — same varargs state as the bare marker.
+							p.next()
+							isVarargs = true
+							break
+						}
 						pn := p.next()
 						if pn == nil || pn.kind != "id" {
 							return nil, fmt.Errorf("expected parameter name at token %v", pn)
@@ -3828,6 +3856,14 @@ func (p *parser) stmt() (any, error) {
 		// dispatch chain: if (x == c1) arm1 else if (x == c2) arm2 ...
 		// else default. (A break in the MIDDLE of a case body is still
 		// stripped — the if-chain has no mid-arm escape.)
+		// The DEFAULT arm's breaks are stripped too: its trailing break
+		// would emit an A1 Break OUTSIDE any loop — an uncaught BREAK
+		// signal in the runtime (the exact divergence that made the CPP
+		// frontend pre-strip it at the token level; now clib owns it so a
+		// direct C parse of the same source is byte-identical).
+		if len(defBody) > 0 {
+			defBody = splitMidBreaks(defBody, []any{})
+		}
 		arms := make([][]any, len(cases))
 		var nextArm []any = defBody
 		for i := len(cases) - 1; i >= 0; i-- {
