@@ -67,6 +67,13 @@ counts over the corpus (top entries):
 
 ## Phased plan (each phase = frontend subset growth + testdata pins, gate green)
 
+MILESTONE (v0.6, same day): first FULL-FILE passes — ast.rs, lib.rs,
+    variable_analysis.rs emit + ingress clean. 3/30.
+1e. DONE v0.6 — receiver methods (Type_method mangling + self positional),
+    FieldRead drop-in node (core), arith field-read hoisting, std
+    constructors next. CORE REQUEST filed: record storage stringification
+    (rust-frontend-20260823-record-storage.md) blocks t45/t46 in
+    testdata-pending/.
 1d. DONE v0.5 — value-position booleans (test-call convention), soundness
     fix for bare bool-var conditions, minimal Ty tracker, proven str-method
     whitelist via A1 MethodCall, shared-borrow erasure, vec!/array literals
