@@ -435,6 +435,12 @@ fn lower_local(local: &syn::Local, cx: &Cx, out: &mut Vec<Value>) -> Option<Valu
     };
     // if-as-value: bind the target in EVERY branch (exact — rustc
     // guarantees all paths produce the value)
+    // array literals STORE via setArray (native array, no coercion)
+    if let Some(elems) = array_literal_elems(&init.expr) {
+        let elements = elems.iter().map(|e| value_expr(e, cx)).collect::<Vec<_>>();
+        cx.vars.borrow_mut().insert(name.clone(), Ty::Arr);
+        return Some(set_array_stmt(&name, elements));
+    }
     if let syn::Expr::Match(m) = &*init.expr {
         return Some(match_value_node(m, BranchTarget::Var(&name), cx, false, out));
     }
@@ -983,6 +989,44 @@ fn hoisted_arith(
     }
 }
 
+/// An array-literal STORE: the setArray builtin keeps a NATIVE JS array
+/// in the named variable (a plain Assign would stringify — "10,20,30").
+/// The exact shape debashc emits for bash `a=(...)`.
+fn set_array_stmt(name: &str, elements: Vec<Value>) -> Value {
+    expr_stmt(json!({
+        "args": [
+            str_lit(name),
+            json!({"elements": elements, "type": "Array"}),
+        ],
+        "func": "setArray", "purity": "Emulable", "type": "Call"
+    }))
+}
+
+/// If e is an ARRAY LITERAL (vec![..] or [..]), its elements — else None.
+fn array_literal_elems(e: &syn::Expr) -> Option<Vec<syn::Expr>> {
+    match e {
+        syn::Expr::Macro(m) => {
+            let name = m.mac.path.segments.last().map(|s| s.ident.to_string())?;
+            if name == "vec" {
+                struct VecElems(syn::punctuated::Punctuated<syn::Expr, syn::Token![,]>);
+                impl syn::parse::Parse for VecElems {
+                    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+                        Ok(VecElems(
+                            syn::punctuated::Punctuated::parse_terminated(input)?,
+                        ))
+                    }
+                }
+                let VecElems(elems) = syn::parse2(m.mac.tokens.clone()).ok()?;
+                Some(elems.into_iter().collect())
+            } else {
+                None
+            }
+        }
+        syn::Expr::Array(ar) => Some(ar.elems.iter().cloned().collect()),
+        _ => None,
+    }
+}
+
 /// Wrap a raw arith AST into the A1 Arith VALUE expr.
 fn arith_value(ast: Value) -> Value {
     json!({"type": "Arith", "ast": ast})
@@ -1168,12 +1212,48 @@ fn match_value_node(
 /// iteration and do NOT hoist (calls there keep refusing).
 fn hoist_cond_calls(e: &syn::Expr, cx: &Cx, out: &mut Vec<Value>) -> syn::Expr {
     match e {
-        syn::Expr::MethodCall(_) => {
+        syn::Expr::MethodCall(m) if m.method == "is_empty" => {
+            // Arr: `${#v} == 0` via a hoisted param(len) read; Str: the
+            // EXACT equality `$s = ""` (no encoding questions at all).
+            let recv_ty = infer_ty(&m.receiver, cx);
+            let name = match &*m.receiver {
+                syn::Expr::Path(p) => single_path(p).map(|i| i.to_string()),
+                _ => None,
+            };
+            match (recv_ty, name) {
+                (Ty::Arr, Some(vname)) => {
+                    out.push(assign_stmt(
+                        "__sh2e",
+                        json!({
+                            "args": [str_lit("len"), str_lit(&vname)],
+                            "func": "param", "purity": "PureCpu", "type": "Call"
+                        }),
+                    ));
+                    cx.vars.borrow_mut().insert("__sh2e".to_string(), Ty::Int);
+                    syn::parse_str::<syn::Expr>("__sh2e == 0")
+                        .unwrap_or_else(|_| refuse("temporary name", e.span()))
+                }
+                (Ty::Str, Some(vname)) => {
+                    syn::parse_str::<syn::Expr>(&format!("{vname} == \"\""))
+                        .unwrap_or_else(|_| refuse("temporary name", e.span()))
+                }
+                _ => refuse("is_empty on unproven receiver", m.method.span()),
+            }
+        }
+        syn::Expr::MethodCall(m) => {
             let v = value_expr(e, cx);
             let mut ctr = cx.tmp.borrow_mut();
             *ctr += 1;
             let temp = format!("__sh2c{}", ctr);
             drop(ctr);
+            // the temp carries the method's result type so a following
+            // test_string sees a PROVEN bool (`contains`) etc.
+            let ty = match m.method.to_string().as_str() {
+                "contains" | "starts_with" | "ends_with" => Ty::Bool,
+                "len" => Ty::Int,
+                _ => infer_ty(e, cx),
+            };
+            cx.vars.borrow_mut().insert(temp.clone(), ty);
             out.push(assign_stmt(&temp, v));
             syn::parse_str::<syn::Expr>(&temp)
                 .unwrap_or_else(|_| refuse("temporary name", e.span()))
@@ -1666,6 +1746,13 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                     "value": value_expr(&m.receiver, cx),
                 });
             }
+            // NOTE: Vec::len() on array variables would lower to the
+            // canonical param("len", name) (${#v}) — but the core's
+            // ESTree fold renders that as String(getVar(name)).length,
+            // and getVar returns the SCALAR view of an array var
+            // (first element) => wrong counts. Refused until the
+            // core/runtime fix lands (see core request
+            // rust-frontend-20260824-param-len-arrays.md).
             if rust_name == "load" {
                 // `flag.load(Ordering::..)` on an AtomicBool — a plain
                 // variable read (single-threaded runtime: exact)
@@ -1694,6 +1781,9 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
             }
             let js_name_raw = match (&recv_ty, rust_name.as_str()) {
                 (Ty::Str, "contains") => "includes",
+                // NOTE: Vec::len() does NOT map to .length here — the
+                // canonical A1 read is the param("len", name) call
+                // (${#a}); handled before this table.
                 (Ty::Str, "starts_with") => "startsWith",
                 (Ty::Str, "ends_with") => "endsWith",
                 (Ty::Str, "trim") => "trim",

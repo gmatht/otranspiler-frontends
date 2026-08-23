@@ -67,6 +67,9 @@ counts over the corpus (top entries):
 
 ## Phased plan (each phase = frontend subset growth + testdata pins, gate green)
 
+1i. DONE v0.10 — setArray-native array storage, Arr::is_empty fold,
+    Str::is_empty equality; SECOND core bug filed (param-len arrays:
+    ${#arr} scalar-view miscount). t51 pins.
 1h. DONE v0.9 — CloneDeep drop-in node (any-receiver .clone()),
     AtomicBool statics (typed statics map, new/load/store), bool test
     operands + proven-bool conditions, If-condition call hoisting

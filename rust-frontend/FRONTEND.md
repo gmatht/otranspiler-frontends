@@ -214,6 +214,23 @@ Pinned by t49_enum_match.rs.
   refusing calls.
 - MILESTONE: 4/30 full-file passes (debug.rs joined via AtomicBool).
 
+## v0.10 additions — array storage & Vec::is_empty
+
+- vec![..] / [a, b] assignments STORE via the setArray builtin — a
+  NATIVE JS array in the variable (a plain Assign stringifies to
+  "10,20,30"; t42/t44 were unobservably wrong before this).
+- Vec::is_empty() folds to length==0 in conditions via the hoisted
+  param("len", name) read; str::is_empty() is the EXACT equality
+  `$s = ""` (no encoding questions).
+- DISCOVERED CORE BUG (filed rust-frontend-20260824-param-len-arrays.md):
+  the core folds param("len", arr) to String(getVar(name)).length, and
+  getVar returns the SCALAR view of an array var => ${#arr} prints the
+  first element's length on the JS tier (pure-bash repro included).
+  Vec::len() therefore still REFUSES.
+- contains(&x) also refuses: no exact builtin read for array membership.
+
+Pinned by t51_len_isempty.rs.
+
 Refused loudly (testdata/*_refuse.rs — the emit MUST fail, t13–t23):
 borrows `&x`, user functions, `String::from`/method calls, `match`,
 `vec!`, `eprintln!`/`dbg!`, floats, `{:?}`/named/width format specs,
