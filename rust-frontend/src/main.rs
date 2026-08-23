@@ -100,6 +100,11 @@ enum Ty {
     Arr,
     /// a named struct (`Point`) — enables receiver-method dispatch
     Struct(String),
+    /// a named UNIT-variant enum (`Color`) — variants lower to their
+    /// qualified tag strings (`"Color::Red"`); matching is string
+    /// equality. Tuple/struct-variant enums refuse until record storage
+    /// lands (payloads need object values).
+    Enum(String),
     Unknown,
 }
 
@@ -113,6 +118,9 @@ fn ty_from_type(t: &syn::Type, cx: &Cx) -> Ty {
             let id = seg.ident.to_string();
             if cx.structs.iter().any(|s| *s == id) {
                 return Ty::Struct(id);
+            }
+            if cx.enums.iter().any(|e| *e == id) {
+                return Ty::Enum(id);
             }
             match seg.ident.to_string().as_str() {
                 "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32"
@@ -146,6 +154,8 @@ struct Cx {
     vars: std::cell::RefCell<HashMap<String, Ty>>,
     /// declared struct names (receiver-method dispatch targets)
     structs: Vec<String>,
+    /// declared enum names (unit-variant tag lowering)
+    enums: Vec<String>,
     /// fresh-temporary counter (field-read hoists)
     tmp: std::cell::RefCell<u32>,
     /// global assignments (consts/statics), in source order
@@ -204,10 +214,12 @@ fn main() {
     });
 
     let mut cx = Cx::default();
-    // struct registry first — type resolution consults it
+    // type registries first — resolution consults them
     for item in &ast.items {
-        if let syn::Item::Struct(s) = item {
-            cx.structs.push(s.ident.to_string());
+        match item {
+            syn::Item::Struct(s) => cx.structs.push(s.ident.to_string()),
+            syn::Item::Enum(e) => cx.enums.push(e.ident.to_string()),
+            _ => {}
         }
     }
     // Flatten inline `mod` blocks into one item list — namespace nesting
@@ -413,8 +425,11 @@ fn lower_local(local: &syn::Local, cx: &Cx, out: &mut Vec<Value>) -> Option<Valu
     };
     // if-as-value: bind the target in EVERY branch (exact — rustc
     // guarantees all paths produce the value)
+    if let syn::Expr::Match(m) = &*init.expr {
+        return Some(match_value_node(m, BranchTarget::Var(&name), cx, false, out));
+    }
     if let syn::Expr::If(ie) = &*init.expr {
-        let v = if_value_node(ie, BranchTarget::Var(&name.to_string()), cx, false);
+        let v = if_value_node(ie, BranchTarget::Var(&name), cx, false);
         let ty = branch_ty(ie, cx);
         cx.vars.borrow_mut().insert(name.clone(), ty);
         return Some(v);
@@ -464,9 +479,18 @@ fn infer_ty(e: &syn::Expr, cx: &Cx) -> Ty {
             }
         }
         syn::Expr::Field(_) => Ty::Unknown,
-        syn::Expr::Path(p) => single_path(p)
-            .and_then(|id| cx.vars.borrow().get(&id.to_string()).cloned())
-            .unwrap_or(Ty::Unknown),
+        syn::Expr::Path(p) => {
+            // `Color::Red` — a unit-variant VALUE has its enum's type
+            if p.qself.is_none() && p.path.segments.len() == 2 {
+                let e = p.path.segments[0].ident.to_string();
+                if cx.enums.iter().any(|x| *x == e) {
+                    return Ty::Enum(e);
+                }
+            }
+            single_path(p)
+                .and_then(|id| cx.vars.borrow().get(&id.to_string()).cloned())
+                .unwrap_or(Ty::Unknown)
+        }
         _ => Ty::Unknown,
     }
 }
@@ -512,6 +536,11 @@ fn lower_expr_stmt(e: &syn::Expr, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) ->
         syn::Expr::Field(_) => {
             // bare `p.x;` — a pure read, discarded (like bare `x;`)
             None
+        }
+        syn::Expr::Match(m) => {
+            // STATEMENT-position match: unit-variant arms -> if-chain;
+            // bodies are plain statements (Unit target).
+            Some(match_value_node(m, BranchTarget::Unit, cx, in_fn, out))
         }
         syn::Expr::MethodCall(m) => {
             // statement-position method call: only PURE methods lower at
@@ -934,6 +963,8 @@ fn block_value(b: &syn::Block) -> Option<&syn::Expr> {
 enum BranchTarget<'a> {
     Var(&'a str),
     Ret,
+    /// statement-position match: bodies are plain statements
+    Unit,
 }
 
 /// A variable's type from an if-expression: the first provable branch
@@ -955,6 +986,139 @@ fn branch_ty(ie: &syn::ExprIf, cx: &Cx) -> Ty {
         },
         None => Ty::Unknown,
     }
+}
+
+/// Push a branch BLOCK's statements for the given target: the trailing
+/// semi-less expression is the branch VALUE (bound/returned), everything
+/// else lowers normally. Unit targets just lower statements.
+fn push_branch_block(
+    b: &syn::Block,
+    target: BranchTarget,
+    cx: &Cx,
+    in_fn: bool,
+    out: &mut Vec<Value>,
+) {
+    let n = b.stmts.len();
+    for (i, s) in b.stmts.iter().enumerate() {
+        if i + 1 == n {
+            if let syn::Stmt::Expr(e, None) = s {
+                match target {
+                    BranchTarget::Var(name) => {
+                        out.push(assign_stmt(name, value_expr(e, cx)))
+                    }
+                    BranchTarget::Ret => {
+                        out.push(json!({"type": "Return", "value": value_expr(e, cx)}))
+                    }
+                    BranchTarget::Unit => {
+                        if let Some(v) = lower_expr_stmt(e, cx, in_fn, out) {
+                            out.push(v);
+                        }
+                    }
+                    _ => unreachable!("Var/Ret handled above"),
+                }
+                continue;
+            }
+        }
+        if let Some(v) = lower_stmt(s, cx, in_fn, out) {
+            out.push(v);
+        }
+    }
+}
+
+/// A UNIT-variant pattern (`Color::Red`) -> its qualified tag string;
+/// None for anything else (payload variants, literals, bindings).
+fn unit_variant_pat(p: &syn::Pat, cx: &Cx) -> Option<String> {
+    if let syn::Pat::Path(pp) = p {
+        if pp.qself.is_none()
+            && pp.path.leading_colon.is_none()
+            && pp.path.segments.len() == 2
+            && pp.path.segments[1].arguments.is_none()
+        {
+            let e = pp.path.segments[0].ident.to_string();
+            let v = pp.path.segments[1].ident.to_string();
+            if cx.enums.iter().any(|x| *x == e) {
+                return Some(format!("{e}::{v}"));
+            }
+        }
+    }
+    None
+}
+
+/// A match arm's test condition: string equality on the hoisted
+/// scrutinee, or-patterns join with `-o`.
+fn arm_cond(temp: &str, pat: &syn::Pat, cx: &Cx) -> Option<String> {
+    fn one(temp: &str, p: &syn::Pat, cx: &Cx) -> Option<String> {
+        unit_variant_pat(p, cx).map(|tag| format!("${temp} = \"{tag}\""))
+    }
+    match pat {
+        syn::Pat::Or(o) => {
+            let mut parts = Vec::new();
+            for p2 in &o.cases {
+                parts.push(one(temp, p2, cx)?);
+            }
+            Some(parts.join(" -o "))
+        }
+        other => one(temp, other, cx),
+    }
+}
+
+/// Lower a `match` whose arms are ALL unit-variant patterns (or `_`):
+/// nested Ifs over string-equality tests on a hoisted scrutinee. The
+/// LAST arm is the fall-through else (rustc guarantees exhaustiveness,
+/// so reaching it means nothing earlier matched — exact). Guards and
+/// payload patterns refuse.
+fn match_value_node(
+    m: &syn::ExprMatch,
+    target: BranchTarget,
+    cx: &Cx,
+    in_fn: bool,
+    out: &mut Vec<Value>,
+) -> Value {
+    if !m.arms.iter().all(|a| a.guard.is_none()) {
+        refuse("match guard", m.span());
+    }
+    // scrutinee hoist — any expression, read once (exact: Rust moves/
+    // borrows the scrutinee once too)
+    let n = cx.tmp.borrow_mut();
+    let temp = format!("__sh2m{n}");
+    drop(n);
+    out.push(assign_stmt(&temp, value_expr(&m.expr, cx)));
+    let mut else_: Vec<Value> = Vec::new();
+    for arm in m.arms.iter().rev() {
+        let Some(cond_s) = arm_cond(&temp, &arm.pat, cx) else {
+            refuse(
+                "match pattern (only unit variants, or-patterns of them, and `_`)",
+                arm.pat.span(),
+            );
+        };
+        let mut then = Vec::new();
+        match &*arm.body {
+            syn::Expr::Block(blk) => {
+                push_branch_block(&blk.block, target, cx, in_fn, &mut then)
+            }
+            body_e => match target {
+                BranchTarget::Var(name) => {
+                    then.push(assign_stmt(name, value_expr(body_e, cx)))
+                }
+                BranchTarget::Ret => then.push(
+                    json!({"type": "Return", "value": value_expr(body_e, cx)}),
+                ),
+                BranchTarget::Unit => {
+                    if let Some(v) = lower_expr_stmt(body_e, cx, in_fn, &mut then) {
+                        then.push(v);
+                    }
+                }
+            },
+        }
+        else_ = vec![json!({
+            "cond": test_call(&cond_s),
+            "then": then,
+            "elsifs": [],
+            "else": else_,
+            "type": "If",
+        })];
+    }
+    else_.remove(0)
 }
 
 /// Lower `if c {A} else {B}` used as a VALUE into the equivalent A1 If:
@@ -985,6 +1149,11 @@ fn if_value_node(
                         BranchTarget::Ret => out.push(
                             json!({"type": "Return", "value": value_expr(e, cx)}),
                         ),
+                        BranchTarget::Unit => {
+                            if let Some(v) = lower_expr_stmt(e, cx, in_fn, out) {
+                                out.push(v);
+                            }
+                        }
                     }
                     continue;
                 }
@@ -1105,17 +1274,27 @@ fn function_def(
             if let syn::Stmt::Expr(e, None) = stmt {
                 if unit_tail(e) {
                     if returns_value {
-                        // an `if` tail IS the function's value on every
-                        // path: If{..Return(branch value)..}. match/loop
-                        // tails still refuse.
-                        let syn::Expr::If(ie) = e else {
-                            refuse(
+                        // an `if`/`match` tail IS the function's value on
+                        // every path: per-branch Returns. loop tails still
+                        // refuse.
+                        match e {
+                            syn::Expr::If(ie) => body.push(if_value_node(
+                                ie,
+                                BranchTarget::Ret,
+                                cx,
+                                true,
+                            )),
+                            syn::Expr::Match(m) => {
+                                let node =
+                                    match_value_node(m, BranchTarget::Ret, cx, true, &mut body);
+                                body.push(node);
+                            }
+                            _ => refuse(
                                 "tail control-flow expression in a value-returning fn \
-                                 (match-as-value not yet supported)",
+                                 (loop values not supported)",
                                 e.span(),
-                            );
-                        };
-                        body.push(if_value_node(ie, BranchTarget::Ret, cx, true));
+                            ),
+                        }
                         continue;
                     }
                     if let Some(v) = lower_stmt(stmt, cx, true, &mut body) {
@@ -1277,6 +1456,19 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
             other => refuse("literal type (only integers, strings, bools)", other.span()),
         },
         syn::Expr::Path(p) => {
+            // `Color::Red` — a UNIT-variant value lowers to its qualified
+            // tag string (matching is string equality). Tuple/struct
+            // variants carry payloads and refuse until record storage.
+            if p.qself.is_none() && p.path.leading_colon.is_none() && p.path.segments.len() == 2 {
+                let e = p.path.segments[0].ident.to_string();
+                let v = p.path.segments[1].ident.to_string();
+                if cx.enums.iter().any(|x| *x == e) {
+                    if !p.path.segments[1].arguments.is_none() {
+                        refuse("enum variant with payload", p.path.segments[1].span());
+                    }
+                    return str_lit(&format!("{e}::{v}"));
+                }
+            }
             let Some(name) = single_path(p) else {
                 refuse("path expression", p.span());
             };
@@ -1418,6 +1610,9 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                             Ty::Arr => "array ",
                             Ty::Struct(ref n) => {
                                 unreachable!("struct receivers dispatched above: {}", n)
+                            }
+                            Ty::Enum(ref n) => {
+                                unreachable!("enum receivers are not method targets: {}", n)
                             }
                             Ty::Unknown => "",
                         }
@@ -1601,8 +1796,8 @@ fn test_string(e: &syn::Expr, cx: &Cx) -> String {
         syn::Expr::Binary(b) => {
             use syn::BinOp::*;
             match b.op {
-                Eq(_) => bin_test("-eq", &b.left, &b.right, cx),
-                Ne(_) => bin_test("-ne", &b.left, &b.right, cx),
+                Eq(_) => bin_test(&eq_op(&b.left, &b.right, false, cx), &b.left, &b.right, cx),
+                Ne(_) => bin_test(&eq_op(&b.left, &b.right, true, cx), &b.left, &b.right, cx),
                 Lt(_) => bin_test("-lt", &b.left, &b.right, cx),
                 Le(_) => bin_test("-le", &b.left, &b.right, cx),
                 Gt(_) => bin_test("-gt", &b.left, &b.right, cx),
@@ -1633,18 +1828,33 @@ fn test_string(e: &syn::Expr, cx: &Cx) -> String {
 }
 
 fn bin_test(op: &str, l: &syn::Expr, r: &syn::Expr, cx: &Cx) -> String {
-    format!("{} {} {}", operand(l, cx), op, operand(r, cx))
+    let str_eq = op == "=" || op == "!=";
+    format!(
+        "{} {} {}",
+        operand(l, cx, str_eq),
+        op,
+        operand(r, cx, str_eq)
+    )
 }
 
-/// Comparison operand: a variable (`$x`) or an integer literal.
-fn operand(e: &syn::Expr, cx: &Cx) -> String {
+/// Comparison operand: a variable (`$x`) or an integer literal. For
+/// STRING equality tests this also admits quoted string literals and
+/// unit-variant values (their qualified tag strings).
+fn operand(e: &syn::Expr, cx: &Cx, str_eq: bool) -> String {
     match e {
         syn::Expr::Path(p) => {
+            // a named const resolves at compile time (const folding);
+            // everything else is a runtime variable read.
+            if p.qself.is_none() && p.path.segments.len() == 2 && str_eq {
+                let en = p.path.segments[0].ident.to_string();
+                let v = p.path.segments[1].ident.to_string();
+                if cx.enums.iter().any(|x| *x == en) {
+                    return format!("\"{en}::{v}\"");
+                }
+            }
             let Some(name) = single_path(p) else {
                 refuse("path in condition operand", p.span());
             };
-            // a named const resolves at compile time (const folding);
-            // everything else is a runtime variable read.
             if let Some(v) = cx.ints.get(&name.to_string()) {
                 return v.to_string();
             }
@@ -1652,11 +1862,49 @@ fn operand(e: &syn::Expr, cx: &Cx) -> String {
         }
         syn::Expr::Lit(l) => match &l.lit {
             syn::Lit::Int(li) => int_text(li),
+            syn::Lit::Str(ls) if str_eq => format!("\"{}\"", ls.value()),
             other => refuse("literal in condition operand", other.span()),
         },
         other => refuse(
             "condition operand (variable or integer literal only)",
             other.span(),
         ),
+    }
+}
+
+/// Equality operator for a comparison: numeric `-eq`/`-ne` unless either
+/// side is PROVEN textual (a string literal / enum variant path / a var
+/// of Str or Enum type) — then bash string equality `=` / `!=`.
+fn eq_op(l: &syn::Expr, r: &syn::Expr, ne: bool, cx: &Cx) -> &'static str {
+    fn textual(e: &syn::Expr, cx: &Cx) -> bool {
+        match e {
+            syn::Expr::Lit(l2) => matches!(l2.lit, syn::Lit::Str(_)),
+            syn::Expr::Reference(r2) => textual(&r2.expr, cx),
+            syn::Expr::Paren(p) => textual(&p.expr, cx),
+            syn::Expr::Path(p) => {
+                if p.qself.is_none() && p.path.segments.len() == 2 {
+                    let en = p.path.segments[0].ident.to_string();
+                    if cx.enums.iter().any(|x| *x == en) {
+                        return true;
+                    }
+                }
+                single_path(p)
+                    .and_then(|id| cx.vars.borrow().get(&id.to_string()).cloned())
+                    .map(|t| matches!(t, Ty::Str | Ty::Enum(_)))
+                    .unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+    if textual(l, cx) || textual(r, cx) {
+        if ne {
+            "!="
+        } else {
+            "="
+        }
+    } else if ne {
+        "-ne"
+    } else {
+        "-eq"
     }
 }

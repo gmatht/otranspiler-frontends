@@ -177,6 +177,25 @@ match-on-enums x5 (needs enum repr + write!), record .clone() x5,
 `?` x2, singletons (write!, lazy_static, wasm_bindgen, generic impl,
 {:?}, Token::lexer iterators, as_bytes).
 
+## v0.8 additions — unit enums & match
+
+- UNIT-variant enum values lower to qualified tag strings
+  (`Color::Red` -> `"Color::Red"`); the Ty tracker gains `Enum(name)`.
+- `match` with unit-variant arms (incl. or-patterns `A | B` and `_`
+  fall-through) lowers to nested Ifs over string-equality tests on a
+  hoisted scrutinee (`__sh2mN <- <scrutinee>`); statement / let /
+  assign / fn-tail positions all supported. Guards and payload
+  (tuple/struct) patterns refuse — payloads need record storage.
+- equality tests dispatch numeric `-eq`/`-ne` vs string `=`/`!=` by
+  PROVEN operand type (string literals, unit variants, Str/Enum-typed
+  vars); unknown types stay numeric (no behavior change).
+- KNOWN LIMITATION documented: A1 function params bind into the SHARED
+  global store, so a param name that collides with a caller's variable
+  clobbers it (shell semantics; per-function locals are a core-side
+  lift analysis). t49 avoids the collision and comments it.
+
+Pinned by t49_enum_match.rs.
+
 Refused loudly (testdata/*_refuse.rs — the emit MUST fail, t13–t23):
 borrows `&x`, user functions, `String::from`/method calls, `match`,
 `vec!`, `eprintln!`/`dbg!`, floats, `{:?}`/named/width format specs,
