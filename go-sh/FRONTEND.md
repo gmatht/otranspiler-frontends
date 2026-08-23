@@ -120,3 +120,38 @@ Corpus state (frontends/coverage/parser-coverage.sh): 125 .go files →
 EMIT 103 (82.4%, was 99/121 = 81.8%), REFUSE 22, PARSE-ERR 0, CRASH 0 —
 no previously-passing file regressed; every refusal is at a named
 construct.
+
+---
+
+## Self-hosting push: computed indexes, struct values, predicates (2026-08-23b)
+
+**Supported now (verified vs native go run):**
+- Computed indexes: `src[i]`, `arr[i+1]` (arrays via evalArith
+  subscripts; strings via ${s:$i:1} single-element reads — Go bytes =
+  chars for the ASCII corpus), indexed writes `a[i] = v`, computed
+  slice bounds `src[start+1 : i]`
+- Struct VALUES via the generic OBJECT STORE runtime helpers
+  (sh2.objNew/objGet/objSet/list*/map* in harness/sh2-namespace.mjs):
+  `&T{...}` / `T{...}` allocate an object whose id is an opaque string;
+  pointers ride the echo/capture value-return protocol with TRUE
+  reference semantics (aliasing/mutation preserved); field access is
+  objGet chains; layouts captured from `type X struct{...}` decls
+- Methods (`func (r T) m(...)`) lower as subs with the receiver as $1
+  (an object id); call sites pass it explicitly
+- Predicate calls in condition position (`if isIdentStart(c) {`) —
+  bool-returning subs signal via EXIT STATUS (`return <cmp>` lowers to
+  sh2.return 0/1); bare Bool-var conditions gate on "$v"="true"
+- Bare `switch {` (switch-true) → chained If; bare `for {}` →
+  While(true); `for i, v := range xs` (index+value, incl. list-object
+  fields); multi-value returns via RESULT SLOTS (__ret_fn_N);
+  comma-ok map reads (`v, ok := m[k]`); strings.TrimSpace/Split/
+  LastIndex/Index helpers; dynamic bytes.Buffer writes
+
+**Self-hosting status:** go-sh now parses its own source past line ~1300
+of 3880 before refusing. Remaining walls (each needing design work):
+maps-in-structs coherence between the assoc-array and object-store
+models; defer/recover; interface{} boxing of object ids; the JSON emit
+library (external package, stubbed). Full-file emit NOT yet achieved.
+
+Corpus unchanged: EMIT 103/125, REFUSE 22, PARSE-ERR 0 — zero
+regressions.

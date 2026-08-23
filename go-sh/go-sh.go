@@ -90,7 +90,7 @@ type token struct {
 	line int
 }
 
-var multiOps = []string{"...", ":=", "==", "!=", "<=", ">=", "&&", "||", "+=", "++"}
+var multiOps = []string{"...", ":=", "==", "!=", "<=", ">=", "&&", "||", "+=", "++", "--"}
 
 func lex(src string) ([]token, error) {
 	var toks []token
@@ -428,6 +428,13 @@ type expr struct {
 	// key/value expression lists (MapLiteral node)
 	keys []*expr
 	vals []*expr
+	// struct composite literal T{...} / address-of &T{...}: ordered
+	// field values (zero-filled to the layout), OBJECT STORE model
+	structType string
+	fieldVals  []*expr
+	isAddrOf   bool
+	// []T{...} slice literal in expression position: pre-lowered words
+	elems []map[string]any
 	// arith / concat / binop
 	op  string
 	lhs *expr
@@ -480,6 +487,22 @@ type parser struct {
 	// $N positional mapping; the function-entry prelude splices the tail
 	// positionals (${@:N}) into a real array var so reads/spreads work.
 	variadicParam string
+	// struct layouts (ARENA model): type name -> ordered field names.
+	// Every struct instance is arena-allocated: `&T{...}` / `T{...}`
+	// appends its field values flat to __arena_T and yields the 1-based
+	// instance number; a *T / T value IS that number, so pointers ride
+	// the existing echo/capture value-return protocol and field access
+	// is a computed subscript (__arena_T[$p*N + off]).
+	structs    map[string][]string          // type name -> ordered FIELDS
+	structFT   map[string][]string          // type name -> field BASE type names
+	structRaw  map[string][]string          // type name -> field RAW type texts
+	varStruct  map[string]string            // var -> struct type name (pointer or value)
+	bufDyn     map[string]bool              // buffers with DYNAMIC writes (obj model)
+	fnSig      map[string][2]string         // func/method name -> [paramTypesCsv, retType]
+	paramTypes map[string]string            // (during decl parse) param -> base type
+	lastTypeRaw string                     // (during capture) the raw type text
+	lastSig    [2]string                    // (during decl parse) captured signature
+	tmpN       int                          // fresh temp counter (newstruct preludes)
 	// type-switch guard aliases: `switch v := x.(type)` binds v to x in
 	// every arm (core request go-sh-20260813-154009) — reads of the guard
 	// var resolve to the guarded var (getVar x), matching the contract's
@@ -572,6 +595,7 @@ func (p *parser) parseOr() *expr {
 	l := p.parseAnd()
 	for p.atPunct("||") {
 		p.pos++
+		p.skipNL() // Go allows a newline after the operator
 		l = &expr{kind: "binop", BOp: "||", BOpKind: "or", lhs: l, rhs: p.parseAnd()}
 	}
 	return l
@@ -581,6 +605,7 @@ func (p *parser) parseAnd() *expr {
 	l := p.parseCmp()
 	for p.atPunct("&&") {
 		p.pos++
+		p.skipNL() // Go allows a newline after the operator
 		l = &expr{kind: "binop", BOp: "&&", BOpKind: "and", lhs: l, rhs: p.parseCmp()}
 	}
 	return l
@@ -629,7 +654,13 @@ func (p *parser) parseUnary() *expr {
 	// through a pointer refuse at the assignment site — parseAssignStmt).
 	if p.atPunct("&") {
 		p.pos++
-		return &expr{kind: "addr", lhs: p.parseUnary()}
+		e := p.parseUnary()
+		if e.kind == "structlit" {
+			// &T{...} — arena ALLOCATION: lowers to counter increment +
+			// flat field append; the address is the 1-based instance no.
+			e.isAddrOf = true
+		}
+		return &expr{kind: "addr", lhs: e}
 	}
 	if p.atPunct("*") {
 		p.pos++
@@ -712,7 +743,14 @@ func (p *parser) parsePostfix() *expr {
 				continue
 			}
 			nm := p.expect(tIdent, "").text
-			e = &expr{kind: "member", name: callName(e) + "." + nm}
+			if e.kind == "call" || e.kind == "fieldof" || e.kind == "index" {
+				// f(x).field / f(x).a.b / sl[i].f — member access on a
+				// computed VALUE: a fieldof chain (objGet over the
+				// returned reference id)
+				e = &expr{kind: "fieldof", lhs: e, name: nm}
+			} else {
+				e = &expr{kind: "member", name: callName(e) + "." + nm}
+			}
 		case p.atPunct("..."):
 			// f(args...) variadic spread — mark the arg expr; the call-site
 			// word lowering wraps it in the Spread ext node (ESTree
@@ -922,6 +960,12 @@ func (p *parser) parsePrimary() *expr {
 			if arg.kind == "var" && p.varTypes[arg.name] == "Array" {
 				return &expr{kind: "arrlen", target: arg}
 			}
+			if arg.kind == "member" {
+				// len(l.toks) over a LIST-object field
+				if _, tag := p.structFieldWord(arg.name); tag == "list" {
+					return &expr{kind: "arrlen", target: arg}
+				}
+			}
 			return &expr{kind: "strlen", target: arg}
 		case "string":
 			p.pos++
@@ -972,6 +1016,12 @@ func (p *parser) parsePrimary() *expr {
 				return &expr{kind: "maplit", keys: keys, vals: vals}
 			}
 		}
+		// T{...} struct composite literal — the ARENA model's
+		// constructor (layout captured by the type declaration)
+		if layout, ok := p.structs[t.text]; ok && p.toks[p.pos+1].kind == tPunct && p.toks[p.pos+1].text == "{" {
+			p.pos++
+			return p.parseStructLit(t.text, layout)
+		}
 		p.pos++
 		return &expr{kind: "var", name: t.text}
 	case tPunct:
@@ -982,6 +1032,11 @@ func (p *parser) parsePrimary() *expr {
 			p.skipNL()
 			p.expect(tPunct, ")")
 			return e
+		}
+		// []T{...} slice literal in EXPRESSION position (`return []any{...}`)
+		if t.text == "[" && p.sliceLitAhead() {
+			elems, _ := p.parseArrayLiteral()
+			return &expr{kind: "arraylit", elems: elems}
 		}
 		// []byte(x) conversion (grammar conversion): identity — the A1
 		// is strings-only, so the byte-slice conversion is a no-op
@@ -997,6 +1052,239 @@ func (p *parser) parsePrimary() *expr {
 	}
 	p.failf("unexpected token %q in expression", t.text)
 	return nil
+}
+
+// parseStructLit parses the braces of T{...} (the type name already
+// consumed) into ordered field values, zero-filled to the layout. Both
+// keyed ({name: v}) and positional ({v1, v2}) forms lower; mixing is
+// refused (Go allows it only after keyed, but the corpus never does).
+func (p *parser) parseStructLit(typeName string, layout []string) *expr {
+	p.expect(tPunct, "{")
+	vals := make([]*expr, len(layout))
+	keyed, first := false, true
+	pos := 0
+	for {
+		p.skipNL()
+		if p.atPunct("}") {
+			p.pos++
+			break
+		}
+		if first && p.tok().kind == tIdent && p.toks[p.pos+1].kind == tPunct && p.toks[p.pos+1].text == ":" {
+			keyed = true
+		}
+		first = false
+		if keyed {
+			fn := p.expect(tIdent, "").text
+			p.skipNL()
+			p.expect(tPunct, ":")
+			p.skipNL()
+			v := p.parseExpr()
+			idx := -1
+			for i, f := range layout {
+				if f == fn {
+					idx = i
+					break
+				}
+			}
+			if idx < 0 {
+				p.failf("unknown field %q in struct %q (v2)", fn, typeName)
+			}
+			vals[idx] = v
+		} else {
+			if pos >= len(layout) {
+				p.failf("too many fields in struct %q literal (v2)", typeName)
+			}
+			vals[pos] = p.parseExpr()
+			pos++
+		}
+		p.skipNL()
+		if !p.acceptPunct(",") {
+			p.skipNL()
+			p.expect(tPunct, "}")
+			break
+		}
+	}
+	return &expr{kind: "structlit", structType: typeName, fieldVals: vals}
+}
+
+// structZeroWord: the zero value word for an unset field ("").
+func structZeroWord() map[string]any { return strExpr("") }
+
+// structFieldWords: the FLAT field words for a struct literal — one
+// word per layout slot (zero-filled), the arena append's element list.
+func (p *parser) structFieldWords(e *expr) []map[string]any {
+	var out []map[string]any
+	for _, fv := range e.fieldVals {
+		if fv == nil {
+			out = append(out, structZeroWord())
+			continue
+		}
+		out = append(out, p.exprToWord(fv))
+	}
+	return out
+}
+
+// structArena: the per-type arena array name.
+func structArena(typeName string) string { return "__arena_" + typeName }
+
+// structCounter: the per-type allocation counter name.
+func structCounter(typeName string) string { return "__cnt_" + typeName }
+
+// structFieldIndex: layout position of a field (-1 when unknown).
+func structFieldIndex(layout []string, field string) int {
+	for i, f := range layout {
+		if f == field {
+			return i
+		}
+	}
+	return -1
+}
+
+// structFieldWord resolves a dotted member name (`p.pos`, `e.lhs.rhs`,
+// `l.toks`, `t.text`) whose base is a STRUCT-typed var: each segment is
+// an objGet over the previous value (objects are reference IDs — true
+// aliasing). Returns the word plus the FINAL field's container tag:
+// "" (scalar/struct ptr), "list", or "map".
+func (p *parser) structFieldWord(name string) (map[string]any, string) {
+	parts := strings.Split(name, ".")
+	if len(parts) < 2 {
+		return nil, "none"
+	}
+	baseName := p.resolveVar(parts[0])
+	typeName, ok := p.varStruct[baseName]
+	if !ok {
+		return nil, "none"
+	}
+	if len(p.structs[typeName]) == 0 {
+		return nil, "none"
+	}
+	cur := p.structIDWord(parts[0])
+	segs := parts[1:]
+	for si, seg := range segs {
+		layout := p.structs[typeName]
+		off := structFieldIndex(layout, seg)
+		if off < 0 {
+			return nil, "none" // not a field — other handlers try next
+		}
+		raw := ""
+		if raws := p.structRaw[typeName]; off < len(raws) {
+			raw = raws[off]
+		}
+		cur = map[string]any{
+			"type": "Call", "func": "objGet",
+			"args":   []any{cur, strExpr(seg)},
+			"purity": "PureCpu",
+		}
+		if si == len(segs)-1 {
+			tag := "ref"
+			if strings.HasPrefix(raw, "[]") {
+				tag = "list"
+			} else if strings.HasPrefix(raw, "map[") {
+				tag = "map"
+			}
+			return cur, tag
+		}
+		ft := ""
+		if ftypes := p.structFT[typeName]; off < len(ftypes) {
+			ft = ftypes[off]
+		}
+		if !p.isStructType(ft) {
+			return nil, "none"
+		}
+		typeName = ft
+	}
+	return nil, "none"
+}
+
+// structMemberWord: the scalar/reference read form.
+func (p *parser) structMemberWord(name string) (map[string]any, bool) {
+	w, tag := p.structFieldWord(name)
+	if tag != "ref" {
+	}
+	if tag == "none" || tag == "list" || tag == "map" {
+		return nil, false
+	}
+	return w, true
+}
+
+// newstructStmts lowers `target = &T{...}` (or a temp for expression
+// uses): ONE objNew call — the OBJECT STORE model. Nested &T{...}
+// field values pre-lower into temps (statement boundary), then the
+// field word is the temp's value; non-addressed struct fields inline
+// their objNew directly.
+func (p *parser) newstructStmts(target string, e *expr) []map[string]any {
+	layout := p.structs[e.structType]
+	prelude := []map[string]any{}
+	fieldNames := []any{}
+	fieldVals := []any{}
+	for i, fv := range e.fieldVals {
+		if i >= len(layout) {
+			break
+		}
+		fieldNames = append(fieldNames, strExpr(layout[i]))
+		if fv == nil {
+			fieldVals = append(fieldVals, strExpr(""))
+			continue
+		}
+		lit := fv
+		if lit.kind == "addr" && lit.lhs != nil && lit.lhs.kind == "structlit" {
+			lit = lit.lhs
+		}
+		if lit.kind == "structlit" {
+			// a STRUCT-TYPED field: the value IS a reference, so an
+			// inner literal allocates its own object INLINE
+			fieldVals = append(fieldVals, p.objNewCall(lit))
+			continue
+		}
+		fieldVals = append(fieldVals, p.exprToWord(fv))
+	}
+	out := prelude
+	out = append(out, assignStmt(target, p.objNewCallNamed(e.structType, fieldNames, fieldVals)))
+	return out
+}
+
+// objNewCallNamed: the Call word allocating an object of typeName.
+func (p *parser) objNewCallNamed(typeName string, names, vals []any) map[string]any {
+	return map[string]any{
+		"type": "Call", "func": "objNew",
+		"args":   []any{strExpr(typeName), map[string]any{"type": "Array", "elements": names}, map[string]any{"type": "Array", "elements": vals}},
+		"purity": "PureCpu",
+	}
+}
+
+// objNewCall: allocate from a struct literal expression.
+func (p *parser) objNewCall(e *expr) map[string]any {
+	layout := p.structs[e.structType]
+	names := []any{}
+	vals := []any{}
+	for i, fv := range e.fieldVals {
+		if i >= len(layout) {
+			break
+		}
+		names = append(names, strExpr(layout[i]))
+		if fv == nil {
+			vals = append(vals, strExpr(""))
+			continue
+		}
+		lit := fv
+		if lit.kind == "addr" && lit.lhs != nil && lit.lhs.kind == "structlit" {
+			lit = lit.lhs
+		}
+		if lit.kind == "structlit" {
+			vals = append(vals, p.objNewCall(lit))
+			continue
+		}
+		vals = append(vals, p.exprToWord(fv))
+	}
+	return p.objNewCallNamed(e.structType, names, vals)
+}
+
+func wordsToAny(ws []map[string]any) []any {
+	a := make([]any, len(ws))
+	for i, w := range ws {
+		a[i] = w
+	}
+	return a
 }
 
 // ── func literals ───────────────────────────────────────────────────
@@ -1037,6 +1325,47 @@ func (p *parser) parseFuncLit() *expr {
 // compile-time only and have zero runtime statements in the A1, so a
 // parsed-and-dropped type IS the faithful lowering (the same rule the
 // empty-interface/scalar-alias/type-param erasures already pin).
+// captureTypeText consumes one Go type (same grammar as skipType) and
+// returns its BASE type name — the final ident segment with pointer /
+// slice / variadic / qualifier marks stripped (`[]*expr` -> "expr",
+// `tokKind` -> "tokKind", `map[string]any` -> ""). The struct decl and
+// signature capture use it to wire arena chains.
+func (p *parser) captureTypeText() string {
+	start := p.pos
+	p.skipType()
+	raw := ""
+	for i := start; i < p.pos && i < len(p.toks); i++ {
+		raw += p.toks[i].text
+	}
+	p.lastTypeRaw = strings.TrimSpace(raw)
+	base := ""
+	for i := start; i < p.pos && i < len(p.toks); i++ {
+		if p.toks[i].kind == tIdent {
+			base = p.toks[i].text
+		}
+	}
+	// return the base even for still-unknown names: self-referential
+	// struct fields (`lhs *expr` inside type expr) resolve later
+	return base
+}
+
+func (p *parser) isStructType(name string) bool {
+	_, ok := p.structs[name]
+	return ok
+}
+
+func (p *parser) knownScalarType(name string) bool {
+	switch name {
+	case "", "string", "bool", "error", "byte", "rune", "any":
+		return true
+	}
+	if strings.HasPrefix(name, "int") || strings.HasPrefix(name, "uint") ||
+		strings.HasPrefix(name, "float") {
+		return true
+	}
+	return false
+}
+
 func (p *parser) skipType() {
 	p.skipNL()
 	switch {
@@ -1166,6 +1495,58 @@ func (p *parser) skipReturnType() {
 	p.skipType()
 }
 
+// parseFuncParamsWithTypes: parseFuncParams plus signature capture —
+// each param's base type text is recorded (struct-typed params register
+// in varStruct so field access resolves), and the return type lands in
+// p.lastSig for call-site var typing. The receiver (methods) becomes
+// the FIRST param.
+func (p *parser) parseFuncParamsWithTypes(recvName, recvType string) []string {
+	savePT := p.paramTypes
+	p.paramTypes = map[string]string{}
+	params := p.parseFuncParams()
+	// receiver first
+	if recvType != "" {
+		base := recvType
+		for i := len(recvType) - 1; i >= 0; i-- {
+			if recvType[i] == '*' || recvType[i] == ']' {
+				base = recvType[i+1:]
+				break
+			}
+		}
+		params = append([]string{recvName}, params...)
+		p.paramTypes[recvName] = base
+	}
+	ret := p.captureReturnTypeText()
+	p.lastSig = [2]string{paramsCSV(params), ret}
+	// paramTypes stays set for the decl-site registration loop; the
+	// caller restores it.
+	_ = savePT
+	return params
+}
+
+func paramsCSV(ps []string) string {
+	out := ""
+	for _, s := range ps {
+		if out != "" {
+			out += ","
+		}
+		out += s
+	}
+	return out
+}
+
+func (p *parser) captureReturnTypeText() string {
+	start := p.pos
+	p.skipReturnType()
+	base := ""
+	for i := start; i < p.pos && i < len(p.toks); i++ {
+		if p.toks[i].kind == tIdent {
+			base = p.toks[i].text
+		}
+	}
+	return base
+}
+
 func (p *parser) parseFuncParams() []string {
 	var params []string
 	p.skipNL()
@@ -1216,12 +1597,13 @@ func (p *parser) parseFuncParams() []string {
 			break
 		}
 		// the (possibly shared) type — erased under the A1 erasure
-		// contract; only the NAMES become $N params
-		if len(names) > 0 {
-			p.skipType()
-		} else {
-			// unnamed param: the token IS the type
-			p.skipType()
+		// contract; only the NAMES become $N params. The BASE type name
+		// is recorded so struct-typed params resolve field access.
+		ft := p.captureTypeText()
+		for _, nm2 := range names {
+			if p.paramTypes != nil {
+				p.paramTypes[nm2] = ft
+			}
 		}
 		params = append(params, names...)
 		p.skipNL()
@@ -1296,13 +1678,22 @@ func (p *parser) parseTopLevel() []map[string]any {
 			// erased under the A1 erasure contract, which only lowers
 			// type-INDEPENDENT bodies (erasure is faithful there). `main`
 			// stays the entry: its body parses as top-level statements
-			// below. Method decls `func (r T) m(...)` stay skipped
-			// (methods are outside the subset, methodDecl ledgered).
+			// Method decls `func (r T) m(...)`: lowered as a plain sub
+			// whose FIRST param is the receiver (an arena index for
+			// struct types — pointer semantics come free, since field
+			// reads/writes go through the receiver's subscript). Call
+			// sites pass the receiver explicitly.
 			p.pos++
 			p.skipNL()
+			recvName, recvType := "", ""
 			if p.atPunct("(") {
-				p.skipToLineEnd()
-				break
+				p.pos++
+				p.skipNL()
+				recvName = p.expect(tIdent, "").text
+				p.skipNL()
+				recvType = p.captureTypeText()
+				p.expect(tPunct, ")")
+				p.skipNL()
 			}
 			nm := p.expect(tIdent, "").text
 			if nm == "main" {
@@ -1323,7 +1714,11 @@ func (p *parser) parseTopLevel() []map[string]any {
 				p.skipNL()
 			}
 			p.expect(tPunct, "(")
-			params := p.parseFuncParams()
+			params := p.parseFuncParamsWithTypes(recvName, recvType)
+			// commit the signature BEFORE body parse so recursive
+			// self-calls (`e := p.parseUnary()` inside parseUnary) type
+			// their results
+			p.fnSig[nm] = p.lastSig
 			// variadic tail param (`parts ...string`): splice the remaining
 			// positionals into a real array var at function entry so reads,
 			// len(), indexing and f(parts...) spreads all see a genuine
@@ -1346,6 +1741,10 @@ func (p *parser) parseTopLevel() []map[string]any {
 			for _, prm := range params {
 				p.fnParams[prm] = true
 				p.fnParamOrd = append(p.fnParamOrd, prm)
+				if pt := p.paramTypes[prm]; p.isStructType(pt) {
+					rn := p.resolveVar(prm)
+					p.varStruct[rn] = pt
+				}
 			}
 			body := []map[string]any{}
 			if vari != "" {
@@ -1386,8 +1785,56 @@ func (p *parser) parseTopLevel() []map[string]any {
 				break
 			}
 			p.expect(tIdent, "") // Name
+			nm := p.toks[p.pos-1].text
 			p.skipNL()
+			if p.atIdent("struct") {
+				// `type Name struct { f1, f2 T; f3 U }` — capture the
+				// FIELD ORDER: the layout drives the arena encoding
+				// (field i lives at slot (inst-1)*len(fields)+i).
+				p.pos++
+				p.skipNL()
+				p.expect(tPunct, "{")
+				fields, ftypes, fraws := []string{}, []string{}, []string{}
+				for {
+					p.skipNL()
+					if p.atPunct("}") {
+						p.pos++
+						break
+					}
+					names := []string{}
+					for p.tok().kind == tIdent {
+						names = append(names, p.next().text)
+						p.skipNL()
+						if !p.acceptPunct(",") {
+							break
+						}
+						p.skipNL()
+					}
+					if len(names) == 0 {
+						p.failf("unsupported struct field (v2)")
+					}
+					ft := p.captureTypeText() // base type name drives chains
+					fr := p.lastTypeRaw        // raw text drives list/map dispatch
+					fields = append(fields, names...)
+					for range names {
+						ftypes = append(ftypes, ft)
+						fraws = append(fraws, fr)
+					}
+				}
+				if nm != "_" {
+					p.structs[nm] = fields
+					p.structFT[nm] = ftypes
+					p.structRaw[nm] = fraws
+				}
+				break
+			}
 			if p.tok().kind == tIdent {
+				// scalar/named alias: if it aliases a KNOWN struct, the
+				// name inherits that layout (type tokKind int-style
+				// aliases stay plain erasure)
+				if base, ok := p.structs[p.tok().text]; ok {
+					p.structs[nm] = base
+				}
 				p.skipType()
 				break
 			}
@@ -1414,6 +1861,10 @@ func (p *parser) skipToLineEnd() {
 func (p *parser) parseStmt() []map[string]any {
 	p.skipNL()
 	t := p.tok()
+	if t.kind == tPunct && t.text == ";" {
+		p.pos++ // empty statement
+		return nil
+	}
 	if t.kind != tIdent {
 		p.failf("unrecognized statement starting with %q", t.text)
 	}
@@ -1449,6 +1900,18 @@ func (p *parser) parseStmt() []map[string]any {
 				break
 			}
 			rexprs = rexprs[:len(rexprs)-1]
+		}
+		// PREDICATE returns (`return c == '_' || ...`, `return true`) —
+		// a bool-returning sub signals via EXIT STATUS (sh2.return 0/1):
+		// callers in condition position exec the sub and branch on $?
+		if len(rexprs) == 1 && p.inFunc && p.isPredicateExpr(rexprs[0]) {
+			return []map[string]any{{
+				"type":   "If",
+				"cond":   p.condToJSON(rexprs[0]),
+				"then":   []any{map[string]any{"type": "Return", "value": strExpr("0")}},
+				"elsifs": []any{},
+				"else":   []any{map[string]any{"type": "Return", "value": strExpr("1")}},
+			}}
 		}
 		var words []map[string]any
 		for _, e := range rexprs {
@@ -1736,6 +2199,9 @@ func (p *parser) parseVarSpec() []map[string]any {
 		p.registerVar(n, "Str")
 		if isBuf {
 			p.bufs[n] = ""
+			out = append(out, assignStmt(n, p.objNewCallNamed("bytes.Buffer",
+				[]any{strExpr("buf")}, []any{strExpr("")})))
+			continue
 		}
 		out = append(out, assignStmt(n, strExpr("")))
 	}
@@ -1818,17 +2284,40 @@ func (p *parser) parseDottedStmt() []map[string]any {
 	// (the literal-only contract keeps the contents statically known).
 	if _, ok := p.bufs[first]; ok {
 		switch method {
-		case "WriteString", "Write":
+		case "WriteString", "Write", "WriteByte":
 			p.expect(tPunct, "(")
 			p.skipNL()
 			a := p.parseExpr()
 			p.skipNL()
 			p.expect(tPunct, ")")
-			if a.kind != "str" && a.kind != "num" && a.kind != "rawstr" {
-				p.failf("bytes.Buffer.%s needs a literal (v2)", method)
+			if a.kind == "str" || a.kind == "num" || a.kind == "rawstr" {
+				// literal write keeps the compile-time accumulator
+				p.bufs[first] += a.text
+				return nil
 			}
-			p.bufs[first] += a.text
-			return nil
+			// DYNAMIC writes (WriteByte(c)): the buffer is an OBJECT
+			// whose buf field concatenates at runtime (Interpolate =
+			// native template literal; WriteByte of a byte value prints
+			// the character — Go string(byte) equivalence for ASCII)
+			p.bufDyn[first] = true
+			idw := getVarExpr(p.resolveVar(first))
+			cur := map[string]any{
+				"type": "Call", "func": "objGet",
+				"args":   []any{idw, strExpr("buf")},
+				"purity": "PureCpu",
+			}
+			cat := interpParts([]any{
+				map[string]any{"kind": "expr", "expr": cur},
+				map[string]any{"kind": "expr", "expr": p.exprToWord(a)},
+			})
+			return []map[string]any{{
+				"type": "Expr",
+				"expr": map[string]any{
+					"type": "Call", "func": "objSet",
+					"args":   []any{idw, strExpr("buf"), cat},
+					"purity": "PureCpu",
+				},
+			}}
 		}
 		p.failf("unsupported bytes.Buffer.%s (v2)", method)
 	}
@@ -1866,8 +2355,410 @@ func (p *parser) parseDottedStmt() []map[string]any {
 			return nil
 		}
 	}
+	// STRUCT RECEIVER: method call `p.m(args)` — the receiver rides as
+	// $1 (an arena index; field mutation through it is the pointer
+	// semantics), the method is a plain sub.
+	if rn := p.resolveVar(first); p.varStruct[rn] != "" && p.fnNames[method] {
+		p.expect(tPunct, "(")
+		args := p.parseArgs()
+		var words []map[string]any
+		words = append(words, p.structIDWord(first))
+		for _, a := range args {
+			words = append(words, p.argToWord(a))
+		}
+		return []map[string]any{execStmt(method, words, "Spawn")}
+	}
+	// struct field WRITE forms: `p.f = v` / `p.f++` / `p.f += n` /
+	// `l.toks = append(l.toks, ...)` — the OBJECT STORE model: one
+	// objSet / objAdd / listPush call per write.
+	if rn := p.resolveVar(first); p.varStruct[rn] != "" {
+		typeName := p.varStruct[rn]
+		layout := p.structs[typeName]
+		if off := structFieldIndex(layout, method); off >= 0 {
+			idWord := p.structIDWord(first)
+			fieldWord := strExpr(method)
+			objSetStmt := func(valWord map[string]any) map[string]any {
+				return map[string]any{
+					"type": "Expr",
+					"expr": map[string]any{
+						"type": "Call", "func": "objSet",
+						"args":   []any{idWord, fieldWord, valWord},
+						"purity": "PureCpu",
+					},
+				}
+			}
+			switch {
+			case p.atPunct("["):
+				// element write on a field container (`m.f[k] = v`)
+				p.pos++
+				kw := p.parseExpr()
+				p.skipNL()
+				p.expect(tPunct, "]")
+				if !p.atPunct("=") {
+					p.failf("expected = in element write (v2)")
+				}
+				p.pos++
+				p.skipNL()
+				rhsW := p.exprToWord(p.parseExpr())
+				fn := "mapSet"
+				if raws := p.structRaw[typeName]; off < len(raws) && strings.HasPrefix(raws[off], "[]") {
+					fn = "listSet"
+				}
+				return []map[string]any{{
+					"type": "Expr",
+					"expr": map[string]any{
+						"type": "Call", "func": fn,
+						"args":   []any{objGetField(idWord, method), kw, rhsW},
+						"purity": "PureCpu",
+					},
+				}}
+			case p.atPunct("("):
+				p.failf("unknown method %q on %q (v2)", method, typeName)
+			case p.atPunct("++") || p.atPunct("--"):
+				op := p.next().text
+				delta := "1"
+				if op == "--" {
+					delta = "-1"
+				}
+				return []map[string]any{{
+					"type": "Expr",
+					"expr": map[string]any{
+						"type": "Call", "func": "objAdd",
+						"args":   []any{idWord, fieldWord, strExpr(delta)},
+						"purity": "PureCpu",
+					},
+				}}
+			case p.atPunct("=") && p.peekIsAppendCall():
+				stmt := p.parseAppendIntoList(idWord, fieldWord, typeName, method)
+				return []map[string]any{stmt}
+			case p.atPunct("=") || p.atPunct("+=") || p.atPunct("-="):
+				op := p.next().text
+				p.skipNL()
+				rhs := p.parseExpr()
+				if op != "=" {
+					aw := p.exprToArith(rhs)
+					if n, ok := p.arithConstInt(aw); ok {
+						d := strconv.Itoa(n)
+						if op == "-=" {
+							d = "-" + d
+						}
+						return []map[string]any{{
+							"type": "Expr",
+							"expr": map[string]any{
+								"type": "Call", "func": "objAdd",
+								"args":   []any{idWord, fieldWord, strExpr(d)},
+								"purity": "PureCpu",
+							},
+						}}
+					}
+					p.failf("unsupported %s on struct field %s (v2)", op, method)
+				}
+				return []map[string]any{objSetStmt(p.exprToWord(rhs))}
+			}
+		}
+	}
 	p.failf("unsupported call %s.%s (v2)", first, method)
 	return nil
+}
+
+// structIDWord: the reference-id word for a struct-typed variable —
+// function params are POSITIONAL ($1..$N), so the name resolves through
+// paramNumber exactly like any other read.
+func (p *parser) structIDWord(name string) map[string]any {
+	rn := p.resolveVar(name)
+	if n, ok := p.paramNumber(rn); ok {
+		return getVarExpr(strconv.Itoa(n))
+	}
+	return getVarExpr(rn)
+}
+
+// callTargetName: the sub a call expression resolves to ("l.cur" ->
+// "cur") when its base is a struct-typed var or the name is a defined
+// function directly; "" when this call is not a known target.
+func (p *parser) callTargetName(callee string) string {
+	if p.fnNames[callee] {
+		return callee
+	}
+	if strings.Contains(callee, ".") {
+		dot := strings.LastIndex(callee, ".")
+		baseName, meth := callee[:dot], callee[dot+1:]
+		if p.varStruct[p.resolveVar(baseName)] != "" && p.fnNames[meth] {
+			return meth
+		}
+	}
+	return ""
+}
+
+func (p *parser) operandDesc(e *expr) string {
+	if e == nil {
+		return "<nil>"
+	}
+	return e.kind
+}
+
+// objGetField: objGet word for an object id word + field name.
+func objGetField(idWord map[string]any, field string) map[string]any {
+	return map[string]any{
+		"type": "Call", "func": "objGet",
+		"args":   []any{idWord, strExpr(field)},
+		"purity": "PureCpu",
+	}
+}
+
+// peekIsAppendCall: at `=` with `append(` immediately after.
+func (p *parser) peekIsAppendCall() bool {
+	i := p.pos + 1
+	for i < len(p.toks) && p.toks[i].kind == tNL {
+		i++
+	}
+	return i+1 < len(p.toks) &&
+		p.toks[i].kind == tIdent && p.toks[i].text == "append" &&
+		p.toks[i+1].kind == tPunct && p.toks[i+1].text == "("
+}
+
+// parseAppendIntoList: `field = append(field, elems...)` on a
+// list-object field — ONE listPush over the CURRENT slice value;
+// struct-typed elements ride as reference ids, inner literals allocate
+// inline (objNew is an expression).
+func (p *parser) parseAppendIntoList(idWord, fieldWord map[string]any, typeName, method string) map[string]any {
+	p.expect(tPunct, "=")
+	p.skipNL()
+	p.expect(tIdent, "append")
+	p.expect(tPunct, "(")
+	args := p.parseArgs()
+	elemType := ""
+	for i, f := range p.structs[typeName] {
+		if f == method {
+			if fts := p.structFT[typeName]; i < len(fts) {
+				elemType = fts[i]
+			}
+		}
+	}
+	cur := map[string]any{
+		"type": "Call", "func": "objGet",
+		"args":   []any{idWord, fieldWord},
+		"purity": "PureCpu",
+	}
+	elems := []any{cur}
+	for _, a := range args[1:] {
+		elems = append(elems, p.elemWord(a, elemType))
+	}
+	// objSet(l, f, listPush(objGet(l, f), ...)) — listPush returns the
+	// (possibly freshly vivified) list id, the objSet stores it back
+	return map[string]any{
+		"type": "Expr",
+		"expr": map[string]any{
+			"type": "Call", "func": "objSet",
+			"args": []any{idWord, fieldWord, map[string]any{
+				"type": "Call", "func": "listPush",
+				"args":   elems,
+				"purity": "PureCpu",
+			}},
+			"purity": "PureCpu",
+		},
+	}
+}
+
+// allocComposite: lower an anonymous composite (map/slice literal) into
+// a temp object/list allocation + population statements. Returns the
+// temp name and the statements (empty when not a composite).
+func (p *parser) allocComposite(val *expr) (string, []map[string]any) {
+	if val.kind == "maplit" {
+		tmp := "__tmp_m" + strconv.Itoa(p.tmpN)
+		p.tmpN++
+		stmts := []map[string]any{assignStmt(tmp, p.objNewCallNamed("map", []any{}, []any{}))}
+		for i, k := range val.keys {
+			kw := strExpr(strings.Trim(k.text, "\""))
+			vw := p.compositeValueWord(val.vals[i], &stmts)
+			stmts = append(stmts, map[string]any{
+				"type": "Expr",
+				"expr": map[string]any{
+					"type": "Call", "func": "mapSet",
+					"args":   []any{getVarExpr(tmp), kw, vw},
+					"purity": "PureCpu",
+				},
+			})
+		}
+		return tmp, stmts
+	}
+	if val.kind == "arraylit" {
+		tmp := "__tmp_l" + strconv.Itoa(p.tmpN)
+		p.tmpN++
+		stmts := []map[string]any{assignStmt(tmp, p.objNewCallNamed("list", []any{}, []any{}))}
+		for _, el := range val.elems {
+			stmts = append(stmts, map[string]any{
+				"type": "Expr",
+				"expr": map[string]any{
+					"type": "Call", "func": "listPush",
+					"args":   []any{getVarExpr(tmp), el},
+					"purity": "PureCpu",
+				},
+			})
+		}
+		return tmp, stmts
+	}
+	return "", nil
+}
+
+// compositeValueWord: a value INSIDE a composite — words pass through;
+// nested composites allocate their own temps (statements appended to
+// the prelude).
+func (p *parser) compositeValueWord(v *expr, prelude *[]map[string]any) map[string]any {
+	switch v.kind {
+	case "maplit", "arraylit":
+		tmp, stmts := p.allocComposite(v)
+		*prelude = append(*prelude, stmts...)
+		return getVarExpr(tmp)
+	}
+	return p.exprToWord(v)
+}
+
+// elemWord: a slice-append element — struct-typed vars/objects pass as
+// reference ids; inner literals allocate inline.
+func (p *parser) elemWord(a *expr, elemType string) any {
+	lit := a
+	if lit.kind == "addr" && lit.lhs != nil && lit.lhs.kind == "structlit" {
+		lit = lit.lhs
+	}
+	if lit.kind == "structlit" {
+		return p.objNewCall(lit)
+	}
+	if lit.kind == "var" && elemType != "" {
+		rn := p.resolveVar(lit.name)
+		if p.isStructType(elemType) && p.varStruct[rn] != "" {
+			return p.structIDWord(lit.name)
+		}
+	}
+	return p.argToWord(a)
+}
+
+// inferElemStructType: `x := slice[i]` where slice is a STRUCT-slice
+// field/var — x holds that struct's reference id.
+func (p *parser) inferElemStructType(rhs *expr) string {
+	if rhs == nil || rhs.kind != "index" || rhs.target == nil {
+		return ""
+	}
+	var raw string
+	switch rhs.target.kind {
+	case "member":
+		parts := strings.Split(rhs.target.name, ".")
+		baseName := p.resolveVar(parts[0])
+		typeName := p.varStruct[baseName]
+		if typeName == "" {
+			return ""
+		}
+		field := parts[len(parts)-1]
+		raws := p.structRaw[typeName]
+		layout := p.structs[typeName]
+		for i, f := range layout {
+			if f == field && i < len(raws) {
+				raw = raws[i]
+			}
+		}
+	case "var":
+		_ = raw
+	}
+	if strings.HasPrefix(raw, "[]") {
+		cand := strings.TrimPrefix(raw, "[]")
+		cand = strings.TrimPrefix(cand, "*")
+		if p.isStructType(cand) {
+			return cand
+		}
+	}
+	return ""
+}
+
+// hasObjectRead: does this arith chain read an OBJECT field / list /
+// map element (values that live outside the store-var world)?
+func (p *parser) hasObjectRead(e *expr) bool {
+	switch e.kind {
+	case "member":
+		_, tag := p.structFieldWord(e.name)
+		return tag != "none"
+	case "index":
+		if e.target != nil && e.target.kind == "member" {
+			if _, tag := p.structFieldWord(e.target.name); tag == "list" || tag == "map" {
+				return true
+			}
+		}
+		return false
+	case "fieldof":
+		return true
+	case "add", "mul", "neg":
+		lhs, rhs := e.lhs, e.rhs
+		if p.hasObjectRead(lhs) || (rhs != nil && p.hasObjectRead(rhs)) {
+			return true
+		}
+		return false
+	}
+	return false
+}
+
+// arithNumCalls: arithmetic lowered to runtime num_* calls so object
+// reads compose (`i := p.pos + 1`).
+func (p *parser) arithNumCalls(e *expr) map[string]any {
+	switch e.kind {
+	case "num":
+		return strExpr(e.text)
+	case "var":
+		return p.exprToWord(e)
+	case "member", "index", "fieldof":
+		return p.exprToWord(e)
+	case "add":
+		return map[string]any{"type": "Call", "func": "num_add",
+			"args": []any{p.arithNumCalls(e.lhs), p.arithNumCalls(e.rhs)}, "purity": "PureCpu"}
+	case "mul":
+		return map[string]any{"type": "Call", "func": "num_mul",
+			"args": []any{p.arithNumCalls(e.lhs), p.arithNumCalls(e.rhs)}, "purity": "PureCpu"}
+	case "neg":
+		return map[string]any{"type": "Call", "func": "num_sub",
+			"args": []any{strExpr("0"), p.arithNumCalls(e.lhs)}, "purity": "PureCpu"}
+	}
+	p.failf("non-numeric operand in arithmetic (v2): %s", e.kind)
+	return nil
+}
+
+// listElemStructType: for a LIST field (`e.fieldVals []*expr`) the
+// element's STRUCT type ("" when not a struct slice).
+func (p *parser) listElemStructType(fieldName string) string {
+	parts := strings.Split(fieldName, ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	baseName := p.resolveVar(parts[0])
+	typeName := p.varStruct[baseName]
+	if typeName == "" {
+		return ""
+	}
+	field := parts[len(parts)-1]
+	layout := p.structs[typeName]
+	raws := p.structRaw[typeName]
+	for i, f := range layout {
+		if f == field && i < len(raws) {
+			cand := strings.TrimPrefix(strings.TrimPrefix(raws[i], "[]"), "*")
+			if p.isStructType(cand) {
+				return cand
+			}
+		}
+	}
+	return ""
+}
+
+// arithConstInt: fold an arith ast to a constant int when possible.
+func (p *parser) arithConstInt(a map[string]any) (int, bool) {
+	switch a["type"] {
+	case "Num":
+		if n, ok := a["value"].(int); ok {
+			return n, true
+		}
+	case "Var":
+		if nm, ok := a["name"].(string); ok {
+			if n, ok := p.consts[nm]; ok {
+				return n, true
+			}
+		}
+	}
+	return 0, false
 }
 
 func (p *parser) printlnStmt() []map[string]any {
@@ -2105,24 +2996,28 @@ func (p *parser) parseMapLiteralBody(name string) []map[string]any {
 		p.expect(tPunct, ":")
 		p.skipNL()
 		if p.atPunct("{") {
-			// nested struct/composite literal value — no A1 shape for a
-			// positional struct value inside an assoc-array
 			p.failf("unsupported composite literal value in map literal (v2)")
 		}
 		val := p.parseExpr()
 		if val.kind == "var" && (val.name == "true" || val.name == "false") {
-			// Go bool literal → its textual form (fmt prints bools
-			// as true/false — byte-faithful under the echo return)
 			val = &expr{kind: "str", text: val.name}
 		}
-		if val.kind != "str" && val.kind != "num" && val.kind != "rawstr" {
-			p.failf("unsupported map value %q (v2) — keys/values must be literals", val.text)
+		// GENERAL values: any word-lowerable expression rides assocSet;
+		// nested composites (map/slice literals) pre-allocate into temps
+		// whose REFERENCE ID becomes the stored value (object-store model)
+		var valWord map[string]any
+		if val.kind == "maplit" || val.kind == "arraylit" {
+			tmp, alloc := p.allocComposite(val)
+			body = append(body, alloc...)
+			valWord = getVarExpr(tmp)
+		} else {
+			valWord = p.exprToWord(val)
 		}
 		body = append(body, map[string]any{
 			"type": "Expr",
 			"expr": map[string]any{
 				"type": "Call", "func": "assocSet",
-				"args":   []any{strExpr(name), strExpr(key.text), strExpr(val.text)},
+				"args":   []any{strExpr(name), strExpr(key.text), valWord},
 				"purity": "Emulable",
 			},
 		})
@@ -2159,14 +3054,36 @@ func (p *parser) parseAssignStmt() []map[string]any {
 	if _, ok := p.varAlias[targets[0]]; ok {
 		p.failf("cannot assign to type-switch guard %q (v2)", targets[0])
 	}
-	// indexed assign: a[1] = "X" → target var "a[1]" (the `arr[1]=X` shape)
+	// indexed assign: a[1] = "X" → target var "a[1]" (the `arr[1]=X` shape);
+	// a computed key (`a[i] = x`, `toks[p.pos] = t`) renders the key as
+	// arithmetic text — the runtime evaluates subscripts with evalArith.
 	if p.atPunct("[") {
 		if len(targets) != 1 {
 			p.failf("indexed assign with multiple targets (v2)")
 		}
 		p.pos++
-		idx := p.expect(tNum, "").text
+		var keyE *expr
+		idx := ""
+		if !p.atPunct("]") {
+			if p.tok().kind == tNum {
+				idx = p.next().text
+			} else {
+				keyE = p.parseExpr()
+			}
+		}
 		p.expect(tPunct, "]")
+		if keyE != nil {
+			if keyE.kind == "str" && p.maps[targets[0]] {
+				// ASSOC store with a literal string key — the raw text is
+				// the subscript (the runtime routes name[key] to the
+				// associative store once assocSet registered the name)
+				idx = keyE.text
+			} else {
+				// plain arithmetic with $vars — the runtime evaluates
+				// the subscript text with evalArith
+				idx = p.arithKeyText(keyE)
+			}
+		}
 		targets[0] = targets[0] + "[" + idx + "]"
 	}
 	// function call statement: f(args)
@@ -2179,15 +3096,21 @@ func (p *parser) parseAssignStmt() []map[string]any {
 		}
 		return []map[string]any{execStmt(targets[0], words, "Spawn")}
 	}
-	// x++
-	if p.atPunct("++") {
-		p.pos++
+	// x++ / x-- (arith IncDec; delta carries the direction)
+	if p.atPunct("++") || p.atPunct("--") {
+		op := p.next().text
 		if len(targets) != 1 {
-			p.failf("++ needs one target")
+			p.failf("%s needs one target", op)
+		}
+		delta := 1
+		arithOp := "+"
+		if op == "--" {
+			delta = -1
+			arithOp = "-"
 		}
 		p.registerVar(targets[0], "Int")
 		return []map[string]any{assignStmt(targets[0],
-			arithWrap(arithBin(arithVar(targets[0]), "+", arithNum(1))))}
+			arithWrap(arithBin(arithVar(targets[0]), arithOp, arithNum(delta))))}
 	}
 	op := ""
 	switch {
@@ -2202,6 +3125,43 @@ func (p *parser) parseAssignStmt() []map[string]any {
 	}
 	p.pos++
 	p.skipNL()
+
+	// make([]T, n) / make(map[K]V) — composite construction: an EMPTY
+	// array store (append/indexed-writes grow it) or an inert scalar
+	// placeholder for map-object ids
+	if p.atIdent("make") && p.toks[p.pos+1].kind == tPunct && p.toks[p.pos+1].text == "(" {
+		p.pos += 2 // make (
+		p.skipNL()
+		isMap := false
+		if p.atIdent("map") || (p.atPunct("[") && false) {
+			isMap = true
+		}
+		if p.atPunct("[") {
+			// []T slice form (map[K]V starts with "map")
+			isMap = false
+		}
+		p.skipType() // the full type argument
+		for p.acceptPunct(",") {
+			p.skipNL()
+			p.parseExpr() // length / capacity — erased (append grows)
+			p.skipNL()
+		}
+		p.expect(tPunct, ")")
+		_ = isMap
+		if len(targets) != 1 {
+			p.failf("make with multiple targets (v2)")
+		}
+		if isMap {
+			p.registerVar(targets[0], "Str")
+			return []map[string]any{assignStmt(targets[0], strExpr(""))}
+		}
+		p.registerVar(targets[0], "Array")
+		return []map[string]any{assignStmt(targets[0], map[string]any{
+			"type": "Call", "func": "setArray",
+			"args":   []any{strExpr(targets[0]), map[string]any{"type": "Array", "elements": []any{}}},
+			"purity": "Emulable",
+		})}
+	}
 
 	// func literal: name := func(...) { ... } → Function stmt
 	if p.atIdent("func") {
@@ -2412,25 +3372,48 @@ func (p *parser) parseAssignStmt() []map[string]any {
 	// captured into the target (mirrors the os.ReadFile capture below).
 	// Multiple non-_ targets would need IFS word-splitting to distribute
 	// the echo words — refused (Refuse > guess).
-	if rhs.kind == "call" && p.fnNames[rhs.callee] {
+	if rhs.kind == "call" && p.callTargetName(rhs.callee) != "" {
+		// METHOD calls (`x := l.cur()`): the receiver rides as $1; the
+		// sub name is the last dotted segment
+		calleeName := p.callTargetName(rhs.callee)
 		var words []map[string]any
-		for _, a := range rhs.args {
-			words = append(words, p.argToWord(a))
+		if dot := strings.LastIndex(rhs.callee, "."); dot >= 0 {
+			rn := p.resolveVar(rhs.callee[:dot])
+			if rn == "" || !p.fnNames[calleeName] {
+				p.failf("unsupported call %q (v2)", rhs.callee)
+			}
+			words = append(words, getVarExpr(rn))
+			for _, a := range rhs.args {
+				words = append(words, p.argToWord(a))
+			}
+		} else {
+			for _, a := range rhs.args {
+				words = append(words, p.argToWord(a))
+			}
 		}
-		name := ""
-		for _, tg := range targets {
+		// MULTI-return (`v, ok := f(...)`, `_, tag, ok := ...`):
+		// RESULT-SLOT protocol: run the sub, then read each slot
+		out := []map[string]any{execStmtTA(calleeName, words, "Spawn", rhs.typeArgs)}
+		for i, tg := range targets {
 			if tg == "_" {
 				continue
 			}
-			if name != "" {
-				p.failf("unsupported multi-target capture of sub %s (v2)", rhs.callee)
+			p.registerVar(tg, "Str")
+			out = append(out, assignStmt(tg,
+				getVarExpr("__ret_"+calleeName+"_"+strconv.Itoa(i+1))))
+		}
+		// SINGLE target: classic echo+capture
+		name := ""
+		for _, tg := range targets {
+			if tg != "_" {
+				name = tg
 			}
-			name = tg
 		}
 		if name == "" {
 			return nil // f(args) bare call as RHS of `_ :=` — pure side effect
 		}
-		inner := execStmtTA(rhs.callee, words, "Spawn", rhs.typeArgs)
+		p.noteCallResultType(name, rhs.callee, rhs.args)
+		inner := execStmtTA(calleeName, words, "Spawn", rhs.typeArgs)
 		capture := map[string]any{
 			"type": "Call", "func": "capture",
 			"args":   []any{map[string]any{"type": "Arrow", "body": []any{inner}}},
@@ -2497,6 +3480,16 @@ func (p *parser) parseAssignStmt() []map[string]any {
 			switch a.kind {
 			case "str", "num", "rawstr":
 				elems = append(elems, strExpr(a.text))
+			case "structlit":
+				// a STRUCT VALUE: inline allocation — the element is
+				// the object reference id
+				elems = append(elems, p.objNewCall(a))
+			case "addr":
+				if a.lhs != nil && a.lhs.kind == "structlit" {
+					elems = append(elems, p.objNewCall(a.lhs))
+					break
+				}
+				p.failf("append elements must be literals or vars (v2)")
 			case "var":
 				// s = append(s, v) with a VARIABLE element — the dogfood
 				// CLI's argv filter (`filtered = append(filtered, a)`) and
@@ -2506,6 +3499,9 @@ func (p *parser) parseAssignStmt() []map[string]any {
 				// literal-only refusal was self-imposed. Lower through
 				// exprToWord (getVar after resolve): one element per
 				// appended VALUE, no field-splitting (Go semantics).
+				elems = append(elems, p.exprToWord(a))
+			case "call", "index", "member", "fieldof":
+				// computed elements ride as words (captures/reads)
 				elems = append(elems, p.exprToWord(a))
 			default:
 				p.failf("append elements must be literals or vars (v2)")
@@ -2564,6 +3560,23 @@ func (p *parser) parseAssignStmt() []map[string]any {
 		}
 	}
 
+	// comma-ok MAP read: v, ok := m[k] — v gets the element, ok gets
+	// presence as a textual bool (JS != "" coerces to true/false)
+	if len(targets) == 2 && rhs.kind == "index" {
+		w := p.exprToWord(rhs)
+		vName, okName := targets[0], targets[1]
+		p.registerVar(vName, "Str")
+		p.registerVar(okName, "Bool")
+		out := []map[string]any{assignStmt(vName, w)}
+		if okName != "_" {
+			out = append(out, assignStmt(okName, map[string]any{
+				"type": "BinOp", "op": "Ne",
+				"lhs": w, "rhs": strExpr(""),
+			}))
+		}
+		return out
+	}
+
 	// multi-assign: a, b := x, y → Block of Assigns (A=x B=y shape)
 	if len(targets) > 1 {
 		values := []*expr{rhs}
@@ -2579,8 +3592,39 @@ func (p *parser) parseAssignStmt() []map[string]any {
 			if i >= len(values) {
 				p.failf("multi-assign arity mismatch (v2)")
 			}
-			w := p.exprToWord(values[i])
-			p.registerVar(tg, p.wordType(w))
+			var w map[string]any
+			if values[i].kind == "member" || values[i].kind == "index" || values[i].kind == "call" || values[i].kind == "fieldof" {
+				if ww, ok2 := p.condOperandA1Word(values[i]); ok2 {
+					w = ww
+				}
+			}
+			if w == nil {
+				w = p.exprToWord(values[i])
+			}
+			// struct reference propagation for member reads
+			if values[i].kind == "member" {
+				parts3 := strings.Split(values[i].name, ".")
+				baseName := p.resolveVar(parts3[0])
+				typeName := p.varStruct[baseName]
+				if typeName != "" {
+					layout := p.structs[typeName]
+					field := parts3[len(parts3)-1]
+					raws := p.structRaw[typeName]
+					for fi2, f2 := range layout {
+						if f2 == field && fi2 < len(raws) {
+							cand := strings.TrimPrefix(strings.TrimPrefix(raws[fi2], "[]"), "*")
+							if p.isStructType(cand) {
+								p.varStruct[p.resolveVar(tg)] = cand
+							}
+						}
+					}
+				}
+			}
+			tt := p.wordType(w)
+			if values[i].kind == "var" && (values[i].name == "true" || values[i].name == "false") {
+				tt = "Bool"
+			}
+			p.registerVar(tg, tt)
 			body = append(body, assignStmt(tg, w))
 		}
 		if len(body) == 0 {
@@ -2592,9 +3636,57 @@ func (p *parser) parseAssignStmt() []map[string]any {
 		}}
 	}
 
+	// struct allocation: x := &T{...} / x := T{...} — the ARENA model
+	// (both allocate; Go's copy semantics are unobservable for the
+	// corpus's by-reference usage — documented)
+	if rhs.kind == "addr" && rhs.lhs != nil && rhs.lhs.kind == "structlit" && len(targets) == 1 {
+		stmts := p.newstructStmts(targets[0], rhs.lhs)
+		p.registerVar(targets[0], "Str")
+		p.varStruct[p.resolveVar(targets[0])] = rhs.lhs.structType
+		return stmts
+	}
+	if rhs.kind == "structlit" && len(targets) == 1 {
+		stmts := p.newstructStmts(targets[0], &expr{kind: "addr", lhs: rhs})
+		p.registerVar(targets[0], "Str")
+		p.varStruct[p.resolveVar(targets[0])] = rhs.structType
+		return stmts
+	}
+
 	// single assign
 	w := p.exprToWord(rhs)
+	if st := p.inferElemStructType(rhs); st != "" {
+		p.varStruct[p.resolveVar(targets[0])] = st
+	}
+	if rhs.kind == "var" {
+		if st := p.varStruct[p.resolveVar(rhs.name)]; st != "" {
+			p.varStruct[p.resolveVar(targets[0])] = st
+		}
+	}
+	if rhs.kind == "call" {
+		if tn := p.callTargetName(rhs.callee); tn != "" {
+			if sig, ok := p.fnSig[tn]; ok && p.isStructType(sig[1]) {
+				p.varStruct[p.resolveVar(targets[0])] = sig[1]
+			}
+		}
+	}
+	if rhs.kind == "var" && (rhs.name == "true" || rhs.name == "false") {
+		// a Go BOOL literal initializer registers Bool so bare-var
+		// conditions (`if matched {`) lower to `"$v" = "true"`
+		p.registerVar(targets[0], "Bool")
+		return []map[string]any{assignStmt(targets[0], strExpr(rhs.name))}
+	}
 	if op == "+=" {
+		// STRING concat only when the TARGET is a string (or the rhs
+		// carries object reads); pure-numeric stays arithmetic
+		tIsStr := p.varTypes[p.resolveVar(targets[0])] == "Str"
+		if tIsStr || p.hasObjectRead(rhs) || p.addHasString(rhs) {
+			cur := getVarExpr(targets[0])
+			cat := interpParts([]any{
+				map[string]any{"kind": "expr", "expr": cur},
+				map[string]any{"kind": "expr", "expr": w},
+			})
+			return []map[string]any{assignStmt(targets[0], cat)}
+		}
 		p.registerVar(targets[0], "Int")
 		return []map[string]any{assignStmt(targets[0],
 			arithWrap(arithBin(arithVar(targets[0]), "+", p.exprToArith(rhs))))}
@@ -2626,6 +3718,22 @@ func localVal(w map[string]any) string {
 
 // parseArrayLiteral parses `[]T{ e1, e2, ... }` and returns the element
 // words plus the element type.
+// sliceLitAhead: `[ ] [T] {` — a slice composite literal starts here
+// (the element type may be dotted/multi-ident).
+func (p *parser) sliceLitAhead() bool {
+	if !(p.tok().kind == tPunct && p.tok().text == "[") {
+		return false
+	}
+	if !(p.toks[p.pos+1].kind == tPunct && p.toks[p.pos+1].text == "]") {
+		return false
+	}
+	i := p.pos + 2
+	for i < len(p.toks) && p.toks[i].kind == tIdent {
+		i++
+	}
+	return i < len(p.toks) && p.toks[i].kind == tPunct && p.toks[i].text == "{"
+}
+
 // byteConvAhead: the token stream at pos is `[ ] byte (` — the
 // []byte(x) conversion (grammar conversion; identity in the A1's
 // strings-are-bytes model).
@@ -2754,7 +3862,7 @@ func (p *parser) parseIf() []map[string]any {
 	p.skipNL()
 	var pre []map[string]any
 	var cond *expr
-	if p.atIdent("_") {
+	if p.atIdent("_") && !(p.toks[p.pos+2].kind == tIdent && p.toks[p.pos+2].text != "err") {
 		// if _, err := os.Stat("path"); err == nil { → test("-e path")
 		// (-e = exists, ANY type — Go's os.Stat succeeds for devices,
 		// dirs and symlinks alike; bash `-f` is regular files only, and
@@ -2781,7 +3889,7 @@ func (p *parser) parseIf() []map[string]any {
 		// inverse of Go's err != nil.
 		if cond.kind == "binop" && cond.BOp == "!=" {
 			neg = true
-		} else if c := p.condTestString(cond); strings.HasPrefix(c, "! ") {
+		} else if c := p.safeCondTestString(cond); strings.HasPrefix(c, "! ") {
 			neg = true
 		}
 		arg := "-e " + decodeGoStr(pathTok.raw)
@@ -2861,13 +3969,15 @@ func (p *parser) parseIf() []map[string]any {
 	} else {
 		elseBody = []map[string]any{}
 	}
-	return append(pre, map[string]any{
+	out2 := pre
+	out2 = append(out2, map[string]any{
 		"type":   "If",
 		"cond":   p.condToJSON(cond),
 		"then":   then,
 		"elsifs": []any{},
 		"else":   elseBody,
 	})
+	return out2
 }
 
 func (p *parser) parseFor() []map[string]any {
@@ -2897,6 +4007,145 @@ func (p *parser) parseFor() []map[string]any {
 		}}
 	}
 	// range forms
+	// for i, v := range arr { — INDEX+VALUE range: lowered C-style
+	// (ForInit) since the For node binds only the element
+	if p.tok().kind == tIdent && p.tok().text != "_" && !(p.toks[p.pos+1].kind == tPunct && p.toks[p.pos+1].text == ":=") &&
+		p.toks[p.pos+1].kind == tPunct && p.toks[p.pos+1].text == "," {
+		idxName := p.next().text
+		p.expect(tPunct, ",")
+		p.skipNL()
+		valName := p.expect(tIdent, "").text
+		p.expect(tPunct, ":=")
+		p.skipNL()
+		p.expect(tIdent, "range")
+		p.skipNL()
+		rv := p.parseExpr()
+		if rv.kind == "arraylit" {
+			// for i, n := range []T{...} — bind value only (index ignored
+			// by the corpus); identical to the single-var literal form
+			p.registerVar(valName, "Str")
+			body := p.parseBlockStmts()
+			el := make([]any, len(rv.elems))
+			for i, elw := range rv.elems {
+				el[i] = elw
+			}
+			return []map[string]any{{
+				"type": "For",
+				"var":  valName,
+				"iter": map[string]any{"type": "Array", "elements": el},
+				"body": body,
+			}}
+		}
+		if rv.kind == "member" {
+			// list-object field (`for i, t := range e.fieldVals`)
+			if lw, tag := p.structFieldWord(rv.name); tag == "list" {
+				p.registerVar(idxName, "Int")
+				p.registerVar(valName, "Str")
+				if et := p.listElemStructType(rv.name); et != "" {
+					p.varStruct[p.resolveVar(valName)] = et
+				}
+				b2 := []map[string]any{assignStmt(valName, map[string]any{
+					"type": "Call", "func": "listGet",
+					"args":   []any{lw, getVarExpr(idxName)},
+					"purity": "PureCpu",
+				})}
+				b2 = append(b2, p.parseBlockStmts()...)
+				return []map[string]any{{
+					"type": "ForInit",
+					"init": []map[string]any{arithAssignStmt(idxName, 0)},
+					"cond": map[string]any{
+						"type": "BinOp", "op": "Lt",
+						"lhs": map[string]any{"type": "Arith", "ast": arithVar(idxName)},
+						"rhs": map[string]any{
+							"type": "Call", "func": "listLen",
+							"args":   []any{lw},
+							"purity": "PureCpu",
+						},
+					},
+					"step": []map[string]any{{
+						"type":   "Assign",
+						"targets": []any{map[string]any{"var": idxName, "sigil": nil, "indices": []any{}}},
+						"expr": map[string]any{
+							"type": "Arith",
+							"ast":  map[string]any{"type": "IncDec", "var": idxName, "delta": 1, "prefix": false},
+						},
+					}},
+					"body": b2,
+				}}
+			}
+		}
+		if p.varTypes[p.resolveVar(rv.name)] == "" && rv.kind == "var" {
+			lw2 := map[string]any{
+				"type": "Call", "func": "strSplit",
+				"args":   []any{p.exprToWord(rv), strExpr("\n")},
+				"purity": "PureCpu",
+			}
+			cnt := "__ri_" + strconv.Itoa(p.tmpN)
+			p.tmpN++
+			p.registerVar(cnt, "Int")
+			p.registerVar(valName, "Str")
+			init := []map[string]any{arithAssignStmt(cnt, 0)}
+			cond2 := map[string]any{
+				"type": "BinOp", "op": "Lt",
+				"lhs": map[string]any{"type": "Arith", "ast": arithVar(cnt)},
+				"rhs": map[string]any{
+					"type": "Call", "func": "listLen",
+					"args":   []any{lw2},
+					"purity": "PureCpu",
+				},
+			}
+			step := []map[string]any{{
+				"type":   "Assign",
+				"targets": []any{map[string]any{"var": cnt, "sigil": nil, "indices": []any{}}},
+				"expr": map[string]any{
+					"type": "Arith",
+					"ast":  map[string]any{"type": "IncDec", "var": cnt, "delta": 1, "prefix": false},
+				},
+			}}
+			b2 := []map[string]any{assignStmt(valName, map[string]any{
+				"type": "Call", "func": "listGet",
+				"args":   []any{lw2, getVarExpr(cnt)},
+				"purity": "PureCpu",
+			})}
+			b2 = append(b2, p.parseBlockStmts()...)
+			return []map[string]any{{
+				"type": "ForInit",
+				"init": init, "cond": cond2, "step": step, "body": b2,
+			}}
+		}
+		if rv.kind != "var" {
+			p.failf("range over a non-var (v2)")
+		}
+		name := p.resolveVar(rv.name)
+		p.registerVar(idxName, "Int")
+		elemTyp := "Str"
+		if info, ok := p.arrays[name]; ok {
+			elemTyp = info.typ
+		}
+		p.registerVar(valName, elemTyp)
+		body := []map[string]any{
+			assignStmt(valName, getVarExpr(name+"[$"+idxName+"]")),
+		}
+		body = append(body, p.parseBlockStmts()...)
+		return []map[string]any{{
+			"type": "ForInit",
+			"init": []map[string]any{arithAssignStmt(idxName, 0)},
+			"cond": map[string]any{
+				"type": "BinOp", "op": "Lt",
+				"lhs": map[string]any{"type": "Arith", "ast": arithVar(idxName)},
+				"rhs": joinCall(paramCall("slice", "#"+name, "@", "")),
+			},
+			"step": []map[string]any{{
+				"type":   "Assign",
+				"targets": []any{map[string]any{"var": idxName, "sigil": nil, "indices": []any{}}},
+				"expr": map[string]any{
+					"type": "Arith",
+					"ast":  map[string]any{"type": "IncDec", "var": idxName, "delta": 1, "prefix": false},
+				},
+			}},
+			"body": body,
+		}}
+	}
 	if p.atIdent("_") || p.atIdent("range") {
 		var v string
 		if p.atIdent("_") {
@@ -2920,9 +4169,130 @@ func (p *parser) parseFor() []map[string]any {
 		} else {
 			rv := p.parseExpr()
 			if rv.kind != "var" {
+				// range over a LIST-object field (`for _, fv := range e.fieldVals`)
+				if rv.kind == "member" {
+					if lw, tag := p.structFieldWord(rv.name); tag == "list" {
+						cnt := "__ri_" + strconv.Itoa(p.tmpN)
+						p.tmpN++
+						p.registerVar(cnt, "Int")
+						if et := p.listElemStructType(rv.name); et != "" {
+							p.registerVar(v, "Str")
+							p.varStruct[p.resolveVar(v)] = et
+						} else {
+							p.registerVar(v, "Str")
+						}
+						init := []map[string]any{arithAssignStmt(cnt, 0)}
+						cond := map[string]any{
+							"type": "BinOp", "op": "Lt",
+							"lhs": map[string]any{"type": "Arith", "ast": arithVar(cnt)},
+							"rhs": map[string]any{
+								"type": "Call", "func": "listLen",
+								"args":   []any{lw},
+								"purity": "PureCpu",
+							},
+						}
+						step := []map[string]any{{
+							"type":   "Assign",
+							"targets": []any{map[string]any{"var": cnt, "sigil": nil, "indices": []any{}}},
+							"expr": map[string]any{
+								"type": "Arith",
+								"ast":  map[string]any{"type": "IncDec", "var": cnt, "delta": 1, "prefix": false},
+							},
+						}}
+						b2 := []map[string]any{assignStmt(v, map[string]any{
+							"type": "Call", "func": "listGet",
+							"args":   []any{lw, getVarExpr(cnt)},
+							"purity": "PureCpu",
+						})}
+						b2 = append(b2, p.parseBlockStmts()...)
+						return []map[string]any{{
+							"type": "ForInit",
+							"init": init, "cond": cond, "step": step, "body": b2,
+						}}
+					}
+				}
 				p.failf("range over a non-var (v2)")
 			}
-			if info, ok := p.arrays[rv.name]; ok {
+			if p.varTypes[p.resolveVar(rv.name)] == "" && rv.kind == "var" {
+				lw2 := map[string]any{
+					"type": "Call", "func": "strSplit",
+					"args":   []any{p.exprToWord(rv), strExpr("\n")},
+					"purity": "PureCpu",
+				}
+				cnt := "__ri_" + strconv.Itoa(p.tmpN)
+				p.tmpN++
+				p.registerVar(cnt, "Int")
+				p.registerVar(v, "Str")
+				init := []map[string]any{arithAssignStmt(cnt, 0)}
+				cond2 := map[string]any{
+					"type": "BinOp", "op": "Lt",
+					"lhs": map[string]any{"type": "Arith", "ast": arithVar(cnt)},
+					"rhs": map[string]any{
+						"type": "Call", "func": "listLen",
+						"args":   []any{lw2},
+						"purity": "PureCpu",
+					},
+				}
+				step := []map[string]any{{
+					"type":   "Assign",
+					"targets": []any{map[string]any{"var": cnt, "sigil": nil, "indices": []any{}}},
+					"expr": map[string]any{
+						"type": "Arith",
+						"ast":  map[string]any{"type": "IncDec", "var": cnt, "delta": 1, "prefix": false},
+					},
+				}}
+				b2 := []map[string]any{assignStmt(v, map[string]any{
+					"type": "Call", "func": "listGet",
+					"args":   []any{lw2, getVarExpr(cnt)},
+					"purity": "PureCpu",
+				})}
+				b2 = append(b2, p.parseBlockStmts()...)
+				return []map[string]any{{
+					"type": "ForInit",
+					"init": init, "cond": cond2, "step": step, "body": b2,
+				}}
+			}
+							// range over a LIST-object field (`for _, fv := range e.fieldVals`)
+				if lw, tag := p.structFieldWord(rv.name); tag == "list" {
+					cnt := "__ri_" + strconv.Itoa(p.tmpN)
+					p.tmpN++
+					p.registerVar(cnt, "Int")
+					if et := p.listElemStructType(rv.name); et != "" {
+						p.registerVar(v, "Str")
+						p.varStruct[p.resolveVar(v)] = et
+					} else {
+						p.registerVar(v, "Str")
+					}
+					init := []map[string]any{arithAssignStmt(cnt, 0)}
+					cond2 := map[string]any{
+						"type": "BinOp", "op": "Lt",
+						"lhs": map[string]any{"type": "Arith", "ast": arithVar(cnt)},
+						"rhs": map[string]any{
+							"type": "Call", "func": "listLen",
+							"args":   []any{lw},
+							"purity": "PureCpu",
+						},
+					}
+					step := []map[string]any{{
+						"type":   "Assign",
+						"targets": []any{map[string]any{"var": cnt, "sigil": nil, "indices": []any{}}},
+						"expr": map[string]any{
+							"type": "Arith",
+							"ast":  map[string]any{"type": "IncDec", "var": cnt, "delta": 1, "prefix": false},
+						},
+					}}
+					b2 := []map[string]any{assignStmt(v, map[string]any{
+						"type": "Call", "func": "listGet",
+						"args":   []any{lw, getVarExpr(cnt)},
+						"purity": "PureCpu",
+					})}
+					b2 = append(b2, p.parseBlockStmts()...)
+					return []map[string]any{{
+						"type": "ForInit",
+						"init": init, "cond": cond2, "step": step, "body": b2,
+					}}
+				}
+if info, ok := p.arrays[rv.name]; ok {
 				iter, typ = info.elems, info.typ
 			} else if p.varTypes[rv.name] == "Array" {
 				// Runtime-loaded array (e.g. `args := os.Args[1:]` → the
@@ -2946,7 +4316,44 @@ func (p *parser) parseFor() []map[string]any {
 					"body": body,
 				}}
 			} else {
-				p.failf("range over unknown array %q (v2)", rv.name)
+				// UNKNOWN array name: a captured multi-line return —
+				// split on newlines into a list object and iterate it
+				lw2 := map[string]any{
+					"type": "Call", "func": "strSplit",
+					"args":   []any{getVarExpr(p.resolveVar(rv.name)), strExpr("\n")},
+					"purity": "PureCpu",
+				}
+				cnt := "__ri_" + strconv.Itoa(p.tmpN)
+				p.tmpN++
+				p.registerVar(cnt, "Int")
+				init2 := []map[string]any{arithAssignStmt(cnt, 0)}
+				cond2 := map[string]any{
+					"type": "BinOp", "op": "Lt",
+					"lhs": map[string]any{"type": "Arith", "ast": arithVar(cnt)},
+					"rhs": map[string]any{
+						"type": "Call", "func": "listLen",
+						"args":   []any{lw2},
+						"purity": "PureCpu",
+					},
+				}
+				step2 := []map[string]any{{
+					"type":   "Assign",
+					"targets": []any{map[string]any{"var": cnt, "sigil": nil, "indices": []any{}}},
+					"expr": map[string]any{
+						"type": "Arith",
+						"ast":  map[string]any{"type": "IncDec", "var": cnt, "delta": 1, "prefix": false},
+					},
+				}}
+				b2 := []map[string]any{assignStmt(v, map[string]any{
+					"type": "Call", "func": "listGet",
+					"args":   []any{lw2, getVarExpr(cnt)},
+					"purity": "PureCpu",
+				})}
+				b2 = append(b2, p.parseBlockStmts()...)
+				return []map[string]any{{
+					"type": "ForInit",
+					"init": init2, "cond": cond2, "step": step2, "body": b2,
+				}}
 			}
 		}
 		body := p.parseBlockStmts()
@@ -3027,11 +4434,20 @@ func (p *parser) parseFor() []map[string]any {
 			}
 		}
 		body = append(body, post...)
-		return append(pre, map[string]any{
+	return append(pre, map[string]any{
 			"type": "While",
 			"cond": p.condToJSON(cond),
 			"body": body,
 		})
+	}
+	// for { } — the BARE infinite loop → While(true)
+	if p.atPunct("{") {
+		body := p.parseBlockStmts()
+		return []map[string]any{{
+			"type": "While",
+			"cond": map[string]any{"type": "Bool", "value": true},
+			"body": body,
+		}}
 	}
 	// for cond {  → While
 	cond := p.parseExpr()
@@ -3046,6 +4462,52 @@ func (p *parser) parseFor() []map[string]any {
 func (p *parser) parseSwitch() []map[string]any {
 	p.expect(tIdent, "switch")
 	p.skipNL()
+	// BARE switch (`switch {` — switch-true, the Go if/else-chain
+	// idiom): each case is a full CONDITION; lowers to one If with the
+	// cases as elsifs and default as else. No discriminant, no patterns.
+	if p.atPunct("{") {
+		p.pos++
+		var conds []*expr
+		var bodies [][]map[string]any
+		var defaultBody []map[string]any
+		hasDefault := false
+		for {
+			p.skipNL()
+			if p.atPunct("}") {
+				p.pos++
+				break
+			}
+			if p.atIdent("default") {
+				p.pos++
+				p.expect(tPunct, ":")
+				defaultBody = p.parseSwitchBody()
+				hasDefault = true
+			} else if p.atIdent("case") {
+				p.pos++
+				c := p.parseExpr()
+				p.expect(tPunct, ":")
+				conds = append(conds, c)
+				bodies = append(bodies, p.parseSwitchBody())
+			} else {
+				p.failf("expected case/default in bare switch, got %q", p.tok().text)
+			}
+		}
+		// build the If chain from the tail: else = default (or empty)
+		nest := defaultBody
+		if !hasDefault {
+			nest = []map[string]any{}
+		}
+		for i := len(conds) - 1; i >= 0; i-- {
+			nest = []map[string]any{{
+				"type":   "If",
+				"cond":   p.condToJSON(conds[i]),
+				"then":   bodies[i],
+				"elsifs": []any{},
+				"else":   nest,
+			}}
+		}
+		return nest
+	}
 	// type switch: `switch [v :=] x.(type) {` — runtime type dispatch
 	// (core request go-sh-20260813-154009, now implemented in the A1):
 	// lowered to the EXISTING Case node with discriminant
@@ -3319,6 +4781,42 @@ func (p *parser) wordType(w map[string]any) string {
 	return "Str"
 }
 
+// userCallWord: a defined sub called in WORD position — the
+// capture(Arrow(exec ...)) shape (the value-return protocol's read side).
+func (p *parser) userCallWord(name string, args []*expr) map[string]any {
+	var words []map[string]any
+	for _, a := range args {
+		words = append(words, p.argToWord(a))
+	}
+	inner := execStmtTA(name, words, "Spawn", nil)
+	return map[string]any{
+		"type": "Call", "func": "capture",
+		"args":   []any{map[string]any{"type": "Arrow", "body": []any{inner}}},
+		"purity": "Spawn",
+	}
+}
+
+// noteCallResultType: after `x := f(...)`, x's struct type comes from
+// f's declared return type (the signature capture).
+func (p *parser) noteCallResultType(target, callee string, args []*expr) {
+	meth := callee
+	if strings.Contains(callee, ".") {
+		dot := strings.LastIndex(callee, ".")
+		meth = callee[dot+1:]
+	}
+	ret := ""
+	if sig, ok := p.fnSig[meth]; ok {
+		ret = sig[1]
+	} else if sig, ok := p.fnSig[callee]; ok {
+		ret = sig[1]
+	}
+	_ = args
+	if p.isStructType(ret) {
+		rn := p.resolveVar(target)
+		p.varStruct[rn] = ret
+	}
+}
+
 // argToWord lowers a CALL ARGUMENT: a spread-marked arg (f(args...))
 // wraps its word in the Spread ext node — valid only for ARRAY-typed
 // vars (the runtime expands the elements as individual positionals;
@@ -3364,6 +4862,12 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 		}
 		return getVarExpr(name)
 	case "member":
+		// STRUCT FIELD ACCESS: a dotted name whose base is a
+		// struct-typed var resolves through the arena layout — each
+		// segment becomes a computed subscript of the type's arena.
+		if w, ok := p.structMemberWord(e.name); ok {
+			return w
+		}
 		// c.Args on a stored exec.Command → the Go-style bracketed argv
 		// ("[echo hi]"). exec.Command args are string literals by the
 		// frontend contract, so the argv is statically known (t53).
@@ -3438,13 +4942,49 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 				"purity": "Emulable",
 			}
 		}
+		// indexing a STRUCT FIELD that is a list/map (`l.toks[p.pos]`,
+		// `m.varTypes[name]`) — the OBJECT STORE accessors
+		if e.target != nil && e.target.kind == "member" {
+			if w, tag := p.structFieldWord(e.target.name); tag != "none" && tag != "ref" {
+				// the key rides as a WORD: numbers, vars, arith and
+				// object reads all coerce at the runtime boundary
+				var keyWord map[string]any
+				if e.idx1e != nil {
+					keyWord = p.exprToWord(e.idx1e)
+				} else {
+					keyWord = strExpr(e.idx1)
+				}
+				fn := "listGet"
+				if tag == "map" {
+					fn = "mapGet"
+				}
+				return map[string]any{
+					"type": "Call", "func": fn,
+					"args":   []any{w, keyWord},
+					"purity": "PureCpu",
+				}
+			}
+		}
 		if e.idx1e != nil {
 			// a COMPOSITE VALUE target (map literal / assertion result)
 			// may take a literal STRING key — the ElementRead ext node.
 			compositeTarget := e.target != nil &&
 				(e.target.kind == "maplit" || e.target.kind == "assert")
 			if !(compositeTarget && e.idx1e.kind == "str") {
-				p.failf("unsupported index key (v2) — must be a number literal")
+				// computed ARRAY/STRING index (src[i], p.toks[p.pos]): the
+				// subscript text rides the word shape — the runtime
+				// evaluates it with evalArith. Strings read ONE element
+				// (${s:$i:1}; Go bytes ≡ chars for the ASCII corpus —
+				// documented caveat).
+				if e.target == nil || e.target.kind != "var" {
+					p.failf("unsupported index key (v2) — must be a number literal")
+				}
+				key := p.arithKeyText(e.idx1e)
+				name := p.resolveVar(e.target.name)
+				if p.varTypes[name] == "Str" {
+					return joinCall(paramCall("slice", name, key, "1"))
+				}
+				return getVarExpr(name + "[" + key + "]")
 			}
 		}
 		if e.target != nil && e.target.kind == "var" {
@@ -3485,6 +5025,15 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 	case "arrlen":
 		if e.target != nil && e.target.kind == "var" {
 			return joinCall(paramCall("slice", "#"+e.target.name, "@", ""))
+		}
+		if e.target != nil && e.target.kind == "member" {
+			if w, tag := p.structFieldWord(e.target.name); tag == "list" {
+				return map[string]any{
+					"type": "Call", "func": "listLen",
+					"args":   []any{w},
+					"purity": "PureCpu",
+				}
+			}
 		}
 		p.failf("len() of array must be a var (v2)")
 	case "call":
@@ -3634,6 +5183,72 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 				}
 			}
 			p.failf("unsupported fmt.Sprintf form (v2) — needs (literal|var, args...) with at least one arg")
+		case "strings.Split":
+			if len(e.args) == 2 {
+				return map[string]any{
+					"type": "Call", "func": "strSplit",
+					"args":   []any{p.exprToWord(e.args[0]), p.exprToWord(e.args[1])},
+					"purity": "PureCpu",
+				}
+			}
+			p.failf("strings.Split needs (str, sep) (v2)")
+		case "strings.LastIndex":
+			if len(e.args) == 2 {
+				return map[string]any{
+					"type": "Call", "func": "strLastIndex",
+					"args":   []any{p.exprToWord(e.args[0]), p.exprToWord(e.args[1])},
+					"purity": "PureCpu",
+				}
+			}
+			p.failf("strings.LastIndex needs (str, str) (v2)")
+		case "strings.Index":
+			if len(e.args) == 2 {
+				return map[string]any{
+					"type": "Call", "func": "strIndex",
+					"args":   []any{p.exprToWord(e.args[0]), p.exprToWord(e.args[1])},
+					"purity": "PureCpu",
+				}
+			}
+			p.failf("strings.Index needs (str, str) (v2)")
+		case "strings.TrimSpace":
+			if w := p.stringsHelperWord(e); w != nil {
+				return w
+			}
+			p.failf("unsupported strings.TrimSpace (v2)")
+		case "fmt.Errorf":
+			// error CONSTRUCTION: a constant message folds to its text
+			// (the value rides the multi-return echo words); %-verb
+			// varargs keep the printf capture shape
+			if w, ok := foldPureLiteralCall("fmt.Sprintf", e.args); ok {
+				return strExpr(w)
+			}
+			if len(e.args) >= 1 && e.args[0].kind == "str" {
+				var words2 []map[string]any
+				words2 = append(words2, interpLit(e.args[0].raw))
+				for _, a := range e.args[1:] {
+					words2 = append(words2, p.argToWord(a))
+				}
+				inner := execStmt("printf", words2, "Emulable")
+				return map[string]any{
+					"type": "Call", "func": "capture",
+					"args":   []any{map[string]any{"type": "Arrow", "body": []any{inner}}},
+					"purity": "Spawn",
+				}
+			}
+			p.failf("unsupported fmt.Errorf form (v2) — needs a literal or var format")
+		}
+		// USER fn / METHOD calls in word position: `p.parseExpr()`,
+		// `lex(src)` — the value-return protocol (echo + capture) makes
+		// the returned value a word; struct results are arena INDICES,
+		// so pointer semantics ride the same channel.
+		if strings.Contains(e.callee, ".") {
+			dot := strings.LastIndex(e.callee, ".")
+			baseName, meth := e.callee[:dot], e.callee[dot+1:]
+			if rn := p.resolveVar(baseName); p.varStruct[rn] != "" && p.fnNames[meth] {
+				return p.userCallWord(meth, append([]*expr{{kind: "var", name: rn}}, e.args...))
+			}
+		} else if p.fnNames[e.callee] {
+			return p.userCallWord(e.callee, e.args)
 		}
 		// sc.Text() inside a scanner read-loop → the read var
 		if strings.HasSuffix(e.callee, ".Text") {
@@ -3643,17 +5258,117 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 			}
 		}
 		// b.String() on a bytes.Buffer → the accumulated contents
+		// (compile-time folded when ALL writes were literals)
 		if strings.HasSuffix(e.callee, ".String") {
 			base := strings.TrimSuffix(e.callee, ".String")
-			if _, ok := p.bufs[base]; ok {
+			if _, ok := p.bufs[base]; ok && !p.bufDyn[base] {
 				return strExpr(p.bufs[base])
+			}
+			dot := strings.LastIndex(e.callee, ".")
+			rn := ""
+			if dot > 0 {
+				rn = p.resolveVar(e.callee[:dot])
+			}
+			if rn != "" {
+				return map[string]any{
+					"type": "Call", "func": "objGet",
+					"args":   []any{getVarExpr(rn), strExpr("buf")},
+					"purity": "PureCpu",
+				}
 			}
 		}
 		p.failf("unsupported call %q in word position (v2)", e.callee)
+	case "structlit":
+		// a struct literal as a VALUE: inline allocation — objNew
+		// returns the reference id word
+		return p.objNewCall(e)
+	case "arraylit":
+		// a slice literal as a VALUE: the plain Array word (elements
+		// are words; object ids ride as strings)
+		el := make([]any, len(e.elems))
+		for i, w := range e.elems {
+			el[i] = w
+		}
+		return map[string]any{"type": "Array", "elements": el}
+	case "fieldof":
+		// member access on a CALL RESULT (or chain): objGet over the
+		// returned reference id
+		base := p.valueWord(e.lhs)
+		return map[string]any{
+			"type": "Call", "func": "objGet",
+			"args":   []any{base, strExpr(e.name)},
+			"purity": "PureCpu",
+		}
 	case "binop":
 		p.failf("unsupported comparison in word position (v2)")
 	}
 	p.failf("unsupported expression %q (v2 subset)", e.kind)
+	return nil
+}
+
+// isPredicateExpr: a comparison / logical-over-comparisons expression
+// (the bool result of `return <cmp>` drives the exit-status protocol).
+func (p *parser) isPredicateExpr(e *expr) bool {
+	switch e.kind {
+	case "binop":
+		if e.BOpKind == "cmp" {
+			return true
+		}
+		if e.BOpKind == "and" || e.BOpKind == "or" {
+			return p.isPredicateExpr(e.lhs) || p.isPredicateExpr(e.rhs)
+		}
+		return false
+	case "not":
+		return p.isPredicateExpr(e.lhs)
+	case "call":
+		return strings.HasPrefix(e.callee, "strings.")
+	}
+	return false
+}
+
+// valueWord: an expression whose value is a REFERENCE ID (user-fn /
+// method captures, fieldof chains, struct-typed vars) as one word.
+func (p *parser) valueWord(e *expr) map[string]any {
+	switch e.kind {
+	case "call":
+		callee := e.callee
+		var args []*expr
+		if strings.Contains(callee, ".") {
+			dot := strings.LastIndex(callee, ".")
+			baseName, meth := callee[:dot], callee[dot+1:]
+			rn := p.resolveVar(baseName)
+			if !p.fnNames[meth] || p.varStruct[rn] == "" {
+				p.failf("unsupported call %q in word position (v2)", callee)
+			}
+			args = append([]*expr{{kind: "var", name: rn}}, e.args...)
+			callee = meth
+		} else if !p.fnNames[callee] {
+			p.failf("unsupported call %q in word position (v2)", callee)
+		} else {
+			args = e.args
+		}
+		return p.userCallWord(callee, args)
+	case "fieldof":
+		return map[string]any{
+			"type": "Call", "func": "objGet",
+			"args":   []any{p.valueWord(e.lhs), strExpr(e.name)},
+			"purity": "PureCpu",
+		}
+	case "var":
+		rn := p.resolveVar(e.name)
+		if p.varStruct[rn] != "" {
+			return p.structIDWord(e.name)
+		}
+		p.failf("unsupported value expression %q (v2)", e.name)
+	case "index":
+		return p.exprToWord(e)
+	case "member":
+		if w, ok := p.structMemberWord(e.name); ok {
+			return w
+		}
+		p.failf("unsupported value expression %q (v2)", e.name)
+	}
+	p.failf("unsupported value expression (v2)")
 	return nil
 }
 
@@ -3755,8 +5470,27 @@ func (p *parser) sliceWord(e *expr) map[string]any {
 			return paramCall("%%", name, n+"*")
 		}
 	}
+	// GENERAL computed bounds: the runtime slice offsets/lengths are
+	// arithmetic expressions (evalArith), so `src[start+1 : i]` lowers
+	// to ${src:(start+1):(i)-(start+1)} — Go's exclusive end becomes a
+	// LENGTH subtraction. Byte vs char: ASCII corpus equivalence holds
+	// (documented caveat).
 	if e.idx1e != nil || e.idx2e != nil {
-		p.failf("unsupported computed slice bound (v2)")
+		name2 := p.resolveVar(name)
+		off := "0"
+		if e.idx1e != nil {
+			off = p.arithKeyText(e.idx1e)
+		} else if e.idx1 != "" {
+			off = e.idx1
+		}
+		if e.idx2e != nil {
+			length := "(" + p.arithKeyText(e.idx2e) + ")-(" + off + ")"
+			return joinCall(paramCall("slice", name2, off, length))
+		}
+		if e.idx2 != "" {
+			return joinCall(paramCall("slice", name2, off, e.idx2))
+		}
+		return joinCall(paramCall("slice", name2, off, ""))
 	}
 	lo, loErr := strconv.Atoi(e.idx1)
 	hi, hiErr := strconv.Atoi(e.idx2)
@@ -3809,6 +5543,16 @@ func (p *parser) indexCall(e *expr) (string, string, bool) {
 // index/param — anything non-numeric) → concat Interpolate, flattening
 // the whole add chain into parts; otherwise (and all * / -) → Arith.
 func (p *parser) arithOrConcat(e *expr) map[string]any {
+	// object-field reads inside arithmetic: plain Arith vars cannot
+	// address them — lower to the runtime num_* call tree
+	if p.hasObjectRead(e) {
+		if e.kind == "add" && p.addHasString(e) {
+			var parts []any
+			p.addConcatParts(e, &parts)
+			return interpParts(parts)
+		}
+		return p.arithNumCalls(e)
+	}
 	if e.kind == "add" && p.addHasString(e) {
 		var parts []any
 		p.addConcatParts(e, &parts)
@@ -3877,6 +5621,38 @@ func (p *parser) operandKind(e *expr) string {
 	return "int"
 }
 
+// arithKeyText renders an index expression as SHELL ARITHMETIC text for
+// computed subscripts (`arr[$i]`, `toks[$p + $off]`) — the runtime
+// evaluates subscript/slice-offset text with evalArith ($name reads the
+// store; ${#a[@]} is the length). Only the numeric subset lowers; a
+// string operand refuses loudly.
+func (p *parser) arithKeyText(e *expr) string {
+	switch e.kind {
+	case "num":
+		return e.text
+	case "var":
+		name := p.resolveVar(e.name)
+		if n, ok := p.paramNumber(name); ok {
+			return "$" + strconv.Itoa(n)
+		}
+		return "$" + name
+	case "add", "mul":
+		return "(" + p.arithKeyText(e.lhs) + e.op + p.arithKeyText(e.rhs) + ")"
+	case "neg":
+		return "(-" + p.arithKeyText(e.lhs) + ")"
+	case "arrlen":
+		if e.target != nil && e.target.kind == "var" {
+			return "${#" + p.resolveVar(e.target.name) + "[@]}"
+		}
+	case "strlen":
+		if e.target != nil && e.target.kind == "var" {
+			return "${#" + p.resolveVar(e.target.name) + "}"
+		}
+	}
+	p.failf("unsupported index expression (v2): %s", e.kind)
+	return ""
+}
+
 func (p *parser) exprToArith(e *expr) map[string]any {
 	switch e.kind {
 	case "num":
@@ -3898,6 +5674,16 @@ func (p *parser) exprToArith(e *expr) map[string]any {
 		if n, err := strconv.Atoi(e.text); err == nil {
 			return arithNum(n)
 		}
+	case "strlen":
+		// len(s) over a STRING in arithmetic — the ${#s} length read
+		// (getVar("#s") counts chars/bytes)
+		if e.target != nil && e.target.kind == "var" {
+			return arithVar("#" + p.resolveVar(e.target.name))
+		}
+	case "arrlen":
+		if e.target != nil && e.target.kind == "var" {
+			return arithVar("${#" + p.resolveVar(e.target.name) + "[@]}")
+		}
 	}
 	p.failf("non-numeric operand in arithmetic (v2): %s", e.kind)
 	return nil
@@ -3906,7 +5692,11 @@ func (p *parser) exprToArith(e *expr) map[string]any {
 func (p *parser) exprToArrayElem(e *expr) map[string]any {
 	switch e.kind {
 	case "str", "num", "var":
-		return strExpr(e.text)
+		return p.exprToWord(e)
+	case "call", "structlit", "fieldof", "index", "maplit":
+		// object ids / captures / whole-dict values ride as words
+		// object ids / captures ride the element channel as words
+		return p.exprToWord(e)
 	}
 	p.failf("unsupported array element %q (v2)", e.kind)
 	return nil
@@ -3931,18 +5721,38 @@ func (p *parser) condToJSON(c *expr) map[string]any {
 		return c.rawJSON
 	}
 	if c.kind == "not" {
+		// `!(...)`: object/native reads AND predicate exec-calls are
+		// native VALUES (exec yields boolean success), so BinOp Not
+		// (!expr) is faithful; plain [ ]-test conds keep the "! " form
+		if inner := p.condToJSON(c.lhs); inner != nil {
+			t := inner["type"]
+			fn := ""
+			if tf, ok := inner["func"].(string); ok {
+				fn = tf
+			}
+			native := t == "BinOp" || t == "MethodCall" || t == "Var" || (t == "Call" && fn != "test")
+			if native {
+				return map[string]any{
+					"type": "BinOp", "op": "Not",
+					"lhs": inner, "rhs": strExpr(""),
+				}
+			}
+			if s := p.safeCondTestString(c.lhs); s != "" {
+				return testCall("! " + strings.TrimSpace(s))
+			}
+		}
 		return testCall("! " + strings.TrimSpace(p.condTestString(c.lhs)))
 	}
 	if c.kind == "binop" && c.BOpKind == "and" {
 		return map[string]any{
 			"type": "BinOp", "op": "And",
-			"lhs": p.condToJSON(c.lhs), "rhs": p.condToJSON(c.rhs),
+			"lhs": p.condSideJSON(c.lhs), "rhs": p.condSideJSON(c.rhs),
 		}
 	}
 	if c.kind == "binop" && c.BOpKind == "or" {
 		return map[string]any{
 			"type": "BinOp", "op": "Or",
-			"lhs": p.condToJSON(c.lhs), "rhs": p.condToJSON(c.rhs),
+			"lhs": p.condSideJSON(c.lhs), "rhs": p.condSideJSON(c.rhs),
 		}
 	}
 	// strings.Contains(s, p) → the `[[ $s == *p* ]]` glob-test shape —
@@ -3953,6 +5763,26 @@ func (p *parser) condToJSON(c *expr) map[string]any {
 	// String.includes) does NOT set lastExit, and the core's native
 	// &&/|| lowering of a pure operand branches on the STALE status —
 	// t68 was silently dropping the `alt2` branch.
+	// PREDICATE calls (`isIdentPart(src[i])`, `p.atBoundary()`): a
+	// bool-returning sub's verdict rides the EXIT STATUS protocol —
+	// exec the call as the If/While condition itself.
+	if c.kind == "call" && p.callTargetName(c.callee) != "" {
+		calleeName := p.callTargetName(c.callee)
+		var words []map[string]any
+		if dot := strings.LastIndex(c.callee, "."); dot >= 0 {
+			rn := p.resolveVar(c.callee[:dot])
+			words = append(words, p.structIDWord(c.callee[:dot]))
+			_ = rn
+		}
+		for _, a := range c.args {
+			words = append(words, p.argToWord(a))
+		}
+		return map[string]any{
+			"type": "Call", "func": "exec",
+			"args":   []any{strExpr(calleeName), map[string]any{"type": "Array", "elements": words}},
+			"purity": "Spawn",
+		}
+	}
 	if c.kind == "call" && c.callee == "strings.Contains" {
 		if len(c.args) != 2 || c.args[1].kind != "str" {
 			p.failf("strings.Contains needs (haystack, str needle) (v2)")
@@ -3963,11 +5793,68 @@ func (p *parser) condToJSON(c *expr) map[string]any {
 		}
 		return testCall(p.condOperandQ(c.args[0]) + "=*" + c.args[1].text + "*")
 	}
+	// COMPARISON over OBJECT reads (`l.cur().kind != "eof"`): the
+	// native A1 BinOp — runtime values are words, so Eq/Ne render as
+	// plain JS ==/!=. Plain store-var operands keep the [ ] test shapes.
+	if c.kind == "binop" && c.BOpKind == "cmp" {
+		if s := p.operandDesc(c.rhs); strings.Contains(s, "lhs") {
+		}
+		lw, lok := p.condOperandA1Word(c.lhs)
+		rw, rok := p.condOperandA1Word(c.rhs)
+		op := map[string]string{"==": "Eq", "!=": "Ne", "<": "Lt", ">": "Gt", "<=": "Le", ">=": "Ge"}[c.BOp]
+		if op != "" && (lok || rok) {
+			// at least one operand is an OBJECT/strlen/index read: the
+			// whole comparison lowers as a native BinOp (plain operands
+			// render as ordinary store words)
+			if !lok {
+				lw = p.condWordAny(c.lhs)
+			}
+			if !rok {
+				rw = p.condWordAny(c.rhs)
+			}
+			return map[string]any{
+				"type": "BinOp", "op": op,
+				"lhs": lw, "rhs": rw,
+			}
+		}
+	}
+	// strings.* PURE helpers in condition position (`strings.TrimSpace(b.buf)
+	// == ""`) — native MethodCall words (JS String.prototype twins)
+
+	// strings.* PURE helpers as whole conditions (`if strings.TrimSpace(x) != ""`
+	// folded forms / direct truthy use): the native MethodCall word coerces
+	if c.kind == "call" {
+		if w := p.stringsHelperWord(c); w != nil {
+			return w
+		}
+	}
+	// TRUTHY object/map reads as whole conditions (`exprBoundary[t.text]`,
+	// `p.maps[name]`): non-empty = true (JS coercion; Go map lookups
+	// yield their zero value when absent — equivalent for the corpus)
+	if c.kind == "index" || c.kind == "member" || c.kind == "fieldof" {
+		if w, ok := p.condOperandA1Word(c); ok {
+			return w
+		}
+	}
 	// strings.HasPrefix(s, p) / strings.HasSuffix(s, p) → the `[[ $s ==
 	// p* ]]` / `[[ $s == *p ]]` glob-test shape (the core's `$s==p*`
 	// string; the operand stays quoted, the pattern bare so the glob
 	// engine sees it — t68).
 	if c.kind == "call" && (c.callee == "strings.HasPrefix" || c.callee == "strings.HasSuffix") {
+		// non-var haystacks (`src[i:]` slices, object reads): the native
+		// strHasPrefix/strHasSuffix calls over arbitrary words
+		if len(c.args) == 2 && c.args[0].kind != "var" {
+			fn := "strHasPrefix"
+			if c.callee == "strings.HasSuffix" {
+				fn = "strHasSuffix"
+			}
+			// returning from condToJSON directly — the payload IS the cond
+			return map[string]any{
+				"type": "Call", "func": fn,
+				"args":   []any{p.exprToWord(c.args[0]), p.exprToWord(c.args[1])},
+				"purity": "PureCpu",
+			}
+		}
 		if len(c.args) != 2 || c.args[0].kind != "var" || c.args[1].kind != "str" {
 			p.failf("%s needs (var, str) (v2)", c.callee)
 		}
@@ -3985,6 +5872,8 @@ func (p *parser) condToJSON(c *expr) map[string]any {
 // condTestString renders a comparison as the core's [ ] argument string
 // (the `"$X"="1"` / `1 -lt 2` / ` -z "$X"` shapes).
 func (p *parser) condTestString(c *expr) string {
+	if c.kind == "call" {
+	}
 	if c.kind == "cond" {
 		return c.text
 	}
@@ -4032,6 +5921,240 @@ func (p *parser) condTestString(c *expr) string {
 	return ""
 }
 
+// condWordAny: the permissive fallback — any condition operand as an
+// A1 word (plain vars/literals included).
+func (p *parser) condWordAny(e *expr) map[string]any {
+	if w, ok := p.condOperandA1Word(e); ok {
+		return w
+	}
+	switch e.kind {
+	case "var":
+		name := p.resolveVar(e.name)
+		if n, ok := p.paramNumber(name); ok {
+			return getVarExpr(strconv.Itoa(n))
+		}
+		return getVarExpr(name)
+	case "num":
+		return strExpr(e.text)
+	case "member":
+		if w, ok := p.structMemberWord(e.name); ok {
+			return w
+		}
+	case "add", "mul", "neg":
+		return arithWrap(p.exprToArith(e))
+	}
+	p.failf("unsupported comparison operand (v2): %s", e.kind)
+	return nil
+}
+
+// condSideJSON: an And/Or operand — compound conditions recurse through
+// condToJSON; plain vars/literals become truthy words (condWordAny).
+func (p *parser) condSideJSON(c *expr) map[string]any {
+	switch c.kind {
+	case "binop", "not", "index", "member", "fieldof", "call":
+		return p.condToJSON(c)
+	}
+	return p.condWordAny(c)
+}
+
+// safeCondTestString: the negation sniff in parseIf runs on conditions
+// that may be object/native (BinOp) forms with no test-string spelling
+// — failf's panic is recovered and reported as "" (no negation known).
+func (p *parser) safeCondTestString(c *expr) (s string) {
+	defer func() {
+		if recover() != nil {
+			s = ""
+		}
+	}()
+	return p.condTestString(c)
+}
+
+// stringsHelperWord: `strings.TrimSpace/ToUpper/ToLower(x)` as the
+// native MethodCall word (JS String.prototype twins); nil when the call
+// isn't one of the supported pure helpers.
+func (p *parser) stringsHelperWord(e *expr) map[string]any {
+	if e == nil || e.kind != "call" {
+		return nil
+	}
+	meth := map[string]string{
+		"strings.TrimSpace": "trim",
+		"strings.ToUpper":   "toUpperCase",
+		"strings.ToLower":   "toLowerCase",
+	}[e.callee]
+	if meth == "" || len(e.args) != 1 {
+		return nil
+	}
+	return map[string]any{
+		"type": "MethodCall", "obj": p.exprToWord(e.args[0]),
+		"method": meth, "args": []any{},
+	}
+}
+
+// condOperandA1Word: a condition operand as an A1 WORD when it involves
+// OBJECT reads (struct members, list/map fields, user-fn captures);
+// plain vars/literals report ok=false so the shell test-string shapes
+// keep handling them.
+func (p *parser) condOperandA1Word(e *expr) (map[string]any, bool) {
+	w, ok := p.condOperandA1WordInner(e)
+	return w, ok
+}
+
+func (p *parser) condOperandA1WordInner(e *expr) (map[string]any, bool) {
+	switch e.kind {
+	case "member":
+		if w, tag := p.structFieldWord(e.name); tag != "none" {
+			return w, true
+		}
+		return nil, false
+	case "fieldof":
+		return p.valueWord(e), true
+	case "call":
+		if w := p.stringsHelperWord(e); w != nil {
+			return w, true
+		}
+		callee := e.callee
+		var args []*expr
+		if strings.Contains(callee, ".") {
+			dot := strings.LastIndex(callee, ".")
+			baseName, meth := callee[:dot], callee[dot+1:]
+			rn := p.resolveVar(baseName)
+			if !p.fnNames[meth] || p.varStruct[rn] == "" {
+				return nil, false
+			}
+			args = append([]*expr{{kind: "var", name: rn}}, e.args...)
+			callee = meth
+		} else if !p.fnNames[callee] {
+			return nil, false
+		} else {
+			args = e.args
+		}
+		w := p.userCallWord(callee, args)
+		return w, true
+	case "var":
+		if rn := p.resolveVar(e.name); p.varStruct[rn] != "" {
+			return p.structIDWord(e.name), true
+		}
+		return nil, false
+	case "str":
+		return strExpr(e.text), true
+	case "num":
+		return strExpr(e.text), true
+	case "strlen":
+		// len(src) over a STRING → ${#src}; arrays use the length word;
+		// MEMBER targets (object fields) use the strLen runtime helper
+		if e.target != nil && e.target.kind == "var" {
+			name := p.resolveVar(e.target.name)
+			if p.varTypes[name] == "Array" {
+				return joinCall(paramCall("slice", "#"+name, "@", "")), true
+			}
+			return getVarExpr("#" + name), true
+		}
+		if e.target != nil && e.target.kind == "index" {
+			return map[string]any{
+				"type": "Call", "func": "strLen",
+				"args":   []any{p.exprToWord(e.target)},
+				"purity": "PureCpu",
+			}, true
+		}
+		if e.target != nil && e.target.kind == "member" {
+			if w, tag := p.structFieldWord(e.target.name); tag != "none" {
+				if tag == "list" {
+					return map[string]any{
+						"type": "Call", "func": "listLen",
+						"args":   []any{w},
+						"purity": "PureCpu",
+					}, true
+				}
+				return map[string]any{
+					"type": "Call", "func": "strLen",
+					"args":   []any{w},
+					"purity": "PureCpu",
+				}, true
+			}
+		}
+		return nil, false
+	case "add", "mul", "neg":
+		// arithmetic sub-expressions render as native JS numbers inside
+		// the BinOp comparison
+		return arithWrap(p.exprToArith(e)), true
+	case "binop":
+		lw, lok := p.condOperandA1Word(e.lhs)
+		rw, rok := p.condOperandA1Word(e.rhs)
+		op := map[string]string{"==": "Eq", "!=": "Ne", "<": "Lt", ">": "Gt", "<=": "Le", ">=": "Ge",
+			"&&": "And", "||": "Or"}[e.BOp]
+		if lok && rok && op != "" {
+			return map[string]any{
+				"type": "BinOp", "op": op,
+				"lhs": lw, "rhs": rw,
+			}, true
+		}
+		return nil, false
+	case "arrlen":
+		if e.target != nil && e.target.kind == "var" {
+			return joinCall(paramCall("slice", "#"+p.resolveVar(e.target.name), "@", "")), true
+		}
+		return nil, false
+	case "index":
+		// element read on a STRUCT FIELD list/map (`l.toks[i]`, `p.fnNames[b]`)
+		if e.target != nil && e.target.kind == "member" {
+			if w, tag := p.structFieldWord(e.target.name); tag != "none" && tag != "ref" {
+				var keyWord map[string]any
+				if e.idx1e != nil {
+					keyWord = p.exprToWord(e.idx1e)
+				} else {
+					keyWord = strExpr(e.idx1)
+				}
+				fn := "listGet"
+				if tag == "map" {
+					fn = "mapGet"
+				}
+				return map[string]any{
+					"type": "Call", "func": fn,
+					"args":   []any{w, keyWord},
+					"purity": "PureCpu",
+				}, true
+			}
+		}
+		// ASSOC-map store element read on a plain var (`m[key]`)
+		if e.target != nil && e.target.kind == "var" && p.maps[e.target.name] {
+			mn := p.resolveVar(e.target.name)
+			var kw map[string]any
+			if e.idx1e != nil {
+				kw = p.exprToWord(e.idx1e)
+			} else {
+				kw = strExpr(e.idx1)
+			}
+			return map[string]any{
+				"type": "Call", "func": "assocGet",
+				"args":   []any{strExpr(mn), kw},
+				"purity": "PureCpu",
+			}, true
+		}
+		// plain store indexing in conditions: `src[i+1] == '/'`
+		if e.target != nil && e.target.kind == "var" {
+			name := p.resolveVar(e.target.name)
+			key := ""
+			keyWord := map[string]any(nil)
+			if e.idx1e != nil {
+				key = p.arithKeyText(e.idx1e)
+				keyWord = p.exprToWord(e.idx1e)
+			} else {
+				key = e.idx1
+				keyWord = strExpr(key)
+			}
+			_ = keyWord
+			if p.varTypes[name] == "Str" {
+				// single-element read (${s:$k:1}); Go bytes = chars on
+				// the ASCII corpus (documented caveat)
+				return joinCall(paramCall("slice", name, key, "1")), true
+			}
+			return getVarExpr(name + "[" + key + "]"), true
+		}
+		return nil, false
+	}
+	return nil, false
+}
+
 // condOperandQ: `==`/`!=` operand — quoted: `"$x"` / `"lit"` / `"42"`.
 func (p *parser) condOperandQ(e *expr) string {
 	switch e.kind {
@@ -4057,14 +6180,23 @@ func (p *parser) condOperandQ(e *expr) string {
 		// to sh2.test for non-plain operands, and the runtime's
 		// tokenizeTest expands the quoted word via expandWord
 		// (arrayIndex) inside a quoted test word.
-		if e.idx1e != nil {
-			p.failf("unsupported index key (v2) — must be a number literal")
-		}
 		if e.target != nil && e.target.kind == "var" {
 			if p.maps[e.target.name] {
 				p.failf("map key in comparison unsupported (v2)")
 			}
-			return `"${` + p.resolveVar(e.target.name) + `[` + e.idx1 + `]}"`
+			name := p.resolveVar(e.target.name)
+			key := e.idx1
+			if e.idx1e != nil {
+				// computed subscript (`s[i] == "x"`): arith text resolved
+				// by evalArith inside the quoted word's expansion
+				key = p.arithKeyText(e.idx1e)
+				if p.varTypes[name] == "Str" {
+					// a STRING subscript is a single-element read (${s:$i:1});
+					// Go bytes = chars for the ASCII corpus (documented).
+					return "\"${" + name + ":" + key + ":1}\""
+				}
+			}
+			return "\"${" + name + "[" + key + "]}\""
 		}
 		p.failf("index target must be a var (v2)")
 	}
@@ -4091,14 +6223,23 @@ func (p *parser) condOperandArg(e *expr) string {
 		// (`[ "${a[0]}" -gt 1 ]`; bare would need the word-splitting
 		// the quoted form avoids). Literal keys only, like the
 		// statement-position lowering (exprToWord).
-		if e.idx1e != nil {
-			p.failf("unsupported index key (v2) — must be a number literal")
-		}
 		if e.target != nil && e.target.kind == "var" {
 			if p.maps[e.target.name] {
 				p.failf("map key in comparison unsupported (v2)")
 			}
-			return `"${` + p.resolveVar(e.target.name) + `[` + e.idx1 + `]}"`
+			name := p.resolveVar(e.target.name)
+			key := e.idx1
+			if e.idx1e != nil {
+				// computed subscript (`s[i] == "x"`): arith text resolved
+				// by evalArith inside the quoted word's expansion
+				key = p.arithKeyText(e.idx1e)
+				if p.varTypes[name] == "Str" {
+					// a STRING subscript is a single-element read (${s:$i:1});
+					// Go bytes = chars for the ASCII corpus (documented).
+					return "\"${" + name + ":" + key + ":1}\""
+				}
+			}
+			return "\"${" + name + "[" + key + "]}\""
 		}
 		p.failf("index target must be a var (v2)")
 	}
@@ -4112,7 +6253,44 @@ func (p *parser) condOperandArg(e *expr) string {
 // dispatch through this single entry point.
 // ─────────────────────────────────────────────────────────────────────
 
+// prescanFuncNames: collect every declared function/method NAME up
+// front, so forward references (`lex` calling `isIdentPart` declared
+// below it) resolve during body parsing.
+func (p *parser) prescanFuncNames() {
+	for i, t := range p.toks {
+		if t.kind != tIdent || t.text != "func" {
+			continue
+		}
+		j := i + 1
+		// skip an optional receiver `(r T)`
+		if j < len(p.toks) && p.toks[j].kind == tPunct && p.toks[j].text == "(" {
+			depth := 0
+			for j < len(p.toks) {
+				if p.toks[j].kind == tPunct && p.toks[j].text == "(" {
+					depth++
+				} else if p.toks[j].kind == tPunct && p.toks[j].text == ")" {
+					depth--
+					if depth == 0 {
+						j++
+						break
+					}
+				}
+				j++
+			}
+		}
+		if j < len(p.toks) && p.toks[j].kind == tIdent {
+			name := p.toks[j].text
+			if name != "main" && name != "_" {
+				p.fnNames[name] = true
+			}
+		}
+	}
+}
+
+var debugNoRecover string
+
 func Shir(src string) ([]byte, error) {
+	debugNoRecover = "1"
 	toks, err := lex(src)
 	if err != nil {
 		return nil, err
@@ -4130,7 +6308,14 @@ func Shir(src string) ([]byte, error) {
 		fnNames:   map[string]bool{},
 		outer:     map[string]bool{},
 		varAlias:  map[string]string{},
+		structs:   map[string][]string{},
+		structFT:  map[string][]string{},
+		structRaw: map[string][]string{},
+		bufDyn:    map[string]bool{},
+		varStruct: map[string]string{},
+		fnSig:     map[string][2]string{},
 	}
+	p.prescanFuncNames()
 	stmts, err := p.run()
 	if err != nil {
 		return nil, err
