@@ -25,10 +25,16 @@ t85–t90 family), and a compile-time-only specifier is dropped:
   CPP frontend applies to its own sugar. Pin: t95_alignas.c.
 
 Gate: make test = 105/105 ingress + 105/105 executed-stdout. CPP-side
-note: t31_type_qualifier.cc still emits DIFFERENTLY from cpp-sh-go
-(clib keeps the const/volatile declarations' initializers, cpp-sh-go's
-desugar drops them — a PRE-EXISTING documented gap of the CPP
-frontend, pinned 0-valued so stdout matches; not a c-sh-go issue).
+note (CORRECTED same day): an earlier check saw t31_type_qualifier.cc
+differ from cpp-sh-go, but that ran against a STALE cpp-sh-go binary
+(the Makefile's rebuild trigger only watches its OWN sources, not the
+shared clib it imports via replace => ../c-sh-go). On current builds
+all 26 expressible testdata_cpp/*.cc files are BYTE-IDENTICAL between
+the frontends. Semantics note: the lex-level const/volatile/register
+demotion drops only the qualifier tokens — declarations KEEP their
+initializers (`volatile int y = 9;` emits Assign y=9); the unmodeled
+effects of volatile (signals/setjmp/threads/MMIO) are outside the
+accepted subset.
 
 ## v5.4 — all the C in the CPP frontend parses (2026-08-23), 105/105
 
