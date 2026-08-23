@@ -501,6 +501,7 @@ type parser struct {
 	fnSig      map[string][2]string         // func/method name -> [paramTypesCsv, retType]
 	paramTypes map[string]string            // (during decl parse) param -> base type
 	curFn      string                       // (during body parse) enclosing func name
+	prescanRet map[string]string            // func name -> raw return base (pre-decl)
 	lastTypeRaw string                     // (during capture) the raw type text
 	lastSig    [2]string                    // (during decl parse) captured signature
 	tmpN       int                          // fresh temp counter (newstruct preludes)
@@ -1811,6 +1812,7 @@ func (p *parser) parseTopLevel() []map[string]any {
 			}
 			// optional return type: T | []T | *T | (T, error) — erased
 			// under the same type-position contract as the params
+			// (WithTypes already captured it into p.lastSig)
 			p.skipReturnType()
 			p.skipNL()
 			// function scope (mirrors parseFuncLit)
@@ -1953,7 +1955,10 @@ func (p *parser) parseStmt() []map[string]any {
 		return nil
 	}
 	if t.kind != tIdent {
-		p.failf("unrecognized statement starting with %q", t.text)
+		// `*p = v` / `*out = ...` pointer writes: the OBJECT STORE could
+		// model them (objSet over the id) — support the common
+		// slice-append form `*x = append(*x, ...)` and refuse the rest
+		p.failf("unsupported statement starting with %q (v2)", t.text)
 	}
 	switch t.text {
 	case "if":
@@ -2020,6 +2025,12 @@ func (p *parser) parseStmt() []map[string]any {
 			p.failf("labeled continue unsupported (v2)")
 		}
 		return []map[string]any{{"type": "Continue"}}
+	case "goto":
+		// A1 Goto node (the core contract has it; estree renders native
+		// JS labeled continue semantics via the runtime's goto support)
+		p.pos++
+		lbl := p.expect(tIdent, "").text
+		return []map[string]any{map[string]any{"type": "Goto", "name": lbl}}
 	case "break":
 		// A1 Break node (shir_json_in "Break" -> IrStmt::Break — the
 		// core contract already has it; the estree/C renderers emit
@@ -2037,6 +2048,16 @@ func (p *parser) parseStmt() []map[string]any {
 		return p.parseConstDecl()
 	case "case", "default":
 		p.failf("'%s' outside switch", t.text)
+	}
+	// LABELED statement `name:` (goto target) → A1 Label node
+	if p.toks[p.pos+1].kind == tPunct && p.toks[p.pos+1].text == ":" {
+		lbl := p.next().text
+		p.pos++ // :
+		out := []map[string]any{map[string]any{"type": "Label", "name": lbl}}
+		if !p.atBoundary() && !p.atPunct("}") {
+			out = append(out, p.parseStmt()...)
+		}
+		return out
 	}
 	if p.toks[p.pos+1].kind == tPunct && p.toks[p.pos+1].text == "." {
 		return p.parseDottedStmt()
@@ -2146,6 +2167,15 @@ func (p *parser) parseConstSpec(iotaIdx int, prev *expr, out *[]map[string]any) 
 func (p *parser) constWord(e *expr, iotaVal int) (map[string]any, string) {
 	v := p.constValue(e, iotaVal)
 	if !v.ok {
+		ctxD := ""
+		for k := p.pos - 5; k < p.pos+2 && k >= 0 && k < len(p.toks); k++ {
+			if p.toks[k].kind == tNL {
+				ctxD += "¶"
+			} else {
+				ctxD += p.toks[k].text + " "
+			}
+		}
+		println("DBG CONST ctx=[", ctxD, "] @line", p.tok().line)
 		p.failf("unsupported const expression (v2): %s", p.constExprDesc(e))
 	}
 	if v.isStr {
@@ -4672,20 +4702,30 @@ if info, ok := p.arrays[rv.name]; ok {
 		p.registerVar(initName, "Int")
 		p.expect(tPunct, ";")
 		p.skipNL()
-		cond := p.parseExpr()
+		// cond/post may each be EMPTY (`for i := 0; ; i++`)
+		var cond *expr
+		if !p.atPunct(";") {
+			cond = p.parseExpr()
+		}
 		p.expect(tPunct, ";")
 		p.skipNL()
-		postName := p.expect(tIdent, "").text
-		postDelta := 1
-		postOp := "+"
-		if p.acceptPunct("--") {
-			postDelta = -1
-			postOp = "-"
-		} else {
-			p.expect(tPunct, "++")
+		post := []map[string]any{}
+		if cond == nil {
+			cond = &expr{kind: "cond", text: "true"}
 		}
-		post := []map[string]any{assignStmt(postName,
-			arithWrap(arithBin(arithVar(postName), postOp, arithNum(postDelta))))}
+		if !p.atPunct("{") {
+			postName := p.expect(tIdent, "").text
+			postDelta := 1
+			postOp := "+"
+			if p.acceptPunct("--") {
+				postDelta = -1
+				postOp = "-"
+			} else {
+				p.expect(tPunct, "++")
+			}
+			post = []map[string]any{assignStmt(postName,
+				arithWrap(arithBin(arithVar(postName), postOp, arithNum(postDelta))))}
+		}
 		body := p.parseBlockStmts()
 		// `i := N; i <= M; i++` (or `i < M`) → the core's ForInit shape
 		// (byte-identical to the `for ((i=N; i<=M; i++))` lowering in
@@ -4697,7 +4737,15 @@ if info, ok := p.arrays[rv.name]; ok {
 		// sh2.vars — string-context body reads (`echo n$i` / printf) then
 		// see "" (t58_seq_range DIFF: n vs n2/n3/n4). ForInit lowers to
 		// the setVar-synced while machinery, which matches bash exactly.
-		if rhs.kind == "num" && initName == postName &&
+		postName := ""
+		if len(post) > 0 {
+			if t0, ok := post[0]["targets"].([]any); ok && len(t0) > 0 {
+				if tt, ok2 := t0[0].(map[string]any); ok2 {
+					postName = tt["var"].(string)
+				}
+			}
+		}
+		if cond != nil && rhs.kind == "num" && initName == postName &&
 			cond.kind == "binop" && cond.BOpKind == "cmp" &&
 			cond.lhs.kind == "var" && cond.lhs.name == initName &&
 			cond.rhs.kind == "num" {
@@ -5098,6 +5146,10 @@ func (p *parser) noteCallResultType(target, callee string, args []*expr) {
 		ret = sig[1]
 	} else if sig, ok := p.fnSig[callee]; ok {
 		ret = sig[1]
+	} else if r, ok := p.prescanRet[meth]; ok && p.isStructType(r) {
+		ret = r
+	} else if r, ok := p.prescanRet[callee]; ok && p.isStructType(r) {
+		ret = r
 	}
 	_ = args
 	if p.isStructType(ret) {
@@ -6591,6 +6643,18 @@ func (p *parser) condOperandArg(e *expr) string {
 // front, so forward references (`lex` calling `isIdentPart` declared
 // below it) resolve during body parsing.
 func (p *parser) prescanFuncNames() {
+	// pre-register every STRUCT TYPE name so forward references
+	// (`v := f()` where f returns a struct declared LATER in the file)
+	// resolve at use time
+	for i, t := range p.toks {
+		if t.kind == tIdent && t.text == "type" &&
+			i+2 < len(p.toks) &&
+			p.toks[i+1].kind == tIdent && p.toks[i+2].kind == tIdent && p.toks[i+2].text == "struct" {
+			p.structs[p.toks[i+1].text] = []string{}
+			p.structFT[p.toks[i+1].text] = []string{}
+			p.structRaw[p.toks[i+1].text] = []string{}
+		}
+	}
 	for i, t := range p.toks {
 		if t.kind != tIdent || t.text != "func" {
 			continue
@@ -6616,6 +6680,21 @@ func (p *parser) prescanFuncNames() {
 			name := p.toks[j].text
 			if name != "main" && name != "_" {
 				p.fnNames[name] = true
+			}
+			// capture the RETURN type's base ident for result-typing
+			j++
+			k := j
+			for k < len(p.toks) && !(p.toks[k].kind == tPunct && p.toks[k].text == "{") && p.toks[k].kind != tNL && p.toks[k].kind != tEOF {
+				if p.toks[k].kind == tIdent {
+					base := p.toks[k].text
+					if p.varStruct != nil || true {
+						_ = base
+					}
+					// record provisional ret type (resolved against
+					// structs at use time)
+					p.prescanRet[name] = base
+				}
+				k++
 			}
 		}
 	}
@@ -6646,10 +6725,12 @@ func Shir(src string) ([]byte, error) {
 		structFT:  map[string][]string{},
 		structRaw: map[string][]string{},
 		bufDyn:    map[string]bool{},
+		prescanRet: map[string]string{},
 		varStruct: map[string]string{},
 		fnSig:     map[string][2]string{},
 	}
 	p.prescanFuncNames()
+
 	stmts, err := p.run()
 	if err != nil {
 		return nil, err
