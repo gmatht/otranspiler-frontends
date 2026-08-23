@@ -196,6 +196,24 @@ match-on-enums x5 (needs enum repr + write!), record .clone() x5,
 
 Pinned by t49_enum_match.rs.
 
+## v0.9 additions — clone & AtomicBool statics
+
+- `x.clone()` on ANY receiver -> the CloneDeep drop-in node (core:
+  shir_nodes/clone_deep.node; JS structuredClone). Sound by the Clone
+  bound itself: clone never aliases, so a deep copy is exact for every
+  store value.
+- `static NAME: AtomicBool = AtomicBool::new(v)` — typed statics persist
+  across per-function scopes; `new` ctor -> the initial value;
+  `.load(Ordering::..)` -> plain variable read; `.store(v, ..)` ->
+  assignment (single-threaded runtime: exact).
+- bool operands in equality tests stringify exactly ("true"/"false")
+  under `=`/`!=`; PROVEN-bool bare variables lower as conditions
+  (`$b = "true"`); unproven variables still refuse.
+- If-condition method calls hoist to temps (If evaluates once — exact);
+  While conditions do NOT hoist (per-iteration semantics) and keep
+  refusing calls.
+- MILESTONE: 4/30 full-file passes (debug.rs joined via AtomicBool).
+
 Refused loudly (testdata/*_refuse.rs — the emit MUST fail, t13–t23):
 borrows `&x`, user functions, `String::from`/method calls, `match`,
 `vec!`, `eprintln!`/`dbg!`, floats, `{:?}`/named/width format specs,

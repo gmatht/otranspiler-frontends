@@ -67,6 +67,10 @@ counts over the corpus (top entries):
 
 ## Phased plan (each phase = frontend subset growth + testdata pins, gate green)
 
+1h. DONE v0.9 — CloneDeep drop-in node (any-receiver .clone()),
+    AtomicBool statics (typed statics map, new/load/store), bool test
+    operands + proven-bool conditions, If-condition call hoisting
+    (t50 pins; debug.rs full pass -> 4/30).
 1g. DONE v0.8 — unit enums + match: tag-string variant values, match ->
     if-chain over string-eq on a hoisted scrutinee (or-patterns/_),
     typed =/!= test dispatch; param-clobber limitation documented.

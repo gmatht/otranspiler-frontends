@@ -1,9 +1,15 @@
-// t39_bool_var_cond_refuse — a bare boolean VARIABLE as a condition
-// refuses: `$b` alone parses in the test grammar as a nonempty-string /
-// file-existence test, NOT a bool read. Until a bool-var contract node
-// lands, lowering would guess — so it refuses (REFUSE > GUESS).
+// t39_bool_var_cond_refuse — an UNPROVEN variable as a condition refuses
+// (its store value could be anything; `$x` alone parses as a nonempty-
+// string/file test, NOT a truthiness read). PROVEN-bool variables DO
+// lower now (`$b = "true"` equality — exact); this pin covers the
+// type-tracker's blind spot, where lowering would guess.
+fn make() -> i64 {
+    1
+}
+
 fn main() {
-    let b = true;
+    let x = make();
+    let b = x;
     if b {
         println!("taken");
     }

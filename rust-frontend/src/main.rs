@@ -105,6 +105,9 @@ enum Ty {
     /// equality. Tuple/struct-variant enums refuse until record storage
     /// lands (payloads need object values).
     Enum(String),
+    /// an `AtomicBool` static — single-threaded JS makes load/store a
+    /// plain value read/write (exact)
+    AtomicBool,
     Unknown,
 }
 
@@ -127,6 +130,7 @@ fn ty_from_type(t: &syn::Type, cx: &Cx) -> Ty {
                 | "u64" | "u128" | "usize" => Ty::Int,
                 "str" | "String" | "Cow" => Ty::Str,
                 "bool" => Ty::Bool,
+                "AtomicBool" => Ty::AtomicBool,
                 "Vec" | "VecDeque" | "HashSet" | "BTreeSet" | "HashMap" | "BTreeMap"
                 | "Slice" => Ty::Arr,
                 _ => Ty::Unknown,
@@ -158,6 +162,8 @@ struct Cx {
     enums: Vec<String>,
     /// fresh-temporary counter (field-read hoists)
     tmp: std::cell::RefCell<u32>,
+    /// STATIC item types (persist across the per-function vars clears)
+    statics: std::cell::RefCell<HashMap<String, Ty>>,
     /// global assignments (consts/statics), in source order
     globals: Vec<Value>,
 }
@@ -239,6 +245,10 @@ fn main() {
                 }
             }
             syn::Item::Static(s) => {
+                // the static's declared type persists in its own map
+                // (infer_ty consults it even after per-fn clears)
+                let ty = ty_from_type(&s.ty, &cx);
+                cx.statics.borrow_mut().insert(s.ident.to_string(), ty);
                 cx.globals.push(assign_stmt(&s.ident.to_string(), value_expr(&s.expr, &cx)));
                 if let Some(v) = const_int(&s.expr, &cx) {
                     cx.ints.insert(s.ident.to_string(), v);
@@ -488,7 +498,11 @@ fn infer_ty(e: &syn::Expr, cx: &Cx) -> Ty {
                 }
             }
             single_path(p)
-                .and_then(|id| cx.vars.borrow().get(&id.to_string()).cloned())
+                .and_then(|id| {
+                    cx.vars.borrow().get(&id.to_string()).cloned().or_else(|| {
+                        cx.statics.borrow().get(&id.to_string()).cloned()
+                    })
+                })
                 .unwrap_or(Ty::Unknown)
         }
         _ => Ty::Unknown,
@@ -511,7 +525,7 @@ fn lower_expr_stmt(e: &syn::Expr, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) ->
                 refuse("binary-operator statement (only compound assigns)", b.op.span())
             }
         }
-        syn::Expr::If(ie) => Some(if_stmt(ie, cx, in_fn)),
+        syn::Expr::If(ie) => Some(if_stmt(ie, cx, in_fn, out)),
         syn::Expr::While(w) => Some(while_stmt(w, cx, in_fn)),
         syn::Expr::ForLoop(fl) => Some(for_stmt(fl, cx, in_fn)),
         syn::Expr::Return(r) => {
@@ -543,10 +557,31 @@ fn lower_expr_stmt(e: &syn::Expr, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) ->
             Some(match_value_node(m, BranchTarget::Unit, cx, in_fn, out))
         }
         syn::Expr::MethodCall(m) => {
-            // statement-position method call: only PURE methods lower at
-            // all (the whitelist in value_expr), and a discarded pure
-            // call is a no-op — drop it. Anything impure/unknown already
-            // refuses inside value_expr.
+            // IMPURE statement-position methods first:
+            // `flag.store(v, Ordering::..)` on an AtomicBool static — a
+            // plain assignment (single-threaded runtime: exact).
+            if m.method == "store" {
+                if let Ty::AtomicBool = infer_ty(&m.receiver, cx) {
+                    let Some(syn::Expr::Path(p)) = Some(m.receiver.as_ref()) else {
+                        refuse("atomic store target path", m.receiver.span());
+                    };
+                    let Some(name) = single_path(p) else {
+                        refuse("atomic store target path", p.span());
+                    };
+                    let mut it = m.args.iter();
+                    let (Some(val), Some(_ord)) = (it.next(), it.next()) else {
+                        refuse("store expects (value, ordering)", m.span());
+                    };
+                    return Some(assign_stmt(
+                        &name.to_string(),
+                        value_expr(val, cx),
+                    ));
+                }
+            }
+            // everything else in statement position: only PURE methods
+            // lower at all (the whitelist in value_expr), and a discarded
+            // pure call is a no-op — drop it. Anything impure/unknown
+            // already refuses inside value_expr.
             let _ = value_expr(e, cx);
             None
         }
@@ -621,8 +656,11 @@ fn compound_assign(b: &syn::ExprBinary, cx: &Cx) -> Value {
     assign_stmt(&name, arith_bin(op, arith_var(&name), arith_expr(&b.right, cx)))
 }
 
-fn if_stmt(ie: &syn::ExprIf, cx: &Cx, in_fn: bool) -> Value {
-    let cond = test_call(&test_string(&ie.cond, cx));
+fn if_stmt(ie: &syn::ExprIf, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) -> Value {
+    // method-call leaves of the condition hoist to temps (If conditions
+    // evaluate once — exact); the rest is test-grammar text
+    let cond_expr = hoist_cond_calls(&ie.cond, cx, out);
+    let cond = test_call(&test_string(&cond_expr, cx));
     let mut then = Vec::new();
     lower_block(&ie.then_branch, cx, in_fn, &mut then);
     let else_stmts: Vec<Value> = match &ie.else_branch {
@@ -631,7 +669,9 @@ fn if_stmt(ie: &syn::ExprIf, cx: &Cx, in_fn: bool) -> Value {
             // `else if` lowers to a NESTED If in the else position — the
             // exact shape the shell frontend emits for elif chains (the
             // `elsifs` field stays empty).
-            syn::Expr::If(inner_if) => vec![if_stmt(inner_if, cx, in_fn)],
+            syn::Expr::If(inner_if) => {
+                vec![if_stmt(inner_if, cx, in_fn, out)]
+            }
             // `else { ... }`
             syn::Expr::Block(blk) => {
                 let mut v = Vec::new();
@@ -774,6 +814,7 @@ fn std_ctor_value(
     let t = p.path.segments[p.path.segments.len() - 2].ident.to_string();
     let f = p.path.segments[p.path.segments.len() - 1].ident.to_string();
     match (t.as_str(), f.as_str()) {
+        ("AtomicBool", "new") if args.len() == 1 => Some(value_expr(&args[0], cx)),
         ("String", "from") if args.len() == 1 => Some(value_expr(&args[0], cx)),
         ("String", "new") if args.is_empty() => Some(str_lit("")),
         ("String", "with_capacity") if args.len() == 1 => Some(str_lit("")),
@@ -1119,6 +1160,42 @@ fn match_value_node(
         })];
     }
     else_.remove(0)
+}
+
+/// Hoist METHOD-CALL leaves of an If CONDITION into fresh temporaries
+/// (the test grammar holds only $vars and literals). Exact for If: the
+/// condition evaluates ONCE. While conditions re-evaluate every
+/// iteration and do NOT hoist (calls there keep refusing).
+fn hoist_cond_calls(e: &syn::Expr, cx: &Cx, out: &mut Vec<Value>) -> syn::Expr {
+    match e {
+        syn::Expr::MethodCall(_) => {
+            let v = value_expr(e, cx);
+            let mut ctr = cx.tmp.borrow_mut();
+            *ctr += 1;
+            let temp = format!("__sh2c{}", ctr);
+            drop(ctr);
+            out.push(assign_stmt(&temp, v));
+            syn::parse_str::<syn::Expr>(&temp)
+                .unwrap_or_else(|_| refuse("temporary name", e.span()))
+        }
+        syn::Expr::Binary(b) => {
+            let mut b2 = b.clone();
+            b2.left = Box::new(hoist_cond_calls(&b.left, cx, out));
+            b2.right = Box::new(hoist_cond_calls(&b.right, cx, out));
+            syn::Expr::Binary(b2)
+        }
+        syn::Expr::Unary(u) => {
+            let mut u2 = u.clone();
+            u2.expr = Box::new(hoist_cond_calls(&u.expr, cx, out));
+            syn::Expr::Unary(u2)
+        }
+        syn::Expr::Paren(p) => {
+            let mut p2 = p.clone();
+            p2.expr = Box::new(hoist_cond_calls(&p.expr, cx, out));
+            syn::Expr::Paren(p2)
+        }
+        other => other.clone(),
+    }
 }
 
 /// Lower `if c {A} else {B}` used as a VALUE into the equivalent A1 If:
@@ -1577,6 +1654,31 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
             // Vec methods, bool-returning predicates, indexing...
             let recv_ty = infer_ty(&m.receiver, cx);
             let rust_name = m.method.to_string();
+            if rust_name == "clone" {
+                // x.clone() under the Rust Clone bound NEVER aliases —
+                // an independent deep copy is exact for every store
+                // value (the CloneDeep drop-in; structuredClone in JS).
+                if !m.args.is_empty() {
+                    refuse("clone with arguments", m.span());
+                }
+                return json!({
+                    "type": "CloneDeep",
+                    "value": value_expr(&m.receiver, cx),
+                });
+            }
+            if rust_name == "load" {
+                // `flag.load(Ordering::..)` on an AtomicBool — a plain
+                // variable read (single-threaded runtime: exact)
+                if let Ty::AtomicBool = recv_ty {
+                    let Some(syn::Expr::Path(p)) = Some(m.receiver.as_ref()) else {
+                        refuse("atomic load target path", m.receiver.span());
+                    };
+                    let Some(name) = single_path(p) else {
+                        refuse("atomic load target path", p.span());
+                    };
+                    return get_var(&name.to_string());
+                }
+            }
             if let Ty::Struct(ty_name) = &recv_ty {
                 // inherent method dispatch: `obj.m(args)` ->
                 // fnValue("Type_m", [obj, args...]) — the mangled def's
@@ -1590,7 +1692,7 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                 call_args.extend(m.args.iter().cloned());
                 return fn_call_expr_values(&target, call_args, "fnValue", cx);
             }
-            let js_name = match (&recv_ty, rust_name.as_str()) {
+            let js_name_raw = match (&recv_ty, rust_name.as_str()) {
                 (Ty::Str, "contains") => "includes",
                 (Ty::Str, "starts_with") => "startsWith",
                 (Ty::Str, "ends_with") => "endsWith",
@@ -1599,6 +1701,8 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                 (Ty::Str, "trim_end") => "trimEnd",
                 (Ty::Str, "to_lowercase") => "toLowerCase",
                 (Ty::Str, "to_uppercase") => "toUpperCase",
+                // strings are immutable JS values — to_string is identity
+                (Ty::Str, "to_string") => "<identity>",
                 _ => refuse(
                     &format!(
                         "method `{}` on {}receiver (no proven JS-equivalent yet)",
@@ -1614,12 +1718,17 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                             Ty::Enum(ref n) => {
                                 unreachable!("enum receivers are not method targets: {}", n)
                             }
+                            Ty::AtomicBool => "",
                             Ty::Unknown => "",
                         }
                     ),
                     m.method.span(),
                 ),
             };
+            if js_name_raw == "<identity>" {
+                return value_expr(&m.receiver, cx);
+            }
+            let js_name = js_name_raw;
             json!({
                 "type": "MethodCall",
                 "object": value_expr(&m.receiver, cx),
@@ -1818,8 +1927,22 @@ fn test_string(e: &syn::Expr, cx: &Cx) -> String {
         // grammar: `$b` alone parses as a nonempty-string/file test, not
         // a bool read. Refuse until a bool-var contract lands.
         syn::Expr::Path(p) => {
+            // a PROVEN-bool variable has an exact condition form: it is
+            // true iff its store value stringifies to "true"
+            let name = single_path(p);
+            let is_bool = name
+                .and_then(|id| {
+                    cx.vars.borrow().get(&id.to_string()).cloned().or_else(|| {
+                        cx.statics.borrow().get(&id.to_string()).cloned()
+                    })
+                })
+                .map(|t| matches!(t, Ty::Bool | Ty::AtomicBool))
+                .unwrap_or(false);
+            if let (Some(name), true) = (name, is_bool) {
+                return format!("${name} = \"true\"");
+            }
             refuse(
-                "boolean variable as a condition (bool vars not yet representable)",
+                "boolean variable as a condition (type not proven)",
                 p.span(),
             )
         }
@@ -1862,6 +1985,11 @@ fn operand(e: &syn::Expr, cx: &Cx, str_eq: bool) -> String {
         }
         syn::Expr::Lit(l) => match &l.lit {
             syn::Lit::Int(li) => int_text(li),
+            // booleans stringify exactly ("true"/"false") — exact under
+            // string equality; numeric -eq would misparse both as 0/NaN
+            syn::Lit::Bool(lb) if str_eq => {
+                format!("\"{}\"", if lb.value() { "true" } else { "false" })
+            }
             syn::Lit::Str(ls) if str_eq => format!("\"{}\"", ls.value()),
             other => refuse("literal in condition operand", other.span()),
         },
@@ -1878,7 +2006,9 @@ fn operand(e: &syn::Expr, cx: &Cx, str_eq: bool) -> String {
 fn eq_op(l: &syn::Expr, r: &syn::Expr, ne: bool, cx: &Cx) -> &'static str {
     fn textual(e: &syn::Expr, cx: &Cx) -> bool {
         match e {
-            syn::Expr::Lit(l2) => matches!(l2.lit, syn::Lit::Str(_)),
+            syn::Expr::Lit(l2) => {
+                matches!(l2.lit, syn::Lit::Str(_) | syn::Lit::Bool(_))
+            }
             syn::Expr::Reference(r2) => textual(&r2.expr, cx),
             syn::Expr::Paren(p) => textual(&p.expr, cx),
             syn::Expr::Path(p) => {
@@ -1889,8 +2019,12 @@ fn eq_op(l: &syn::Expr, r: &syn::Expr, ne: bool, cx: &Cx) -> &'static str {
                     }
                 }
                 single_path(p)
-                    .and_then(|id| cx.vars.borrow().get(&id.to_string()).cloned())
-                    .map(|t| matches!(t, Ty::Str | Ty::Enum(_)))
+                    .and_then(|id| {
+                        cx.vars.borrow().get(&id.to_string()).cloned().or_else(|| {
+                            cx.statics.borrow().get(&id.to_string()).cloned()
+                        })
+                    })
+                    .map(|t| matches!(t, Ty::Str | Ty::Enum(_) | Ty::Bool | Ty::AtomicBool))
                     .unwrap_or(false)
             }
             _ => false,
