@@ -29,6 +29,7 @@
 //! eprintln!, floats, bools, char literals, dynamic range bounds, macros.
 
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::process::exit;
 use syn::spanned::Spanned;
 
@@ -87,6 +88,37 @@ fn arith_bin(op: &str, lhs: Value, rhs: Value) -> Value {
 
 // ── CLI ─────────────────────────────────────────────────────────────
 
+
+/// Lowering context — the integer-const table. Rust const-evaluates
+/// `const`/`static` items with literal initializers; range bounds and
+/// comparison operands may legally reference them, so path lowering
+/// resolves against this table. Const folding is semantics-preserving
+/// compiler work, NOT a backend encoding.
+#[derive(Default)]
+struct Cx {
+    ints: HashMap<String, i64>,
+    /// global assignments (consts/statics), in source order
+    globals: Vec<Value>,
+}
+
+/// Const-evaluate an expression to i64 if possible (literal / -literal /
+/// paren / already-tabled path).
+fn const_int(e: &syn::Expr, cx: &Cx) -> Option<i64> {
+    match e {
+        syn::Expr::Lit(l) => match &l.lit {
+            syn::Lit::Int(li) => li.base10_parse().ok(),
+            _ => None,
+        },
+        syn::Expr::Unary(u) => match u.op {
+            syn::UnOp::Neg(_) => Some(-const_int(&u.expr, cx)?),
+            _ => None,
+        },
+        syn::Expr::Paren(p) => const_int(&p.expr, cx),
+        syn::Expr::Path(p) => single_path(p).and_then(|id| cx.ints.get(&id.to_string()).copied()),
+        _ => None,
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut file: Option<String> = None;
@@ -120,10 +152,35 @@ fn main() {
         exit(1);
     });
 
+    // pre-pass: collect consts/statics (globals + int-const table) so any
+    // later lowering step can const-fold against them.
+    let mut cx = Cx::default();
+    for item in &ast.items {
+        match item {
+            syn::Item::Const(c) => {
+                cx.globals.push(assign_stmt(&c.ident.to_string(), value_expr(&c.expr, &cx)));
+                if let Some(v) = const_int(&c.expr, &cx) {
+                    cx.ints.insert(c.ident.to_string(), v);
+                }
+            }
+            syn::Item::Static(s) => {
+                cx.globals.push(assign_stmt(&s.ident.to_string(), value_expr(&s.expr, &cx)));
+                if let Some(v) = const_int(&s.expr, &cx) {
+                    cx.ints.insert(s.ident.to_string(), v);
+                }
+            }
+            _ => {}
+        }
+    }
     let mut stmts: Vec<Value> = Vec::new();
     let mut found_main = false;
     for item in &ast.items {
         match item {
+            // `use` imports name things for the TYPE CHECKER only — they
+            // have no runtime effect, so lowering drops them.
+            syn::Item::Use(_) => {}
+            // consts/statics were collected in the pre-pass above.
+            syn::Item::Const(_) | syn::Item::Static(_) => {}
             syn::Item::Fn(f) => {
                 if f.sig.ident != "main" {
                     refuse("functions other than `main`", f.sig.ident.span());
@@ -141,21 +198,23 @@ fn main() {
                     refuse("non-plain `fn main` (async/unsafe/const)", f.sig.ident.span());
                 }
                 found_main = true;
-                lower_block(&f.block, &mut stmts);
+                lower_block(&f.block, &cx, &mut stmts);
             }
-            other => refuse("items other than `fn main`", other.span()),
+            other => refuse("items other than `fn`/`use`/`const`/`static`", other.span()),
         }
     }
     if !found_main {
         refuse("no `main` function", proc_macro2::Span::call_site());
     }
+    let mut all_stmts = std::mem::take(&mut cx.globals);
+    all_stmts.append(&mut stmts);
 
     let prog = json!({
         "contract_version": 1,
         "imports": [],
         "requires": [],
         "stmt_lines": [],
-        "stmts": stmts,
+        "stmts": all_stmts,
         "subs": [],
         "type": "Program",
         "var_const": [],
@@ -168,25 +227,32 @@ fn main() {
 
 // ── statements ──────────────────────────────────────────────────────
 
-fn lower_block(block: &syn::Block, out: &mut Vec<Value>) {
+fn lower_block(block: &syn::Block, cx: &Cx, out: &mut Vec<Value>) {
     for stmt in &block.stmts {
-        if let Some(v) = lower_stmt(stmt) {
+        if let Some(v) = lower_stmt(stmt, cx) {
             out.push(v);
         }
     }
 }
 
-fn lower_stmt(stmt: &syn::Stmt) -> Option<Value> {
+fn lower_stmt(stmt: &syn::Stmt, cx: &Cx) -> Option<Value> {
     match stmt {
-        syn::Stmt::Local(local) => lower_local(local),
-        syn::Stmt::Expr(e, _semi) => lower_expr_stmt(e),
+        syn::Stmt::Local(local) => lower_local(local, cx),
+        syn::Stmt::Expr(e, _semi) => lower_expr_stmt(e, cx),
         syn::Stmt::Item(item) => refuse("nested item declarations", item.span()),
-        syn::Stmt::Macro(m) => Some(lower_print_macro(&m.mac)),
+        syn::Stmt::Macro(m) => Some(lower_print_macro(&m.mac, cx)),
     }
 }
 
-fn lower_local(local: &syn::Local) -> Option<Value> {
-    let syn::Pat::Ident(pi) = &local.pat else {
+fn lower_local(local: &syn::Local, cx: &Cx) -> Option<Value> {
+    // `let x: i64 = ...` parses as Pat::Type wrapping Pat::Ident — the
+    // annotation is type-checker information, erased here (the store is
+    // dynamically typed).
+    let pat: &syn::Pat = match &local.pat {
+        syn::Pat::Type(pt) => &pt.pat,
+        p => p,
+    };
+    let syn::Pat::Ident(pi) = pat else {
         refuse("non-identifier `let` binding", local.pat.span());
     };
     let name = pi.ident.to_string();
@@ -196,13 +262,13 @@ fn lower_local(local: &syn::Local) -> Option<Value> {
         // no-op in the store model, exactly like c-sh-go's dropped `int i;`.
         return None;
     };
-    Some(assign_stmt(&name, value_expr(&init.expr)))
+    Some(assign_stmt(&name, value_expr(&init.expr, cx)))
 }
 
-fn lower_expr_stmt(e: &syn::Expr) -> Option<Value> {
+fn lower_expr_stmt(e: &syn::Expr, cx: &Cx) -> Option<Value> {
     match e {
-        syn::Expr::Macro(m) => Some(lower_print_macro(&m.mac)),
-        syn::Expr::Assign(a) => Some(plain_assign(a)),
+        syn::Expr::Macro(m) => Some(lower_print_macro(&m.mac, cx)),
+        syn::Expr::Assign(a) => Some(plain_assign(a, cx)),
         syn::Expr::Binary(b) => {
             // `x += e` parses as Expr::Binary with a compound-assign op
             use syn::BinOp::*;
@@ -210,14 +276,14 @@ fn lower_expr_stmt(e: &syn::Expr) -> Option<Value> {
                 b.op,
                 AddAssign(_) | SubAssign(_) | MulAssign(_) | DivAssign(_) | RemAssign(_)
             ) {
-                Some(compound_assign(b))
+                Some(compound_assign(b, cx))
             } else {
                 refuse("binary-operator statement (only compound assigns)", b.op.span())
             }
         }
-        syn::Expr::If(ie) => Some(if_stmt(ie)),
-        syn::Expr::While(w) => Some(while_stmt(w)),
-        syn::Expr::ForLoop(fl) => Some(for_stmt(fl)),
+        syn::Expr::If(ie) => Some(if_stmt(ie, cx)),
+        syn::Expr::While(w) => Some(while_stmt(w, cx)),
+        syn::Expr::ForLoop(fl) => Some(for_stmt(fl, cx)),
         syn::Expr::Return(r) => {
             if r.expr.is_some() {
                 refuse("`return` with a value", r.span());
@@ -236,22 +302,22 @@ fn lower_expr_stmt(e: &syn::Expr) -> Option<Value> {
                 refuse("bare path statement", e.span());
             }
         }
-        syn::Expr::Paren(p) => lower_expr_stmt(&p.expr),
+        syn::Expr::Paren(p) => lower_expr_stmt(&p.expr, cx),
         other => refuse("statement form", other.span()),
     }
 }
 
-fn plain_assign(a: &syn::ExprAssign) -> Value {
+fn plain_assign(a: &syn::ExprAssign, cx: &Cx) -> Value {
     let syn::Expr::Path(p) = &*a.left else {
         refuse("assignment target (only plain variables are supported)", a.left.span());
     };
     let Some(name) = single_path(p) else {
         refuse("assignment target path", p.span());
     };
-    assign_stmt(&name.to_string(), value_expr(&a.right))
+    assign_stmt(&name.to_string(), value_expr(&a.right, cx))
 }
 
-fn compound_assign(b: &syn::ExprBinary) -> Value {
+fn compound_assign(b: &syn::ExprBinary, cx: &Cx) -> Value {
     let syn::Expr::Path(p) = &*b.left else {
         refuse("assignment target (only plain variables are supported)", b.left.span());
     };
@@ -269,24 +335,24 @@ fn compound_assign(b: &syn::ExprBinary) -> Value {
         _ => refuse("compound assignment operator", b.op.span()),
     };
     // `i += 1` lowers to `i = i + 1` — the c-sh-go compound shape
-    assign_stmt(&name, arith_bin(op, arith_var(&name), arith_expr(&b.right)))
+    assign_stmt(&name, arith_bin(op, arith_var(&name), arith_expr(&b.right, cx)))
 }
 
-fn if_stmt(ie: &syn::ExprIf) -> Value {
-    let cond = test_call(&test_string(&ie.cond));
+fn if_stmt(ie: &syn::ExprIf, cx: &Cx) -> Value {
+    let cond = test_call(&test_string(&ie.cond, cx));
     let mut then = Vec::new();
-    lower_block(&ie.then_branch, &mut then);
+    lower_block(&ie.then_branch, cx, &mut then);
     let else_stmts: Vec<Value> = match &ie.else_branch {
         None => vec![],
         Some((_, inner)) => match &**inner {
             // `else if` lowers to a NESTED If in the else position — the
             // exact shape the shell frontend emits for elif chains (the
             // `elsifs` field stays empty).
-            syn::Expr::If(inner_if) => vec![if_stmt(inner_if)],
+            syn::Expr::If(inner_if) => vec![if_stmt(inner_if, cx)],
             // `else { ... }`
             syn::Expr::Block(blk) => {
                 let mut v = Vec::new();
-                lower_block(&blk.block, &mut v);
+                lower_block(&blk.block, cx, &mut v);
                 v
             }
             other => refuse("else form", other.span()),
@@ -295,17 +361,17 @@ fn if_stmt(ie: &syn::ExprIf) -> Value {
     json!({"cond": cond, "then": then, "elsifs": [], "else": else_stmts, "type": "If"})
 }
 
-fn while_stmt(w: &syn::ExprWhile) -> Value {
+fn while_stmt(w: &syn::ExprWhile, cx: &Cx) -> Value {
     if w.label.is_some() {
         refuse("labeled while", w.span());
     }
-    let cond = test_call(&test_string(&w.cond));
+    let cond = test_call(&test_string(&w.cond, cx));
     let mut body = Vec::new();
-    lower_block(&w.body, &mut body);
+    lower_block(&w.body, cx, &mut body);
     json!({"cond": cond, "body": body, "type": "While"})
 }
 
-fn for_stmt(fl: &syn::ExprForLoop) -> Value {
+fn for_stmt(fl: &syn::ExprForLoop, cx: &Cx) -> Value {
     if fl.label.is_some() {
         refuse("labeled for", fl.span());
     }
@@ -319,11 +385,11 @@ fn for_stmt(fl: &syn::ExprForLoop) -> Value {
     let (start, end, inclusive) = match &*fl.expr {
         syn::Expr::Range(r) => {
             let start = match &r.start {
-                Some(e) => int_literal(e),
+                Some(e) => int_literal(e, cx),
                 None => refuse("range without a start bound", r.span()),
             };
             let end = match &r.end {
-                Some(e) => int_literal(e),
+                Some(e) => int_literal(e, cx),
                 None => refuse("open-ended range", r.span()),
             };
             (start, end, matches!(r.limits, syn::RangeLimits::Closed(..)))
@@ -331,7 +397,7 @@ fn for_stmt(fl: &syn::ExprForLoop) -> Value {
         other => refuse("for-loop iterator (only `0..N` / `0..=N` ranges)", other.span()),
     };
     let mut body = Vec::new();
-    lower_block(&fl.body, &mut body);
+    lower_block(&fl.body, cx, &mut body);
     let end = if inclusive { end } else { end - 1 };
     json!({
         "body": body,
@@ -362,7 +428,7 @@ impl syn::parse::Parse for FmtArgs {
     }
 }
 
-fn lower_print_macro(mac: &syn::Macro) -> Value {
+fn lower_print_macro(mac: &syn::Macro, cx: &Cx) -> Value {
     let newline = if mac.path.segments.len() == 1 && mac.path.leading_colon.is_none() {
         match mac.path.segments[0].ident.to_string().as_str() {
             "println" => true,
@@ -390,7 +456,7 @@ fn lower_print_macro(mac: &syn::Macro) -> Value {
         translated
     })];
     for a in args {
-        elements.push(value_expr(a));
+        elements.push(value_expr(a, cx));
     }
     expr_stmt(exec_call("printf", elements))
 }
@@ -459,12 +525,16 @@ fn single_path(p: &syn::ExprPath) -> Option<&syn::Ident> {
 
 /// Value-position expression: int/string literals -> Str, vars -> getVar,
 /// arithmetic -> Arith (the c-sh-go value-node shapes).
-fn value_expr(e: &syn::Expr) -> Value {
+fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
     match e {
         syn::Expr::Lit(l) => match &l.lit {
             syn::Lit::Int(li) => str_lit(&int_text(li)),
             syn::Lit::Str(ls) => str_lit(&ls.value()),
-            other => refuse("literal type (only integers and strings)", other.span()),
+            // booleans are their OWN store kind — the A1 Bool expr renders
+            // to a JS boolean (native `true`/`false`), which prints exactly
+            // like Rust's `{}` formatting for bools.
+            syn::Lit::Bool(lb) => json!({"type": "Bool", "value": lb.value()}),
+            other => refuse("literal type (only integers, strings, bools)", other.span()),
         },
         syn::Expr::Path(p) => {
             let Some(name) = single_path(p) else {
@@ -472,15 +542,15 @@ fn value_expr(e: &syn::Expr) -> Value {
             };
             get_var(&name.to_string())
         }
-        syn::Expr::Binary(b) => arith_from_binary(b),
-        syn::Expr::Unary(u) => arith_from_unary(u),
-        syn::Expr::Paren(p) => value_expr(&p.expr),
+        syn::Expr::Binary(b) => arith_from_binary(b, cx),
+        syn::Expr::Unary(u) => arith_from_unary(u, cx),
+        syn::Expr::Paren(p) => value_expr(&p.expr, cx),
         other => refuse("expression", other.span()),
     }
 }
 
 /// Arithmetic-position expression -> the A1 Arith AST (Num/Var/Bin).
-fn arith_expr(e: &syn::Expr) -> Value {
+fn arith_expr(e: &syn::Expr, cx: &Cx) -> Value {
     match e {
         syn::Expr::Lit(l) => match &l.lit {
             syn::Lit::Int(li) => arith_num(int_text(li).parse().unwrap_or_else(|_| {
@@ -494,14 +564,14 @@ fn arith_expr(e: &syn::Expr) -> Value {
             };
             arith_var(&name.to_string())
         }
-        syn::Expr::Binary(b) => arith_from_binary(b),
-        syn::Expr::Unary(u) => arith_from_unary(u),
-        syn::Expr::Paren(p) => arith_expr(&p.expr),
+        syn::Expr::Binary(b) => arith_from_binary(b, cx),
+        syn::Expr::Unary(u) => arith_from_unary(u, cx),
+        syn::Expr::Paren(p) => arith_expr(&p.expr, cx),
         other => refuse("expression in arithmetic", other.span()),
     }
 }
 
-fn arith_from_binary(b: &syn::ExprBinary) -> Value {
+fn arith_from_binary(b: &syn::ExprBinary, cx: &Cx) -> Value {
     use syn::BinOp::*;
     let op = match b.op {
         Add(_) => "+",
@@ -511,12 +581,12 @@ fn arith_from_binary(b: &syn::ExprBinary) -> Value {
         Rem(_) => "%",
         _ => refuse("binary operator in arithmetic", b.op.span()),
     };
-    arith_bin(op, arith_expr(&b.left), arith_expr(&b.right))
+    arith_bin(op, arith_expr(&b.left, cx), arith_expr(&b.right, cx))
 }
 
-fn arith_from_unary(u: &syn::ExprUnary) -> Value {
+fn arith_from_unary(u: &syn::ExprUnary, cx: &Cx) -> Value {
     match u.op {
-        syn::UnOp::Neg(_) => arith_bin("-", arith_num(0), arith_expr(&u.expr)),
+        syn::UnOp::Neg(_) => arith_bin("-", arith_num(0), arith_expr(&u.expr, cx)),
         _ => refuse("unary operator", u.op.span()),
     }
 }
@@ -533,8 +603,16 @@ fn int_text(li: &syn::LitInt) -> String {
     v.to_string()
 }
 
-fn int_literal(e: &syn::Expr) -> i64 {
+fn int_literal(e: &syn::Expr, cx: &Cx) -> i64 {
     match e {
+        syn::Expr::Path(p) => {
+            // a named const (`for i in 0..LIMIT`) — Rust const-evaluates
+            // it; resolve from the table or refuse.
+            match const_int(e, cx) {
+                Some(v) => v,
+                None => refuse("range bound (unknown const)", p.span()),
+            }
+        }
         syn::Expr::Lit(l) => match &l.lit {
             syn::Lit::Int(li) => int_text(li)
                 .parse()
@@ -552,44 +630,62 @@ fn int_literal(e: &syn::Expr) -> i64 {
 
 /// A boolean condition -> the `test` STRING grammar the runtime parses
 /// (`$x -gt 1`, `-a`/`-o` chains, `!`, parens) — the c-sh-go shapes.
-fn test_string(e: &syn::Expr) -> String {
+fn test_string(e: &syn::Expr, cx: &Cx) -> String {
     match e {
+        // literal-bool conditions (`while true`, `if false`) — the test
+        // grammar has no boolean literals, so they fold to always-true /
+        // always-false numeric comparisons.
+        syn::Expr::Lit(l) => match &l.lit {
+            syn::Lit::Bool(lb) => {
+                if lb.value() {
+                    "1 -eq 1".into()
+                } else {
+                    "0 -eq 1".into()
+                }
+            }
+            _ => refuse("literal in condition", l.span()),
+        },
         syn::Expr::Binary(b) => {
             use syn::BinOp::*;
             match b.op {
-                Eq(_) => bin_test("-eq", &b.left, &b.right),
-                Ne(_) => bin_test("-ne", &b.left, &b.right),
-                Lt(_) => bin_test("-lt", &b.left, &b.right),
-                Le(_) => bin_test("-le", &b.left, &b.right),
-                Gt(_) => bin_test("-gt", &b.left, &b.right),
-                Ge(_) => bin_test("-ge", &b.left, &b.right),
+                Eq(_) => bin_test("-eq", &b.left, &b.right, cx),
+                Ne(_) => bin_test("-ne", &b.left, &b.right, cx),
+                Lt(_) => bin_test("-lt", &b.left, &b.right, cx),
+                Le(_) => bin_test("-le", &b.left, &b.right, cx),
+                Gt(_) => bin_test("-gt", &b.left, &b.right, cx),
+                Ge(_) => bin_test("-ge", &b.left, &b.right, cx),
                 // the runtime's test parser binds -a tighter than -o,
                 // matching Rust's && before ||
-                And(_) => format!("{} -a {}", test_string(&b.left), test_string(&b.right)),
-                Or(_) => format!("{} -o {}", test_string(&b.left), test_string(&b.right)),
+                And(_) => format!("{} -a {}", test_string(&b.left, cx), test_string(&b.right, cx)),
+                Or(_) => format!("{} -o {}", test_string(&b.left, cx), test_string(&b.right, cx)),
                 _ => refuse("binary operator in condition", b.op.span()),
             }
         }
         syn::Expr::Unary(u) => match u.op {
-            syn::UnOp::Not(_) => format!("! {}", test_string(&u.expr)),
+            syn::UnOp::Not(_) => format!("! {}", test_string(&u.expr, cx)),
             _ => refuse("unary operator in condition", u.op.span()),
         },
-        syn::Expr::Paren(p) => format!("( {} )", test_string(&p.expr)),
+        syn::Expr::Paren(p) => format!("( {} )", test_string(&p.expr, cx)),
         other => refuse("condition expression", other.span()),
     }
 }
 
-fn bin_test(op: &str, l: &syn::Expr, r: &syn::Expr) -> String {
-    format!("{} {} {}", operand(l), op, operand(r))
+fn bin_test(op: &str, l: &syn::Expr, r: &syn::Expr, cx: &Cx) -> String {
+    format!("{} {} {}", operand(l, cx), op, operand(r, cx))
 }
 
 /// Comparison operand: a variable (`$x`) or an integer literal.
-fn operand(e: &syn::Expr) -> String {
+fn operand(e: &syn::Expr, cx: &Cx) -> String {
     match e {
         syn::Expr::Path(p) => {
             let Some(name) = single_path(p) else {
                 refuse("path in condition operand", p.span());
             };
+            // a named const resolves at compile time (const folding);
+            // everything else is a runtime variable read.
+            if let Some(v) = cx.ints.get(&name.to_string()) {
+                return v.to_string();
+            }
             format!("${name}")
         }
         syn::Expr::Lit(l) => match &l.lit {

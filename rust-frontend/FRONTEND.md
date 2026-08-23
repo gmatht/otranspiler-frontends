@@ -36,6 +36,32 @@ Expressible (each pinned by a testdata/*.rs stdout example, t01–t12):
 - bare `return;` lowers to the A1 `Exit` statement (it ENDS the program —
   not a no-op; regression t25) and bare `x;` (no-op) is dropped
 
+## v0.2 additions (the src/ coverage push, tier-1 = JS/ESTree)
+
+The goal: parse ALL the Rust in sh2perl's `src/` (30 files, ~109k lines).
+Architecture stance (per the core owner):
+  - the frontend emits NATURAL Rust semantics in shIR — no shell-shaped
+    encodings, no JS-specific ones either; conversion to a concrete
+    backend is the CORE WORKER's job or a GENERIC shIR->shIR transform;
+  - where shIR lacks a node Rust needs, it is added as a DROP-IN file
+    (`sh2perl/src/shir_nodes/*.node`) so build.rs generates the bindings —
+    never by editing shared core files (merge-conflict discipline);
+  - tier-1 validation is the executed-stdout oracle vs native rustc
+    through the ESTree/JS path (`make test`).
+
+Added (each pinned by testdata t31-t34):
+- `use` items — dropped (type-checker-only names, zero runtime effect)
+- `const NAME: T = e;` / `static NAME: T = e;` items — immutable globals,
+  lowered to assignments that run BEFORE main; integer consts join a
+  const table and are FOLDED at compile time wherever the A1 grammar
+  demands a literal (range bounds `for i in 0..LIMIT`, test operands).
+  Const folding is semantics-preserving compiler work, not an encoding.
+- `let x: i64 = e;` type annotations (Pat::Type) — erased (the store is
+  dynamically typed); deferred-init typed lets still dropped
+- boolean literals as VALUES (`let b = true;`) — the A1 `Bool` expr,
+  rendered by the core to a native JS boolean (prints like Rust `{}`);
+  literal-bool CONDITIONS fold to always-true/false numeric tests
+
 Refused loudly (testdata/*_refuse.rs — the emit MUST fail, t13–t23):
 borrows `&x`, user functions, `String::from`/method calls, `match`,
 `vec!`, `eprintln!`/`dbg!`, floats, `{:?}`/named/width format specs,
