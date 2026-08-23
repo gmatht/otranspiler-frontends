@@ -154,10 +154,16 @@ fn main() {
         exit(1);
     });
 
+    // Flatten inline `mod` blocks into one item list — namespace nesting
+    // has no effect on the lowered program (names stay as written;
+    // qualified paths resolve only for `Type::method` call targets).
+    let mut flat: Vec<&syn::Item> = Vec::new();
+    flatten_items(&ast.items, &mut flat);
+
     // pre-pass: collect consts/statics (globals + int-const table) so any
     // later lowering step can const-fold against them.
     let mut cx = Cx::default();
-    for item in &ast.items {
+    for item in &flat {
         match item {
             syn::Item::Const(c) => {
                 cx.globals.push(assign_stmt(&c.ident.to_string(), value_expr(&c.expr, &cx)));
@@ -174,26 +180,87 @@ fn main() {
             _ => {}
         }
     }
-    // second pre-pass: register the non-main functions (call targets).
-    let mut fns: Vec<&syn::ItemFn> = Vec::new();
-    for item in &ast.items {
-        if let syn::Item::Fn(f) = item {
-            if f.sig.ident != "main" {
+    // second pre-pass: register the non-main functions (call targets) —
+    // free fns under their own name, inherent impl methods under the
+    // mangled `Type_method` name (`Point::new` -> `Point_new`).
+    let mut fns: Vec<FnSource> = Vec::new();
+    for item in &flat {
+        match item {
+            syn::Item::Fn(f) if f.sig.ident != "main" => {
                 cx.fns.push(f.sig.ident.to_string());
-                fns.push(f);
+                fns.push(FnSource::Free(f));
             }
+            syn::Item::Impl(i) => {
+                // Inherent AND trait impls lower their methods under the
+                // mangled `Type_method` name. This guesses nothing: every
+                // method-CALL path (receiver syntax, trait dispatch)
+                // refuses at its expression site until the method-contract
+                // tranche lands, so a dropped/lowered impl body is dead
+                // code until then.
+                let ty = type_ident(&i.self_ty).unwrap_or_else(|| {
+                    refuse("impl of generic/qualified type", i.self_ty.span())
+                });
+                for ii in &i.items {
+                    if let syn::ImplItem::Fn(m) = ii {
+                        let mangled = format!("{}_{}", ty, m.sig.ident);
+                        cx.fns.push(mangled.clone());
+                        fns.push(FnSource::Method(mangled, m));
+                    }
+                    // non-fn impl items (consts/types) are declaration-only
+                }
+            }
+            _ => {}
         }
     }
     let mut stmts: Vec<Value> = Vec::new();
-    for item in &ast.items {
+    for item in &flat {
         match item {
             // `use` imports name things for the TYPE CHECKER only — they
             // have no runtime effect, so lowering drops them.
             syn::Item::Use(_) => {}
             // consts/statics were collected in the pre-pass above.
             syn::Item::Const(_) | syn::Item::Static(_) => {}
+            // `#[cfg(test)]`-gated items are test-harness-only code —
+            // they do not exist in a normal build; drop the subtree.
+            syn::Item::Fn(f) if cfg_test_only(&f.attrs) => {}
+            syn::Item::Mod(m) if cfg_test_only(&m.attrs) => {}
+            syn::Item::Impl(i) if cfg_test_only(&i.attrs) => {}
+            syn::Item::Struct(s) if cfg_test_only(&s.attrs) => {}
+            syn::Item::Enum(e) if cfg_test_only(&e.attrs) => {}
+            syn::Item::Static(s) if cfg_test_only(&s.attrs) => {}
+            syn::Item::Const(c) if cfg_test_only(&c.attrs) => {}
             // non-main fns were collected just above and lower below.
             syn::Item::Fn(f) if f.sig.ident != "main" => {}
+            syn::Item::Impl(_) => {}
+            // the mod ITEM itself: contents were flattened above; file
+            // modules (`mod x;`) contribute nothing on their own.
+            syn::Item::Mod(_) => {}
+            // Declaration-only items: no runtime effect BY THEMSELVES.
+            // Every USE (struct literal, variant path, trait method call)
+            // refuses at its own expression site — nothing is smeared.
+            syn::Item::Struct(_)
+            | syn::Item::Enum(_)
+            | syn::Item::Union(_)
+            | syn::Item::Type(_)
+            | syn::Item::Trait(_) => {}
+            // `macro_rules!` DEFINITIONS have no runtime effect; unknown
+            // INVOCATIONS still refuse at their site. Any other item-level
+            // macro (lazy_static! etc. creates state) refuses.
+            syn::Item::Macro(m) => {
+                let is_rules = m
+                    .mac
+                    .path
+                    .segments
+                    .last()
+                    .map(|s| s.ident == "macro_rules")
+                    .unwrap_or(false);
+                if !is_rules {
+                    refuse(
+                        "item-level macro invocation (creates state / selects code)",
+                        m.span(),
+                    );
+                }
+            }
             syn::Item::Fn(f) => {
                 if let Some(a) = first_semantic_attr(&f.attrs) {
                     refuse("semantic attribute on `fn main`", a.span());
@@ -218,8 +285,19 @@ fn main() {
     let mut all_stmts = std::mem::take(&mut cx.globals);
     // function definitions FIRST — runtime def-before-use order (the A1
     // Function statement lowers to a definition executed in stmt order).
-    for f in &fns {
-        all_stmts.push(fn_def(f, &cx));
+    for src_fn in &fns {
+        all_stmts.push(match src_fn {
+            FnSource::Free(f) => function_def(
+                f.sig.ident.to_string(),
+                &f.attrs,
+                &f.sig,
+                &f.block,
+                &cx,
+            ),
+            FnSource::Method(name, m) => {
+                function_def(name.clone(), &m.attrs, &m.sig, &m.block, &cx)
+            }
+        });
     }
     all_stmts.append(&mut stmts);
 
@@ -323,14 +401,10 @@ fn lower_expr_stmt(e: &syn::Expr, cx: &Cx, in_fn: bool) -> Option<Value> {
             let Some(syn::Expr::Path(p)) = Some(c.func.as_ref()) else {
                 refuse("call target path", c.func.span());
             };
-            let Some(name) = single_path(p) else {
-                refuse("qualified call target", p.span());
+            let Some(target) = call_target(p, cx) else {
+                refuse("call to unknown function", c.func.span());
             };
-            let name = name.to_string();
-            if !cx.fns.iter().any(|f| *f == name) {
-                refuse(&format!("call to unknown function `{name}`"), c.func.span());
-            }
-            Some(expr_stmt(fn_call_expr(&name, &c.args, "fnCall", cx)))
+            Some(expr_stmt(fn_call_expr(&target, &c.args, "fnCall", cx)))
         }
         syn::Expr::Path(p) => {
             // bare `x;` — evaluates the variable, no side effect (c-sh-go
@@ -447,6 +521,62 @@ fn for_stmt(fl: &syn::ExprForLoop, cx: &Cx, in_fn: bool) -> Value {
     })
 }
 
+/// Where a lowered function definition came from: a free `fn` item or an
+/// inherent impl method (lowered under the mangled `Type_method` name).
+enum FnSource<'a> {
+    Free(&'a syn::ItemFn),
+    Method(String, &'a syn::ImplItemFn),
+}
+
+/// Flatten inline `mod` blocks into one item list (recursively). File
+/// modules (`mod x;`) contribute nothing — their contents live in other
+/// files this single-file lowering never sees; any cross-file USE refuses
+/// at its own site.
+fn flatten_items<'a>(items: &'a [syn::Item], out: &mut Vec<&'a syn::Item>) {
+    for item in items {
+        // a `#[cfg(test)]`-gated inline mod contributes NOTHING to a
+        // normal build — do not descend into it (its children must not
+        // re-enter the flat list as standalone items).
+        if let syn::Item::Mod(m) = item {
+            if cfg_test_only(&m.attrs) {
+                continue;
+            }
+        }
+        out.push(item);
+        if let syn::Item::Mod(m) = item {
+            if let Some((_, inner)) = &m.content {
+                flatten_items(inner, out);
+            }
+        }
+    }
+}
+
+/// The plain identifier of a non-generic path type (`Point`), or None
+/// (`Vec<T>`, `&T`, qualified paths — none name a lowerable impl target).
+fn type_ident(ty: &syn::Type) -> Option<String> {
+    if let syn::Type::Path(tp) = ty {
+        if tp.qself.is_none() {
+            if let Some(seg) = tp.path.segments.last() {
+                if seg.arguments.is_none() && tp.path.leading_colon.is_none() {
+                    return Some(seg.ident.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// True when EVERY attribute on the item is `#[cfg(test)]` — the item is
+/// test-harness-only code that does not exist in a normal build, so
+/// dropping it (with its whole subtree) is semantics-preserving.
+fn cfg_test_only(attrs: &[syn::Attribute]) -> bool {
+    !attrs.is_empty()
+        && attrs.iter().all(|a| {
+            a.path().is_ident("cfg")
+                && a.meta.require_list().map(|l| l.tokens.to_string()).map(|t| t.trim() == "test").unwrap_or(false)
+        })
+}
+
 /// Inert attributes: compile-time-only metadata with NO runtime effect
 /// (`#[test]` defs are ordinary functions outside `cargo test`;
 /// `#[macro_export]`/doc/allow/inline/deprecated are compiler bookkeeping).
@@ -457,6 +587,37 @@ fn first_semantic_attr<'a>(attrs: &'a [syn::Attribute]) -> Option<&'a syn::Attri
         let name = a.path().segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
         !matches!(name.as_str(), "test" | "macro_export" | "allow" | "inline" | "deprecated" | "doc")
     })
+}
+
+/// Resolve a call target path to a registered lowered-name: a free fn
+/// (`f`) or an inherent impl method (`Type::method` -> `Type_method`).
+/// Returns None for anything else (unknown names, deeper paths,
+/// turbofish) — the caller refuses.
+fn call_target(p: &syn::ExprPath, cx: &Cx) -> Option<String> {
+    if p.qself.is_some() || p.path.leading_colon.is_some() {
+        return None;
+    }
+    let segs: Vec<&syn::PathSegment> = p.path.segments.iter().collect();
+    let known = |n: &str| cx.fns.iter().any(|f| *f == n);
+    match segs.len() {
+        1 if segs[0].arguments.is_none() => {
+            let n = segs[0].ident.to_string();
+            if known(&n) {
+                Some(n)
+            } else {
+                None
+            }
+        }
+        2 if segs.iter().all(|s| s.arguments.is_none()) => {
+            let mangled = format!("{}_{}", segs[0].ident, segs[1].ident);
+            if known(&mangled) {
+                Some(mangled)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 /// A user-fn call node — `func` is "fnCall" (statement/void) or "fnValue"
@@ -491,26 +652,33 @@ fn unit_tail(e: &syn::Expr) -> bool {
     )
 }
 
-/// Lower a non-main `fn` item to the A1 Function statement — the
+/// Lower a function definition to the A1 Function statement — the
 /// c-sh-go protocol: positional params copied from getVar("1")... at
-/// entry; calls dispatch via fnCall (void) / fnValue (value).
-fn fn_def(f: &syn::ItemFn, cx: &Cx) -> Value {
-    if let Some(a) = first_semantic_attr(&f.attrs) {
+/// entry; calls dispatch via fnCall (void) / fnValue (value). `name` is
+/// the free-fn ident or the mangled `Type_method` for impl methods.
+fn function_def(
+    name: String,
+    attrs: &[syn::Attribute],
+    sig: &syn::Signature,
+    block: &syn::Block,
+    cx: &Cx,
+) -> Value {
+    if let Some(a) = first_semantic_attr(attrs) {
         refuse("semantic attribute on a function", a.span());
     }
-    if !f.sig.generics.params.is_empty() {
-        refuse("generic function", f.sig.generics.params.span());
+    if !sig.generics.params.is_empty() {
+        refuse("generic function", sig.generics.params.span());
     }
-    if f.sig.asyncness.is_some() || f.sig.unsafety.is_some() || f.sig.constness.is_some() {
-        refuse("non-plain `fn` (async/unsafe/const)", f.sig.ident.span());
+    if sig.asyncness.is_some() || sig.unsafety.is_some() || sig.constness.is_some() {
+        refuse("non-plain `fn` (async/unsafe/const)", sig.ident.span());
     }
-    if f.sig.variadic.is_some() {
-        refuse("variadic function", f.sig.variadic.span());
+    if sig.variadic.is_some() {
+        refuse("variadic function", sig.variadic.span());
     }
-    let returns_value = !matches!(f.sig.output, syn::ReturnType::Default);
+    let returns_value = !matches!(sig.output, syn::ReturnType::Default);
     let mut body: Vec<Value> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
-    for (i, input) in f.sig.inputs.iter().enumerate() {
+    for (i, input) in sig.inputs.iter().enumerate() {
         let pt = match input {
             syn::FnArg::Typed(pt) => pt,
             syn::FnArg::Receiver(r) => {
@@ -534,8 +702,8 @@ fn fn_def(f: &syn::ItemFn, cx: &Cx) -> Value {
     }
     // Body statements; a SEMI-LESS tail expression RETURNS ITS VALUE when
     // the signature declares a return type (Rust tail-expression return).
-    let n = f.block.stmts.len();
-    for (i, stmt) in f.block.stmts.iter().enumerate() {
+    let n = block.stmts.len();
+    for (i, stmt) in block.stmts.iter().enumerate() {
         if i + 1 == n {
             if let syn::Stmt::Expr(e, None) = stmt {
                 if unit_tail(e) {
@@ -563,7 +731,7 @@ fn fn_def(f: &syn::ItemFn, cx: &Cx) -> Value {
             body.push(v);
         }
     }
-    json!({"body": body, "name": f.sig.ident.to_string(), "type": "Function"})
+    json!({"body": body, "name": name, "type": "Function"})
 }
 
 // ── print!/println! (the only supported macros) ─────────────────────
@@ -711,14 +879,10 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
             let Some(syn::Expr::Path(p)) = Some(c.func.as_ref()) else {
                 refuse("call target path", c.func.span());
             };
-            let Some(name) = single_path(p) else {
-                refuse("qualified call target", p.span());
+            let Some(target) = call_target(p, cx) else {
+                refuse("call to unknown function", c.func.span());
             };
-            let name = name.to_string();
-            if !cx.fns.iter().any(|f| *f == name) {
-                refuse(&format!("call to unknown function `{name}`"), c.func.span());
-            }
-            fn_call_expr(&name, &c.args, "fnValue", cx)
+            fn_call_expr(&target, &c.args, "fnValue", cx)
         }
         other => refuse("expression", other.span()),
     }

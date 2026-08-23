@@ -86,6 +86,29 @@ Added (each pinned by testdata t31-t34):
 Pinned by t35_functions.rs; t14_fn_refuse moved to the generic-fn
 refusal boundary.
 
+## v0.4 additions — declarations & associated functions
+
+- struct / enum / union / type-alias / trait ITEMS accepted as
+  declarations (no runtime effect by themselves; every USE — struct
+  literal, variant path, trait dispatch — refuses at its own site)
+- inline `mod` blocks flattened into the item list (namespace nesting is
+  invisible to the lowered names); file `mod x;` contributes nothing;
+  `#[cfg(test)]`-gated subtrees dropped entirely (test-harness-only code
+  does not exist in a normal build)
+- `macro_rules!` definitions dropped (unknown invocations still refuse);
+  other item-level macros refuse (lazy_static! etc. creates state)
+- inherent AND trait impl methods lower as mangled `Type_method`
+  Function defs; calls resolve `Type::method(...)` through the mangling.
+  This guesses nothing: every RECEIVER path (&self syntax) refuses until
+  the method-contract tranche lands.
+- STILL refused: method receivers/field access, unknown call targets
+  (`String::from`, mod-path calls like `math::triple`), closures
+
+Pinned by t36_decls.rs + t37_method_refuse.rs. Corpus movement:
+11/30 -> 17/30 files past ALL structure into expression-level gaps
+(17x method-call/field-access expressions, 4x receivers, 3x unknown
+call targets, 1x if-tail-value, 1x {:?}, 1x lazy_static, 1x wasm_bindgen).
+
 Refused loudly (testdata/*_refuse.rs — the emit MUST fail, t13–t23):
 borrows `&x`, user functions, `String::from`/method calls, `match`,
 `vec!`, `eprintln!`/`dbg!`, floats, `{:?}`/named/width format specs,

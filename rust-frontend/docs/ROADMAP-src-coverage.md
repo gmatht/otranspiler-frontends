@@ -67,6 +67,10 @@ counts over the corpus (top entries):
 
 ## Phased plan (each phase = frontend subset growth + testdata pins, gate green)
 
+1c. DONE v0.4 — declarations: struct/enum/type/trait items, mod flattening,
+    cfg(test) subtree drops, macro_rules defs, impl methods under Type_method
+    mangling with Type::method call resolution; receivers still refuse
+    (t36/t37 pin it). Corpus: 17/30 past structure.
 1b. DONE v0.3 — user functions: multi-fn programs, positional params,
     fnValue/fnCall dispatch, native Return, tail-expression returns,
     no-main library files, inert attrs. t35 pins it. Corpus movement:
