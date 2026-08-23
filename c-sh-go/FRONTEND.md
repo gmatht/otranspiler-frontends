@@ -2,6 +2,34 @@
 
 C source -> A1 shIR JSON (the shell-flavored subset of C).
 
+## v5.5 — GNU asm operand sections + _Alignas (2026-08-23), 105/105
+
+The v5.4 "105/105" claim was STALE: the gate actually refused t91 and
+t95 at frontend emit (both testdata files post-date the doc). Two
+clib fixes, both in the refuse>guess spirit — a directive whose
+machine code the estree runtime cannot execute lowers to NO code (the
+t85–t90 family), and a compile-time-only specifier is dropped:
+
+- **GNU asm operand/clobber sections** (simpleAssign): the lexer's
+  qualifier drop removes `volatile`, so `asm volatile("" : "+r"(x))`
+  reached the generic call-statement parse and refused at the first
+  `:` (constraint strings are not comma-separated expressions).
+  `asm(...)` now skips its BALANCED parenthesized body — template plus
+  the `:` sections — and emits nothing. Pins: t91_asm_operand.c.
+- **`_Alignas(N)` / `alignas(N)`** (lex): the alignment specifier AND
+  its balanced parenthesized argument are dropped, so
+  `_Alignas(16) int x = 5;` parses like a plain declaration (before,
+  `_Alignas` became the declared name and the real type keyword
+  refused the statement). Alignment is a compile-time hint with no
+  runtime semantics in this subset — the same token-level strip the
+  CPP frontend applies to its own sugar. Pin: t95_alignas.c.
+
+Gate: make test = 105/105 ingress + 105/105 executed-stdout. CPP-side
+note: t31_type_qualifier.cc still emits DIFFERENTLY from cpp-sh-go
+(clib keeps the const/volatile declarations' initializers, cpp-sh-go's
+desugar drops them — a PRE-EXISTING documented gap of the CPP
+frontend, pinned 0-valued so stdout matches; not a c-sh-go issue).
+
 ## v5.4 — all the C in the CPP frontend parses (2026-08-23), 105/105
 
 Goal: the C frontend accepts every C construct the cpp-sh-go corpus

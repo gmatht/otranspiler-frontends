@@ -1666,6 +1666,43 @@ func lex(src string) ([]tok, error) {
 				j++
 			}
 			w := src[i:j]
+			// type QUALIFIERS carry no runtime semantics here — drop them
+			// so `const int x = 5;` keeps its initializer (the documented
+			// typeQualifier gap: the qualifier made the declarator parse
+			// as a bare `const` id and the initializer vanished) and
+			// `const char* f(...)` signatures parse like plain char*
+			switch w {
+			case "const", "volatile", "register", "restrict":
+				i = j
+				continue
+			case "_Alignas", "alignas":
+				// alignment specifier — C11 `<stdalign.h>`/C23 keyword.
+				// Compile-time-only (alignment hint, no runtime semantics
+				// in this subset): drop the specifier AND its balanced
+				// parenthesized argument (`_Alignas(16) int x = 5;` →
+				// `int x = 5;`) so the declaration parses like a plain
+				// one. Without this, `_Alignas` parsed as the declared
+				// name and the real type keyword refused the statement.
+				i = j
+				for i < n && (src[i] == ' ' || src[i] == '\t' || src[i] == '\n' || src[i] == '\r') {
+					i++
+				}
+				if i < n && src[i] == '(' {
+					depth := 0
+					for ; i < n; i++ {
+						if src[i] == '(' {
+							depth++
+						} else if src[i] == ')' {
+							depth--
+							if depth == 0 {
+								i++
+								break
+							}
+						}
+					}
+				}
+				continue
+			}
 			// C23 boolean / null-pointer keywords fold onto the int model —
 			// the SAME demotion the CPP frontend's desugar applies before
 			// clib sees the tokens (one lowering, two grammars). `bool` is
@@ -4328,6 +4365,36 @@ func (p *parser) simpleAssign() (any, error) {
 			}, nil
 		}
 		refuse("indexed assignment to " + name + " (not a heap pointer or array)")
+	}
+	if name == "asm" && p.isOp("(") {
+		// GNU asm statement (the lexer already dropped the optional
+		// `volatile` qualifier with the other type qualifiers): a
+		// compile-time-only directive whose machine code the estree
+		// runtime cannot execute. Skip the BALANCED parenthesized body —
+		// the template plus the `:`-separated operand/clobber/goto-label
+		// sections, whose `:` and constraint strings are not expressions
+		// (a generic call parse refuses at the first `:`) — and emit
+		// nothing: the same no-code lowering as the t85–t90
+		// attribute/qualifier/asm directive family.
+		depth := 0
+		for {
+			t := p.next()
+			if t == nil {
+				refuse("unterminated asm(...) statement")
+			}
+			if t.kind == "op" && t.text == "(" {
+				depth++
+			} else if t.kind == "op" && t.text == ")" {
+				depth--
+				if depth == 0 {
+					break
+				}
+			}
+		}
+		if err := p.expectOp(";"); err != nil {
+			return nil, err
+		}
+		return nil, nil
 	}
 	if p.isOp("(") {
 		// a call used as a statement: free(a) / sprintf(buf, ...) /
