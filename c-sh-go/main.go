@@ -1790,9 +1790,15 @@ func preprocessDefines(src string) {
 			continue
 		}
 		name := rest[:i]
+		// function-like ONLY when '(' immediately follows the name —
+		// `#define H (W + 2)` is an OBJECT-like macro whose body is a
+		// parenthesized expression (C standard: the space decides).
+		// Treating every leading-'(' body as a param list made such
+		// macros unexpandable at use sites (silent Var reads).
+		fnLike := i < len(rest) && rest[i] == '('
 		rest = strings.TrimSpace(rest[i:])
 		var params []string
-		if strings.HasPrefix(rest, "(") {
+		if fnLike && strings.HasPrefix(rest, "(") {
 			j := 1
 			for j < len(rest) && rest[j] != ')' {
 				j++
@@ -2510,7 +2516,14 @@ func arithNodeInner(e *expr) any {
 		// be modeled. Refuse (refuse > guess — silently folding to 0
 		// would be a lie). Lower the read to a temp first (`int v = p[i]`).
 		refuse("array/pointer read in an arithmetic context (lower it to a temp: int v = p[i])")
+	case "member":
+		// p.x — a flattened struct member read in arithmetic context: a
+		// plain store Var (the store owns the dotted name). Before this
+		// case the fall-through folded EVERY member read to Num(0)
+		// (p.y * 10 became 0 * 10 — a silent wrong answer).
+		return map[string]any{"type": "Var", "name": e.name}
 	}
+	refuse("unsupported construct in an arithmetic context")
 	return map[string]any{"type": "Num", "value": 0}
 }
 

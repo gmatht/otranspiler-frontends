@@ -201,6 +201,12 @@ func translate(toks []tok) ([]tok, error) {
 		case "bool":
 			out = append(out, tok{"id", "int"})
 			i++
+		case "const", "volatile", "register", "restrict":
+			// type qualifiers carry no runtime semantics — DROP them so
+			// the reconstructed C text matches the C frontend's lexer
+			// demotion (c-sh-go v5.4): `const int x = 5;` keeps its
+			// initializer on both fronts and emits byte-identical A1
+			i++
 		case "true":
 			out = append(out, tok{"num", "1"})
 			i++
