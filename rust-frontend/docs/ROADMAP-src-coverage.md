@@ -67,6 +67,11 @@ counts over the corpus (top entries):
 
 ## Phased plan (each phase = frontend subset growth + testdata pins, gate green)
 
+1d. DONE v0.5 — value-position booleans (test-call convention), soundness
+    fix for bare bool-var conditions, minimal Ty tracker, proven str-method
+    whitelist via A1 MethodCall, shared-borrow erasure, vec!/array literals
+    (t39-t44). Frontier: struct literals + field access (drop-in node work),
+    iterator machinery, receivers.
 1c. DONE v0.4 — declarations: struct/enum/type/trait items, mod flattening,
     cfg(test) subtree drops, macro_rules defs, impl methods under Type_method
     mangling with Type::method call resolution; receivers still refuse

@@ -89,6 +89,41 @@ fn arith_bin(op: &str, lhs: Value, rhs: Value) -> Value {
 // ── CLI ─────────────────────────────────────────────────────────────
 
 
+/// Minimal receiver types, enough to lower methods WITHOUT guessing:
+/// the store holds JS strings / numbers / booleans / native arrays, and
+/// a method's Rust semantics must map onto the exact JS the core renders.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Ty {
+    Int,
+    Str,
+    Bool,
+    Arr,
+    Unknown,
+}
+
+fn ty_from_type(t: &syn::Type) -> Ty {
+    match t {
+        syn::Type::Path(tp) => {
+            let seg = match tp.path.segments.last() {
+                Some(s) => s,
+                None => return Ty::Unknown,
+            };
+            match seg.ident.to_string().as_str() {
+                "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32"
+                | "u64" | "u128" | "usize" => Ty::Int,
+                "str" | "String" | "Cow" => Ty::Str,
+                "bool" => Ty::Bool,
+                "Vec" | "VecDeque" | "HashSet" | "BTreeSet" | "HashMap" | "BTreeMap"
+                | "Slice" => Ty::Arr,
+                _ => Ty::Unknown,
+            }
+        }
+        syn::Type::Reference(r) => ty_from_type(&r.elem),
+        syn::Type::Slice(s) => Ty::Arr,
+        _ => Ty::Unknown,
+    }
+}
+
 /// Lowering context — the integer-const table. Rust const-evaluates
 /// `const`/`static` items with literal initializers; range bounds and
 /// comparison operands may legally reference them, so path lowering
@@ -99,6 +134,10 @@ struct Cx {
     ints: HashMap<String, i64>,
     /// names of the program's non-main functions (call targets)
     fns: Vec<String>,
+    /// variable -> receiver type (per-function scope; cleared between
+    /// functions, re-seeded from params/literals/annotations). RefCell:
+    /// type tracking mutates during lowering while Cx travels as &Cx.
+    vars: std::cell::RefCell<HashMap<String, Ty>>,
     /// global assignments (consts/statics), in source order
     globals: Vec<Value>,
 }
@@ -274,6 +313,7 @@ fn main() {
                 if f.sig.asyncness.is_some() || f.sig.unsafety.is_some() || f.sig.constness.is_some() {
                     refuse("non-plain `fn main` (async/unsafe/const)", f.sig.ident.span());
                 }
+                cx.vars.borrow_mut().clear();
                 lower_block(&f.block, &cx, false, &mut stmts);
             }
             other => refuse("items other than `fn`/`use`/`const`/`static`", other.span()),
@@ -354,7 +394,39 @@ fn lower_local(local: &syn::Local, cx: &Cx) -> Option<Value> {
         // no-op in the store model, exactly like c-sh-go's dropped `int i;`.
         return None;
     };
+    // NOTE: infer BEFORE taking the write guard (infer_ty reads vars).
+    let init_ty = infer_ty(&init.expr, cx);
+    cx.vars.borrow_mut().insert(name.clone(), init_ty);
     Some(assign_stmt(&name, value_expr(&init.expr, cx)))
+}
+
+/// Infer a value's receiver type from its shape: literals are exact,
+/// vec![] is an array, everything else is Unknown (Rust's own static
+/// typing guarantees correctness; we only track what we can SEE).
+fn infer_ty(e: &syn::Expr, cx: &Cx) -> Ty {
+    match e {
+        syn::Expr::Lit(l) => match &l.lit {
+            syn::Lit::Int(_) => Ty::Int,
+            syn::Lit::Str(_) => Ty::Str,
+            syn::Lit::Bool(_) => Ty::Bool,
+            _ => Ty::Unknown,
+        },
+        syn::Expr::Macro(m) => {
+            let name = m.mac.path.segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
+            if name == "vec" {
+                Ty::Arr
+            } else {
+                Ty::Unknown
+            }
+        }
+        syn::Expr::Paren(p) => infer_ty(&p.expr, cx),
+        syn::Expr::Reference(r) => infer_ty(&r.expr, cx),
+        syn::Expr::Array(_) => Ty::Arr,
+        syn::Expr::Path(p) => single_path(p)
+            .and_then(|id| cx.vars.borrow().get(&id.to_string()).copied())
+            .unwrap_or(Ty::Unknown),
+        _ => Ty::Unknown,
+    }
 }
 
 fn lower_expr_stmt(e: &syn::Expr, cx: &Cx, in_fn: bool) -> Option<Value> {
@@ -395,6 +467,14 @@ fn lower_expr_stmt(e: &syn::Expr, cx: &Cx, in_fn: bool) -> Option<Value> {
                 Some(json!({"type": "Exit", "value": null}))
             }
         }
+        syn::Expr::MethodCall(m) => {
+            // statement-position method call: only PURE methods lower at
+            // all (the whitelist in value_expr), and a discarded pure
+            // call is a no-op — drop it. Anything impure/unknown already
+            // refuses inside value_expr.
+            let _ = value_expr(e, cx);
+            None
+        }
         syn::Expr::Call(c) => {
             // statement-position call: the VOID dispatch (fnCall). Any
             // returned value is discarded.
@@ -427,6 +507,9 @@ fn plain_assign(a: &syn::ExprAssign, cx: &Cx) -> Value {
     let Some(name) = single_path(p) else {
         refuse("assignment target path", p.span());
     };
+    // NOTE: infer BEFORE taking the write guard (infer_ty reads vars).
+    let rhs_ty = infer_ty(&a.right, cx);
+    cx.vars.borrow_mut().insert(name.to_string(), rhs_ty);
     assign_stmt(&name.to_string(), value_expr(&a.right, cx))
 }
 
@@ -676,6 +759,8 @@ fn function_def(
         refuse("variadic function", sig.variadic.span());
     }
     let returns_value = !matches!(sig.output, syn::ReturnType::Default);
+    // fresh variable-type scope per function (params re-seed it)
+    cx.vars.borrow_mut().clear();
     let mut body: Vec<Value> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
     for (i, input) in sig.inputs.iter().enumerate() {
@@ -697,6 +782,7 @@ fn function_def(
             refuse("duplicate parameter name", pi.ident.span());
         }
         seen.push(pname.clone());
+        cx.vars.borrow_mut().insert(pname.clone(), ty_from_type(&pt.ty));
         // positional binding: param i <- getVar("i+1")
         body.push(assign_stmt(&pname, get_var(&(i + 1).to_string())));
     }
@@ -868,8 +954,106 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
             };
             get_var(&name.to_string())
         }
-        syn::Expr::Binary(b) => arith_from_binary(b, cx),
-        syn::Expr::Unary(u) => arith_from_unary(u, cx),
+        syn::Expr::Binary(b) => {
+            use syn::BinOp::*;
+            if matches!(b.op, Eq(_) | Ne(_) | Lt(_) | Le(_) | Gt(_) | Ge(_) | And(_) | Or(_)) {
+                // VALUE-position boolean: the fleet convention (py-sh-go
+                // CompareE) — a `test` call, which the runtime evaluates
+                // to a native JS boolean (prints like Rust's bool {}).
+                // Operands are ints/int-vars (string comparison refuses
+                // in the test grammar — loud, not guessed).
+                test_call(&test_string(e, cx))
+            } else {
+                arith_from_binary(b, cx)
+            }
+        }
+        syn::Expr::Unary(u) => match u.op {
+            syn::UnOp::Not(_) => test_call(&test_string(e, cx)),
+            _ => arith_from_unary(u, cx),
+        },
+        syn::Expr::Array(ar) => {
+            // `[e1, e2]` -> an A1 Array literal, exactly like vec![..] —
+            // the runtime store keeps native JS arrays.
+            json!({
+                "type": "Array",
+                "elements": ar.elems.iter().map(|a| value_expr(a, cx)).collect::<Vec<_>>(),
+            })
+        }
+        syn::Expr::Reference(r) => {
+            // SHARED borrows erase to the value itself: while a `&T`
+            // borrow lives, Rust forbids mutation through the original
+            // (no `&mut` aliasing exists), so a value SNAPSHOT has exactly
+            // the borrow's observable semantics. `&mut` refuses — writes
+            // through it are NOT representable in the value store.
+            if r.mutability.is_some() {
+                refuse("`&mut` borrow (mutation through a borrow is not representable)", r.span());
+            }
+            value_expr(&r.expr, cx)
+        }
+        syn::Expr::Macro(m) => {
+            // `vec![a, b, c]` -> an A1 Array literal — the runtime store
+            // keeps native JS arrays, so this is the EXACT value shape
+            // (infer_ty already types vec![] as Arr).
+            let name = m.mac.path.segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
+            if name != "vec" {
+                refuse(&format!("macro `{name}!` in value position"), m.span());
+            }
+            struct VecElems(syn::punctuated::Punctuated<syn::Expr, syn::Token![,]>);
+            impl syn::parse::Parse for VecElems {
+                fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+                    Ok(VecElems(
+                        syn::punctuated::Punctuated::parse_terminated(input)?,
+                    ))
+                }
+            }
+            let VecElems(elems) = syn::parse2(m.mac.tokens.clone())
+                .unwrap_or_else(|e| refuse(&format!("vec! arguments: {e}"), m.span()));
+            json!({
+                "type": "Array",
+                "elements": elems.iter().map(|a| value_expr(a, cx)).collect::<Vec<_>>(),
+            })
+        }
+        syn::Expr::MethodCall(m) => {
+            // obj.method(args) -> the A1 MethodCall expr (the contract's
+            // generic member call; the ESTree path renders it as a NATIVE
+            // JS call). The method NAME must be a valid JS member whose
+            // semantics match Rust exactly — the table below only maps
+            // string-receiver methods where the mapping is 1:1 and pure.
+            // Everything else refuses (REFUSE > GUESS): iterators,
+            // Vec methods, bool-returning predicates, indexing...
+            let recv_ty = infer_ty(&m.receiver, cx);
+            let rust_name = m.method.to_string();
+            let js_name = match (recv_ty, rust_name.as_str()) {
+                (Ty::Str, "contains") => "includes",
+                (Ty::Str, "starts_with") => "startsWith",
+                (Ty::Str, "ends_with") => "endsWith",
+                (Ty::Str, "trim") => "trim",
+                (Ty::Str, "trim_start") => "trimStart",
+                (Ty::Str, "trim_end") => "trimEnd",
+                (Ty::Str, "to_lowercase") => "toLowerCase",
+                (Ty::Str, "to_uppercase") => "toUpperCase",
+                _ => refuse(
+                    &format!(
+                        "method `{}` on {}receiver (no proven JS-equivalent yet)",
+                        rust_name,
+                        match recv_ty {
+                            Ty::Int => "int ",
+                            Ty::Str => "string ",
+                            Ty::Bool => "bool ",
+                            Ty::Arr => "array ",
+                            Ty::Unknown => "",
+                        }
+                    ),
+                    m.method.span(),
+                ),
+            };
+            json!({
+                "type": "MethodCall",
+                "object": value_expr(&m.receiver, cx),
+                "method": js_name,
+                "args": m.args.iter().map(|a| value_expr(a, cx)).collect::<Vec<_>>(),
+            })
+        }
         syn::Expr::Paren(p) => value_expr(&p.expr, cx),
         syn::Expr::Call(c) => {
             // value-position call: the VALUE-returning dispatch (fnValue,
@@ -884,7 +1068,56 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
             };
             fn_call_expr(&target, &c.args, "fnValue", cx)
         }
-        other => refuse("expression", other.span()),
+        other => refuse(
+            &format!("expression kind `{}`", expr_kind(other)),
+            other.span(),
+        ),
+    }
+}
+
+/// A stable name for an expression variant — refusal diagnostics only.
+fn expr_kind(e: &syn::Expr) -> &'static str {
+    match e {
+        syn::Expr::Array(_) => "array literal",
+        syn::Expr::Assign(_) => "assignment",
+        syn::Expr::Async(_) => "async block",
+        syn::Expr::Await(_) => ".await",
+        syn::Expr::Binary(_) => "binary op",
+        syn::Expr::Block(_) => "block",
+        syn::Expr::Break(_) => "break",
+        syn::Expr::Call(_) => "call",
+        syn::Expr::Cast(_) => "cast (`as`)",
+        syn::Expr::Closure(_) => "closure",
+        syn::Expr::Const(_) => "const block",
+        syn::Expr::Continue(_) => "continue",
+        syn::Expr::Field(_) => "field access",
+        syn::Expr::ForLoop(_) => "for loop",
+        syn::Expr::Group(_) => "group",
+        syn::Expr::If(_) => "if",
+        syn::Expr::Index(_) => "indexing",
+        syn::Expr::Infer(_) => "_",
+        syn::Expr::Let(_) => "let-chain",
+        syn::Expr::Lit(_) => "literal",
+        syn::Expr::Loop(_) => "loop",
+        syn::Expr::Macro(_) => "macro",
+        syn::Expr::Match(_) => "match",
+        syn::Expr::MethodCall(_) => "method call",
+        syn::Expr::Paren(_) => "parens",
+        syn::Expr::Path(_) => "path",
+        syn::Expr::Range(_) => "range",
+        syn::Expr::Reference(_) => "borrow `&x`",
+        syn::Expr::Repeat(_) => "[e; n]",
+        syn::Expr::Return(_) => "return",
+        syn::Expr::Struct(_) => "struct literal",
+        syn::Expr::Try(_) => "`?`",
+        syn::Expr::TryBlock(_) => "try block",
+        syn::Expr::Tuple(_) => "tuple",
+        syn::Expr::Unary(_) => "unary op",
+        syn::Expr::Unsafe(_) => "unsafe block",
+        syn::Expr::Verbatim(_) => "verbatim (macro-expanded)",
+        syn::Expr::While(_) => "while",
+        syn::Expr::Yield(_) => "yield",
+        _ => "other",
     }
 }
 
@@ -1005,6 +1238,15 @@ fn test_string(e: &syn::Expr, cx: &Cx) -> String {
             _ => refuse("unary operator in condition", u.op.span()),
         },
         syn::Expr::Paren(p) => format!("( {} )", test_string(&p.expr, cx)),
+        // a bare boolean VARIABLE is not representable in the test
+        // grammar: `$b` alone parses as a nonempty-string/file test, not
+        // a bool read. Refuse until a bool-var contract lands.
+        syn::Expr::Path(p) => {
+            refuse(
+                "boolean variable as a condition (bool vars not yet representable)",
+                p.span(),
+            )
+        }
         other => refuse("condition expression", other.span()),
     }
 }

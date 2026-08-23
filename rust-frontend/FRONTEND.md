@@ -109,6 +109,34 @@ Pinned by t36_decls.rs + t37_method_refuse.rs. Corpus movement:
 (17x method-call/field-access expressions, 4x receivers, 3x unknown
 call targets, 1x if-tail-value, 1x {:?}, 1x lazy_static, 1x wasm_bindgen).
 
+## v0.5 additions — value-position booleans, methods, borrows, arrays
+
+- comparisons / `&&` / `||` / `!` in VALUE position lower to `test`
+  calls (the py-sh-go CompareE convention — the runtime returns native
+  JS booleans, printing like Rust's bool `{}`). Operands are ints /
+  int-vars; string comparison refuses (test grammar is numeric).
+- SOUNDNESS FIX: a bare boolean VARIABLE as a condition now REFUSES
+  (`$b` alone parses as a nonempty-string/file test — silently wrong).
+- minimal type tracker (`Ty`: Int/Str/Bool/Arr/Unknown) seeded from
+  param annotations, let annotations and literal shapes; per-function
+  scope; a re-`let` re-infers. This is what keeps method lowering from
+  guessing.
+- string methods with PROVEN 1:1 JS equivalents on Str receivers:
+  contains->includes, starts_with->startsWith, ends_with->endsWith,
+  trim/trim_start/trim_end, to_lowercase/to_uppercase (A1 MethodCall,
+  rendered NATIVE JS by the core). Everything else refuses.
+- shared `&T` borrows erase to value snapshots (exact: no concurrent
+  mutation is possible through the original while a shared borrow
+  lives); `&mut` refuses; obsolete t13 pin removed.
+- `vec![..]` and `[a, b]` literals -> native A1 Array literals.
+
+Pinned by t39 (refuse), t40, t41, t42, t43 (refuse), t44. Corpus
+movement: 17/30 -> 18+/30 files deeper into the expression frontier;
+remaining first-gaps: struct literals x4 (needs field-access contract),
+unproven methods x6 (iterators: collect/chars/iter...), receivers x4,
+unknown call targets x3, if-tail-value, {:?}, lazy_static!,
+wasm_bindgen, `?`, tuple.
+
 Refused loudly (testdata/*_refuse.rs — the emit MUST fail, t13–t23):
 borrows `&x`, user functions, `String::from`/method calls, `match`,
 `vec!`, `eprintln!`/`dbg!`, floats, `{:?}`/named/width format specs,
