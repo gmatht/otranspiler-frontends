@@ -44,7 +44,11 @@ conditionals, comments.
 
 ## Status
 
-127/180 cells green (was 69 at goal start). Per-backend state with the current core
+149/180 matrix cells green (up from 69 at goal start). Remaining 31:
+mem-arena model for compiled backends (006), char-array element
+semantics (012/013 in zig/java/perl), switch-in-helper-body rendering
+(003), and a few typed-int edge cases (008 go/java) — each a
+self-contained next wave. Per-backend state with the current core
 (s2p.c f120f194 + workspace bed252b3):
 
 - **perl**: green except function-outparam/struct examples (the
