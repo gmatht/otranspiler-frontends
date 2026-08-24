@@ -551,8 +551,10 @@ fn lower_local(local: &syn::Local, cx: &Cx, out: &mut Vec<Value>) -> Option<Valu
     // iterator chains (`SRC.iter().map(F).collect()`) desugar to
     // accumulator + index loop + setArrayAppend
     if as_method_call(&init.expr, "collect").is_some() {
-        if let Some((src_expr, map_fn)) = parse_collect_chain(&init.expr, cx) {
-            return collect_chain_stmt(&name, src_expr, map_fn, cx, out);
+        let parsed = parse_collect_chain(&init.expr, cx);
+        eprintln!("DBG local-chain parsed={}", parsed.is_some());
+        if let Some((src_expr, steps)) = parsed {
+            return collect_chain_stmt(&name, src_expr, steps, cx, out);
         }
         refuse(
             "iterator chain (only SRC.iter()[.map(closure-or-fn)].collect())",
@@ -631,6 +633,14 @@ fn infer_ty(e: &syn::Expr, cx: &Cx) -> Ty {
                 }
             } else {
                 Ty::Arr(None, None)
+            }
+        }
+        syn::Expr::Binary(b) => {
+            use syn::BinOp::*;
+            if matches!(b.op, Eq(_) | Ne(_) | Lt(_) | Le(_) | Gt(_) | Ge(_) | And(_) | Or(_)) {
+                Ty::Bool
+            } else {
+                Ty::Int
             }
         }
         syn::Expr::Paren(p) => infer_ty(&p.expr, cx),
@@ -794,9 +804,9 @@ fn plain_assign(a: &syn::ExprAssign, cx: &Cx, out: &mut Vec<Value>) -> Value {
     };
     // iterator chains in assignment position
     if as_method_call(&a.right, "collect").is_some() {
-        if let Some((src_expr, map_fn)) = parse_collect_chain(&a.right, cx) {
+        if let Some((src_expr, steps)) = parse_collect_chain(&a.right, cx) {
             let node =
-                collect_chain_stmt(&name.to_string(), src_expr, map_fn, cx, out);
+                collect_chain_stmt(&name.to_string(), src_expr, steps, cx, out);
             return match node {
                 Some(v) => v,
                 None => refuse("iterator chain produced no loop", a.right.span()),
@@ -1339,6 +1349,19 @@ enum MapFn<'a> {
     Fn(String),
 }
 
+/// One pipeline step between the source array and `.collect()`.
+enum Step<'a> {
+    /// `.iter()` / `.iter_mut()` — enters the pipeline
+    Iter,
+    /// `.map(F)` — F is an inline closure or a registered fn name
+    Map(MapFn<'a>),
+    /// `.filter(|x| bool-expr)` — skips elements whose proven-bool
+    /// predicate is false
+    Filter(&'a syn::ExprClosure),
+    /// `.take(N)` — N a literal int (bounds the loop)
+    Take(u64),
+}
+
 fn as_method_call<'a>(e: &'a syn::Expr, name: &str) -> Option<&'a syn::ExprMethodCall> {
     match e {
         syn::Expr::MethodCall(m) if m.method == name => Some(m),
@@ -1346,44 +1369,91 @@ fn as_method_call<'a>(e: &'a syn::Expr, name: &str) -> Option<&'a syn::ExprMetho
     }
 }
 
-/// Parse `SRC.iter()[.map(F)].collect()` -> (SRC, map fn or None).
-/// Turbofished collects (`collect::<Vec<_>>()`) are fine; anything else
-/// in the chain (filter, take, ...) returns None — the caller refuses.
+/// Parse `SRC.<steps...>.collect()` into (SRC, ordered steps). Supported
+/// steps: iter/iter_mut (entering), map(F: closure or registered fn),
+/// filter(bool-closure), take(literal N). Anything else returns None —
+/// the caller refuses.
 fn parse_collect_chain<'a>(
     e: &'a syn::Expr,
     cx: &Cx,
-) -> Option<(&'a syn::Expr, Option<MapFn<'a>>)> {
+) -> Option<(&'a syn::Expr, Vec<Step<'a>>)> {
     let collect = as_method_call(e, "collect")?;
-    // turbofish allowed but ignored (the dst annotation carries the type)
-    let prev = &*collect.receiver;
-    if let Some(map) = as_method_call(prev, "map") {
-        if map.args.len() != 1 {
-            return None;
-        }
-        let f = match &map.args[0] {
-            syn::Expr::Closure(c) => MapFn::Closure(c),
-            syn::Expr::Path(p) => {
-                let name = single_path(p)?.to_string();
-                if !cx.fns.iter().any(|f| *f == name) {
-                    return None;
+    if !collect.args.is_empty() || collect.turbofish.is_some() && false {
+        // turbofished collect is allowed (the dst annotation types it)
+    }
+    let mut rev: Vec<Step> = Vec::new();
+    let mut node: &syn::Expr = &*collect.receiver;
+    loop {
+        match node {
+            syn::Expr::MethodCall(mc) => {
+                let mname = mc.method.to_string();
+                match mname.as_str() {
+                    "iter" | "iter_mut" => {
+                        if !mc.args.is_empty() || mc.turbofish.is_some() {
+                            return None;
+                        }
+                        rev.push(Step::Iter);
+                        node = &mc.receiver;
+                    }
+                    "map" => {
+                        if mc.args.len() != 1 {
+                            return None;
+                        }
+                        let f = match &mc.args[0] {
+                            syn::Expr::Closure(c) => MapFn::Closure(c),
+                            syn::Expr::Path(p) => {
+                                let name = single_path(p)?.to_string();
+                                if !cx.fns.iter().any(|f| *f == name) {
+                                    return None;
+                                }
+                                MapFn::Fn(name)
+                            }
+                            _ => return None,
+                        };
+                        rev.push(Step::Map(f));
+                        node = &mc.receiver;
+                    }
+                    "filter" => {
+                        if mc.args.len() != 1 {
+                            return None;
+                        }
+                        match &mc.args[0] {
+                            syn::Expr::Closure(c) => rev.push(Step::Filter(c)),
+                            _ => return None,
+                        }
+                        node = &mc.receiver;
+                    }
+                    "take" => {
+                        if mc.args.len() != 1 {
+                            return None;
+                        }
+                        match mc.args.first() {
+                            Some(syn::Expr::Lit(l)) => match &l.lit {
+                                syn::Lit::Int(li) => {
+                                    let n: u64 = li.base10_parse().ok()?;
+                                    rev.push(Step::Take(n));
+                                    node = &mc.receiver;
+                                }
+                                _ => return None,
+                            },
+                            _ => return None,
+                        }
+                    }
+                    _ => return None,
                 }
-                MapFn::Fn(name)
             }
-            _ => return None,
-        };
-        // unwrap the `.iter()` between the source and the map
-        let src = as_method_call(&map.receiver, "iter")?;
-        if !src.args.is_empty() {
-            return None;
+            syn::Expr::Path(_) => break, // the SOURCE reached
+            other => { eprintln!("DBG chain: stop at {}", expr_kind(other)); return None; }
         }
-        return Some((&*src.receiver, Some(f)));
     }
-    // bare SRC.iter().collect() — element copy
-    let iter = as_method_call(prev, "iter")?;
-    if !iter.args.is_empty() {
-        return None;
+    // rev holds steps BACKWARD; reverse first, then require Iter to open
+    // the pipeline and a plain-path source behind it
+    rev.reverse();
+    match (rev.first(), node) {
+        (Some(Step::Iter), syn::Expr::Path(p)) if p.qself.is_none() => {}
+        _ => return None,
     }
-    Some((&*iter.receiver, None))
+    Some((node, rev))
 }
 
 /// Lower `let D = SRC.iter().map(F).collect();` — accumulator + index
@@ -1397,7 +1467,7 @@ fn parse_collect_chain<'a>(
 fn collect_chain_stmt(
     dst: &str,
     src_expr: &syn::Expr,
-    map_fn: Option<MapFn>,
+    steps: Vec<Step>,
     cx: &Cx,
     out: &mut Vec<Value>,
 ) -> Option<Value> {
@@ -1409,76 +1479,140 @@ fn collect_chain_stmt(
         refuse("iterator source path", sp.span());
     };
     let src_name = src_name.to_string();
-    let elem_ty = match infer_ty(src_expr, cx) {
-        Ty::Arr(Some(t), _) => (t.as_ref().clone()),
+    let elem0_ty = match infer_ty(src_expr, cx) {
+        Ty::Arr(Some(t), _) => t.as_ref().clone(),
         _ => Ty::Unknown,
     };
 
-    // result type for the dst annotation consumers
-    let res_ty = match &map_fn {
-        Some(MapFn::Closure(c)) => infer_ty(&c.body, cx),
-        Some(MapFn::Fn(name)) => cx.fn_rets.get(name).cloned().unwrap_or(Ty::Unknown),
-        None => elem_ty.clone(),
-    };
-
-    let idx = format!("__sh2i{}", { let mut c = cx.tmp.borrow_mut(); *c += 1; c });
-    let lenv = format!("__sh2l{}", { let mut c = cx.tmp.borrow_mut(); *c += 1; c });
-    let itv = format!("__sh2t{}", { let mut c = cx.tmp.borrow_mut(); *c += 1; c });
-
-    // pre-loop: fresh accumulator + hoisted length + zeroed index.
-    // The length MUST be provable from a literal-built source — the
-    // param(len) fallback misreads array vars (core request
-    // rust-frontend-20260824-param-len-arrays.md).
-    let src_known_len = match infer_ty(src_expr, cx) {
+    // KNOWN length only (literal-built sources): Take(n) caps it at n.
+    // The param(len) fallback miscounts arrays (core request
+    // rust-frontend-20260824-param-len-arrays.md) — refuses otherwise.
+    let mut known_len: Option<u64> = match infer_ty(src_expr, cx) {
         Ty::Arr(_, l) => l,
         _ => None,
     };
-    let Some(n) = src_known_len else {
+    for step in &steps {
+        if let Step::Take(n) = step {
+            known_len = Some(match known_len {
+                Some(l) if l > *n => *n,
+                Some(l) => l,
+                None => *n, // unproven source + take(n): EXACT bound
+            });
+        }
+    }
+    let Some(bound) = known_len else {
         refuse(
             "iterator source length unproven (param-len arrays core request)",
             src_expr.span(),
         );
     };
+
+    // result type: last Map's output (or the element type)
+    let mut res_ty = elem0_ty.clone();
+    for step in &steps {
+        if let Step::Map(f) = step {
+            res_ty = match f {
+                MapFn::Closure(c) => infer_ty(&c.body, cx),
+                MapFn::Fn(name) => cx.fn_rets.get(name).cloned().unwrap_or(Ty::Unknown),
+            };
+        }
+    }
+
+    let idx = format!("__sh2i{}", { let mut c = cx.tmp.borrow_mut(); *c += 1; c });
+    let lenv = format!("__sh2l{}", { let mut c = cx.tmp.borrow_mut(); *c += 1; c });
+    let cur = format!("__sh2v{}", { let mut c = cx.tmp.borrow_mut(); *c += 1; c });
+
+    // pre-loop: fresh accumulator + hoisted bound + zeroed index
     out.push(set_array_stmt(dst, vec![]));
     cx.vars.borrow_mut().insert(
         dst.to_string(),
         Ty::Arr(Some(Box::new(res_ty.clone())), None),
     );
-    out.push(assign_stmt(&lenv, str_lit(&n.to_string())));
+    out.push(assign_stmt(
+        &lenv,
+        str_lit(&bound.to_string()),
+    ));
     cx.vars.borrow_mut().insert(lenv.clone(), Ty::Int);
     out.push(assign_stmt(&idx, arith_value(arith_num(0))));
     cx.vars.borrow_mut().insert(idx.clone(), Ty::Int);
 
-    // per-iteration body: element read -> (param bind) -> value -> append
+    // per-iteration body:
+    //   __cur <- arrayIndex(SRC, __i)
+    //   per step: Map rebinds __cur via closure/fnValue; Filter skips on
+    //   a proven-false predicate (Continue)
     let mut loop_body = Vec::new();
     loop_body.push(assign_stmt(
-        &itv,
+        &cur,
         json!({
             "args": [str_lit(&src_name),
                      {"type": "Arith", "ast": {"name": idx, "type": "Var"}}],
             "func": "arrayIndex", "purity": "PureCpu", "type": "Call"
         }),
     ));
-    cx.vars.borrow_mut().insert(itv.clone(), elem_ty.clone());
-    let value = match &map_fn {
-        Some(MapFn::Closure(c)) => {
-            let Some(syn::Pat::Ident(pi)) = c.inputs.first() else {
-                refuse("closure parameter pattern", c.inputs.span());
-            };
-            let pname = pi.ident.to_string();
-            loop_body.push(assign_stmt(&pname, get_var(&itv)));
-            cx.vars.borrow_mut().insert(pname.clone(), elem_ty.clone());
-            value_expr(&c.body, cx)
+    cx.vars.borrow_mut().insert(cur.clone(), elem0_ty);
+    for step in steps.iter().skip(1) {
+        match step {
+            Step::Iter => {}
+            Step::Take(_) => {} // folded into the hoisted bound
+            Step::Map(f) => {
+                let value = match f {
+                    MapFn::Closure(c) => {
+                        let Some(syn::Pat::Ident(pi)) = c.inputs.first() else {
+                            refuse("closure parameter pattern", c.inputs.span());
+                        };
+                        let pname = pi.ident.to_string();
+                        loop_body.push(assign_stmt(&pname, get_var(&cur)));
+                        cx.vars
+                            .borrow_mut()
+                            .insert(pname.clone(), Ty::Unknown);
+                        value_expr(&c.body, cx)
+                    }
+                    MapFn::Fn(name) => fn_call_expr_a1(
+                        name,
+                        vec![get_var(&cur)],
+                        "fnValue",
+                    ),
+                };
+                loop_body.push(assign_stmt(&cur, value));
+                cx.vars.borrow_mut().insert(cur.clone(), Ty::Unknown);
+            }
+            Step::Filter(c) => {
+                // the predicate MUST be proven bool — JS "" is falsy but
+                // Rust values are never "falsy", so truthiness guessing
+                // would diverge
+                if !matches!(infer_ty(&c.body, cx), Ty::Bool) {
+                    refuse(
+                        "filter predicate (must be a proven boolean)",
+                        c.body.span(),
+                    );
+                }
+                let Some(syn::Pat::Ident(pi)) = c.inputs.first() else {
+                    refuse("closure parameter pattern", c.inputs.span());
+                };
+                let pname = pi.ident.to_string();
+                loop_body.push(assign_stmt(&pname, get_var(&cur)));
+                cx.vars.borrow_mut().insert(pname.clone(), Ty::Unknown);
+                let ftemp = format!(
+                    "__sh2f{}",
+                    { let mut ctr = cx.tmp.borrow_mut(); *ctr += 1; ctr }
+                );
+                loop_body.push(assign_stmt(&ftemp, value_expr(&c.body, cx)));
+                cx.vars.borrow_mut().insert(ftemp.clone(), Ty::Bool);
+                loop_body.push(json!({
+                    "cond": test_call(&format!("${ftemp} = \"true\"")),
+                    "then": [],
+                    "elsifs": [],
+                    "else": [{"type": "Continue"}],
+                    "type": "If",
+                }));
+            }
         }
-        Some(MapFn::Fn(name)) => {
-            fn_call_expr_a1(name, vec![get_var(&itv)], "fnValue")
-        }
-        None => get_var(&itv),
-    };
+    }
+    // Collect: append the final element value
     loop_body.push(expr_stmt(json!({
         "args": [
             str_lit(dst),
-            json!({"elements": vec![value], "type": "Array"}),
+            json!({"elements": vec![get_var(&cur)], "type": "Array"}),
         ],
         "func": "setArrayAppend", "purity": "Emulable", "type": "Call"
     })));

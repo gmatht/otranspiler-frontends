@@ -278,6 +278,22 @@ Pinned by t52_for_vec.rs.
 - Source length must be PROVEN from a literal-built array (the
   param fallback miscounts); otherwise refuses.
 
+## v0.13 additions — multi-step iterator pipelines
+
+- chains generalize: SRC.iter()[.map(F)]*[.filter(P)]*[.take(N)]*.
+  collect() desugars to the accumulator loop; each element flows
+  through the steps in order:
+  - map: closure inline or registered-fn fnValue dispatch, result
+    rebinds a per-iteration holder temp
+  - filter: predicate must be PROVEN bool (JS "" is falsy but Rust
+    values never are — truthiness guessing would diverge); skips via
+    Continue on a hoisted bool temp
+  - take(N): literal N caps the known bound
+- comparisons/logic now infer Ty::Bool (filter predicates and
+  value-position booleans type-resolve)
+
+Pinned by t54_iter_chain.rs.
+
 Refused loudly (testdata/*_refuse.rs — the emit MUST fail, t13–t23):
 borrows `&x`, user functions, `String::from`/method calls, `match`,
 `vec!`, `eprintln!`/`dbg!`, floats, `{:?}`/named/width format specs,

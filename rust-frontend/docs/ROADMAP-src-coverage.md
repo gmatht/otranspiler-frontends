@@ -72,6 +72,9 @@ counts over the corpus (top entries):
     inline, fn-names dispatch fnValue; result typing propagates.
     BLOCKED at oracle: getVar scalar view (param-len request). t53
     pending.
+1m. DONE v0.13 — generalized iterator pipelines (map*/filter*/take*
+    over .iter(), proven-bool filters with Continue skip, take-capped
+    bounds); Ty::Bool inference for comparisons (t54).
 1k. DONE v0.11b — Vec/array for-loops (index while-loop + arrayIndex,
     hoisted var bound, element-type tracking incl. literal lengths),
     scalar deref erasure (t52).
