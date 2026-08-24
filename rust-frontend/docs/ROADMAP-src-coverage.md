@@ -67,6 +67,10 @@ counts over the corpus (top entries):
 
 ## Phased plan (each phase = frontend subset growth + testdata pins, gate green)
 
+1n. DONE v0.14 — lib-tree GATED splice (clean modules only, mtime-cached
+    single-file verdicts), lifetime-generic erasure, const-slice
+    contains -> OR-eq chains. builtin.rs lowers cleanly; the four
+    backend files still refuse on it (slice patterns vs IrExpr::*).
 1l. DONE v0.12 — iterator-chain desugar (.iter().map(closure|fn).
     collect()) via accumulator + index loop + setArrayAppend; closures
     inline, fn-names dispatch fnValue; result typing propagates.

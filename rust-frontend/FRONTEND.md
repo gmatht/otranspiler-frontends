@@ -294,6 +294,26 @@ Pinned by t52_for_vec.rs.
 
 Pinned by t54_iter_chain.rs.
 
+## v0.14 additions — lib-tree gated splice + verdict cache + lifetime erasure
+
+- expansion now ALSO walks lib.rs's module TREE with the same gated
+  splice (clean-alone modules only) — cross-crate calls into CLEAN
+  modules resolve; calls into dirty ones refuse at the site. The
+  earlier 0/30 disaster cannot recur: dirty modules never join.
+- clean-lowering verdicts are disk-cached (mtime-keyed, /tmp) and
+  child checks run in SINGLE-FILE mode (RUST_FRONTEND_NO_EXPAND=1),
+  breaking the check-recursion cycle; census runs in ~20s.
+- LIFETIME generics erase unconditionally (`fn f<'a>(x: &'a T)` IS
+  `fn f(x: &T)` at runtime); type/const generics + where clauses still
+  refuse.
+- const-array membership: `.contains(&x)` on a literal const slice
+  (`const BUILTINS: &[&str] = &[..]`) lowers to an exact OR-equality
+  chain over the known contents in the test grammar.
+
+Pinned indirectly via transforms/builtin.rs lowering cleanly
+(69-entry builtins table). Remaining blockers there: slice patterns
+against core IrExpr::* variants (meta-level).
+
 Refused loudly (testdata/*_refuse.rs — the emit MUST fail, t13–t23):
 borrows `&x`, user functions, `String::from`/method calls, `match`,
 `vec!`, `eprintln!`/`dbg!`, floats, `{:?}`/named/width format specs,

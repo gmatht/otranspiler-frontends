@@ -160,12 +160,103 @@ fn ty_from_type(t: &syn::Type, cx: &Cx) -> Ty {
     }
 }
 
+/// Literal STRING-array contents of a const initializer (`&["a", "b"]`,
+/// `vec!["a"]`, `["a"]`) — membership chains compile from these.
+fn const_str_array(e: &syn::Expr) -> Option<Vec<String>> {
+    let arr = match e {
+        syn::Expr::Reference(r) => match &*r.expr {
+            syn::Expr::Array(a) => a,
+            _ => return None,
+        },
+        syn::Expr::Array(a) => a,
+        _ => return None,
+    };
+    let mut out = Vec::new();
+    for el in &arr.elems {
+        match el {
+            syn::Expr::Lit(l) => match &l.lit {
+                syn::Lit::Str(ls) => out.push(ls.value()),
+                _ => return None,
+            },
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
 /// A signature's declared return Ty (`-> T`), Unknown when unit/absent.
 fn ret_ty(output: &syn::ReturnType, cx: &Cx) -> Ty {
     match output {
         syn::ReturnType::Default => Ty::Unknown,
         syn::ReturnType::Type(_, t) => ty_from_type(t, cx),
     }
+}
+
+// ── clean-lowering verdict cache (mtime-keyed, cross-process) ───────
+// The gated splice checks each module by running this binary on it;
+// nested checks recurse, so verdicts MUST be cached to stay linear.
+// Stale entries can only over-splice a dirty module — visible as an
+// entry refusal, never as silent miscompilation.
+fn clean_cache_path() -> PathBuf {
+    std::env::temp_dir().join("rust-frontend-clean-cache.json")
+}
+
+fn mtime_secs(p: &Path) -> Option<u64> {
+    p.metadata().ok()?.modified().ok()?;
+    Some(
+        p.metadata()
+            .ok()?
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs(),
+    )
+}
+
+fn cache_get(path: &Path) -> Option<bool> {
+    let txt = std::fs::read_to_string(clean_cache_path()).ok()?;
+    let map: HashMap<String, (u64, bool)> = serde_json::from_str(&txt).ok()?;
+    let m = mtime_secs(path)?;
+    map.get(&path.to_string_lossy().to_string())
+        .filter(|(m0, _)| *m0 == m)
+        .map(|(_, ok)| *ok)
+}
+
+fn cache_put(path: &Path, ok: bool) {
+    let Some(m) = mtime_secs(path) else { return };
+    let mut map: HashMap<String, (u64, bool)> = std::fs::read_to_string(clean_cache_path())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    map.insert(path.to_string_lossy().to_string(), (m, ok));
+    let _ = std::fs::write(clean_cache_path(), serde_json::to_string(&map).unwrap_or_default());
+}
+
+/// Does this module file lower cleanly on its own? Disk-cached verdicts
+/// keep the nested subprocess checks linear.
+fn lowers_clean(path: &Path) -> bool {
+    if let Some(cached) = cache_get(path) {
+        return cached;
+    }
+    let ok = std::env::current_exe().ok()
+        .and_then(|exe| {
+            std::process::Command::new(exe)
+                .args(["--shir"])
+                .arg(path)
+                .arg("--raw")
+                // SINGLE-FILE mode: no crate expansion, no nested
+                // clean-checks — breaks the check-recursion cycle
+                .env("RUST_FRONTEND_NO_EXPAND", "1")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .ok()
+        })
+        .map(|st| st.success())
+        .unwrap_or(false);
+    cache_put(path, ok);
+    ok
 }
 
 /// WHOLE-CRATE expansion: resolve file `mod x;` declarations against
@@ -200,20 +291,7 @@ fn expand_crate(
                 // module whose own body refuses would poison the entry
                 // (its deep gaps are not this file's semantics).
                 // Self-exactness: the check IS this same binary.
-                let lowers_alone = std::env::current_exe().ok()
-                    .and_then(|exe| {
-                        std::process::Command::new(exe)
-                            .args(["--shir"])
-                            .arg(path)
-                            .arg("--raw")
-                            .stdout(std::process::Stdio::null())
-                            .stderr(std::process::Stdio::null())
-                            .status()
-                            .ok()
-                    })
-                    .map(|st| st.success())
-                    .unwrap_or(false);
-                if !lowers_alone {
+                if !lowers_clean(path) {
                     continue;
                 }
                 if let Ok(src_text) = std::fs::read_to_string(path) {
@@ -250,6 +328,10 @@ struct Cx {
     enums: Vec<String>,
     /// registered fn name -> declared return Ty (chain desugar typing)
     fn_rets: HashMap<String, Ty>,
+    /// CONST array items with fully-literal STRING contents
+    /// (`const BUILTINS: &[&str] = &["a", ..]`) — membership tests
+    /// lower to exact OR-equality chains over these literals
+    const_arrays: HashMap<String, Vec<String>>,
     /// fresh-temporary counter (field-read hoists)
     tmp: std::cell::RefCell<u32>,
     /// STATIC item types (persist across the per-function vars clears)
@@ -334,12 +416,32 @@ fn main() {
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
-    // NOTE: deliberately ENTRY-FILE-ONLY expansion — merging the whole
-    // lib tree makes every file inherit the crate's deepest gap (tried
-    // it: 0/30). Per-file granularity beats whole-crate conflation.
+    // Entry-file expansion first (including its own mod tree), then the
+    // lib.rs MODULE TREE with the same GATED splice: a module joins the
+    // program only when it lowers cleanly on its own. This differs from
+    // naive whole-crate merging (reverted earlier: 0/30) because dirty
+    // modules never poison the entry — their calls simply refuse.
+    let no_expand = std::env::var("RUST_FRONTEND_NO_EXPAND").is_ok();
     let mut visited: HashSet<PathBuf> = HashSet::new();
     visited.insert(std::fs::canonicalize(&file).unwrap_or_else(|_| PathBuf::from(&file)));
-    let roots: Vec<syn::Item> = expand_crate(&ast.items, &base_dir, &mut visited);
+    // Entry file + its mod tree first...
+    let mut roots: Vec<syn::Item> = if no_expand {
+        ast.items.clone()
+    } else {
+        expand_crate(&ast.items, &base_dir, &mut visited)
+    };
+    // ...then the lib.rs MODULE TREE with the same GATED splice: a module
+    // joins only when it lowers cleanly alone, so a dirty module never
+    // poisons the entry (its cross-calls simply refuse at the site).
+    let lib_path = base_dir.join("lib.rs");
+    if !no_expand && lib_path.exists() && !visited.contains(&lib_path) {
+        visited.insert(lib_path.clone());
+        if let Ok(src_text) = std::fs::read_to_string(&lib_path) {
+            if let Ok(f) = syn::parse_file(&src_text) {
+                roots.extend(expand_crate(&f.items, &base_dir, &mut visited));
+            }
+        }
+    }
     // Flatten inline `mod` blocks into one item list — namespace nesting
     // has no effect on the lowered program (names stay as written;
     // qualified paths resolve only for `Type::method` call targets).
@@ -355,8 +457,14 @@ fn main() {
                 if let Some(v) = const_int(&c.expr, &cx) {
                     cx.ints.insert(c.ident.to_string(), v);
                 }
+                if let Some(lits) = const_str_array(&c.expr) {
+                    cx.const_arrays.insert(c.ident.to_string(), lits);
+                }
             }
             syn::Item::Static(s) => {
+                if let Some(lits) = const_str_array(&s.expr) {
+                    cx.const_arrays.insert(s.ident.to_string(), lits);
+                }
                 // the static's declared type persists in its own map
                 // (infer_ty consults it even after per-fn clears)
                 let ty = ty_from_type(&s.ty, &cx);
@@ -1969,8 +2077,17 @@ fn function_def(
     if let Some(a) = first_semantic_attr(attrs) {
         refuse("semantic attribute on a function", a.span());
     }
-    if !sig.generics.params.is_empty() {
-        refuse("generic function", sig.generics.params.span());
+    // LIFETIME generics erase unconditionally — they are borrow-checker
+    // metadata with zero runtime meaning (`fn f<'a>(x: &'a T)` IS
+    // `fn f(x: &T)` at runtime). Type/const generics refuse.
+    let has_type_generics = sig.generics.params.iter().any(|p| {
+        matches!(p, syn::GenericParam::Type(_) | syn::GenericParam::Const(_))
+    });
+    if has_type_generics {
+        refuse("generic function (type/const parameters)", sig.generics.params.span());
+    }
+    if sig.generics.where_clause.is_some() {
+        refuse("where clause on a function", sig.generics.where_clause.span());
     }
     if sig.asyncness.is_some() || sig.unsafety.is_some() || sig.constness.is_some() {
         refuse("non-plain `fn` (async/unsafe/const)", sig.ident.span());
@@ -2350,6 +2467,32 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                     "value": value_expr(&m.receiver, cx),
                 });
             }
+            // `.contains(&x)` on a LITERAL const array -> an exact
+            // OR-equality chain over the known contents ($x = ".." -o ..)
+            let recv_name = match &*m.receiver {
+                syn::Expr::Path(p) => single_path(p).map(|i| i.to_string()),
+                _ => None,
+            };
+            if rust_name == "contains" {
+                if let (Some(_), Some(lits)) = (
+                    recv_name.as_ref(),
+                    recv_name.as_ref().and_then(|n| cx.const_arrays.get(n)),
+                ) {
+                    if !m.args.is_empty() {
+                        let arg_val = match &m.args[0] {
+                            syn::Expr::Reference(r) => &r.expr,
+                            a => a,
+                        };
+                        let opnd = operand(arg_val, cx, true);
+                        let cond = lits
+                            .iter()
+                            .map(|lit| format!("{opnd} = \"{}\"", lit))
+                            .collect::<Vec<_>>()
+                            .join(" -o ");
+                        return test_call(&cond);
+                    }
+                }
+            }
             // NOTE: Vec::len() on array variables would lower to the
             // canonical param("len", name) (${#v}) — but the core's
             // ESTree fold renders that as String(getVar(name)).length,
@@ -2443,6 +2586,7 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                 return v;
             }
             let Some(target) = call_target(p, cx) else {
+                eprintln!("DBG unknown call target: {:?}", expr_kind(c.func.as_ref()));
                 refuse("call to unknown function", c.func.span());
             };
             fn_call_expr(&target, &c.args, "fnValue", cx)
