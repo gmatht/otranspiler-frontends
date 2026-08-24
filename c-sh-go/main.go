@@ -11,6 +11,7 @@ package clib
 // Emit shapes mirror the py-sh-go frontend so the estree runner executes
 // them identically. Unsupported constructs fail loud (refuse > guess).
 import (
+	"os"
 	"math"
 	"encoding/json"
 	"fmt"
@@ -1065,6 +1066,14 @@ func userStmtsA1(stmts []*uStmt, params []string, ptrs map[string]string) []any 
 				// `*p++ = v` — advance the pointer after the store
 				out = append(out, memAdvanceCall(s.name, 1))
 			}
+		case "if":
+			out = append(out, map[string]any{
+				"type":   "If",
+				"cond":   userExprA1(s.e, params),
+				"then":   userStmtsA1(s.body, params, ptrs),
+				"elsifs": []any{},
+				"else":   userStmtsA1(s.elseBody, params, ptrs),
+			})
 		case "while":
 			out = append(out, map[string]any{
 				"type": "While",
@@ -1147,6 +1156,7 @@ type uStmt struct {
 	op      string // "=" | "+=" | "-="  (ptrinc: "++" | "--")
 	e       *expr  // assign rhs / while cond / return expr / deref rhs / for cond
 	body    []*uStmt // while body / if then-arm / for body / seq items
+	elseBody []*uStmt // if else-arm
 	init    *uStmt   // for: the loop initializer (an assign)
 	step    *uStmt   // for: the loop step (an assign)
 	a1      any  // a raw A1 statement (exec-carrier kind)
@@ -5060,17 +5070,198 @@ func (p *parser) userStmt() (*uStmt, error) {
 		// any other STATEMENT (if/while/switch/... inside a user fn
 		// body) — the mini-interpreter cannot model control flow, and a
 		// silent drop would emit a function that computes the WRONG
+		case p.isId("if"):
+			fmt.Fprintln(os.Stderr, "DBG if arm fired")
+			p.next()
+			if err := p.expectOp("("); err != nil {
+				return nil, err
+			}
+			c, err := p.expr()
+			if err != nil {
+				return nil, err
+			}
+			if err := p.expectOp(")"); err != nil {
+				return nil, err
+			}
+			thenB, err := p.userStmtOrBlock()
+			if err != nil {
+				return nil, err
+			}
+			elseB := []*uStmt{}
+			if p.isId("else") {
+				p.next()
+				elseB, err = p.userStmtOrBlock()
+				if err != nil {
+					return nil, err
+				}
+			}
+			return &uStmt{kind: "if", e: c, body: thenB, elseBody: elseB}, nil
+		case p.isId("switch"):
+			stmts, serr := p.parseSwitch()
+			if serr != nil {
+				return nil, serr
+			}
+			switch len(stmts) {
+			case 0:
+				return &uStmt{kind: "skip"}, nil
+			case 1:
+				return stmts[0], nil
+			default:
+				return &uStmt{kind: "seq", body: stmts}, nil
+			}
+		}
+		// any other STATEMENT (if/while/switch/... inside a user fn
+		// body) — the mini-interpreter cannot model control flow, and a
+		// silent drop would emit a function that computes the WRONG
 		// value (003_switch_dispatch: an if/return chain vanished).
 		// Refuse loudly instead — refuse > guess.
-		for !p.isOp(";") && p.peek() != nil {
-			p.next()
-		}
-		if p.isOp(";") {
-			p.next()
-		}
-		refuse("unsupported statement in user-function body (only simple assignments, calls and returns are in the subset)")
 		return &uStmt{kind: "skip"}, nil
 	}
+
+// userStmtOrBlock — one statement or a { ... } block, as uStmts.
+func (p *parser) userStmtOrBlock() ([]*uStmt, error) {
+	if p.isOp("{") {
+		return p.userBlock()
+	}
+	s, err := p.userStmt()
+	if err != nil {
+		return nil, err
+	}
+	if s == nil {
+		return []*uStmt{}, nil
+	}
+	return []*uStmt{s}, nil
+}
+
+// parseSwitch — `switch (e) { case V: … default: … }` lowered to a
+// nested if/else chain of uStmts at parse time. C fallthrough: empty
+// case bodies share the next arm (`case 1: case 2: body`); a trailing
+// break binds to the switch and is dropped.
+func (p *parser) parseSwitch() ([]*uStmt, error) {
+	p.next() // consume "switch"
+	if err := p.expectOp("("); err != nil {
+		return nil, err
+	}
+	disc, err := p.expr()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expectOp(")"); err != nil {
+		return nil, err
+	}
+	if err := p.expectOp("{"); err != nil {
+		return nil, err
+	}
+	type entry struct {
+		vals []*expr // case labels (empty = default)
+		body []*uStmt
+	}
+	var entries []entry
+	for {
+		t := p.peek()
+		if t == nil {
+			return nil, fmt.Errorf("unterminated switch")
+		}
+		if t.kind == "op" && t.text == "}" {
+			break
+		}
+		if p.isId("case") {
+			p.next()
+			cv, cerr := p.expr()
+			if cerr != nil {
+				return nil, cerr
+			}
+			if err := p.expectOp(":"); err != nil {
+				return nil, err
+			}
+			entries = append(entries, entry{vals: []*expr{cv}})
+			continue
+		}
+		if p.isId("default") {
+			p.next()
+			if err := p.expectOp(":"); err != nil {
+				return nil, err
+			}
+			entries = append(entries, entry{})
+			continue
+		}
+		stmts, serr := p.userStmtOrBlock()
+		if serr != nil {
+			return nil, serr
+		}
+		if len(entries) > 0 {
+			e := &entries[len(entries)-1]
+			e.body = append(e.body, stmts...)
+		}
+	}
+	p.next() // }
+
+	// group entries into ARMS: consecutive value-only entries share one
+	// arm (fallthrough of empty cases); each arm's body is whatever its
+	// entries carried; default marks the else-arm.
+	type arm struct {
+		vals []*expr
+		body []*uStmt
+		def  bool
+	}
+	var arms []arm
+	cur := -1
+	for _, e := range entries {
+		isDefault := len(e.vals) == 0
+		hasBody := len(e.body) > 0
+		switch {
+		case isDefault:
+			if cur >= 0 && len(arms[cur].body) == 0 {
+				// fallthrough into default: the default body serves as
+				// this arm's body too
+				arms[cur].vals = append(arms[cur].vals, e.vals...)
+				arms[cur].body = e.body
+				cur = -1
+				continue
+			}
+			arms = append(arms, arm{body: e.body, def: true})
+			cur = len(arms) - 1
+		case cur >= 0 && !arms[cur].def && len(arms[cur].body) == 0:
+			// fallthrough: extend the open arm's values AND take the new
+			// entry's body (a shared-label `case 1: case 2: body` keeps
+			// one arm with merged values and the real body)
+			arms[cur].vals = append(arms[cur].vals, e.vals...)
+			if hasBody {
+				arms[cur].body = e.body
+			}
+		default:
+			arms = append(arms, arm{vals: e.vals, body: e.body})
+			cur = len(arms) - 1
+		}
+	}
+
+	discCopy := disc
+	// build the nested if-chain from the LAST arm backwards; the default
+	// arm's body is the innermost else
+	eq := func(v *expr) *expr {
+		return &expr{kind: "bin", op: "==", l: discCopy, r: v}
+	}
+	var build func(i int) ([]*uStmt, error)
+	build = func(i int) ([]*uStmt, error) {
+		if i >= len(arms) {
+			return nil, nil
+		}
+		a := arms[i]
+		if a.def {
+			return a.body, nil
+		}
+		cond := eq(a.vals[0])
+		for _, extra := range a.vals[1:] {
+			cond = &expr{kind: "bin", op: "||", l: cond, r: eq(extra)}
+		}
+		els, eerr := build(i + 1)
+		if eerr != nil {
+			return nil, eerr
+		}
+		return []*uStmt{{kind: "if", e: cond, body: a.body, elseBody: els}}, nil
+	}
+	res, rerr := build(0)
+	return res, rerr
 }
 
 // printfFold — sprintf's format with literal args folded to its C text
