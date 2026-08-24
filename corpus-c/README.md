@@ -42,9 +42,9 @@ conditionals, comments.
 | 017_struct_arrow | struct field mutation through a pointer (-> idiom) |
 | 018_enum_state | enum constants as named ints driving dispatch |
 
-## Status (2026-08-23)
+## Status
 
-86/180 cells green. Per-backend state with the current core
+125/180 cells green (was 69 at goal start). Per-backend state with the current core
 (s2p.c f120f194 + workspace bed252b3):
 
 - **perl**: green except function-outparam/struct examples (the
