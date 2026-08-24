@@ -1772,6 +1772,71 @@ func isIdent(c byte) bool {
 }
 
 // ── preprocessor (the #define subset) ────────────────────────────────
+// preprocessEnums — lower `enum [Tag] { A, B = 5, C } [typedef-name]`
+// declarations onto the int model: each enumerator becomes an object-
+// like macro with a literal value (0-based, explicit values pin), the
+// declaration text disappears (standalone) or degrades to `typedef int
+// NAME`, and remaining `enum Tag` TYPE USES rewrite to `int`. Without
+// this pass enumerator uses read as undefined vars (getVar("IDLE") —
+// empty string where C means 0).
+func preprocessEnums(src string) string {
+	re := regexp.MustCompile(`(?s)enum\s+([A-Za-z_]\w*)?\s*\{([^}]*)\}\s*([A-Za-z_]\w*)?(;?)`)
+	var next int64
+	out := re.ReplaceAllStringFunc(src, func(m string) string {
+		groups := re.FindStringSubmatch(m)
+		body, name, semi := groups[2], groups[3], groups[4]
+		next = 0
+		for _, entry := range strings.Split(body, ",") {
+			entry = strings.TrimSpace(entry)
+			if entry == "" {
+				continue
+			}
+			constName := entry
+			valStr := ""
+			if eq := strings.Index(entry, "="); eq >= 0 {
+				constName = strings.TrimSpace(entry[:eq])
+				valStr = strings.TrimSpace(entry[eq+1:])
+			}
+			if constName == "" {
+				continue
+			}
+			if valStr != "" {
+				if v, err := strconv.ParseInt(valStr, 0, 64); err == nil {
+					next = v
+				} else if mm, ok := macros[valStr]; ok && len(mm.params) == 0 {
+					// an earlier constant or macro as the value
+					if lit := strings.TrimSpace(tokText(mm.body)); lit != "" {
+						if v2, err2 := strconv.ParseInt(lit, 0, 64); err2 == nil {
+							next = v2
+						}
+					}
+				}
+			}
+			if _, dup := macros[constName]; !dup {
+				macros[constName] = macro{body: []tok{{"num", strconv.FormatInt(next, 10)}}}
+			}
+			next++
+		}
+		if name != "" {
+			return "typedef int " + name + semi
+		}
+		return ""
+	})
+	// type USES: `enum Tag var;` / `enum Tag *p;` → `int ...`
+	useRe := regexp.MustCompile(`enum\s+[A-Za-z_]\w*`)
+	out = useRe.ReplaceAllString(out, "int")
+	return out
+}
+
+// tokText — the concatenated text of a token list (for literal folding).
+func tokText(ts []tok) string {
+	var sb strings.Builder
+	for _, t := range ts {
+		sb.WriteString(t.text)
+	}
+	return sb.String()
+}
+
 // preprocessDefines — collect `#define NAME body` / `#define NAME(a,b)
 // body` lines into the macro table. Other `#` lines (include) stay
 // skipped by the lexer. Bodies are lexed as token lists.
@@ -3205,6 +3270,12 @@ func (p *parser) stmts() ([]any, error) {
 				return nil, err
 			}
 			out = append(out, inner...)
+			continue
+		}
+		if t.kind == "op" && t.text == ";" {
+			// a bare `;` (empty statement) — skip; a leftover from a
+			// preprocessing rewrite must never poison the stream
+			p.next()
 			continue
 		}
 		s, err := p.stmt()
@@ -4986,13 +5057,18 @@ func (p *parser) userStmt() (*uStmt, error) {
 					ptrPost: target.kind == "postinc" || target.kind == "postdec"}, nil
 			}
 		}
-		// any other expression statement — consume to ';' (uninterpreted)
+		// any other STATEMENT (if/while/switch/... inside a user fn
+		// body) — the mini-interpreter cannot model control flow, and a
+		// silent drop would emit a function that computes the WRONG
+		// value (003_switch_dispatch: an if/return chain vanished).
+		// Refuse loudly instead — refuse > guess.
 		for !p.isOp(";") && p.peek() != nil {
 			p.next()
 		}
 		if p.isOp(";") {
 			p.next()
 		}
+		refuse("unsupported statement in user-function body (only simple assignments, calls and returns are in the subset)")
 		return &uStmt{kind: "skip"}, nil
 	}
 }
@@ -5134,6 +5210,7 @@ func Shir(src string) (out []byte, err error) {
 	structLayouts = map[string][]structMember{}
 	varStruct = map[string]string{}
 	macros = map[string]macro{}
+	src = preprocessEnums(src)
 	preprocessDefines(src)
 	ts, err := lex(src)
 	if err != nil {
