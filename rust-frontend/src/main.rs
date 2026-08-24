@@ -110,6 +110,12 @@ enum Ty {
     /// an `AtomicBool` static — single-threaded JS makes load/store a
     /// plain value read/write (exact)
     AtomicBool,
+    /// a TUPLE of the given arity — values lower to native arrays;
+    /// `.N` reads are computed index reads
+    Tuple(u32),
+    /// a FUNCTION ITEM (`transforms::f`) — its store value is the
+    /// REGISTERED lowered name; indirect calls dispatch by that name
+    Fn(String),
     Unknown,
 }
 
@@ -156,6 +162,7 @@ fn ty_from_type(t: &syn::Type, cx: &Cx) -> Ty {
         syn::Type::Slice(s) => {
             Ty::Arr(Some(Box::new(ty_from_type(&s.elem, cx))), None)
         }
+        syn::Type::Tuple(tup) => Ty::Tuple(tup.elems.len() as u32),
         _ => Ty::Unknown,
     }
 }
@@ -764,6 +771,24 @@ fn infer_ty(e: &syn::Expr, cx: &Cx) -> Ty {
                 None => Ty::Unknown,
             }
         }
+        // a TUPLE literal is an array of the first element's proven type
+        syn::Expr::Tuple(tu) => Ty::Arr(
+            Some(Box::new(
+                tu.elems.first().map(|e| infer_ty(e, cx)).unwrap_or(Ty::Unknown),
+            )),
+            Some(tu.elems.len() as u64),
+        ),
+        // `.N` on a proven Arr(tuple) reads an element of the elem type
+        syn::Expr::Field(f)
+            if matches!(&f.member, syn::Member::Unnamed(_))
+                && matches!(infer_ty(&f.base, cx), Ty::Arr(..)) =>
+        {
+            match infer_ty(&f.base, cx) {
+                Ty::Arr(Some(t), _) => *t,
+                _ => Ty::Unknown,
+            }
+        }
+
         syn::Expr::Field(f) => {
             // `base.field` where base is a KNOWN struct: the field's
             // declared type (`prog.var_types` -> Arr)
@@ -783,6 +808,23 @@ fn infer_ty(e: &syn::Expr, cx: &Cx) -> Ty {
             Ty::Unknown
         }
         syn::Expr::Path(p) => {
+            // a registered-FN item used as a value carries its name — but
+            // ONLY when it is not shadowed by a tracked variable
+            if p.qself.is_none()
+                && !p.path.leading_colon.is_none() == false
+                && p.path.segments.iter().all(|s| s.arguments.is_none())
+            {
+                let last = p.path.segments.last().unwrap().ident.to_string();
+                let is_var = single_path(p)
+                    .map(|id| {
+                        cx.vars.borrow().contains_key(&id.to_string())
+                            || cx.statics.borrow().contains_key(&id.to_string())
+                    })
+                    .unwrap_or(false);
+                if !is_var && cx.fns.iter().any(|f| *f == last) {
+                    return Ty::Fn(last);
+                }
+            }
             // `Color::Red` — a unit-variant VALUE has its enum's type
             if p.qself.is_none() && p.path.segments.len() == 2 {
                 let e = p.path.segments[0].ident.to_string();
@@ -1223,6 +1265,25 @@ fn std_ctor_value(
     }
 }
 
+/// A FUNCTION ITEM used as a VALUE (`let f = transforms::g;`): its
+/// store value is the REGISTERED lowered name. Sound because the only
+/// operation on a fn value is an indirect call, which dispatches by that
+/// name (the runtime resolves sh2.functions entries by string).
+fn fn_item_value(p: &syn::ExprPath, cx: &Cx) -> Option<Value> {
+    if p.qself.is_some() {
+        return None;
+    }
+    let last = p.path.segments.last()?.ident.to_string();
+    if cx.fns.iter().any(|f| *f == last) && p.path.segments.len() >= 2 {
+        return Some(str_lit(&last));
+    }
+    None
+}
+
+fn last_len_in_fns(last: &str, cx: &Cx) -> bool {
+    cx.fns.iter().any(|f| f == last)
+}
+
 /// Resolve a call target path to a registered lowered-name: a free fn
 /// (`f`) or an inherent impl method (`Type::method` -> `Type_method`).
 /// Returns None for anything else (unknown names, deeper paths,
@@ -1233,6 +1294,20 @@ fn call_target(p: &syn::ExprPath, cx: &Cx) -> Option<String> {
     }
     let segs: Vec<&syn::PathSegment> = p.path.segments.iter().collect();
     let known = |n: &str| cx.fns.iter().any(|f| *f == n);
+    // a VARIABLE of proven Fn(type) dispatches to its registered name
+    // (compile-time resolution: the tracker follows reassignments)
+    if segs.len() == 1 && segs[0].arguments.is_none() {
+        let n = segs[0].ident.to_string();
+        let vt = cx
+            .vars
+            .borrow()
+            .get(&n)
+            .cloned()
+            .or_else(|| cx.statics.borrow().get(&n).cloned());
+        if let Some(Ty::Fn(reg)) = vt {
+            return Some(reg);
+        }
+    }
     // exactly-2 segments: the `Type::method` mangling wins first
     if segs.len() == 2 && segs.iter().all(|s| s.arguments.is_none()) {
         let mangled = format!("{}_{}", segs[0].ident, segs[1].ident);
@@ -1446,6 +1521,8 @@ fn array_literal_elems(e: &syn::Expr) -> Option<Vec<syn::Expr>> {
             }
         }
         syn::Expr::Array(ar) => Some(ar.elems.iter().cloned().collect()),
+        // tuples ARE native arrays in the store model
+        syn::Expr::Tuple(tu) => Some(tu.elems.iter().cloned().collect()),
         _ => None,
     }
 }
@@ -2344,6 +2421,19 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                     return str_lit(&format!("{e}::{v}"));
                 }
             }
+            // a FUNCTION ITEM used as a value (`transforms::g`) lowers
+            // to its registered name string — indirect calls dispatch
+            // by that name
+            if p.qself.is_none()
+                && p.path.leading_colon.is_none()
+                && p.path.segments.len() >= 2
+                && p.path.segments.iter().all(|s| s.arguments.is_none())
+            {
+                let last = p.path.segments.last().unwrap().ident.to_string();
+                if cx.fns.iter().any(|f| *f == last) {
+                    return str_lit(&last);
+                }
+            }
             let Some(name) = single_path(p) else {
                 refuse("path expression", p.span());
             };
@@ -2431,13 +2521,39 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
             }
             json!({"type": "Object", "properties": props})
         }
+        syn::Expr::Tuple(tup) => {
+            // `(a, b)` -> a native array (the store's tuple value);
+            // arity is tracked for `.N` bound checks
+            json!({
+                "type": "Array",
+                "elements": tup.elems.iter().map(|e| value_expr(e, cx)).collect::<Vec<_>>(),
+            })
+        }
         syn::Expr::Field(f) => {
-            // `p.x` -> the FieldRead ext node (shir_nodes/field_read.node:
-            // named field read on a composite value). Tuple reads (`p.0`)
-            // refuse — no tuple contract yet.
+            // NUMERIC members (`t.0`) on a tracked ARRAY variable read
+            // elements via the arrayIndex builtin — getVar returns the
+            // scalar view of arrays, so a plain read would be wrong.
+            // NAMED members use the FieldRead ext node (property read).
+            if let syn::Member::Unnamed(ix) = &f.member {
+                let recv_ty = infer_ty(&f.base, cx);
+                if matches!(recv_ty, Ty::Arr(..)) {
+                    if let Some(syn::Expr::Path(p)) = Some(&*f.base) {
+                        if let Some(vname) = single_path(p) {
+                            return json!({
+                                "args": [
+                                    str_lit(&vname.to_string()),
+                                    {"type": "Arith", "ast": {"type": "Num", "value": ix.index as i64}},
+                                ],
+                                "func": "arrayIndex", "purity": "PureCpu", "type": "Call"
+                            });
+                        }
+                    }
+                }
+                refuse("tuple-index read on an untracked receiver", f.span());
+            }
             let name = match &f.member {
                 syn::Member::Named(ident) => ident.to_string(),
-                syn::Member::Unnamed(ix) => refuse("tuple-index field read", ix.span()),
+                syn::Member::Unnamed(_) => unreachable!("handled above"),
             };
             json!({
                 "type": "FieldRead",
@@ -2556,6 +2672,8 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                                 unreachable!("enum receivers are not method targets: {}", n)
                             }
                             Ty::AtomicBool => "",
+                            Ty::Tuple(_) => "tuple ",
+                            Ty::Fn(_) => "",
                             Ty::Unknown => "",
                         }
                     ),

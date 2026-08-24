@@ -314,6 +314,22 @@ Pinned indirectly via transforms/builtin.rs lowering cleanly
 (69-entry builtins table). Remaining blockers there: slice patterns
 against core IrExpr::* variants (meta-level).
 
+## v0.15 additions — tuples & fn-items as values
+
+- tuple literals `(a, b)` store as native arrays via setArray;
+  `t.N` reads on tracked array vars lower to the exact arrayIndex
+  builtin (getVar's scalar view would misread). `.N` on untracked
+  receivers refuses.
+- fn items used as VALUES (`transforms::g`, or a bare registered `g`
+  not shadowed by a variable) lower to their REGISTERED name string;
+  indirect calls through tracked Fn-typed vars resolve to that name at
+  compile time and dispatch fnValue/fnCall. Sound: the only operation
+  on a fn value is an indirect call, which dispatches by name.
+- Ty gains Tuple(arity) and Fn(name); inference covers annotations,
+  tuple-literal shapes, and non-shadowed fn paths.
+
+Pinned by t55_tuples_fnvals.rs.
+
 Refused loudly (testdata/*_refuse.rs — the emit MUST fail, t13–t23):
 borrows `&x`, user functions, `String::from`/method calls, `match`,
 `vec!`, `eprintln!`/`dbg!`, floats, `{:?}`/named/width format specs,
