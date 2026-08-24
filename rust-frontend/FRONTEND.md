@@ -261,6 +261,23 @@ Pinned by t51_len_isempty.rs.
 
 Pinned by t52_for_vec.rs.
 
+## v0.12 additions — iterator-chain desugar (.iter().map(F).collect())
+
+- `let D = SRC.iter().map(F).collect();` (assignment position too)
+  desugars to accumulator + hoisted ${#SRC} bound + index while-loop +
+  per-element setArrayAppend — all existing A1 shapes. F is either an
+  INLINE CLOSURE (param bound to the element read, body evaluated in
+  place — captures read from the shared store, exact for our subset)
+  or a registered fn name (per-element fnValue dispatch).
+- Result typing: closure body Ty / fn return Ty propagate to D.
+- KNOWN GATE GAP: the executed-stdout oracle still fails for these
+  programs because EVERY array read-back goes through getVar's scalar
+  view (the param-len core request). t53 lives in testdata-pending/
+  with instrumentation proving all appends fire correctly; it promotes
+  automatically once that request lands.
+- Source length must be PROVEN from a literal-built array (the
+  param fallback miscounts); otherwise refuses.
+
 Refused loudly (testdata/*_refuse.rs — the emit MUST fail, t13–t23):
 borrows `&x`, user functions, `String::from`/method calls, `match`,
 `vec!`, `eprintln!`/`dbg!`, floats, `{:?}`/named/width format specs,

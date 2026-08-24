@@ -160,6 +160,14 @@ fn ty_from_type(t: &syn::Type, cx: &Cx) -> Ty {
     }
 }
 
+/// A signature's declared return Ty (`-> T`), Unknown when unit/absent.
+fn ret_ty(output: &syn::ReturnType, cx: &Cx) -> Ty {
+    match output {
+        syn::ReturnType::Default => Ty::Unknown,
+        syn::ReturnType::Type(_, t) => ty_from_type(t, cx),
+    }
+}
+
 /// WHOLE-CRATE expansion: resolve file `mod x;` declarations against
 /// sibling sources, recursively, so cross-module calls resolve (the
 /// inline-mod flattening then merges namespaces by bare name). Roots =
@@ -240,6 +248,8 @@ struct Cx {
     structs: std::cell::RefCell<HashMap<String, Vec<(String, Ty)>>>,
     /// declared enum names (unit-variant tag lowering)
     enums: Vec<String>,
+    /// registered fn name -> declared return Ty (chain desugar typing)
+    fn_rets: HashMap<String, Ty>,
     /// fresh-temporary counter (field-read hoists)
     tmp: std::cell::RefCell<u32>,
     /// STATIC item types (persist across the per-function vars clears)
@@ -383,6 +393,7 @@ fn main() {
                     if let syn::ImplItem::Fn(m) = ii {
                         let mangled = format!("{}_{}", ty, m.sig.ident);
                         cx.fns.push(mangled.clone());
+                        cx.fn_rets.insert(mangled.clone(), ret_ty(&m.sig.output, &cx));
                         fns.push(FnSource::Method(mangled, m, ty.clone()));
                     }
                     // non-fn impl items (consts/types) are declaration-only
@@ -537,6 +548,17 @@ fn lower_local(local: &syn::Local, cx: &Cx, out: &mut Vec<Value>) -> Option<Valu
     };
     // if-as-value: bind the target in EVERY branch (exact — rustc
     // guarantees all paths produce the value)
+    // iterator chains (`SRC.iter().map(F).collect()`) desugar to
+    // accumulator + index loop + setArrayAppend
+    if as_method_call(&init.expr, "collect").is_some() {
+        if let Some((src_expr, map_fn)) = parse_collect_chain(&init.expr, cx) {
+            return collect_chain_stmt(&name, src_expr, map_fn, cx, out);
+        }
+        refuse(
+            "iterator chain (only SRC.iter()[.map(closure-or-fn)].collect())",
+            init.expr.span(),
+        );
+    }
     // array literals STORE via setArray (native array, no coercion)
     if let Some(elems) = array_literal_elems(&init.expr) {
         let elements = elems.iter().map(|e| value_expr(e, cx)).collect::<Vec<_>>();
@@ -770,6 +792,21 @@ fn plain_assign(a: &syn::ExprAssign, cx: &Cx, out: &mut Vec<Value>) -> Value {
     let Some(name) = single_path(p) else {
         refuse("assignment target path", p.span());
     };
+    // iterator chains in assignment position
+    if as_method_call(&a.right, "collect").is_some() {
+        if let Some((src_expr, map_fn)) = parse_collect_chain(&a.right, cx) {
+            let node =
+                collect_chain_stmt(&name.to_string(), src_expr, map_fn, cx, out);
+            return match node {
+                Some(v) => v,
+                None => refuse("iterator chain produced no loop", a.right.span()),
+            };
+        }
+        refuse(
+            "iterator chain (only SRC.iter()[.map(closure-or-fn)].collect())",
+            a.right.span(),
+        );
+    }
     // array literal RHS stores via setArray (native, no coercion)
     if let Some(elems) = array_literal_elems(&a.right) {
         let elements = elems.iter().map(|e| value_expr(e, cx)).collect::<Vec<_>>();
@@ -1128,6 +1165,17 @@ fn fn_call_expr(
     fn_call_expr_values(name, owned, func, cx)
 }
 
+/// The same call node over already-lowered A1 argument values.
+fn fn_call_expr_a1(name: &str, args: Vec<Value>, func: &str) -> Value {
+    json!({
+        "args": [
+            str_lit(name),
+            json!({"elements": args, "type": "Array"}),
+        ],
+        "func": func, "purity": "Emulable", "type": "Call"
+    })
+}
+
 /// The same call node over already-collected argument expressions (the
 /// receiver-method dispatch passes the receiver as first positional).
 fn fn_call_expr_values<I>(name: &str, args: I, func: &str, cx: &Cx) -> Value
@@ -1282,6 +1330,168 @@ fn array_literal_elems(e: &syn::Expr) -> Option<Vec<syn::Expr>> {
         syn::Expr::Array(ar) => Some(ar.elems.iter().cloned().collect()),
         _ => None,
     }
+}
+
+/// The per-element transform of a `.map(F)`: a closure (inlined) or a
+/// registered fn name (dispatched via fnValue).
+enum MapFn<'a> {
+    Closure(&'a syn::ExprClosure),
+    Fn(String),
+}
+
+fn as_method_call<'a>(e: &'a syn::Expr, name: &str) -> Option<&'a syn::ExprMethodCall> {
+    match e {
+        syn::Expr::MethodCall(m) if m.method == name => Some(m),
+        _ => None,
+    }
+}
+
+/// Parse `SRC.iter()[.map(F)].collect()` -> (SRC, map fn or None).
+/// Turbofished collects (`collect::<Vec<_>>()`) are fine; anything else
+/// in the chain (filter, take, ...) returns None — the caller refuses.
+fn parse_collect_chain<'a>(
+    e: &'a syn::Expr,
+    cx: &Cx,
+) -> Option<(&'a syn::Expr, Option<MapFn<'a>>)> {
+    let collect = as_method_call(e, "collect")?;
+    // turbofish allowed but ignored (the dst annotation carries the type)
+    let prev = &*collect.receiver;
+    if let Some(map) = as_method_call(prev, "map") {
+        if map.args.len() != 1 {
+            return None;
+        }
+        let f = match &map.args[0] {
+            syn::Expr::Closure(c) => MapFn::Closure(c),
+            syn::Expr::Path(p) => {
+                let name = single_path(p)?.to_string();
+                if !cx.fns.iter().any(|f| *f == name) {
+                    return None;
+                }
+                MapFn::Fn(name)
+            }
+            _ => return None,
+        };
+        // unwrap the `.iter()` between the source and the map
+        let src = as_method_call(&map.receiver, "iter")?;
+        if !src.args.is_empty() {
+            return None;
+        }
+        return Some((&*src.receiver, Some(f)));
+    }
+    // bare SRC.iter().collect() — element copy
+    let iter = as_method_call(prev, "iter")?;
+    if !iter.args.is_empty() {
+        return None;
+    }
+    Some((&*iter.receiver, None))
+}
+
+/// Lower `let D = SRC.iter().map(F).collect();` — accumulator + index
+/// loop + setArrayAppend, all existing A1 shapes:
+///   setArray(D, [])
+///   __n <- param(len, SRC); __i = 0
+///   while $__i < $__n:
+///     it <- arrayIndex(SRC, __i); [P <- it;]
+///     setArrayAppend(D, [VALUE])
+///     __i += 1
+fn collect_chain_stmt(
+    dst: &str,
+    src_expr: &syn::Expr,
+    map_fn: Option<MapFn>,
+    cx: &Cx,
+    out: &mut Vec<Value>,
+) -> Option<Value> {
+    // the SOURCE must be a plain variable holding an array
+    let Some(syn::Expr::Path(sp)) = Some(src_expr) else {
+        refuse("iterator source path", src_expr.span());
+    };
+    let Some(src_name) = single_path(sp) else {
+        refuse("iterator source path", sp.span());
+    };
+    let src_name = src_name.to_string();
+    let elem_ty = match infer_ty(src_expr, cx) {
+        Ty::Arr(Some(t), _) => (t.as_ref().clone()),
+        _ => Ty::Unknown,
+    };
+
+    // result type for the dst annotation consumers
+    let res_ty = match &map_fn {
+        Some(MapFn::Closure(c)) => infer_ty(&c.body, cx),
+        Some(MapFn::Fn(name)) => cx.fn_rets.get(name).cloned().unwrap_or(Ty::Unknown),
+        None => elem_ty.clone(),
+    };
+
+    let idx = format!("__sh2i{}", { let mut c = cx.tmp.borrow_mut(); *c += 1; c });
+    let lenv = format!("__sh2l{}", { let mut c = cx.tmp.borrow_mut(); *c += 1; c });
+    let itv = format!("__sh2t{}", { let mut c = cx.tmp.borrow_mut(); *c += 1; c });
+
+    // pre-loop: fresh accumulator + hoisted length + zeroed index.
+    // The length MUST be provable from a literal-built source — the
+    // param(len) fallback misreads array vars (core request
+    // rust-frontend-20260824-param-len-arrays.md).
+    let src_known_len = match infer_ty(src_expr, cx) {
+        Ty::Arr(_, l) => l,
+        _ => None,
+    };
+    let Some(n) = src_known_len else {
+        refuse(
+            "iterator source length unproven (param-len arrays core request)",
+            src_expr.span(),
+        );
+    };
+    out.push(set_array_stmt(dst, vec![]));
+    cx.vars.borrow_mut().insert(
+        dst.to_string(),
+        Ty::Arr(Some(Box::new(res_ty.clone())), None),
+    );
+    out.push(assign_stmt(&lenv, str_lit(&n.to_string())));
+    cx.vars.borrow_mut().insert(lenv.clone(), Ty::Int);
+    out.push(assign_stmt(&idx, arith_value(arith_num(0))));
+    cx.vars.borrow_mut().insert(idx.clone(), Ty::Int);
+
+    // per-iteration body: element read -> (param bind) -> value -> append
+    let mut loop_body = Vec::new();
+    loop_body.push(assign_stmt(
+        &itv,
+        json!({
+            "args": [str_lit(&src_name),
+                     {"type": "Arith", "ast": {"name": idx, "type": "Var"}}],
+            "func": "arrayIndex", "purity": "PureCpu", "type": "Call"
+        }),
+    ));
+    cx.vars.borrow_mut().insert(itv.clone(), elem_ty.clone());
+    let value = match &map_fn {
+        Some(MapFn::Closure(c)) => {
+            let Some(syn::Pat::Ident(pi)) = c.inputs.first() else {
+                refuse("closure parameter pattern", c.inputs.span());
+            };
+            let pname = pi.ident.to_string();
+            loop_body.push(assign_stmt(&pname, get_var(&itv)));
+            cx.vars.borrow_mut().insert(pname.clone(), elem_ty.clone());
+            value_expr(&c.body, cx)
+        }
+        Some(MapFn::Fn(name)) => {
+            fn_call_expr_a1(name, vec![get_var(&itv)], "fnValue")
+        }
+        None => get_var(&itv),
+    };
+    loop_body.push(expr_stmt(json!({
+        "args": [
+            str_lit(dst),
+            json!({"elements": vec![value], "type": "Array"}),
+        ],
+        "func": "setArrayAppend", "purity": "Emulable", "type": "Call"
+    })));
+    loop_body.push(assign_stmt(
+        &idx,
+        arith_bin("+", arith_var(&idx), arith_num(1)),
+    ));
+
+    Some(json!({
+        "type": "While",
+        "cond": test_call(&format!("${idx} -lt ${lenv}")),
+        "body": loop_body,
+    }))
 }
 
 /// Wrap a raw arith AST into the A1 Arith VALUE expr.

@@ -67,6 +67,11 @@ counts over the corpus (top entries):
 
 ## Phased plan (each phase = frontend subset growth + testdata pins, gate green)
 
+1l. DONE v0.12 — iterator-chain desugar (.iter().map(closure|fn).
+    collect()) via accumulator + index loop + setArrayAppend; closures
+    inline, fn-names dispatch fnValue; result typing propagates.
+    BLOCKED at oracle: getVar scalar view (param-len request). t53
+    pending.
 1k. DONE v0.11b — Vec/array for-loops (index while-loop + arrayIndex,
     hoisted var bound, element-type tracking incl. literal lengths),
     scalar deref erasure (t52).
