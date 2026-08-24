@@ -330,6 +330,20 @@ against core IrExpr::* variants (meta-level).
 
 Pinned by t55_tuples_fnvals.rs.
 
+## v0.16 additions — .enumerate() / .rev() / tuple-destructuring params
+
+- chain steps generalize further: `.enumerate()` pairs (position,
+  element) with the position being THE LOOP INDEX (never materialized
+  as a nested array); `.rev()` flips visitation (position =
+  bound-1-idx); both compose with map/filter/take in any order.
+- closure params destructure TUPLES: `.enumerate().map(|(i, x)| ...)`
+  binds i <- position, x <- arrayIndex(src, position) directly.
+- filter/params ADOPT the holder's proven type (`|b| *b` derefs
+  through; comparisons infer Bool).
+- KNOWN GATE GAP (same param-len request): accumulated-array read-backs
+  still go through getVar's scalar view, so t56 waits in
+  testdata-pending/ with t53.
+
 Refused loudly (testdata/*_refuse.rs — the emit MUST fail, t13–t23):
 borrows `&x`, user functions, `String::from`/method calls, `match`,
 `vec!`, `eprintln!`/`dbg!`, floats, `{:?}`/named/width format specs,

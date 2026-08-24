@@ -667,7 +667,6 @@ fn lower_local(local: &syn::Local, cx: &Cx, out: &mut Vec<Value>) -> Option<Valu
     // accumulator + index loop + setArrayAppend
     if as_method_call(&init.expr, "collect").is_some() {
         let parsed = parse_collect_chain(&init.expr, cx);
-        eprintln!("DBG local-chain parsed={}", parsed.is_some());
         if let Some((src_expr, steps)) = parsed {
             return collect_chain_stmt(&name, src_expr, steps, cx, out);
         }
@@ -760,6 +759,10 @@ fn infer_ty(e: &syn::Expr, cx: &Cx) -> Ty {
         }
         syn::Expr::Paren(p) => infer_ty(&p.expr, cx),
         syn::Expr::Reference(r) => infer_ty(&r.expr, cx),
+        // deref reads pass through: the store holds values
+        syn::Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => {
+            infer_ty(&u.expr, cx)
+        }
         syn::Expr::Array(ar) => Ty::Arr(Some(Box::new(
             ar.elems.first().map(|e| infer_ty(e, cx)).unwrap_or(Ty::Unknown),
         )), Some(ar.elems.len() as u64)),
@@ -1534,6 +1537,14 @@ enum MapFn<'a> {
     Fn(String),
 }
 
+/// The first input pattern of a map's closure/fn, if it is a closure.
+fn c_inputs_first<'a>(f: &'a MapFn) -> Option<&'a syn::Pat> {
+    match f {
+        MapFn::Closure(c) => c.inputs.first(),
+        MapFn::Fn(_) => None,
+    }
+}
+
 /// One pipeline step between the source array and `.collect()`.
 enum Step<'a> {
     /// `.iter()` / `.iter_mut()` — enters the pipeline
@@ -1545,6 +1556,11 @@ enum Step<'a> {
     Filter(&'a syn::ExprClosure),
     /// `.take(N)` — N a literal int (bounds the loop)
     Take(u64),
+    /// `.enumerate()` — pairs (position, element); positions are the
+    /// LOOP INDEX (exact: the pipeline visits elements in order)
+    Enumerate,
+    /// `.rev()` — reverse visitation order
+    Rev,
 }
 
 fn as_method_call<'a>(e: &'a syn::Expr, name: &str) -> Option<&'a syn::ExprMethodCall> {
@@ -1573,6 +1589,20 @@ fn parse_collect_chain<'a>(
             syn::Expr::MethodCall(mc) => {
                 let mname = mc.method.to_string();
                 match mname.as_str() {
+                    "enumerate" => {
+                        if !mc.args.is_empty() || mc.turbofish.is_some() {
+                            return None;
+                        }
+                        rev.push(Step::Enumerate);
+                        node = &mc.receiver;
+                    }
+                    "rev" => {
+                        if !mc.args.is_empty() || mc.turbofish.is_some() {
+                            return None;
+                        }
+                        rev.push(Step::Rev);
+                        node = &mc.receiver;
+                    }
                     "iter" | "iter_mut" => {
                         if !mc.args.is_empty() || mc.turbofish.is_some() {
                             return None;
@@ -1676,13 +1706,20 @@ fn collect_chain_stmt(
         Ty::Arr(_, l) => l,
         _ => None,
     };
+    let mut enumerated = false;
+    let mut reversed = false;
     for step in &steps {
-        if let Step::Take(n) = step {
-            known_len = Some(match known_len {
-                Some(l) if l > *n => *n,
-                Some(l) => l,
-                None => *n, // unproven source + take(n): EXACT bound
-            });
+        match step {
+            Step::Take(n) => {
+                known_len = Some(match known_len {
+                    Some(l) if l > *n => *n,
+                    Some(l) => l,
+                    None => *n, // unproven source + take(n): EXACT bound
+                });
+            }
+            Step::Enumerate => enumerated = true,
+            Step::Rev => reversed = !reversed,
+            _ => {}
         }
     }
     let Some(bound) = known_len else {
@@ -1695,11 +1732,17 @@ fn collect_chain_stmt(
     // result type: last Map's output (or the element type)
     let mut res_ty = elem0_ty.clone();
     for step in &steps {
-        if let Step::Map(f) = step {
-            res_ty = match f {
-                MapFn::Closure(c) => infer_ty(&c.body, cx),
-                MapFn::Fn(name) => cx.fn_rets.get(name).cloned().unwrap_or(Ty::Unknown),
-            };
+        match step {
+            Step::Map(f) => {
+                res_ty = match f {
+                    MapFn::Closure(c) => infer_ty(&c.body, cx),
+                    MapFn::Fn(name) => cx.fn_rets.get(name).cloned().unwrap_or(Ty::Unknown),
+                };
+            }
+            // enumerate wraps elements in (position, element) pairs — the
+            // pair is never materialized (bindings read position/element
+            // directly), so the RESULT element type is unchanged
+            Step::Enumerate | Step::Rev | Step::Take(_) | Step::Iter | Step::Filter(_) => {}
         }
     }
 
@@ -1722,61 +1765,140 @@ fn collect_chain_stmt(
     cx.vars.borrow_mut().insert(idx.clone(), Ty::Int);
 
     // per-iteration body:
-    //   __cur <- arrayIndex(SRC, __i)
+    //   __cur <- arrayIndex(SRC, POSITION)   (position = idx, or
+    //   bound-1-idx under .rev(); enumerate exposes the position itself)
     //   per step: Map rebinds __cur via closure/fnValue; Filter skips on
     //   a proven-false predicate (Continue)
+    let enumerated_any = steps.iter().any(|s| matches!(s, Step::Enumerate));
+    let pos_ast = if reversed {
+        json!({
+            "lhs": {"type": "Num", "value": bound.saturating_sub(1)},
+            "op": "-",
+            "rhs": {"name": idx, "type": "Var"},
+            "type": "Bin"
+        })
+    } else {
+        json!({"name": idx, "type": "Var"})
+    };
     let mut loop_body = Vec::new();
     loop_body.push(assign_stmt(
         &cur,
         json!({
             "args": [str_lit(&src_name),
-                     {"type": "Arith", "ast": {"name": idx, "type": "Var"}}],
+                     {"type": "Arith", "ast": pos_ast.clone()}],
             "func": "arrayIndex", "purity": "PureCpu", "type": "Call"
         }),
     ));
-    cx.vars.borrow_mut().insert(cur.clone(), elem0_ty);
+    cx.vars.borrow_mut().insert(cur.clone(), elem0_ty.clone());
     for step in steps.iter().skip(1) {
         match step {
             Step::Iter => {}
             Step::Take(_) => {} // folded into the hoisted bound
+            // enumerate pairs (position, element): the position IS the
+            // loop index and the element is arrayIndex(src, idx') — the
+            // pair is never materialized. rev flips the element read.
+            Step::Enumerate => {}
+            Step::Rev => {}
             Step::Map(f) => {
-                let value = match f {
-                    MapFn::Closure(c) => {
+                // (the rebound holder carries the STEP RESULT's proven
+                // type so later filters see it)
+                // `.enumerate().map(|(i, e)| ..)` — the pair is never
+                // materialized: the position IS the loop index and the
+                // element is arrayIndex(src, position).
+                let enum_tuple: Option<Vec<syn::Ident>> =
+                    if enumerated_any {
+                        match c_inputs_first(f).as_deref() {
+                            Some(syn::Pat::Tuple(tp)) if tp.elems.len() == 2 => {
+                                let mut ids = Vec::new();
+                                let mut ok = true;
+                                for sub in &tp.elems {
+                                    match sub {
+                                        syn::Pat::Ident(pi) => {
+                                            ids.push(pi.ident.clone())
+                                        }
+                                        _ => ok = false,
+                                    }
+                                }
+                                if ok { Some(ids) } else { None }
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                let idents = enum_tuple.as_deref();
+                match (f, idents) {
+                    (
+                        MapFn::Closure(c),
+                        Some([i_name, e_name]),
+                    ) => {
+                        let i_val = arith_value(pos_ast.clone());
+                        loop_body.push(assign_stmt(&i_name.to_string(), i_val));
+                        cx.vars.borrow_mut().insert(i_name.to_string(), Ty::Int);
+                        let e_val = json!({
+                            "args": [str_lit(&src_name),
+                                     {"type": "Arith", "ast": pos_ast.clone()}],
+                            "func": "arrayIndex", "purity": "PureCpu", "type": "Call"
+                        });
+                        loop_body.push(assign_stmt(&e_name.to_string(), e_val));
+                        cx.vars.borrow_mut().insert(e_name.to_string(), elem0_ty.clone());
+                        let v = value_expr(&c.body, cx);
+                        let v_ty = infer_ty(&c.body, cx);
+                        loop_body.push(assign_stmt(&cur, v));
+                        cx.vars.borrow_mut().insert(cur.clone(), v_ty);
+                    }
+                    (MapFn::Closure(c), _) => {
                         let Some(syn::Pat::Ident(pi)) = c.inputs.first() else {
                             refuse("closure parameter pattern", c.inputs.span());
                         };
                         let pname = pi.ident.to_string();
+                        // param adopts the INCOMING element type
+                        let in_ty = cx
+                            .vars
+                            .borrow()
+                            .get(&cur)
+                            .cloned()
+                            .unwrap_or(Ty::Unknown);
+                        cx.vars.borrow_mut().insert(pname.clone(), in_ty);
                         loop_body.push(assign_stmt(&pname, get_var(&cur)));
-                        cx.vars
-                            .borrow_mut()
-                            .insert(pname.clone(), Ty::Unknown);
-                        value_expr(&c.body, cx)
+                        let v = value_expr(&c.body, cx);
+                        let v_ty = infer_ty(&c.body, cx);
+                        loop_body.push(assign_stmt(&cur, v));
+                        cx.vars.borrow_mut().insert(cur.clone(), v_ty);
                     }
-                    MapFn::Fn(name) => fn_call_expr_a1(
-                        name,
-                        vec![get_var(&cur)],
-                        "fnValue",
-                    ),
-                };
-                loop_body.push(assign_stmt(&cur, value));
-                cx.vars.borrow_mut().insert(cur.clone(), Ty::Unknown);
+                    (MapFn::Fn(name), _) => {
+                        let v = fn_call_expr_a1(
+                            name,
+                            vec![get_var(&cur)],
+                            "fnValue",
+                        );
+                        // fn return types come from the registration map
+                        let v_ty = cx.fn_rets.get(name).cloned().unwrap_or(Ty::Unknown);
+                        loop_body.push(assign_stmt(&cur, v));
+                        cx.vars.borrow_mut().insert(cur.clone(), v_ty);
+                    }
+                }
             }
             Step::Filter(c) => {
-                // the predicate MUST be proven bool — JS "" is falsy but
-                // Rust values are never "falsy", so truthiness guessing
-                // would diverge
-                if !matches!(infer_ty(&c.body, cx), Ty::Bool) {
-                    refuse(
-                        "filter predicate (must be a proven boolean)",
-                        c.body.span(),
-                    );
-                }
+                // bind the closure param FIRST (the predicate's proof may
+                // need it: `|b| *b` derefs through to the element type),
+                // then require a PROVEN bool — JS "" is falsy but Rust
+                // values are never "falsy", so guessing would diverge
                 let Some(syn::Pat::Ident(pi)) = c.inputs.first() else {
                     refuse("closure parameter pattern", c.inputs.span());
                 };
                 let pname = pi.ident.to_string();
+                // param ADOPTS the holder's proven type (`|b| *b` derefs
+                // through to it)
+                let cur_ty = cx.vars.borrow().get(&cur).cloned().unwrap_or(Ty::Unknown);
+                cx.vars.borrow_mut().insert(pname.clone(), cur_ty);
                 loop_body.push(assign_stmt(&pname, get_var(&cur)));
-                cx.vars.borrow_mut().insert(pname.clone(), Ty::Unknown);
+            if !matches!(infer_ty(&c.body, cx), Ty::Bool) {
+                refuse(
+                    "filter predicate (must be a proven boolean)",
+                    c.body.span(),
+                );
+            }
                 let ftemp = format!(
                     "__sh2f{}",
                     { let mut ctr = cx.tmp.borrow_mut(); *ctr += 1; ctr }
@@ -2449,7 +2571,9 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                 // in the test grammar — loud, not guessed).
                 test_call(&test_string(e, cx))
             } else {
-                arith_from_binary(b, cx)
+                // multi-operator arithmetic composes RAW nodes; the outer
+                // Arith wrapper goes here exactly once
+                arith_value(arith_from_binary(b, cx))
             }
         }
         syn::Expr::Unary(u) => match u.op {
@@ -2457,7 +2581,7 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
             // `*r` — a deref READ: the store holds values (no pointers),
             // so the deref is the value itself
             syn::UnOp::Deref(_) => value_expr(&u.expr, cx),
-            _ => arith_from_unary(u, cx),
+            _ => arith_value(arith_from_unary(u, cx)),
         },
         syn::Expr::Array(ar) => {
             // `[e1, e2]` -> an A1 Array literal, exactly like vec![..] —
@@ -2704,7 +2828,6 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                 return v;
             }
             let Some(target) = call_target(p, cx) else {
-                eprintln!("DBG unknown call target: {:?}", expr_kind(c.func.as_ref()));
                 refuse("call to unknown function", c.func.span());
             };
             fn_call_expr(&target, &c.args, "fnValue", cx)
@@ -2784,6 +2907,8 @@ fn arith_expr(e: &syn::Expr, cx: &Cx) -> Value {
     }
 }
 
+/// Raw arith AST node (NOT wrapped in the Arith value) — for use as an
+/// operand of another node or inside arith_value(..).
 fn arith_from_binary(b: &syn::ExprBinary, cx: &Cx) -> Value {
     use syn::BinOp::*;
     let op = match b.op {
@@ -2794,7 +2919,12 @@ fn arith_from_binary(b: &syn::ExprBinary, cx: &Cx) -> Value {
         Rem(_) => "%",
         _ => refuse("binary operator in arithmetic", b.op.span()),
     };
-    arith_bin(op, arith_expr(&b.left, cx), arith_expr(&b.right, cx))
+    json!({
+        "lhs": arith_expr(&b.left, cx),
+        "op": op,
+        "rhs": arith_expr(&b.right, cx),
+        "type": "Bin",
+    })
 }
 
 fn arith_from_unary(u: &syn::ExprUnary, cx: &Cx) -> Value {
@@ -2804,7 +2934,12 @@ fn arith_from_unary(u: &syn::ExprUnary, cx: &Cx) -> Value {
         return arith_expr(&u.expr, cx);
     }
     match u.op {
-        syn::UnOp::Neg(_) => arith_bin("-", arith_num(0), arith_expr(&u.expr, cx)),
+        syn::UnOp::Neg(_) => json!({
+            "lhs": arith_num(0),
+            "op": "-",
+            "rhs": arith_expr(&u.expr, cx),
+            "type": "Bin"
+        }),
         _ => refuse("unary operator", u.op.span()),
     }
 }

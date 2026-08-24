@@ -76,6 +76,9 @@ counts over the corpus (top entries):
     inline, fn-names dispatch fnValue; result typing propagates.
     BLOCKED at oracle: getVar scalar view (param-len request). t53
     pending.
+1o. DONE v0.16 — enumerate/rev steps + tuple-destructuring closure
+    params (position = loop index; no materialized pairs). Oracle-gated
+    on the param-len request like all array read-backs (t56 pending).
 1n. DONE v0.15 — tuples (native-array values, computed index reads via
     arrayIndex), fn-items-as-values (registered-name strings +
     compile-time-resolved indirect calls) (t55).
