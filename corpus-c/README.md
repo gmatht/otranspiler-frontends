@@ -44,7 +44,7 @@ conditionals, comments.
 
 ## Status
 
-125/180 cells green (was 69 at goal start). Per-backend state with the current core
+127/180 cells green (was 69 at goal start). Per-backend state with the current core
 (s2p.c f120f194 + workspace bed252b3):
 
 - **perl**: green except function-outparam/struct examples (the
