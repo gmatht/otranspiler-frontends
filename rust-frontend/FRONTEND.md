@@ -231,6 +231,20 @@ Pinned by t49_enum_match.rs.
 
 Pinned by t51_len_isempty.rs.
 
+## v0.11 additions — file-mod expansion (gated)
+
+- `mod x;` FILE declarations now resolve against sibling sources and
+  splice their items recursively — so cross-module calls into a file's
+  OWN submodule tree resolve (`transforms.rs` -> `builtin.rs`).
+- GATED SPLICE: a module is included only when it lowers cleanly ON ITS
+  OWN (self-check via this binary). A module that refuses contributes
+  nothing sound — the entry's calls into it refuse loudly instead.
+  Whole-crate merging was tried and REVERTED: it made every file inherit
+  the crate's deepest gap (0/30).
+- Known limitation: cross-crate calls into NON-lowerable modules
+  (`crate::transforms::builtin::fallback_builtin_to_exec` from the four
+  backend files) still refuse until those modules pass individually.
+
 Refused loudly (testdata/*_refuse.rs — the emit MUST fail, t13–t23):
 borrows `&x`, user functions, `String::from`/method calls, `match`,
 `vec!`, `eprintln!`/`dbg!`, floats, `{:?}`/named/width format specs,

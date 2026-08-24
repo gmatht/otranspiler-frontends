@@ -67,6 +67,10 @@ counts over the corpus (top entries):
 
 ## Phased plan (each phase = frontend subset growth + testdata pins, gate green)
 
+1j. DONE v0.11 — file-mod expansion with gated splice (clean modules
+    only; whole-crate merging tried + reverted). Last-segment call
+    resolution for crate paths; struct field-type tracking (field
+    receivers type-resolve). 4/30 holds.
 1i. DONE v0.10 — setArray-native array storage, Arr::is_empty fold,
     Str::is_empty equality; SECOND core bug filed (param-len arrays:
     ${#arr} scalar-view miscount). t51 pins.

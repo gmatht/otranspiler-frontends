@@ -29,7 +29,8 @@
 //! eprintln!, floats, bools, char literals, dynamic range bounds, macros.
 
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::process::exit;
 use syn::spanned::Spanned;
 
@@ -119,7 +120,7 @@ fn ty_from_type(t: &syn::Type, cx: &Cx) -> Ty {
                 None => return Ty::Unknown,
             };
             let id = seg.ident.to_string();
-            if cx.structs.iter().any(|s| *s == id) {
+            if cx.structs.borrow().contains_key(&id) {
                 return Ty::Struct(id);
             }
             if cx.enums.iter().any(|e| *e == id) {
@@ -142,6 +143,67 @@ fn ty_from_type(t: &syn::Type, cx: &Cx) -> Ty {
     }
 }
 
+/// WHOLE-CRATE expansion: resolve file `mod x;` declarations against
+/// sibling sources, recursively, so cross-module calls resolve (the
+/// inline-mod flattening then merges namespaces by bare name). Roots =
+/// the entry FILE plus its crate's lib.rs/main.rs tree when present;
+/// the visited set dedupes (the entry file always comes first).
+fn expand_crate(
+    items: &[syn::Item],
+    base: &Path,
+    visited: &mut HashSet<PathBuf>,
+) -> Vec<syn::Item> {
+    let mut out = Vec::new();
+    for item in items {
+        match item {
+            syn::Item::Mod(m) if m.content.is_none() => {
+                // cfg-gated file mods contribute nothing to a normal build
+                if cfg_test_only(&m.attrs) {
+                    continue;
+                }
+                let cands = [
+                    base.join(format!("{}.rs", m.ident)),
+                    base.join(m.ident.to_string()).join("mod.rs"),
+                ];
+                let Some(path) = cands.iter().find(|p| p.exists()) else {
+                    continue; // unresolved module: any USE refuses at its site
+                };
+                if !visited.insert(path.clone()) {
+                    continue;
+                }
+                // Splice ONLY modules that lower cleanly ON THEIR OWN: a
+                // module whose own body refuses would poison the entry
+                // (its deep gaps are not this file's semantics).
+                // Self-exactness: the check IS this same binary.
+                let lowers_alone = std::env::current_exe().ok()
+                    .and_then(|exe| {
+                        std::process::Command::new(exe)
+                            .args(["--shir"])
+                            .arg(path)
+                            .arg("--raw")
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .status()
+                            .ok()
+                    })
+                    .map(|st| st.success())
+                    .unwrap_or(false);
+                if !lowers_alone {
+                    continue;
+                }
+                if let Ok(src_text) = std::fs::read_to_string(path) {
+                    if let Ok(f) = syn::parse_file(&src_text) {
+                        let sub_base = path.parent().unwrap_or(base).to_path_buf();
+                        out.extend(expand_crate(&f.items, &sub_base, visited));
+                    }
+                }
+            }
+            other => out.push(other.clone()),
+        }
+    }
+    out
+}
+
 /// Lowering context — the integer-const table. Rust const-evaluates
 /// `const`/`static` items with literal initializers; range bounds and
 /// comparison operands may legally reference them, so path lowering
@@ -156,8 +218,9 @@ struct Cx {
     /// functions, re-seeded from params/literals/annotations). RefCell:
     /// type tracking mutates during lowering while Cx travels as &Cx.
     vars: std::cell::RefCell<HashMap<String, Ty>>,
-    /// declared struct names (receiver-method dispatch targets)
-    structs: Vec<String>,
+    /// declared struct fields: struct name -> [(field, type)] — lets
+    /// `self.list.push(..)` / `prog.var_types.is_empty()` resolve
+    structs: std::cell::RefCell<HashMap<String, Vec<(String, Ty)>>>,
     /// declared enum names (unit-variant tag lowering)
     enums: Vec<String>,
     /// fresh-temporary counter (field-read hoists)
@@ -223,16 +286,38 @@ fn main() {
     // type registries first — resolution consults them
     for item in &ast.items {
         match item {
-            syn::Item::Struct(s) => cx.structs.push(s.ident.to_string()),
+            syn::Item::Struct(s) => {
+                let fields: Vec<(String, Ty)> = s
+                    .fields
+                    .iter()
+                    .filter_map(|f| match &f.ident {
+                        Some(id) => Some((id.to_string(), ty_from_type(&f.ty, &cx))),
+                        None => None,
+                    })
+                    .collect();
+                cx.structs.borrow_mut().insert(s.ident.to_string(), fields);
+            }
             syn::Item::Enum(e) => cx.enums.push(e.ident.to_string()),
             _ => {}
         }
     }
+    // WHOLE-CRATE expansion: entry file + its lib.rs tree (deduped) so
+    // cross-module calls resolve; then flatten inline `mod` blocks.
+    let base_dir = Path::new(&file)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    // NOTE: deliberately ENTRY-FILE-ONLY expansion — merging the whole
+    // lib tree makes every file inherit the crate's deepest gap (tried
+    // it: 0/30). Per-file granularity beats whole-crate conflation.
+    let mut visited: HashSet<PathBuf> = HashSet::new();
+    visited.insert(std::fs::canonicalize(&file).unwrap_or_else(|_| PathBuf::from(&file)));
+    let roots: Vec<syn::Item> = expand_crate(&ast.items, &base_dir, &mut visited);
     // Flatten inline `mod` blocks into one item list — namespace nesting
     // has no effect on the lowered program (names stay as written;
     // qualified paths resolve only for `Type::method` call targets).
     let mut flat: Vec<&syn::Item> = Vec::new();
-    flatten_items(&ast.items, &mut flat);
+    flatten_items(&roots, &mut flat);
 
     // pre-pass: collect consts/statics (globals + int-const table) so any
     // later lowering step can const-fold against them.
@@ -494,7 +579,24 @@ fn infer_ty(e: &syn::Expr, cx: &Cx) -> Ty {
                 None => Ty::Unknown,
             }
         }
-        syn::Expr::Field(_) => Ty::Unknown,
+        syn::Expr::Field(f) => {
+            // `base.field` where base is a KNOWN struct: the field's
+            // declared type (`prog.var_types` -> Arr)
+            let base_ty = infer_ty(&f.base, cx);
+            if let Ty::Struct(sname) = &base_ty {
+                if let syn::Member::Named(ident) = &f.member {
+                    let fields = cx.structs.borrow();
+                    if let Some(fs) = fields.get(sname) {
+                        if let Some((_, ft)) =
+                            fs.iter().find(|(n, _)| n.as_str() == ident.to_string().as_str())
+                        {
+                            return ft.clone();
+                        }
+                    }
+                }
+            }
+            Ty::Unknown
+        }
         syn::Expr::Path(p) => {
             // `Color::Red` — a unit-variant VALUE has its enum's type
             if p.qself.is_none() && p.path.segments.len() == 2 {
@@ -845,6 +947,23 @@ fn call_target(p: &syn::ExprPath, cx: &Cx) -> Option<String> {
     }
     let segs: Vec<&syn::PathSegment> = p.path.segments.iter().collect();
     let known = |n: &str| cx.fns.iter().any(|f| *f == n);
+    // exactly-2 segments: the `Type::method` mangling wins first
+    if segs.len() == 2 && segs.iter().all(|s| s.arguments.is_none()) {
+        let mangled = format!("{}_{}", segs[0].ident, segs[1].ident);
+        if known(&mangled) {
+            return Some(mangled);
+        }
+    }
+    // deeper crate/mod paths (`crate::transforms::builtin::f`) resolve by
+    // their LAST segment — consistent with the inline-mod flattening that
+    // already registers nested fns under their bare names
+    if segs.len() >= 2 && segs.iter().all(|s| s.arguments.is_none()) {
+        let last = segs.last().unwrap().ident.to_string();
+        if known(&last) {
+            return Some(last);
+        }
+        return None;
+    }
     match segs.len() {
         1 if segs[0].arguments.is_none() => {
             let n = segs[0].ident.to_string();
