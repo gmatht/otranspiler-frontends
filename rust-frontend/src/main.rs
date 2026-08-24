@@ -98,7 +98,8 @@ enum Ty {
     Int,
     Str,
     Bool,
-    Arr,
+    /// an array/Vec; element type when provable
+    Arr(Option<std::boxed::Box<Ty>>, Option<u64>),
     /// a named struct (`Point`) — enables receiver-method dispatch
     Struct(String),
     /// a named UNIT-variant enum (`Color`) — variants lower to their
@@ -133,12 +134,28 @@ fn ty_from_type(t: &syn::Type, cx: &Cx) -> Ty {
                 "bool" => Ty::Bool,
                 "AtomicBool" => Ty::AtomicBool,
                 "Vec" | "VecDeque" | "HashSet" | "BTreeSet" | "HashMap" | "BTreeMap"
-                | "Slice" => Ty::Arr,
+                | "Slice" => {
+                    // Vec<T>: extract the element type when shape allows
+                    let elem = match &seg.arguments {
+                        syn::PathArguments::AngleBracketed(a) => {
+                            a.args.iter().find_map(|arg| match arg {
+                                syn::GenericArgument::Type(t) => {
+                                    Some(Box::new(ty_from_type(t, cx)))
+                                }
+                                _ => None,
+                            })
+                        }
+                        _ => None,
+                    };
+                    Ty::Arr(elem, None)
+                }
                 _ => Ty::Unknown,
             }
         }
         syn::Type::Reference(r) => ty_from_type(&r.elem, cx),
-        syn::Type::Slice(_) => Ty::Arr,
+        syn::Type::Slice(s) => {
+            Ty::Arr(Some(Box::new(ty_from_type(&s.elem, cx))), None)
+        }
         _ => Ty::Unknown,
     }
 }
@@ -523,7 +540,14 @@ fn lower_local(local: &syn::Local, cx: &Cx, out: &mut Vec<Value>) -> Option<Valu
     // array literals STORE via setArray (native array, no coercion)
     if let Some(elems) = array_literal_elems(&init.expr) {
         let elements = elems.iter().map(|e| value_expr(e, cx)).collect::<Vec<_>>();
-        cx.vars.borrow_mut().insert(name.clone(), Ty::Arr);
+        let first_ty = elems
+            .first()
+            .map(|e| infer_ty(e, cx))
+            .unwrap_or(Ty::Unknown);
+        cx.vars.borrow_mut().insert(
+            name.clone(),
+            Ty::Arr(Some(Box::new(first_ty)), Some(elems.len() as u64)),
+        );
         return Some(set_array_stmt(&name, elements));
     }
     if let syn::Expr::Match(m) = &*init.expr {
@@ -563,14 +587,35 @@ fn infer_ty(e: &syn::Expr, cx: &Cx) -> Ty {
         syn::Expr::Macro(m) => {
             let name = m.mac.path.segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
             if name == "vec" {
-                Ty::Arr
+                // literal args give the EXACT element type (first arg)
+                // and LENGTH — the loop bound needs both
+                struct VecElems(syn::punctuated::Punctuated<syn::Expr, syn::Token![,]>);
+                impl syn::parse::Parse for VecElems {
+                    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+                        Ok(VecElems(
+                            syn::punctuated::Punctuated::parse_terminated(input)?,
+                        ))
+                    }
+                }
+                match syn::parse2::<VecElems>(m.mac.tokens.clone()) {
+                    Ok(VecElems(elems)) => {
+                        let elem = elems
+                            .first()
+                            .map(|e| Box::new(infer_ty(e, cx)))
+                            .unwrap_or_else(|| Box::new(Ty::Unknown));
+                        Ty::Arr(Some(elem), Some(elems.len() as u64))
+                    }
+                    Err(_) => Ty::Arr(None, None),
+                }
             } else {
-                Ty::Unknown
+                Ty::Arr(None, None)
             }
         }
         syn::Expr::Paren(p) => infer_ty(&p.expr, cx),
         syn::Expr::Reference(r) => infer_ty(&r.expr, cx),
-        syn::Expr::Array(_) => Ty::Arr,
+        syn::Expr::Array(ar) => Ty::Arr(Some(Box::new(
+            ar.elems.first().map(|e| infer_ty(e, cx)).unwrap_or(Ty::Unknown),
+        )), Some(ar.elems.len() as u64)),
         // a struct literal HAS its named record type (receiver dispatch)
         syn::Expr::Struct(se) => {
             let seg = se.path.segments.last();
@@ -635,7 +680,7 @@ fn lower_expr_stmt(e: &syn::Expr, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) ->
         }
         syn::Expr::If(ie) => Some(if_stmt(ie, cx, in_fn, out)),
         syn::Expr::While(w) => Some(while_stmt(w, cx, in_fn)),
-        syn::Expr::ForLoop(fl) => Some(for_stmt(fl, cx, in_fn)),
+        syn::Expr::ForLoop(fl) => Some(for_stmt(fl, cx, in_fn, out)),
         syn::Expr::Return(r) => {
             if in_fn {
                 // inside a user function: a NATIVE return carries the
@@ -725,6 +770,19 @@ fn plain_assign(a: &syn::ExprAssign, cx: &Cx, out: &mut Vec<Value>) -> Value {
     let Some(name) = single_path(p) else {
         refuse("assignment target path", p.span());
     };
+    // array literal RHS stores via setArray (native, no coercion)
+    if let Some(elems) = array_literal_elems(&a.right) {
+        let elements = elems.iter().map(|e| value_expr(e, cx)).collect::<Vec<_>>();
+        let first_ty = elems
+            .first()
+            .map(|e| infer_ty(e, cx))
+            .unwrap_or(Ty::Unknown);
+        cx.vars.borrow_mut().insert(
+            name.to_string(),
+            Ty::Arr(Some(Box::new(first_ty)), Some(elems.len() as u64)),
+        );
+        return set_array_stmt(&name.to_string(), elements);
+    }
     // `x = if c {A} else {B}` — bind x in every branch
     if let syn::Expr::If(ie) = &*a.right {
         return if_value_node(ie, BranchTarget::Var(&name.to_string()), cx, false);
@@ -802,7 +860,7 @@ fn while_stmt(w: &syn::ExprWhile, cx: &Cx, in_fn: bool) -> Value {
     json!({"cond": cond, "body": body, "type": "While"})
 }
 
-fn for_stmt(fl: &syn::ExprForLoop, cx: &Cx, in_fn: bool) -> Value {
+fn for_stmt(fl: &syn::ExprForLoop, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) -> Value {
     if fl.label.is_some() {
         refuse("labeled for", fl.span());
     }
@@ -813,6 +871,76 @@ fn for_stmt(fl: &syn::ExprForLoop, cx: &Cx, in_fn: bool) -> Value {
     // A1 Range is INCLUSIVE (bash seq semantics: `i <= end`); Rust `a..b`
     // is exclusive, `a..=b` inclusive. Dynamic bounds refuse — the A1
     // deserializer requires an int end.
+    // ARRAY iteration: `for x in v` / `v.iter()` / `v.iter_mut()` — an
+    // index while-loop with arrayIndex reads. The length hoists ONCE:
+    // Rust's borrow checker forbids mutating the array during iteration,
+    // so a single read is exact.
+    let iter_arr: Option<&syn::Expr> = match &*fl.expr {
+        syn::Expr::MethodCall(m)
+            if (m.method == "iter" || m.method == "iter_mut") && m.args.is_empty() =>
+        {
+            Some(&m.receiver)
+        }
+        e if matches!(infer_ty(e, cx), Ty::Arr(..)) => Some(e),
+        _ => None,
+    };
+    if let Some(arr_expr) = iter_arr {
+        let Some(syn::Expr::Path(p)) = Some(arr_expr) else {
+            refuse("array iteration target path", arr_expr.span());
+        };
+        let Some(vname) = single_path(p) else {
+            refuse("array iteration target path", p.span());
+        };
+        let vname = vname.to_string();
+        let (elem_ty, known_len) = match infer_ty(arr_expr, cx) {
+            Ty::Arr(Some(t), l) => (*t.clone(), l),
+            Ty::Arr(_, l) => (Ty::Unknown, l),
+            _ => (Ty::Unknown, None),
+        };
+        let idx = format!("__sh2i{}", { let mut c = cx.tmp.borrow_mut(); *c += 1; c });
+        // The bound is ALWAYS a variable — the while-condition grammar
+        // reads bare numbers as positionals ($3!). Known literal lengths
+        // assign the constant; unknown ones use the ${#v} param read
+        // (whose array-view miscount is filed as
+        // rust-frontend-20260824-param-len-arrays.md).
+        let lenv = format!("__sh2l{}", { let mut c = cx.tmp.borrow_mut(); *c += 1; c });
+        match known_len {
+            Some(n) => {
+                out.push(assign_stmt(&lenv, str_lit(&n.to_string())));
+            }
+            None => {
+                out.push(assign_stmt(
+                    &lenv,
+                    json!({
+                        "args": [str_lit("len"), str_lit(&vname)],
+                        "func": "param", "purity": "PureCpu", "type": "Call"
+                    }),
+                ));
+            }
+        }
+        cx.vars.borrow_mut().insert(lenv.clone(), Ty::Int);
+        cx.vars.borrow_mut().insert(idx.clone(), Ty::Int);
+        cx.vars.borrow_mut().insert(name.clone(), elem_ty);
+        let mut body_all = Vec::new();
+        body_all.push(assign_stmt(
+            &name,
+            json!({
+                "args": [str_lit(&vname),
+                         {"type": "Arith", "ast": {"name": idx, "type": "Var"}}],
+                "func": "arrayIndex", "purity": "PureCpu", "type": "Call"
+            }),
+        ));
+        lower_block(&fl.body, cx, in_fn, &mut body_all);
+        body_all.push(assign_stmt(
+            &idx,
+            arith_bin("+", arith_var(&idx), arith_num(1)),
+        ));
+        return json!({
+            "type": "While",
+            "cond": test_call(&format!("${idx} -lt ${lenv}")),
+            "body": body_all,
+        });
+    }
     let (start, end, inclusive) = match &*fl.expr {
         syn::Expr::Range(r) => {
             let start = match &r.start {
@@ -825,7 +953,10 @@ fn for_stmt(fl: &syn::ExprForLoop, cx: &Cx, in_fn: bool) -> Value {
             };
             (start, end, matches!(r.limits, syn::RangeLimits::Closed(..)))
         }
-        other => refuse("for-loop iterator (only `0..N` / `0..=N` ranges)", other.span()),
+        other => refuse(
+            "for-loop iterator (ranges and Vec/array iteration only)",
+            other.span(),
+        ),
     };
     let mut body = Vec::new();
     lower_block(&fl.body, cx, in_fn, &mut body);
@@ -1027,6 +1158,13 @@ fn arith_contains_field(e: &syn::Expr) -> bool {
         }
         syn::Expr::Unary(u) => arith_contains_field(&u.expr),
         syn::Expr::Paren(p) => arith_contains_field(&p.expr),
+        syn::Expr::Unary(u) => {
+            if matches!(u.op, syn::UnOp::Deref(_)) {
+                arith_contains_field(&u.expr)
+            } else {
+                false
+            }
+        }
         syn::Expr::Field(_) => true,
         _ => false,
     }
@@ -1340,7 +1478,7 @@ fn hoist_cond_calls(e: &syn::Expr, cx: &Cx, out: &mut Vec<Value>) -> syn::Expr {
                 _ => None,
             };
             match (recv_ty, name) {
-                (Ty::Arr, Some(vname)) => {
+                (Ty::Arr(_, _), Some(vname)) => {
                     out.push(assign_stmt(
                         "__sh2e",
                         json!({
@@ -1765,6 +1903,9 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
         }
         syn::Expr::Unary(u) => match u.op {
             syn::UnOp::Not(_) => test_call(&test_string(e, cx)),
+            // `*r` — a deref READ: the store holds values (no pointers),
+            // so the deref is the value itself
+            syn::UnOp::Deref(_) => value_expr(&u.expr, cx),
             _ => arith_from_unary(u, cx),
         },
         syn::Expr::Array(ar) => {
@@ -1920,7 +2061,7 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                             Ty::Int => "int ",
                             Ty::Str => "string ",
                             Ty::Bool => "bool ",
-                            Ty::Arr => "array ",
+                            Ty::Arr(..) => "array ",
                             Ty::Struct(ref n) => {
                                 unreachable!("struct receivers dispatched above: {}", n)
                             }
@@ -2051,6 +2192,11 @@ fn arith_from_binary(b: &syn::ExprBinary, cx: &Cx) -> Value {
 }
 
 fn arith_from_unary(u: &syn::ExprUnary, cx: &Cx) -> Value {
+    // scalar deref read = the value itself (runtime arith coerces the
+    // decimal string)
+    if let syn::UnOp::Deref(_) = u.op {
+        return arith_expr(&u.expr, cx);
+    }
     match u.op {
         syn::UnOp::Neg(_) => arith_bin("-", arith_num(0), arith_expr(&u.expr, cx)),
         _ => refuse("unary operator", u.op.span()),

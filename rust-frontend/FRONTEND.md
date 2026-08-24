@@ -245,6 +245,22 @@ Pinned by t51_len_isempty.rs.
   (`crate::transforms::builtin::fallback_builtin_to_exec` from the four
   backend files) still refuse until those modules pass individually.
 
+## v0.11 additions (cont.) — Vec/array for-loops
+
+- `for x in v` / `v.iter()` / `v.iter_mut()` lower to an index
+  while-loop with arrayIndex element reads; the bound is ALWAYS a
+  variable (the while-condition grammar reads bare numbers as
+  positionals — $3!). Known literal lengths assign the constant;
+  unknown ones use the ${#v} param read (miscounts for arrays until
+  the param-len core request lands).
+- Ty::Arr now carries the ELEMENT type (Vec<T> annotations, vec!
+  literal first-element inference, slice types) and the KNOWN length
+  of literal-built arrays; loop vars inherit it so `x.method(..)`
+  dispatches on T.
+- scalar deref reads (`*n`) erase to the value itself.
+
+Pinned by t52_for_vec.rs.
+
 Refused loudly (testdata/*_refuse.rs — the emit MUST fail, t13–t23):
 borrows `&x`, user functions, `String::from`/method calls, `match`,
 `vec!`, `eprintln!`/`dbg!`, floats, `{:?}`/named/width format specs,

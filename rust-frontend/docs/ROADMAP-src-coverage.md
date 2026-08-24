@@ -67,6 +67,9 @@ counts over the corpus (top entries):
 
 ## Phased plan (each phase = frontend subset growth + testdata pins, gate green)
 
+1k. DONE v0.11b — Vec/array for-loops (index while-loop + arrayIndex,
+    hoisted var bound, element-type tracking incl. literal lengths),
+    scalar deref erasure (t52).
 1j. DONE v0.11 — file-mod expansion with gated splice (clean modules
     only; whole-crate merging tried + reverted). Last-segment call
     resolution for crate paths; struct field-type tracking (field
