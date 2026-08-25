@@ -439,17 +439,20 @@ Println(call) captures the sub instead of exec-ing it (Go evaluates f
 and prints its RETURN VALUE). Oracle: if/bool-param/type-assert
 programs byte-identical; gates green.
 
-### Next frontier (zig-sh-go:1304, named decision)
+### Next frontier (zig-sh-go:1304, named decision — attempt reverted)
 
 `inner[i:i+len(spec.zig)] == spec.zig` — a SLICE in ==-comparison
-position. Slices now enter condOperandA1Word (sliceWord/memberSliceWord)
-but the computed bound `i+len(member)` needs shell-arithmetic text that
-evalArith cannot express over objGet chains. NAMED DECISION: lower the
-whole comparison as strings.HasPrefix(X[i:], Z) — semantically exact
-(the corpus's `&& i+len(z) <= len(inner)` guard implies the bound) —
-requiring the HasPrefix glob-test arm to accept non-literal needles
-(quoted operand + quoted needle word, no bare-glob). Blocked on the
-glob-test shape taking word operands.
+position. ATTEMPTED 2026-09-01 and REVERTED: BinOp-eq over A1 words +
+a strSlice runtime helper (word bounds) rendered a program that spins
+(refuse spam without advancing i). Root cause not yet isolated — the
+anon-struct field reads and strSlice probe correctly in isolation; the
+composed loop (goto-flag + early-return refuse + word-bounded slice in
+==) misbehaves at runtime. NAMED DECISION unchanged: rewrite as
+strings.HasPrefix(X[i:], Z), which needs the HasPrefix glob-test arm to
+accept word needles AND the goto/label lowering audited (the __gmatched
+flag is set but never consulted by the loop — likely the real spin).
+
+### Remaining refusals by category (each with named blocking decision)
 
 ### Remaining refusals by category (each with named blocking decision)
 
