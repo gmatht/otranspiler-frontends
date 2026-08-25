@@ -241,6 +241,7 @@ root.Content), busybox/main.go (function-value fields `clib.Shir` et al.
 | construct | disposition |
 |---|---|
 | strings.Trim(s, cutset) | **CutsetTrim** drop-in node (shir_nodes/cutset_trim.node + render_ext_expr/render_ext_estree handlers): Perl `s/^[..]+//`-pair with \Q\E quoting; JS scan/slice IIFE; Rust trim_matches. Verified vs `go run`. |
+| strings.TrimLeft/TrimRight(s, cutset) | **CutsetTrim side field** (optional_string: "left"/"right"/absent=both, commit 2a90a1b): Perl conditional s/// substitutions, Go backend strings.TrimLeft/Right, ESTree handler skips the corresponding scan loop. go-sh lowers through CutsetTrim with side; accepts SLICE operands (s[0:i]) via exprToWord. Oracle-verified vs `go run` on all three sides (JS byte-identical; Perl render correct). |
 | sync.Once.Do(fn) | frontend lowering: guard-var idiom (`$__once_x != "1"` gates assign+body) — no node needed; verified once-only execution end-to-end |
 | os.Stat | named-target if-init arm: `if info, err := os.Stat(E); err == nil && info.IsDir()` → `-d E`; `err == nil`/`err != nil` → `-e`/`! -e`; var paths supported. Full FileInfo structs stay refused (no faithful A1 shape) |
 | regexp.MustCompile | JUSTIFIED REFUSAL: first-class regex objects have no A1 value representation; per-method lowerings (MatchString etc.) would need pattern-object transport |
