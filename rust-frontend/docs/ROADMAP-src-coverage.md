@@ -82,6 +82,33 @@ counts over the corpus (top entries):
 1r. DONE v0.19 — `?` propagation under None≡"" + registered-fn return
     types in cx.fn_rets (t60). Enables unwrap_or("") chains on call
     results.
+## Phase A-E DESIGNS (detailed, ready to implement)
+
+Phase A — RECORD STORAGE (unblocks t45/t46/t53 promotion, payload enums,
+    record mutation): requires core/runtime decision per
+    rust-frontend-20260823-record-storage.md. Frontend-side work is DONE
+    (Object literals + FieldRead emit correctly); blocked at the core's
+    Assign String() coercion only.
+
+Phase B — PARAM-LEN (unblocks Vec::len/contains, t56/t58 sums):
+    requires runtime getVar array-view decision per
+    rust-frontend-20260824-param-len-arrays.md. Frontend emits exact
+    param("len", name)/arrayIndex shapes already.
+
+Phase C — ENUM PAYLOAD VARIANTS: after A, tuple variants lower to
+    [tag, payload...] arrays; match arms destructure positionally via
+    computed FieldRead/arrayIndex. ast_words*.rs then unblock.
+
+Phase D — DISPLAY/write!: `write!(f, ..)` in Display impls appends to a
+    String accumulator; needs the f-param convention (a String var named
+    by the impl) + format-spec coverage beyond {}/int-{:?}. mir_simple's
+    Display impls are the target corpus.
+
+Phase E — Result<T,E>: NOT representable under None≡"" for arbitrary E;
+    refuse stays correct until a two-slot convention is designed. `?` on
+    Option<Str> IS expressible (empty-check early-return) if a use case
+    demands it before Results.
+
 1q. DONE v0.18 — .skip(K) window shifts composing with take/map/filter
     (t58 pending on param-len like t53/t56).
 1p. DONE v0.17 — Option<T> layer: Opt type + method family
