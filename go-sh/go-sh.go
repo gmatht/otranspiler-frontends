@@ -7599,6 +7599,41 @@ func (p *parser) sliceWord(e *expr) map[string]any {
 	// (documented caveat).
 	if e.idx1e != nil || e.idx2e != nil {
 		name2 := p.resolveVar(name)
+		// BOUNDS EXPRESSIBLE as shell-arithmetic text → the ${v:off:len}
+		// param shape. A bound reading a STRUCT FIELD (len(spec.zig) —
+		// zig-sh-go's format-spec match) has no arith twin (objGet chains
+		// are not evalArith operands): fall back to the strSlice runtime
+		// helper, whose bounds are plain WORDS.
+		offOK, lenOK := true, true
+		if e.idx1e != nil && p.hasObjectRead(e.idx1e) {
+			offOK = false
+		}
+		if e.idx2e != nil && p.hasObjectRead(e.idx2e) {
+			lenOK = false
+		}
+		if !offOK || !lenOK {
+			loW := strExpr("0")
+			if e.idx1e != nil {
+				loW = p.exprToWord(e.idx1e)
+			} else if e.idx1 != "" {
+				loW = strExpr(e.idx1)
+			}
+			hiW := map[string]any{
+				"type": "Call", "func": "strLen",
+				"args":   []any{getVarExpr(name2)},
+				"purity": "PureCpu",
+			}
+			if e.idx2e != nil {
+				hiW = p.exprToWord(e.idx2e)
+			} else if e.idx2 != "" {
+				hiW = strExpr(e.idx2)
+			}
+			return map[string]any{
+				"type": "Call", "func": "strSlice",
+				"args":   []any{getVarExpr(name2), loW, hiW},
+				"purity": "PureCpu",
+			}
+		}
 		off := "0"
 		if e.idx1e != nil {
 			off = p.arithKeyText(e.idx1e)
@@ -7881,6 +7916,27 @@ func (p *parser) condToJSON(c *expr) map[string]any {
 			}
 		}
 		return testCall("! " + strings.TrimSpace(p.condTestString(c.lhs)))
+	}
+	// OBJECT/NATIVE equality: BOTH operands lower to A1 words (slices,
+	// struct fields, helper calls — condOperandA1Word's vocabulary) —
+	// compare natively (BinOp Eq/Ne over the words; the runtime string-
+	// compares the values). zig-sh-go's `inner[i:i+len(spec.zig)] ==
+	// spec.zig` format-spec match: the slice word evaluates to the
+	// sliced text. Placed BEFORE the And/Or arms so compound guards
+	// with a sliced leaf lower natively too (condSideJSON routes here).
+	if c.kind == "binop" && (c.BOp == "==" || c.BOp == "!=") {
+		lw, ok1 := p.condOperandA1Word(c.lhs)
+		rw, ok2 := p.condOperandA1Word(c.rhs)
+		if ok1 && ok2 {
+			op := "Eq"
+			if c.BOp == "!=" {
+				op = "Ne"
+			}
+			return map[string]any{
+				"type": "BinOp", "op": op,
+				"lhs": lw, "rhs": rw,
+			}
+		}
 	}
 	if c.kind == "binop" && c.BOpKind == "and" {
 		return map[string]any{
