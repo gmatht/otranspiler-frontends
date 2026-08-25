@@ -1,9 +1,44 @@
 # PLAN_POWERSHELL_F — a PowerShell frontend on the bat precedent
 
-**Status: IN PROGRESS — t33 landed (gate green).** The
+**Status: IN PROGRESS — t36 landed (gate green).** The
 proposal is implemented as described; revision history below.
 
 ## 0. Revision history
+
+- 2026-08-24 (t36_arithmetic, gate green): the additive_expression /
+  multiplicative_expression nodes land — the binary arithmetic
+  operators in a PARENTHESIZED command argument (`Write-Output (1 +
+  2)`; the grammar reaches them exactly there and in bare statement
+  position, which stays REFUSED — the t17 statement-level precedent;
+  the argument_list forms (additive_ / multiplicative_argument_
+  expression) stay REFUSED on the t14 machinery) — the plan's "`+ - *
+  / %` (numeric) → the Arith AST" row, the planned t03_arith.ps1
+  surface, now landed as t36. Verified against live pwsh 7.6.4: the
+  parens evaluate the arithmetic to ONE object (`Write-Output (1 +
+  2)` prints 3, `7 - 2` → 5, `2 * 3` → 6, `7 % 3` → 1, `1 + 2 * 3` →
+  7, `1 + 2 + 3` → 6), so the argument lowers to ONE echo of the A1
+  Arith expression — the core's `echo $((1+2))` emission,
+  byte-identical (verified against `debashc --shir --raw`); the
+  A1→ESTree renderer lowers + - * to native JS arithmetic and % to
+  the bash-semantics helper, which agree with pwsh on integer
+  operands, so the executed-stdout oracle matches live pwsh by
+  construction. The subset pins ALL-LITERAL arithmetic (every operand
+  a bare decimal integer_literal or a nested expression of the same
+  shape — the precedence/associativity pins; the ArithAst is a
+  compile-time Num/Bin tree with NO variables) and the paren as the
+  command's ONLY element (the t21/t25/t33 precedent). The divergent
+  edges refuse, pinned `testdata_refuse/t36_*`: `/` (pwsh REAL
+  division — `Write-Output (7 / 2)` prints 3.5 — vs the A1's bash
+  INTEGER division Math.trunc — the transpiled run prints 3), `\`
+  (pwsh integer division — the A1 ArithAst has no such operator),
+  the string-concat trap the plan named ("`\"a\" + \"b\"` must not
+  become numeric arith"), a variable operand ($null→0 coercion vs
+  the store's "" — the concat coercion trap), a unary-operator
+  operand (`-1`) and a head argument before the paren (a SECOND
+  pipeline object). The ledger's `ts node additive_expression` /
+  `multiplicative_expression` entries were removed from
+  `frontends/coverage/refused-powershell-sh-go.txt` (exercised now);
+  the argument_list twins stay ledgered.
 
 - 2026-08-14 (t35_while_statement, gate green): the while_statement
   node lands — `while ($c) { B }` (the `while` keyword and the parens
@@ -552,8 +587,11 @@ read-only).
 ## 5. Testdata plan (t01+)
 
 `t01_echo.ps1` (Write-Output / Write-Host), `t02_var.ps1` (`$x = 5`,
-interpolation), `t03_arith.ps1` (+ - * / %, and the string-concat pin),
-`t04_if.ps1` (elseif chain), `t05_for.ps1`, `t06_foreach.ps1` (array +
+interpolation), `t03_arith.ps1` (+ - * / %, and the string-concat pin)
+— landed as `t36_arithmetic.ps1` 2026-08-24 (the A1 Arith node;
+ALL-LITERAL `+ - * %` in a parenthesized command argument, the
+string-concat / variable-operand / `/` real-division edges pinned in
+`testdata_refuse/t36_*`), `t04_if.ps1` (elseif chain), `t05_for.ps1`, `t06_foreach.ps1` (array +
 `$a[0]` + `$a.Count`), `t07_fn.ps1` (parens-param function + return + call — the grammar's
 param()-block gap is pinned as a refuse case), `t08_pipeline.ps1` (text
 pipe), `t09_strings.ps1` (single-quote literal, `` `n `` escapes),

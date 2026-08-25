@@ -95,7 +95,11 @@ run_frontend cpp-sh-go "$FE/cpp-sh-go/cpp-sh-go" "unsupported C++:" \
   "frontends/cpp-sh-go/testdata_cpp/*.cc (13)" "$FE"/cpp-sh-go/testdata_cpp/*.cc
 
 # go — the fleet's own Go code (real Go: packages, imports, interfaces)
-run_frontend go-sh "$FE/go-sh/go-sh" "unsupported" \
+# go-sh's controlled refusals all surface as `go-sh: line N: <msg>`
+# (failf panics are recovered in run()); genuine crashes print raw
+# panics instead — so the LINE-PREFIX is the honest refuse marker,
+# not just messages containing "unsupported"
+run_frontend go-sh "$FE/go-sh/go-sh" "go-sh: line" \
   "frontends/**/*.go (the fleet's own Go)" $(find "$FE" -maxdepth 3 -name '*.go' -not -path '*/gen/*')
 
 # py — workspace Python (real Python 3) + the frontend's own testdata

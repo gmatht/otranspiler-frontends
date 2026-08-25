@@ -3251,6 +3251,22 @@ func exprJSON(e Expr) map[string]interface{} {
 	case *VarE:
 		return map[string]interface{}{"type": "Var", "name": t.Name, "sigil": nil}
 	case *CallE:
+		// `$(...)` in quoted contexts (assignment RHS / env values /
+		// interpolated parts) lowers internally to the legacy capture
+		// call, but the A1 contract serializes it as the first-class
+		// Capture node (core request zsh-sh-go-20260814-230503):
+		// `{"type":"Capture","expr":<Arrow>,"native":false}` — the
+		// node whose analysis arms mirror the call form, so the internal
+		// IR keeps the call shape and only the emitted JSON differs.
+		if t.Func == "capture" && len(t.Args) == 1 {
+			if _, ok := t.Args[0].(*ArrowE); ok {
+				return map[string]interface{}{
+					"type":   "Capture",
+					"expr":   exprJSON(t.Args[0]),
+					"native": false,
+				}
+			}
+		}
 		return map[string]interface{}{
 			"type":   "Call",
 			"func":   t.Func,
@@ -3384,6 +3400,10 @@ func stmtJSON(s Stmt) map[string]interface{} {
 			v = exprJSON(t.Value)
 		}
 		return map[string]interface{}{"type": "Return", "value": v}
+	case *BreakS:
+		return map[string]interface{}{"type": "Break", "runs": provablyRuns[s]}
+	case *ContinueS:
+		return map[string]interface{}{"type": "Continue", "runs": provablyRuns[s]}
 	case *CaseS:
 		var clauses []interface{}
 		for _, cl := range t.Clauses {

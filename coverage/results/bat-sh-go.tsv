@@ -45,3 +45,7 @@ EMIT	t46_forftok.bat
 EMIT	t47_exitval.bat
 EMIT	t48_robocopy.bat
 EMIT	t49_robocopy2.bat
+EMIT	t50_conjunction.bat
+EMIT	t51_shift.bat
+EMIT	t52_pipeline.bat
+EMIT	t53_renpattern.bat

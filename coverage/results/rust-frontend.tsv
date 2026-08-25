@@ -7,6 +7,7 @@ REFUSE	c_backend.rs
 REFUSE	debug.rs
 REFUSE	debug_tokens.rs
 REFUSE	estree.rs
+REFUSE	glsl_backend.rs
 REFUSE	go_backend.rs
 REFUSE	ir.rs
 REFUSE	java_backend.rs

@@ -1,0 +1,33 @@
+./bat-sh-go/bat.go	go-sh: line 54: unsupported call sp.inSub (v2) 
+./bat-sh-go/cmd/bat-sh-go/main.go	go-sh: line 35: unsupported call "batshgo.Parse" in word position (v2) 
+./busybox/main.go	go-sh: line 49: unsupported composite literal value in map literal (v2) 
+./c-sh-go/cmd/c-sh-go/main.go	go-sh: line 30: unsupported call "clib.Shir" in word position (v2) 
+./c-sh-go/main.go	go-sh: line 37: unsupported type assertion to "map[string]any" (v2) 
+./coverage/ts-node-gap/main.go	go-sh: line 92: unsupported call "json.Unmarshal" in word position (v2) 
+./cpp-sh-go/cmd/cpp-sh-go/main.go	go-sh: line 33: unsupported call "cppshgo.Shir" in word position (v2) 
+./cpp-sh-go/main.go	go-sh: line 557: unsupported call "treeCheck" in word position (v2) 
+./cpp-sh-go/parser.go	go-sh: line 80: unsupported call "n.StartPoint" in word position (v2) 
+./fish-sh-go/cmd/fish-sh-go/main.go	go-sh: line 27: unsupported call "fishlib.Shir" in word position (v2) 
+./fish-sh-go/fish-sh-go.go	go-sh: line 240: strings.ReplaceAll needs (var, str, str) (v2) 
+./go-sh/cmd/go-sh/main.go	go-sh: line 39: unsupported call "os.ReadDir" in word position (v2) 
+./go-sh/go-sh.go	go-sh: line 3213: range over a non-var (v2) 
+./perl-sh-go/cmd/perl-sh-go/main.go	go-sh: line 32: unsupported call "pllib.Shir" in word position (v2) 
+./perl-sh-go/main.go	go-sh: line 496: expected assignment operator, got "func" 
+./posix-sh-go/analysis.go	go-sh: line 27: unsupported condition (v2): call 
+./posix-sh-go/lowering.go	go-sh: line 136: unsupported type assertion to "*StrE" (v2) 
+./posix-sh-go/main.go	go-sh: line 459: unsupported call be.BracePrefix (v2) 
+./powershell-sh-go/cmd/powershell-sh-go/main.go	go-sh: line 22: unsupported call "root.Content" in word position (v2) 
+./powershell-sh-go/cmd/ts-coverage/main.go	go-sh: line 43: unsupported call "filepath.Glob" in word position (v2) 
+./powershell-sh-go/emit.go	go-sh: line 43: unsupported call "json.NewEncoder" in word position (v2) 
+./powershell-sh-go/lower.go	go-sh: line 90: unsupported call "root.NamedChild" in word position (v2) 
+./powershell-sh-go/main.go	go-sh: line 43: range over a non-var (v2) 
+./powershell-sh-go/refuse.go	go-sh: line 15: unsupported call "n.Content" in word position (v2) 
+./py-sh-go/cmd/py-sh-go/main.go	go-sh: line 35: unsupported condition (v2): call 
+./py-sh-go/main.go	go-sh: line 206: unsupported comparison in word position (v2) 
+./shir-emit-go/emit.go	go-sh: line 84: unsupported call "json.Marshal" in word position (v2) 
+./zig-sh-go/cmd/zig-sh-go/main.go	go-sh: line 30: unsupported call "ziglib.Shir" in word position (v2) 
+./zig-sh-go/main.go	go-sh: line 251: map key must be a literal (v2) 
+./zsh-sh-go/analysis.go	go-sh: line 26: unsupported condition (v2): call 
+./zsh-sh-go/cmd/zsh-sh-go/main.go	go-sh: line 35: unsupported condition (v2): call 
+./zsh-sh-go/lowering.go	go-sh: line 154: unsupported type assertion to "*StrE" (v2) 
+./zsh-sh-go/main.go	go-sh: line 460: unsupported call be.BracePrefix (v2) 

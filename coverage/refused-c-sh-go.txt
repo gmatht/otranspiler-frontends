@@ -1,0 +1,104 @@
+exprList
+genericSelection
+genericAssocList
+genericAssociation
+attributeDeclaration
+enumTypeSpecifier
+typeofSpecifier
+atomicTypeSpecifier
+typedefName
+designation
+designatorList
+designator
+directAbstractDeclarator
+declarationList
+asmClobbers
+gnuIdentifier
+identifierList
+gnuArrayDesignator
+vcSpecificModifer
+toplevelAsmArgument
+toplevelAsmArgument
+toplevelAsmArgument
+toplevelAsmArgument
+toplevelAsmArgument
+toplevelAsmArgument
+A1 node ArrayComp
+A1 node Background
+A1 node BinOp
+A1 node Bool
+A1 node Capture
+A1 node Case
+A1 node Declare
+A1 node DefinedOr
+A1 node Arrow
+A1 node Exec
+A1 node Exit
+A1 node Cond
+A1 node Die
+A1 node For
+toplevelAsmArgument
+A1 node MethodCall
+A1 node Object
+ts node abstract_array_declarator
+A1 node Ident
+ts node abstract_parenthesized_declarator
+ts node abstract_function_declarator
+ts node bitfield_clause
+ts node comma_expression
+ts node compound_literal_expression
+ts node extension_expression
+ts node generic_expression
+ts node initializer_pair
+ts node linkage_specification
+ts node macro_type_specifier
+ts node ms_based_modifier
+ts node ms_call_modifier
+ts node attributed_statement
+ts node ms_pointer_modifier
+ts node ms_restrict_modifier
+ts node ms_signed_ptr_modifier
+ts node ms_unsigned_ptr_modifier
+ts node null
+ts node offsetof_expression
+ts node preproc_call
+ts node preproc_defined
+ts node preproc_directive
+ts node preproc_elif
+ts node preproc_else
+ts node preproc_if
+ts node seh_except_clause
+ts node attributed_declarator
+ts node concatenated_string
+ts node declaration_list
+ts node ms_declspec_modifier
+ts node ms_unaligned_ptr_modifier
+ts node seh_finally_clause
+ts node seh_leave_statement
+ts node seh_try_statement
+ts node true
+ts node type_definition
+ts node union_specifier
+A1 node Index
+A1 node Int
+A1 node Json
+A1 node Lambda
+A1 node Output
+A1 node Pipeline
+A1 node Range
+A1 node RawExpr
+A1 node RawText
+A1 node Redirect
+A1 node Regex
+A1 node Require
+A1 node Select
+A1 node SetChildError
+A1 node Subshell
+A1 node Ternary
+A1 node Try
+A1 node Warn
+ts node gnu_asm_clobber_list
+ts node gnu_asm_goto_list
+ts node gnu_asm_input_operand
+A1 node WriteFile
+A1 node Splice

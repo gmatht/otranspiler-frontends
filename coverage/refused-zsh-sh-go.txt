@@ -1,5 +1,4 @@
 A1 node ArrayComp
-A1 node Continue
 A1 node Declare
 A1 node DefinedOr
 A1 node Die
@@ -20,3 +19,8 @@ A1 node Try
 A1 node Warn
 A1 node WriteFile
 ts node process_substitution
+ts node simple_variable_name
+A1 node Select
+ts node flag
+ts node separator
+ts node translated_string

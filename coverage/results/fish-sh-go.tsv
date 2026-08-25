@@ -66,10 +66,15 @@ EMIT	t68_case_glob.fish
 EMIT	t69_brace.fish
 EMIT	t70_fish_status.fish
 EMIT	t71_fish_cmdsub.fish
-PARSE-ERR	t72_fish_and_or.fish
+EMIT	t72_fish_and_or.fish
 EMIT	t73_fish_string_len.fish
 EMIT	t74_fish_for_seq.fish
 EMIT	t75_fish_func_scope.fish
 EMIT	t76_string_sub.fish
 EMIT	t77_switch.fish
 EMIT	t78_set_local.fish
+EMIT	t79_return.fish
+EMIT	t80_arith_unary.fish
+EMIT	t81_regex_match.fish
+EMIT	t82_break.fish
+EMIT	t83_continue.fish

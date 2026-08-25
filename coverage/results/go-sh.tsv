@@ -56,6 +56,7 @@ EMIT	t28_and_or.go
 EMIT	t33_pipe.go
 EMIT	t68_case_glob.go
 EMIT	t55_array_elem.go
+EMIT	t103_map_literal.go
 EMIT	t37_substring.go
 EMIT	t21_array.go
 EMIT	t25_num_cmp.go
@@ -79,9 +80,11 @@ EMIT	t66_array_slice.go
 EMIT	t45_env_set.go
 EMIT	t77_fixed_array.go
 EMIT	t19_while_loop.go
+EMIT	t100_type_assert.go
 EMIT	t46_printf.go
 EMIT	t81_channel_type.go
 EMIT	t58_seq_range.go
+EMIT	t101_addr_deref.go
 EMIT	t78_type_switch.go
 EMIT	t52_full_prog.go
 EMIT	t22_func_def.go
@@ -104,6 +107,7 @@ EMIT	t08_comment.go
 EMIT	t70_switch.go
 EMIT	t57_strings_ops.go
 EMIT	t13_interp.go
+EMIT	t102_variadic_spread.go
 EMIT	t54_str_subst.go
 EMIT	t55_filepath.go
 EMIT	t01_print.go

@@ -78,6 +78,11 @@ type FunctionS struct {
 	Body []Stmt
 }
 type ReturnS struct{ Value Expr } // nil → null
+// BreakS/ContinueS — first-class control stmt nodes (the A1 contract
+// emits `{"type":"Break","runs":…}` / `{"type":"Continue",…}`, not
+// the legacy `call("break")` expression form).
+type BreakS struct{}
+type ContinueS struct{}
 type CaseS struct {
 	Disc    Expr
 	Clauses []CaseClauseIR
@@ -1676,9 +1681,9 @@ func stmtForCommand(cmd *Command) Stmt {
 		}
 		return &RedirectS{Inner: []Stmt{&ExprS{Expr: e}}, Redirects: redirectsIR(cmd.Redirect)}
 	case "break":
-		return &ExprS{Expr: call("break", []Expr{})}
+		return &BreakS{}
 	case "continue":
-		return &ExprS{Expr: call("continue", []Expr{})}
+		return &ContinueS{}
 	case "return":
 		var val Expr
 		if cmd.RetVal != nil {
