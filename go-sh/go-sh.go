@@ -1142,9 +1142,6 @@ func (p *parser) parseBraceMapLit() *expr {
 // keyed ({name: v}) and positional ({v1, v2}) forms lower; mixing is
 // refused (Go allows it only after keyed, but the corpus never does).
 func (p *parser) parseStructLit(typeName string, layout []string) *expr {
-	if os.Getenv("NSDBG") != "" {
-		fmt.Fprintln(os.Stderr, "SLDBG typename=", typeName, "layout=", layout)
-	}
 	p.expect(tPunct, "{")
 	vals := make([]*expr, len(layout))
 	keyed, first := false, true
@@ -5414,9 +5411,6 @@ func (p *parser) parseFor() []map[string]any {
 				"type": "ForInit",
 				"init": init, "cond": cond2, "step": step, "body": b2,
 			}}
-		}
-		if os.Getenv("RNGDBG") != "" {
-			fmt.Fprintln(os.Stderr, "RNGDBG rv.kind=", rv.kind, "name=", rv.name)
 		}
 		if rv.kind == "member" || rv.kind == "fieldof" {
 			// member of a COMPUTED base (`args[0].args` — an element
