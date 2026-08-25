@@ -79,6 +79,10 @@ counts over the corpus (top entries):
 1o. DONE v0.16 — enumerate/rev steps + tuple-destructuring closure
     params (position = loop index; no materialized pairs). Oracle-gated
     on the param-len request like all array read-backs (t56 pending).
+1p. DONE v0.17 — Option<T> layer: Opt type + method family
+    (as_deref/unwrap_or("")/unwrap_or_default identity reads under the
+    None≡"" convention), Some/None ctors, method-result inference,
+    deref-through typing (t57). 6/30 full passes.
 1n. DONE v0.15 — tuples (native-array values, computed index reads via
     arrayIndex), fn-items-as-values (registered-name strings +
     compile-time-resolved indirect calls) (t55).

@@ -344,6 +344,24 @@ Pinned by t55_tuples_fnvals.rs.
   still go through getVar's scalar view, so t56 waits in
   testdata-pending/ with t53.
 
+## v0.17 additions — Option<T> layer
+
+- Ty::Opt(elem): Option<T> annotations/fields map to the store's
+  None≡"" convention (None IS "" — exact whenever no code distinguishes
+  Some("") from None; the c-sh-go null→"" idiom, and what getVar's
+  unset→"" already does).
+- Option method family on proven-Opt receivers: as_deref(),
+  unwrap_or_default(), unwrap_or("") / unwrap_or_else(empty) — all
+  collapse to the plain variable read. unwrap_or(non-empty) refuses
+  (branching not representable in value position).
+- Some(v)/None constructors: Some(v) IS v; None IS "". Bare and
+  qualified forms both accepted.
+- Method-call RESULT types now infer (as_deref keeps Opt-ness,
+  unwrap_or takes the default's type) so chains compose.
+- infer_ty: comparisons/logic -> Bool (from v0.13), deref passthrough.
+
+Pinned by t57_option.rs (self-contained struct + params + locals).
+
 Refused loudly (testdata/*_refuse.rs — the emit MUST fail, t13–t23):
 borrows `&x`, user functions, `String::from`/method calls, `match`,
 `vec!`, `eprintln!`/`dbg!`, floats, `{:?}`/named/width format specs,

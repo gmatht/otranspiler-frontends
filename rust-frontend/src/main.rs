@@ -116,6 +116,11 @@ enum Ty {
     /// a FUNCTION ITEM (`transforms::f`) — its store value is the
     /// REGISTERED lowered name; indirect calls dispatch by that name
     Fn(String),
+    /// an OPTION of T. Store convention: None ≡ "" (the empty string IS
+    /// the absent marker, exactly like c-sh-go's dropped `int i;` and
+    /// the runtime getVar's unset->""). Sound whenever no code
+    /// distinguishes Some("") from None.
+    Opt(Box<Ty>),
     Unknown,
 }
 
@@ -132,6 +137,21 @@ fn ty_from_type(t: &syn::Type, cx: &Cx) -> Ty {
             }
             if cx.enums.iter().any(|e| *e == id) {
                 return Ty::Enum(id);
+            }
+            // Option<T> -> Opt(T): the store convention maps None ≡ ""
+            if id == "Option" {
+                let elem = match &seg.arguments {
+                    syn::PathArguments::AngleBracketed(a) => a.args.iter().find_map(|arg| {
+                        match arg {
+                            syn::GenericArgument::Type(t) => {
+                                Some(Box::new(ty_from_type(t, cx)))
+                            }
+                            _ => None,
+                        }
+                    }),
+                    _ => None,
+                };
+                return Ty::Opt(elem.unwrap_or(Box::new(Ty::Unknown)));
             }
             match seg.ident.to_string().as_str() {
                 "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32"
@@ -775,6 +795,20 @@ fn infer_ty(e: &syn::Expr, cx: &Cx) -> Ty {
             }
         }
         // a TUPLE literal is an array of the first element's proven type
+        // method-call result types (the small proven family)
+        syn::Expr::MethodCall(m) => {
+            let rty = infer_ty(&m.receiver, cx);
+            match m.method.to_string().as_str() {
+                // identity-shaped reads keep the receiver's option-ness
+                "as_deref" | "unwrap_or_default" => rty,
+                "unwrap_or" => match m.args.first() {
+                    Some(a) => infer_ty(a, cx),
+                    None => Ty::Unknown,
+                },
+                "clone" => rty,
+                _ => Ty::Unknown,
+            }
+        }
         syn::Expr::Tuple(tu) => Ty::Arr(
             Some(Box::new(
                 tu.elems.first().map(|e| infer_ty(e, cx)).unwrap_or(Ty::Unknown),
@@ -1246,14 +1280,36 @@ fn std_ctor_value(
     args: &syn::punctuated::Punctuated<syn::Expr, syn::Token![,]>,
     cx: &Cx,
 ) -> Option<Value> {
-    if p.qself.is_some() || p.path.segments.len() < 2 {
+    if p.qself.is_some() {
+        return None;
+    }
+    let nsegs = p.path.segments.len();
+    let f = p
+        .path
+        .segments
+        .last()
+        .map(|s| s.ident.to_string())
+        .unwrap_or_default();
+    // BARE option constructors: `Some(expr)` / `None` — unambiguous
+    // (registered fns were resolved before this runs)
+    if nsegs == 1 && !p.path.leading_colon.is_some() {
+        match f.as_str() {
+            "Some" if args.len() == 1 => return Some(value_expr(&args[0], cx)),
+            "None" if args.is_empty() => return Some(str_lit("")),
+            _ => return None,
+        }
+    }
+    if nsegs < 2 {
         return None;
     }
     // match the LAST two segments (`std::collections::HashMap::new`)
-    let t = p.path.segments[p.path.segments.len() - 2].ident.to_string();
-    let f = p.path.segments[p.path.segments.len() - 1].ident.to_string();
+    let t = p.path.segments[nsegs - 2].ident.to_string();
     match (t.as_str(), f.as_str()) {
+        // OPTION constructors under the None≡"" convention:
+        // Some(v) IS v (payload passthrough); None IS "".
         ("AtomicBool", "new") if args.len() == 1 => Some(value_expr(&args[0], cx)),
+        ("Some", _) if args.len() == 1 => Some(value_expr(&args[0], cx)),
+        ("None", _) if args.is_empty() => Some(str_lit("")),
         ("String", "from") if args.len() == 1 => Some(value_expr(&args[0], cx)),
         ("String", "new") if args.is_empty() => Some(str_lit("")),
         ("String", "with_capacity") if args.len() == 1 => Some(str_lit("")),
@@ -1658,7 +1714,7 @@ fn parse_collect_chain<'a>(
                 }
             }
             syn::Expr::Path(_) => break, // the SOURCE reached
-            other => { eprintln!("DBG chain: stop at {}", expr_kind(other)); return None; }
+            other => return None,
         }
     }
     // rev holds steps BACKWARD; reverse first, then require Iter to open
@@ -2766,6 +2822,36 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                 call_args.extend(m.args.iter().cloned());
                 return fn_call_expr_values(&target, call_args, "fnValue", cx);
             }
+            // OPTION methods: under the None≡"" store convention,
+            // as_deref / unwrap_or("") / unwrap_or_default are ALL the
+            // plain variable read (Some(v) -> v, None -> ""). Exact when
+            // no code distinguishes Some("") from None.
+            if matches!(recv_ty, Ty::Opt(_)) {
+                match rust_name.as_str() {
+                    "as_deref" | "unwrap_or_default" => {
+                        if !m.args.is_empty() {
+                            refuse("option method with arguments", m.span());
+                        }
+                        return value_expr(&m.receiver, cx);
+                    }
+                    "unwrap_or" | "unwrap_or_else" => {
+                        // exact ONLY for the empty-string default (the
+                        // convention's absent marker)
+                        let empty_default = m.args.first().map(|a| match a {
+                            syn::Expr::Lit(l) => matches!(&l.lit, syn::Lit::Str(s) if s.value().is_empty()),
+                            _ => false,
+                        }).unwrap_or(false);
+                        if empty_default {
+                            return value_expr(&m.receiver, cx);
+                        }
+                        refuse(
+                            "unwrap_or with a non-empty default (branching not representable in value position)",
+                            m.method.span(),
+                        );
+                    }
+                    _ => {}
+                }
+            }
             let js_name_raw = match (&recv_ty, rust_name.as_str()) {
                 (Ty::Str, "contains") => "includes",
                 // NOTE: Vec::len() does NOT map to .length here — the
@@ -2798,6 +2884,7 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                             Ty::AtomicBool => "",
                             Ty::Tuple(_) => "tuple ",
                             Ty::Fn(_) => "",
+                            Ty::Opt(_) => "option ",
                             Ty::Unknown => "",
                         }
                     ),
