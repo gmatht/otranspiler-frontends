@@ -425,6 +425,19 @@ to stderr, os.Args[i] positional reads, os.Stdout.Write, regexp
 MustCompile tracking, SplitN param-op lowering, local type declarations,
 bare-switch or-chain flag-based lowering.
 
+### ACTIVE REGRESSION (found 2026-09-01, NOT frontend-caused)
+
+`if <bool var> { return X }` + fallthrough return misrenders: the If's
+test-call cond collapses at ESTree render time to `String("") !== ""`
+(always false) — f(true)/f(false) print "no"/"no" instead of yes/no.
+Reproduces identically on BOTH trees' debashc binaries with identical
+shir input (the shir is CORRECT: cond=test("-n \"$ok\"")); the collapse
+happens in shir.rs render/fold machinery. Suspect: concurrent worker's
+"text_ops: construct-normalisation transforms" commit 44c350a (touched
+shir.rs). fail-go stays green because the snippet corpus lacks this
+shape. Needs a bisect against 44c350a^ (that parent has an unrelated
+compile error — seq_range_for duplicate — fix that first).
+
 ### Remaining refusals by category (each with named blocking decision)
 
 **CGO-PATH → C frontend** (10 files): sitter.NewLanguage/NewParser,
