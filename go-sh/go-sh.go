@@ -4055,6 +4055,31 @@ func (p *parser) parseAssignStmt() []map[string]any {
 	// captured into the target (mirrors the os.ReadFile capture below).
 	// Multiple non-_ targets would need IFS word-splitting to distribute
 	// the echo words — refused (Refuse > guess).
+	// os.ReadDir(dir) with multi-target (`entries, err2 := os.ReadDir(d)`)
+	// → entries gets the captured `ls -1 dir` listing (names-only; the
+	// "captured multi-line return" convention), err2 = "" (always succeeds)
+	if rhs.kind == "call" && rhs.callee == "os.ReadDir" && len(rhs.args) == 1 {
+		dirW := p.exprToWord(rhs.args[0])
+		for _, tg := range targets {
+			p.registerVar(tg, "Array")
+		}
+		capWr := map[string]any{
+			"type": "Call", "func": "capture",
+			"args": []any{map[string]any{
+				"type": "Arrow", "body": []any{
+					execStmt("ls", []map[string]any{strExpr("-1"), dirW}, "Spawn"),
+				},
+			}},
+			"purity": "Spawn",
+		}
+		var rdOut []map[string]any
+		rdOut = append(rdOut, assignStmt(targets[0], capWr))
+		for i := 1; i < len(targets); i++ {
+			p.registerVar(targets[i], "Str")
+			rdOut = append(rdOut, assignStmt(targets[i], strExpr("")))
+		}
+		return rdOut
+	}
 	if rhs.kind == "call" && p.callTargetName(rhs.callee) != "" {
 		// METHOD calls (`x := l.cur()`): the receiver rides as $1; the
 		// sub name is the last dotted segment
@@ -5257,6 +5282,11 @@ func (p *parser) parseFor() []map[string]any {
 			elemTyp = info.typ
 		}
 		p.registerVar(valName, elemTyp)
+		// Propagate readDirVars tracking through range loops so
+		// e.Name()/e.IsDir() methods resolve on the loop variable
+		if _, isRD := p.readDirVars[name]; isRD {
+			p.readDirVars[valName] = name
+		}
 		body := []map[string]any{
 			assignStmt(valName, getVarExpr(name+"[$"+idxName+"]")),
 		}
@@ -6529,11 +6559,21 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 				}
 			}
 		}
-		if e.callee == "strings.TrimLeft" && len(e.args) == 2 && e.args[0].kind == "var" && e.args[1].kind == "str" {
-			return paramCall("#", e.args[0].name, e.args[1].text)
+		if e.callee == "strings.TrimLeft" && len(e.args) == 2 {
+			return map[string]any{
+				"type":   "CutsetTrim",
+				"text":   p.exprToWord(e.args[0]),
+				"cutset": p.exprToWord(e.args[1]),
+				"side":   "left",
+			}
 		}
-		if e.callee == "strings.TrimRight" && len(e.args) == 2 && e.args[0].kind == "var" && e.args[1].kind == "str" {
-			return paramCall("%", e.args[0].name, e.args[1].text)
+		if e.callee == "strings.TrimRight" && len(e.args) == 2 {
+			return map[string]any{
+				"type":   "CutsetTrim",
+				"text":   p.exprToWord(e.args[0]),
+				"cutset": p.exprToWord(e.args[1]),
+				"side":   "right",
+			}
 		}
 		if e.callee == "strings.ReplaceAll" && len(e.args) == 3 {
 			return map[string]any{
