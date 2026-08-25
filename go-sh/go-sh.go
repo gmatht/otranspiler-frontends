@@ -60,8 +60,8 @@ package golib
 import (
 	"fmt"
 	"os"
-	"runtime/debug"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 
@@ -495,26 +495,26 @@ type parser struct {
 	// instance number; a *T / T value IS that number, so pointers ride
 	// the existing echo/capture value-return protocol and field access
 	// is a computed subscript (__arena_T[$p*N + off]).
-	structs    map[string][]string          // type name -> ordered FIELDS
-	structFT   map[string][]string          // type name -> field BASE type names
-	structRaw  map[string][]string          // type name -> field RAW type texts
-	varStruct  map[string]string            // var -> struct type name (pointer or value)
-	bufDyn     map[string]bool              // buffers with DYNAMIC writes (obj model)
-	fnSig      map[string][2]string         // func/method name -> [paramTypesCsv, retType]
-	paramTypes map[string]string            // (during decl parse) param -> base type
-	curFn      string                       // (during body parse) enclosing func name
-	prescanRet map[string]string            // func name -> raw return base (pre-decl)
-	pkgNames   map[string]bool              // package clauses seen in the concatenated source (PACKAGE MODE)
-	boolFuncs  map[string]bool              // subs whose return is a bool expression (STATUS protocol)
-	regexpVars map[string]string            // var -> regex source (`re := regexp.MustCompile(pat)`)
-	splitNVars map[string]splitNInfo        // var -> SplitN tracking (source var + separator)
-	readDirVars map[string]string           // var -> dir path (os.ReadDir tracking)
-	cgoObjs    map[string]bool              // vars holding cgo-bound objects (CGO-PATH)
-	lastTypeRaw string                     // (during capture) the raw type text
-	lastSig    [2]string                    // (during decl parse) captured signature
-	lastRetIds []string                     // (during decl parse) per-position return bases
-	fnRetIdents map[string][]string         // func name -> per-POSITION return bases
-	tmpN       int                          // fresh temp counter (newstruct preludes)
+	structs     map[string][]string   // type name -> ordered FIELDS
+	structFT    map[string][]string   // type name -> field BASE type names
+	structRaw   map[string][]string   // type name -> field RAW type texts
+	varStruct   map[string]string     // var -> struct type name (pointer or value)
+	bufDyn      map[string]bool       // buffers with DYNAMIC writes (obj model)
+	fnSig       map[string][2]string  // func/method name -> [paramTypesCsv, retType]
+	paramTypes  map[string]string     // (during decl parse) param -> base type
+	curFn       string                // (during body parse) enclosing func name
+	prescanRet  map[string]string     // func name -> raw return base (pre-decl)
+	pkgNames    map[string]bool       // package clauses seen in the concatenated source (PACKAGE MODE)
+	boolFuncs   map[string]bool       // subs whose return is a bool expression (STATUS protocol)
+	regexpVars  map[string]string     // var -> regex source (`re := regexp.MustCompile(pat)`)
+	splitNVars  map[string]splitNInfo // var -> SplitN tracking (source var + separator)
+	readDirVars map[string]string     // var -> dir path (os.ReadDir tracking)
+	cgoObjs     map[string]bool       // vars holding cgo-bound objects (CGO-PATH)
+	lastTypeRaw string                // (during capture) the raw type text
+	lastSig     [2]string             // (during decl parse) captured signature
+	lastRetIds  []string              // (during decl parse) per-position return bases
+	fnRetIdents map[string][]string   // func name -> per-POSITION return bases
+	tmpN        int                   // fresh temp counter (newstruct preludes)
 	// type-switch guard aliases: `switch v := x.(type)` binds v to x in
 	// every arm (core request go-sh-20260813-154009) — reads of the guard
 	// var resolve to the guarded var (getVar x), matching the contract's
@@ -1010,7 +1010,7 @@ func (p *parser) parsePrimary() *expr {
 			// anonymous value flowing through the string-typed capture
 			// protocol is not representable (documented gap).
 			if p.toks[p.pos+1].kind == tPunct && p.toks[p.pos+1].text == "[" {
-				p.pos++ // map
+				p.pos++      // map
 				p.skipType() // [K]V — balanced type erasure, incl. map forms
 				p.skipNL()
 				p.expect(tPunct, "{")
@@ -1331,6 +1331,13 @@ func (p *parser) newstructStmts(target string, e *expr) []map[string]any {
 			fieldVals = append(fieldVals, p.objNewCall(lit))
 			continue
 		}
+		// a MAP-TYPED field (`&xlator{arrays: map[string]string{}}`):
+		// allocate the map OBJECT — exprToWord's MapLiteral word with
+		// null keys/values is rejected by the shIR ingress
+		if lit.kind == "maplit" {
+			fieldVals = append(fieldVals, p.objNewCall(lit))
+			continue
+		}
 		fieldVals = append(fieldVals, p.exprToWord(fv))
 	}
 	out := prelude
@@ -1385,6 +1392,13 @@ func (p *parser) objNewCall(e *expr) map[string]any {
 			lit = lit.lhs
 		}
 		if lit.kind == "structlit" {
+			vals = append(vals, p.objNewCall(lit))
+			continue
+		}
+		// map FIELD VALUE (`&xlator{arrays: map[string]string{}}`):
+		// allocate the map OBJECT and store its ref — exprToWord would
+		// emit a degenerate MapLiteral word the ingress rejects
+		if lit.kind == "maplit" {
 			vals = append(vals, p.objNewCall(lit))
 			continue
 		}
@@ -1835,7 +1849,7 @@ func (p *parser) parseTopLevel() []map[string]any {
 					// before the type name
 					p.pos++
 				}
-			recvName = p.expect(tIdent, "").text
+				recvName = p.expect(tIdent, "").text
 				p.skipNL()
 				recvType = p.captureTypeText()
 				p.expect(tPunct, ")")
@@ -1913,7 +1927,7 @@ func (p *parser) parseTopLevel() []map[string]any {
 			}
 			body = append(body, p.parseBlockStmts()...)
 			p.curFn = saveCur
-						p.fnParams, p.fnParamOrd, p.fnLocals, p.inFunc = saveParams, saveOrd, saveLocals, saveIn
+			p.fnParams, p.fnParamOrd, p.fnLocals, p.inFunc = saveParams, saveOrd, saveLocals, saveIn
 			p.fnNames[nm] = true
 			out = append(out, map[string]any{"type": "Function", "name": nm, "body": body})
 		case p.atIdent("type"):
@@ -1938,11 +1952,13 @@ func (p *parser) parseTopLevel() []map[string]any {
 // contract already pinned for empty interfaces (t80/t82/t84/t85),
 // scalar aliases (`type tokKind int`) and generic type parameters.
 // Supported underlying forms:
-//   interface{…}   — empty OR method-set body (a method SPEC is
-//                    itself compile-time only; method DISPATCH on
-//                    values stays refused at its use sites)
-//   struct{…}      — field list, erased field by field
-//   T | pkg.T      — scalar/named alias
+//
+//	interface{…}   — empty OR method-set body (a method SPEC is
+//	                 itself compile-time only; method DISPATCH on
+//	                 values stays refused at its use sites)
+//	struct{…}      — field list, erased field by field
+//	T | pkg.T      — scalar/named alias
+//
 // Composite value-shapes (map/[]/*/func/chan underlying types) also
 // erase here — the DECLARATION is inert; only a VALUE of such a type
 // needs a runtime shape, and those stay gated at their use sites
@@ -2138,7 +2154,7 @@ func (p *parser) parseStmt() []map[string]any {
 		// PREDICATE returns (`return c == '_' || ...`, `return true`) —
 		// a bool-returning sub signals via EXIT STATUS (sh2.return 0/1):
 		// callers in condition position exec the sub and branch on $?
-				if len(rexprs) == 1 && p.inFunc && p.isPredicateExpr(rexprs[0]) {
+		if len(rexprs) == 1 && p.inFunc && p.isPredicateExpr(rexprs[0]) {
 			// STATUS-ONLY predicate return: the sub signals via exit
 			// status (Return 0/1). Value-position callers wrap the exec
 			// with a $?→"true"/"false" echo (userCallWord), so nested
@@ -2152,9 +2168,9 @@ func (p *parser) parseStmt() []map[string]any {
 			p.registerVar(flag, "Str")
 			stmts := p.boolTreeStmts(rexprs[0], flag)
 			stmts = append(stmts, []map[string]any{{
-				"type": "If",
-				"cond": testCall("\"$" + flag + "\"==\"true\""),
-				"then": []map[string]any{{"type": "Return", "value": strExpr("0")}},
+				"type":   "If",
+				"cond":   testCall("\"$" + flag + "\"==\"true\""),
+				"then":   []map[string]any{{"type": "Return", "value": strExpr("0")}},
 				"elsifs": []any{},
 				"else":   []map[string]any{{"type": "Return", "value": strExpr("1")}},
 			}}...)
@@ -2609,8 +2625,8 @@ func (p *parser) parseDottedStmt() []map[string]any {
 			body := []map[string]any{assignStmt(flag, strExpr("1"))}
 			body = append(body, fl.body...)
 			return []map[string]any{{
-				"type": "If",
-				"cond": testCall("\"${" + flag + "}\"!=\"1\""),
+				"type":   "If",
+				"cond":   testCall("\"${" + flag + "}\"!=\"1\""),
 				"then":   []any{map[string]any{"type": "Block", "body": body}},
 				"elsifs": []any{},
 				"else":   []any{},
@@ -2785,6 +2801,10 @@ func (p *parser) parseDottedStmt() []map[string]any {
 				// element write on a field container (`m.f[k] = v`)
 				p.pos++
 				kw := p.parseExpr()
+				// the key rides as a lowered WORD (exprToWord): the raw
+				// expr node serializes as its Go struct ({"BOp":"",…}),
+				// which the ingress rejects
+				kwW := p.exprToWord(kw)
 				p.skipNL()
 				p.expect(tPunct, "]")
 				// NESTED field write: `l[i].Lit += v` — element-of-list
@@ -2804,7 +2824,7 @@ func (p *parser) parseDottedStmt() []map[string]any {
 							elem := objGetField(idWord, method)
 							elem = map[string]any{
 								"type": "Call", "func": "listGet",
-								"args":   []any{elem, kw},
+								"args":   []any{elem, kwW},
 								"purity": "PureCpu",
 							}
 							if compound {
@@ -2828,7 +2848,19 @@ func (p *parser) parseDottedStmt() []map[string]any {
 					}
 				}
 				p.skipNL()
-				p.expect(tPunct, "]")
+				// DOUBLE-INDEX container (`m.f[i][j] = v`): the second
+				// bracket pair refines the element; a PLAIN element write
+				// (`m.f[k] = v`, `l[i] = v`) has no second bracket — the
+				// unconditional expect here refused every simple write
+				// with "expected ], got =" (the zig-sh-go x.arrays[k]
+				// frontier). Parse the optional second key instead.
+				if p.atPunct("[") {
+					p.pos++
+					kw = p.parseExpr()
+					kwW = p.exprToWord(kw)
+					p.skipNL()
+					p.expect(tPunct, "]")
+				}
 				container := objGetField(idWord, method)
 				fn := "mapSet"
 				elemStr := false
@@ -2862,7 +2894,7 @@ func (p *parser) parseDottedStmt() []map[string]any {
 						rhsW = interpParts([]any{
 							map[string]any{"kind": "expr", "expr": map[string]any{
 								"type": "Call", "func": getFn,
-								"args":   []any{container, kw},
+								"args":   []any{container, kwW},
 								"purity": "PureCpu",
 							}},
 							map[string]any{"kind": "expr", "expr": rhsW},
@@ -2897,7 +2929,7 @@ func (p *parser) parseDottedStmt() []map[string]any {
 					"type": "Expr",
 					"expr": map[string]any{
 						"type": "Call", "func": fn,
-						"args":   []any{objGetField(idWord, method), kw, rhsW},
+						"args":   []any{objGetField(idWord, method), kwW, rhsW},
 						"purity": "PureCpu",
 					},
 				}}
@@ -2987,7 +3019,7 @@ func (p *parser) parseDottedStmt() []map[string]any {
 		p.skipNL()
 		p.expect(tPunct, ")")
 		return []map[string]any{{"type": "Expr", "expr": map[string]any{
-			"type":  "CgoCall",
+			"type":   "CgoCall",
 			"target": strExpr(first + "." + method),
 			"args":   argsW,
 		}}}
@@ -3127,7 +3159,7 @@ func (p *parser) parseAppendIntoList(idWord, fieldWord map[string]any, typeName,
 		"type": "Expr",
 		"expr": map[string]any{
 			"type": "Call", "func": "objSet",
-			"args": []any{idWord, fieldWord, pushExpr},
+			"args":   []any{idWord, fieldWord, pushExpr},
 			"purity": "PureCpu",
 		},
 	}
@@ -3991,14 +4023,14 @@ func (p *parser) parseAssignStmt() []map[string]any {
 			[]map[string]any{strExpr("-r"), strExpr(readVar)}, "Emulable")}
 	}
 
-// n, _ := strconv.Atoi("42") → n = "42" — the error return is
-// dropped, and Atoi over a literal folds at emit time (t72).
-// The ParseInt/ParseFloat/ParseBool family lowers the same shape: over
-// a LITERAL it folds only for Atoi (base 10 — ParseInt's base argument
-// can reinterpret the digits, so it never folds); over a runtime
-// expression it assigns the strAtoi call word (the same lowering the
-// expression-position path pins at the call case below).
-// strconv.Itoa / FormatInt(n, 10) are the INVERSE: assign strItoa(word).
+	// n, _ := strconv.Atoi("42") → n = "42" — the error return is
+	// dropped, and Atoi over a literal folds at emit time (t72).
+	// The ParseInt/ParseFloat/ParseBool family lowers the same shape: over
+	// a LITERAL it folds only for Atoi (base 10 — ParseInt's base argument
+	// can reinterpret the digits, so it never folds); over a runtime
+	// expression it assigns the strAtoi call word (the same lowering the
+	// expression-position path pins at the call case below).
+	// strconv.Itoa / FormatInt(n, 10) are the INVERSE: assign strItoa(word).
 	if p.atIdent("strconv") {
 		p.next()
 		p.expect(tPunct, ".")
@@ -5072,9 +5104,9 @@ func (p *parser) parseIf() []map[string]any {
 		p.registerVar(flag, "Str")
 		stmts := p.boolTreeStmts(cond, flag)
 		guarded := []map[string]any{{
-			"type": "If",
-			"cond": testCall("\"$" + flag + "\"==\"true\""),
-			"then": then,
+			"type":   "If",
+			"cond":   testCall("\"$" + flag + "\"==\"true\""),
+			"then":   then,
 			"elsifs": []any{},
 			"else":   elseBody,
 		}}
@@ -5106,9 +5138,10 @@ func (p *parser) condToJSONIf(cond *expr, then, elseBody []map[string]any) []map
 // short-circuit semantics, immune to the statused And/Or render (whose
 // `(l, lastExit===0 ? r : false)` form reads STALE $? when the leaves
 // are native JS comparisons).
-//   or:  eval lhs; if flag != "true", eval rhs
-//   and: eval lhs; if flag == "true", eval rhs
-//   leaf: If(condToJSON(leaf)) { flag = "true" } else { flag = "false" }
+//
+//	or:  eval lhs; if flag != "true", eval rhs
+//	and: eval lhs; if flag == "true", eval rhs
+//	leaf: If(condToJSON(leaf)) { flag = "true" } else { flag = "false" }
 func (p *parser) boolTreeStmts(e *expr, flag string) []map[string]any {
 
 	setTrue := assignStmt(flag, strExpr("true"))
@@ -5126,9 +5159,9 @@ func (p *parser) boolTreeStmts(e *expr, flag string) []map[string]any {
 			gate = testCall("\"$" + flag + "\"!=\"true\"")
 		}
 		out = append(out, map[string]any{
-			"type": "If",
-			"cond": gate,
-			"then": []any{map[string]any{"type": "Block", "body": p.boolTreeStmts(e.rhs, flag)}},
+			"type":   "If",
+			"cond":   gate,
+			"then":   []any{map[string]any{"type": "Block", "body": p.boolTreeStmts(e.rhs, flag)}},
 			"elsifs": []any{},
 			"else":   []any{},
 		})
@@ -5139,9 +5172,9 @@ func (p *parser) boolTreeStmts(e *expr, flag string) []map[string]any {
 		// correct for any nesting (`!(A && B)`, `!!A`, …)
 		out := p.boolTreeStmts(e.lhs, flag)
 		out = append(out, map[string]any{
-			"type": "If",
-			"cond": testCall("\"$" + flag + "\"!=\"true\""),
-			"then": []any{assignStmt(flag, strExpr("true"))},
+			"type":   "If",
+			"cond":   testCall("\"$" + flag + "\"!=\"true\""),
+			"then":   []any{assignStmt(flag, strExpr("true"))},
 			"elsifs": []any{},
 			"else":   []any{assignStmt(flag, strExpr("false"))},
 		})
@@ -5149,9 +5182,9 @@ func (p *parser) boolTreeStmts(e *expr, flag string) []map[string]any {
 	}
 	cond := p.condToJSON(e)
 	return []map[string]any{{
-		"type": "If",
-		"cond": cond,
-		"then": []any{setTrue},
+		"type":   "If",
+		"cond":   cond,
+		"then":   []any{setTrue},
 		"elsifs": []any{},
 		"else":   []any{setFalse},
 	}}
@@ -5216,7 +5249,7 @@ func (p *parser) parseFor() []map[string]any {
 			"rhs": lenExpr,
 		}
 		step3 := []map[string]any{{
-			"type":   "Assign",
+			"type":    "Assign",
 			"targets": []any{map[string]any{"var": v, "sigil": nil, "indices": []any{}}},
 			"expr": map[string]any{
 				"type": "Arith",
@@ -5286,7 +5319,7 @@ func (p *parser) parseFor() []map[string]any {
 						},
 					},
 					"step": []map[string]any{{
-						"type":   "Assign",
+						"type":    "Assign",
 						"targets": []any{map[string]any{"var": idxName, "sigil": nil, "indices": []any{}}},
 						"expr": map[string]any{
 							"type": "Arith",
@@ -5324,7 +5357,7 @@ func (p *parser) parseFor() []map[string]any {
 					},
 				},
 				"step": []map[string]any{{
-					"type":   "Assign",
+					"type":    "Assign",
 					"targets": []any{map[string]any{"var": idxName, "sigil": nil, "indices": []any{}}},
 					"expr": map[string]any{
 						"type": "Arith",
@@ -5355,7 +5388,7 @@ func (p *parser) parseFor() []map[string]any {
 				},
 			}
 			step := []map[string]any{{
-				"type":   "Assign",
+				"type":    "Assign",
 				"targets": []any{map[string]any{"var": cnt, "sigil": nil, "indices": []any{}}},
 				"expr": map[string]any{
 					"type": "Arith",
@@ -5401,7 +5434,7 @@ func (p *parser) parseFor() []map[string]any {
 				"rhs": joinCall(paramCall("slice", "#"+name, "@", "")),
 			},
 			"step": []map[string]any{{
-				"type":   "Assign",
+				"type":    "Assign",
 				"targets": []any{map[string]any{"var": idxName, "sigil": nil, "indices": []any{}}},
 				"expr": map[string]any{
 					"type": "Arith",
@@ -5486,7 +5519,7 @@ func (p *parser) parseFor() []map[string]any {
 							},
 						}
 						step2 := []map[string]any{{
-							"type":   "Assign",
+							"type":    "Assign",
 							"targets": []any{map[string]any{"var": cnt2, "sigil": nil, "indices": []any{}}},
 							"expr": map[string]any{
 								"type": "Arith",
@@ -5494,10 +5527,10 @@ func (p *parser) parseFor() []map[string]any {
 							},
 						}}
 						b2 := []map[string]any{assignStmt(v, map[string]any{
-							"type":     "Call",
-							"func":     "listGet",
-							"args":     []any{lw, getVarExpr(cnt2 + "+" + lo)},
-							"purity":   "PureCpu",
+							"type":   "Call",
+							"func":   "listGet",
+							"args":   []any{lw, getVarExpr(cnt2 + "+" + lo)},
+							"purity": "PureCpu",
 						})}
 						b2 = append(b2, p.parseBlockStmts()...)
 						return []map[string]any{{
@@ -5529,7 +5562,7 @@ func (p *parser) parseFor() []map[string]any {
 							},
 						}
 						step := []map[string]any{{
-							"type":   "Assign",
+							"type":    "Assign",
 							"targets": []any{map[string]any{"var": cnt, "sigil": nil, "indices": []any{}}},
 							"expr": map[string]any{
 								"type": "Arith",
@@ -5571,7 +5604,7 @@ func (p *parser) parseFor() []map[string]any {
 					},
 				}
 				step := []map[string]any{{
-					"type":   "Assign",
+					"type":    "Assign",
 					"targets": []any{map[string]any{"var": cnt, "sigil": nil, "indices": []any{}}},
 					"expr": map[string]any{
 						"type": "Arith",
@@ -5589,47 +5622,47 @@ func (p *parser) parseFor() []map[string]any {
 					"init": init, "cond": cond2, "step": step, "body": b2,
 				}}
 			}
-							// range over a LIST-object field (`for _, fv := range e.fieldVals`)
-				if lw, tag := p.structFieldWord(rv.name); tag == "list" {
-					cnt := "__ri_" + strconv.Itoa(p.tmpN)
-					p.tmpN++
-					p.registerVar(cnt, "Int")
-					if et := p.listElemStructType(rv.name); et != "" {
-						p.registerVar(v, "Str")
-						p.varStruct[p.resolveVar(v)] = et
-					} else {
-						p.registerVar(v, "Str")
-					}
-					init := []map[string]any{arithAssignStmt(cnt, 0)}
-					cond2 := map[string]any{
-						"type": "BinOp", "op": "Lt",
-						"lhs": map[string]any{"type": "Arith", "ast": arithVar(cnt)},
-						"rhs": map[string]any{
-							"type": "Call", "func": "listLen",
-							"args":   []any{lw},
-							"purity": "PureCpu",
-						},
-					}
-					step := []map[string]any{{
-						"type":   "Assign",
-						"targets": []any{map[string]any{"var": cnt, "sigil": nil, "indices": []any{}}},
-						"expr": map[string]any{
-							"type": "Arith",
-							"ast":  map[string]any{"type": "IncDec", "var": cnt, "delta": 1, "prefix": false},
-						},
-					}}
-					b2 := []map[string]any{assignStmt(v, map[string]any{
-						"type": "Call", "func": "listGet",
-						"args":   []any{lw, getVarExpr(cnt)},
-						"purity": "PureCpu",
-					})}
-					b2 = append(b2, p.parseBlockStmts()...)
-					return []map[string]any{{
-						"type": "ForInit",
-						"init": init, "cond": cond2, "step": step, "body": b2,
-					}}
+			// range over a LIST-object field (`for _, fv := range e.fieldVals`)
+			if lw, tag := p.structFieldWord(rv.name); tag == "list" {
+				cnt := "__ri_" + strconv.Itoa(p.tmpN)
+				p.tmpN++
+				p.registerVar(cnt, "Int")
+				if et := p.listElemStructType(rv.name); et != "" {
+					p.registerVar(v, "Str")
+					p.varStruct[p.resolveVar(v)] = et
+				} else {
+					p.registerVar(v, "Str")
 				}
-if info, ok := p.arrays[rv.name]; ok {
+				init := []map[string]any{arithAssignStmt(cnt, 0)}
+				cond2 := map[string]any{
+					"type": "BinOp", "op": "Lt",
+					"lhs": map[string]any{"type": "Arith", "ast": arithVar(cnt)},
+					"rhs": map[string]any{
+						"type": "Call", "func": "listLen",
+						"args":   []any{lw},
+						"purity": "PureCpu",
+					},
+				}
+				step := []map[string]any{{
+					"type":    "Assign",
+					"targets": []any{map[string]any{"var": cnt, "sigil": nil, "indices": []any{}}},
+					"expr": map[string]any{
+						"type": "Arith",
+						"ast":  map[string]any{"type": "IncDec", "var": cnt, "delta": 1, "prefix": false},
+					},
+				}}
+				b2 := []map[string]any{assignStmt(v, map[string]any{
+					"type": "Call", "func": "listGet",
+					"args":   []any{lw, getVarExpr(cnt)},
+					"purity": "PureCpu",
+				})}
+				b2 = append(b2, p.parseBlockStmts()...)
+				return []map[string]any{{
+					"type": "ForInit",
+					"init": init, "cond": cond2, "step": step, "body": b2,
+				}}
+			}
+			if info, ok := p.arrays[rv.name]; ok {
 				iter, typ = info.elems, info.typ
 			} else if p.varTypes[rv.name] == "Array" {
 				// Runtime-loaded array (e.g. `args := os.Args[1:]` → the
@@ -5674,7 +5707,7 @@ if info, ok := p.arrays[rv.name]; ok {
 					},
 				}
 				step2 := []map[string]any{{
-					"type":   "Assign",
+					"type":    "Assign",
 					"targets": []any{map[string]any{"var": cnt, "sigil": nil, "indices": []any{}}},
 					"expr": map[string]any{
 						"type": "Arith",
@@ -5831,7 +5864,7 @@ if info, ok := p.arrays[rv.name]; ok {
 			}
 		}
 		body = append(body, post...)
-	return append(pre, map[string]any{
+		return append(pre, map[string]any{
 			"type": "While",
 			"cond": p.condToJSON(cond),
 			"body": body,
@@ -5906,9 +5939,9 @@ func (p *parser) parseSwitch() []map[string]any {
 				p.registerVar(flag, "Str")
 				stmts := p.boolTreeStmts(c, flag)
 				stmts = append(stmts, map[string]any{
-					"type": "If",
-					"cond": testCall("\"$" + flag + "\"==\"true\""),
-					"then": bodies[i],
+					"type":   "If",
+					"cond":   testCall("\"$" + flag + "\"==\"true\""),
+					"then":   bodies[i],
 					"elsifs": []any{},
 					"else":   nest,
 				})
@@ -6281,9 +6314,9 @@ func (p *parser) userCallWord(name string, args []*expr) map[string]any {
 		// arm echoing its verdict — capture collects exactly ONE echo
 		callExpr := &expr{kind: "call", callee: name, args: args}
 		verdict := []map[string]any{{
-			"type": "If",
-			"cond": p.condToJSON(callExpr),
-			"then": []any{execStmt("echo", []map[string]any{strExpr("true")}, "Emulable")},
+			"type":   "If",
+			"cond":   p.condToJSON(callExpr),
+			"then":   []any{execStmt("echo", []map[string]any{strExpr("true")}, "Emulable")},
 			"elsifs": []any{},
 			"else":   []any{execStmt("echo", []map[string]any{strExpr("false")}, "Emulable")},
 		}}
@@ -6550,8 +6583,8 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 			}
 			return map[string]any{
 				"type": "ElementRead",
-				"coll":  p.exprToWord(e.target),
-				"key":   strExpr(key),
+				"coll": p.exprToWord(e.target),
+				"key":  strExpr(key),
 			}
 		}
 		p.failf("index target must be a var (v2)")
@@ -6725,7 +6758,7 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 				argsW = append(argsW, p.exprToWord(a))
 			}
 			return map[string]any{
-				"type":  "CgoCall",
+				"type":   "CgoCall",
 				"target": strExpr(e.callee),
 				"args":   argsW[1:],
 			}
@@ -8349,36 +8382,36 @@ func Shir(src string) ([]byte, error) {
 		return nil, err
 	}
 	p := &parser{
-		toks:      toks,
-		varTypes:  map[string]string{},
-		consts:    map[string]int{},
-		constStrs: map[string]string{},
-		arrays:    map[string]arrayInfo{},
-		maps:      map[string]bool{},
-		bufs:      map[string]string{},
-		cmds:      map[string][]*expr{},
-		stdinRdr:  map[string]bool{},
-		fnNames:   map[string]bool{},
-		outer:     map[string]bool{},
-		varAlias:  map[string]string{},
-		structs:   map[string][]string{},
-		structFT:  map[string][]string{},
-		structRaw: map[string][]string{},
-		bufDyn:    map[string]bool{},
-		prescanRet: map[string]string{},
-		pkgNames:   map[string]bool{},
+		toks:        toks,
+		varTypes:    map[string]string{},
+		consts:      map[string]int{},
+		constStrs:   map[string]string{},
+		arrays:      map[string]arrayInfo{},
+		maps:        map[string]bool{},
+		bufs:        map[string]string{},
+		cmds:        map[string][]*expr{},
+		stdinRdr:    map[string]bool{},
+		fnNames:     map[string]bool{},
+		outer:       map[string]bool{},
+		varAlias:    map[string]string{},
+		structs:     map[string][]string{},
+		structFT:    map[string][]string{},
+		structRaw:   map[string][]string{},
+		bufDyn:      map[string]bool{},
+		prescanRet:  map[string]string{},
+		pkgNames:    map[string]bool{},
 		fnRetIdents: map[string][]string{},
-		boolFuncs:  map[string]bool{},
+		boolFuncs:   map[string]bool{},
 		readDirVars: map[string]string{},
-		splitNVars: make(map[string]splitNInfo),
-		cgoObjs:    map[string]bool{},
-		varStruct: map[string]string{},
-		fnSig:     map[string][2]string{},
-		fnParams:  map[string]bool{},
-		fnParamOrd: []string{},
-		fnLocals:  map[string]bool{},
-		paramTypes: map[string]string{},
-		regexpVars: map[string]string{},
+		splitNVars:  make(map[string]splitNInfo),
+		cgoObjs:     map[string]bool{},
+		varStruct:   map[string]string{},
+		fnSig:       map[string][2]string{},
+		fnParams:    map[string]bool{},
+		fnParamOrd:  []string{},
+		fnLocals:    map[string]bool{},
+		paramTypes:  map[string]string{},
+		regexpVars:  map[string]string{},
 	}
 	p.prescanFuncNames()
 
@@ -8404,5 +8437,3 @@ func (p *parser) run() (stmts []map[string]any, err error) {
 	}()
 	return p.parseTopLevel(), nil
 }
-
-
