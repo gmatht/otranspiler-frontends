@@ -4880,6 +4880,38 @@ func (p *parser) parseArrayLiteral() ([]map[string]any, string) {
 			p.failf("unterminated array literal")
 		}
 		if t.kind == tIdent {
+			// ANONYMOUS STRUCT element type (`[]struct{ a, b T }{...}` —
+			// zig-sh-go's format-spec table): register the field list as
+			// a synthetic type so elements lower to objNew refs and
+			// `spec.field` reads resolve; then skip to the REAL literal
+			// brace (the braces just consumed were the FIELD LIST)
+			if t.text == "struct" && p.tok().kind == tPunct && p.tok().text == "{" {
+				p.pos++
+				var fields []string
+				for !p.atPunct("}") {
+					if p.tok().kind == tIdent {
+						nm := p.next().text
+						fields = append(fields, nm)
+						if p.acceptPunct(",") {
+							p.skipNL()
+							continue
+						}
+						p.skipType() // the group's shared type
+						if p.acceptPunct(";") {
+							p.skipNL()
+							continue
+						}
+						break
+					}
+					p.pos++
+				}
+				p.expect(tPunct, "}")
+				typ = "__anon" + strconv.Itoa(p.tmpN)
+				p.tmpN++
+				p.structs[typ] = fields
+				p.skipNL()
+				continue
+			}
 			typ = t.text
 		}
 		p.skipNL()
@@ -4892,8 +4924,15 @@ func (p *parser) parseArrayLiteral() ([]map[string]any, string) {
 			p.pos++
 			break
 		}
-		e := p.parseExpr()
-		elems = append(elems, p.exprToArrayElem(e))
+		// bare `{...}` elements of an anon-struct slice literal: Go
+		// elides the type prefix inside []T{...} — positional fields
+		if p.atPunct("{") && strings.HasPrefix(typ, "__anon") {
+			sl := p.parseStructLit(typ, p.structs[typ])
+			elems = append(elems, p.exprToArrayElem(sl))
+		} else {
+			e := p.parseExpr()
+			elems = append(elems, p.exprToArrayElem(e))
+		}
 		if !p.acceptPunct(",") {
 			p.skipNL()
 			p.expect(tPunct, "}")
@@ -5579,6 +5618,12 @@ func (p *parser) parseFor() []map[string]any {
 		if p.atPunct("[") {
 			elems, t := p.parseArrayLiteral()
 			iter, typ = elems, t
+			// anon-struct element type: bind the loop var's struct so
+			// `spec.field` reads lower to objGet over the element ref
+			if strings.HasPrefix(t, "__anon") && len(p.structs[t]) > 0 {
+				p.registerVar(v, "Str")
+				p.varStruct[p.resolveVar(v)] = t
+			}
 		} else {
 			rv := p.parseExpr()
 			if rv.kind != "var" {
@@ -6045,10 +6090,23 @@ func (p *parser) parseSwitch() []map[string]any {
 				hasDefault = true
 			} else if p.atIdent("case") {
 				p.pos++
-				c := p.parseExpr()
+				// COMMA-SEPARATED case expressions (`case A, B:`): each
+				// expression becomes its own cond; they share ONE body
+				// (the If-chain build duplicates the body per arm —
+				// Go semantics, any match runs it)
+				body := []map[string]any(nil)
+				for {
+					conds = append(conds, p.parseExpr())
+					if !p.acceptPunct(",") {
+						break
+					}
+					p.skipNL()
+				}
 				p.expect(tPunct, ":")
-				conds = append(conds, c)
-				bodies = append(bodies, p.parseSwitchBody())
+				body = p.parseSwitchBody()
+				for range conds {
+					bodies = append(bodies, body)
+				}
 			} else {
 				p.failf("expected case/default in bare switch, got %q", p.tok().text)
 			}
