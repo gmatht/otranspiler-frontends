@@ -1142,6 +1142,9 @@ func (p *parser) parseBraceMapLit() *expr {
 // keyed ({name: v}) and positional ({v1, v2}) forms lower; mixing is
 // refused (Go allows it only after keyed, but the corpus never does).
 func (p *parser) parseStructLit(typeName string, layout []string) *expr {
+	if os.Getenv("NSDBG") != "" {
+		fmt.Fprintln(os.Stderr, "SLDBG typename=", typeName, "layout=", layout)
+	}
 	p.expect(tPunct, "{")
 	vals := make([]*expr, len(layout))
 	keyed, first := false, true
@@ -1308,6 +1311,12 @@ func (p *parser) structMemberWord(name string) (map[string]any, bool) {
 // field word is the temp's value; non-addressed struct fields inline
 // their objNew directly.
 func (p *parser) newstructStmts(target string, e *expr) []map[string]any {
+	// unwrap the addr wrapper (the non-addr assignment path passes
+	// &expr{kind:"addr", lhs: structlit} — reading structType/fieldVals
+	// off the WRAPPER yields ""/nil, allocating a nameless empty object)
+	if e.kind == "addr" && e.lhs != nil {
+		e = e.lhs
+	}
 	layout := p.structs[e.structType]
 	prelude := []map[string]any{}
 	fieldNames := []any{}
