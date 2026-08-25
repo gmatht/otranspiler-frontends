@@ -1612,6 +1612,8 @@ enum Step<'a> {
     Filter(&'a syn::ExprClosure),
     /// `.take(N)` — N a literal int (bounds the loop)
     Take(u64),
+    /// `.skip(K)` — K a literal int (shifts the iteration window)
+    Skip(u64),
     /// `.enumerate()` — pairs (position, element); positions are the
     /// LOOP INDEX (exact: the pipeline visits elements in order)
     Enumerate,
@@ -1694,6 +1696,22 @@ fn parse_collect_chain<'a>(
                         }
                         node = &mc.receiver;
                     }
+                    "skip" => {
+                        if mc.args.len() != 1 {
+                            return None;
+                        }
+                        match mc.args.first() {
+                            Some(syn::Expr::Lit(l)) => match &l.lit {
+                                syn::Lit::Int(li) => {
+                                    let n: u64 = li.base10_parse().ok()?;
+                                    rev.push(Step::Skip(n));
+                                    node = &mc.receiver;
+                                }
+                                _ => return None,
+                            },
+                            _ => return None,
+                        }
+                    }
                     "take" => {
                         if mc.args.len() != 1 {
                             return None;
@@ -1773,6 +1791,12 @@ fn collect_chain_stmt(
                     None => *n, // unproven source + take(n): EXACT bound
                 });
             }
+            Step::Skip(k) => {
+                // skip past a proven-length source shrinks the window;
+                // skipping an UNPROVEN source keeps it unproven (the
+                // param-len fallback would miscount)
+                known_len = known_len.map(|l| l.saturating_sub(*k));
+            }
             Step::Enumerate => enumerated = true,
             Step::Rev => reversed = !reversed,
             _ => {}
@@ -1798,7 +1822,8 @@ fn collect_chain_stmt(
             // enumerate wraps elements in (position, element) pairs — the
             // pair is never materialized (bindings read position/element
             // directly), so the RESULT element type is unchanged
-            Step::Enumerate | Step::Rev | Step::Take(_) | Step::Iter | Step::Filter(_) => {}
+            Step::Enumerate | Step::Rev | Step::Take(_) | Step::Skip(_)
+            | Step::Iter | Step::Filter(_) => {}
         }
     }
 
@@ -1825,6 +1850,13 @@ fn collect_chain_stmt(
     //   bound-1-idx under .rev(); enumerate exposes the position itself)
     //   per step: Map rebinds __cur via closure/fnValue; Filter skips on
     //   a proven-false predicate (Continue)
+    let skip_k: u64 = steps
+        .iter()
+        .map(|s| match s {
+            Step::Skip(k) => *k,
+            _ => 0,
+        })
+        .sum();
     let enumerated_any = steps.iter().any(|s| matches!(s, Step::Enumerate));
     let pos_ast = if reversed {
         json!({
@@ -1841,7 +1873,12 @@ fn collect_chain_stmt(
         &cur,
         json!({
             "args": [str_lit(&src_name),
-                     {"type": "Arith", "ast": pos_ast.clone()}],
+                     {"type": "Arith", "ast": {
+                        "lhs": pos_ast.clone(),
+                        "op": "+",
+                        "rhs": {"type": "Num", "value": skip_k},
+                        "type": "Bin"
+                     }}],
             "func": "arrayIndex", "purity": "PureCpu", "type": "Call"
         }),
     ));
@@ -1850,11 +1887,13 @@ fn collect_chain_stmt(
         match step {
             Step::Iter => {}
             Step::Take(_) => {} // folded into the hoisted bound
+            Step::Skip(_) => {} // folded into the hoisted bound + start offset
             // enumerate pairs (position, element): the position IS the
             // loop index and the element is arrayIndex(src, idx') — the
             // pair is never materialized. rev flips the element read.
             Step::Enumerate => {}
             Step::Rev => {}
+            Step::Skip(_) => {} // folded into the hoisted bound
             Step::Map(f) => {
                 // (the rebound holder carries the STEP RESULT's proven
                 // type so later filters see it)

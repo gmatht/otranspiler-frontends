@@ -362,6 +362,16 @@ Pinned by t55_tuples_fnvals.rs.
 
 Pinned by t57_option.rs (self-contained struct + params + locals).
 
+## v0.18 additions — .skip(K) windows
+
+- `.skip(K)` joins the pipeline steps: the hoisted element read offsets
+  by K (`arrayIndex(src, pos + K)`); with `.take(N)` the window is
+  exactly K..K+N. Composes with map/filter/enumerate/rev.
+- Instrumented verification: appends carry exact values; all remaining
+  oracle divergences for array-collecting chains trace to ONE core
+  issue — getVar's scalar view of array vars under the ${#acc} fold
+  (param-len request, evidence extended). t58 in testdata-pending/.
+
 Refused loudly (testdata/*_refuse.rs — the emit MUST fail, t13–t23):
 borrows `&x`, user functions, `String::from`/method calls, `match`,
 `vec!`, `eprintln!`/`dbg!`, floats, `{:?}`/named/width format specs,
