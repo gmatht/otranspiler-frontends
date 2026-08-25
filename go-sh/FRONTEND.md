@@ -439,18 +439,27 @@ Println(call) captures the sub instead of exec-ing it (Go evaluates f
 and prints its RETURN VALUE). Oracle: if/bool-param/type-assert
 programs byte-identical; gates green.
 
-### Next frontier (zig-sh-go:1304, named decision — attempt reverted)
+### Next frontier (zig-sh-go:1304, named decision — root-caused in the CORE pass)
 
-`inner[i:i+len(spec.zig)] == spec.zig` — a SLICE in ==-comparison
-position. ATTEMPTED 2026-09-01 and REVERTED: BinOp-eq over A1 words +
-a strSlice runtime helper (word bounds) rendered a program that spins
-(refuse spam without advancing i). Root cause not yet isolated — the
-anon-struct field reads and strSlice probe correctly in isolation; the
-composed loop (goto-flag + early-return refuse + word-bounded slice in
-==) misbehaves at runtime. NAMED DECISION unchanged: rewrite as
-strings.HasPrefix(X[i:], Z), which needs the HasPrefix glob-test arm to
-accept word needles AND the goto/label lowering audited (the __gmatched
-flag is set but never consulted by the loop — likely the real spin).
+`inner[i:i+len(spec.zig)] == spec.zig` — slice-in-comparison + goto/label.
+ROOT-CAUSED 2026-09-01 (minimal repro ng.go): the spin is in
+shir_passes/restructure.rs handle_nested, NOT the comparison lowering:
+
+1. For `goto L` nested in for-inside-if with L in the GRANDPARENT while,
+   find_nested yields only ONE loop step (the inner for) — so
+   handle_nested skips ALL outer-loop break guards (k == last), leaving
+   the flag write orphaned (estree shows __gmatched_0 exactly twice:
+   decl + set, never read).
+2. The label's trailing `Continue` then re-binds to the INNERMOST
+   enclosing JS loop after restructuring (the inner for), not the outer
+   while Go intended — i never advances -> infinite refuse spam.
+
+FIX PATH (core, fresh session): handle_nested must walk the LABEL's
+containing loop chain too — emit break guards for EVERY loop strictly
+between the goto and the label's loop, and convert the label's
+trailing Continue into the outermost loop's continue (or emit the
+guards + explicit advance). The prefix-match comparison lowering itself
+(A1-word BinOp-eq + strSlice) is sound once jumps are structured.
 
 ### Remaining refusals by category (each with named blocking decision)
 
