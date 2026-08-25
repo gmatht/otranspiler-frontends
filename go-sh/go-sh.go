@@ -974,7 +974,8 @@ func (p *parser) parsePrimary() *expr {
 			p.skipNL()
 			arg := p.parseExpr()
 			p.expect(tPunct, ")")
-			if arg.kind == "var" && p.varTypes[arg.name] == "Array" {
+			if arg.kind == "var" && (p.varTypes[arg.name] == "Array" ||
+				p.varTypes[p.resolveVar(arg.name)] == "ListRef") {
 				return &expr{kind: "arrlen", target: arg}
 			}
 			if arg.kind == "member" {
@@ -3089,20 +3090,44 @@ func (p *parser) parseAppendIntoList(idWord, fieldWord map[string]any, typeName,
 		"purity": "PureCpu",
 	}
 	elems := []any{cur}
+	var spreads []map[string]any
 	for _, a := range args[1:] {
+		// variadic spread of a MEMBER list (`x.out = append(x.out,
+		// update...)`): listExtend pushes the SOURCE LIST'S ITEMS
+		// (a plain listPush would store the ref as one element).
+		if a.spread && a.kind == "slice" && a.target != nil && p.memberListType(a.target) != "" {
+			spreads = append(spreads, p.memberSliceWord(a))
+			continue
+		}
+		// variadic spread of a VAR holding a list ref (the value came
+		// from a member-slice/copy lowering): listExtend resolves the
+		// ref and pushes its items.
+		if a.spread && a.kind == "var" {
+			spreads = append(spreads, p.exprToWord(a))
+			continue
+		}
 		elems = append(elems, p.elemWord(a, elemType))
 	}
-	// objSet(l, f, listPush(objGet(l, f), ...)) — listPush returns the
-	// (possibly freshly vivified) list id, the objSet stores it back
+	pushExpr := map[string]any{
+		"type": "Call", "func": "listPush",
+		"args":   elems,
+		"purity": "PureCpu",
+	}
+	for _, sw := range spreads {
+		pushExpr = map[string]any{
+			"type": "Call", "func": "listExtend",
+			"args":   []any{pushExpr, sw},
+			"purity": "PureCpu",
+		}
+	}
+	// objSet(l, f, listExtend(listPush(objGet(l, f), ...), …)) —
+	// listPush returns the (possibly freshly vivified) list id, each
+	// listExtend absorbs one spread source, the objSet stores it back
 	return map[string]any{
 		"type": "Expr",
 		"expr": map[string]any{
 			"type": "Call", "func": "objSet",
-			"args": []any{idWord, fieldWord, map[string]any{
-				"type": "Call", "func": "listPush",
-				"args":   elems,
-				"purity": "PureCpu",
-			}},
+			"args": []any{idWord, fieldWord, pushExpr},
 			"purity": "PureCpu",
 		},
 	}
@@ -3164,6 +3189,69 @@ func (p *parser) compositeValueWord(v *expr, prelude *[]map[string]any) map[stri
 
 // elemWord: a slice-append element — struct-typed vars/objects pass as
 // reference ids; inner literals allocate inline.
+// memberListType: for `x.f` (member/fieldof), the declared field type
+// when the base var's struct declares f as a SLICE ([]…); "" when the
+// shape isn't a known struct-field list.
+func (p *parser) memberListType(t *expr) string {
+	if t == nil || (t.kind != "member" && t.kind != "fieldof") {
+		return ""
+	}
+	parts := strings.Split(t.name, ".")
+	if len(parts) != 2 {
+		return ""
+	}
+	tn := p.varStruct[p.resolveVar(parts[0])]
+	if tn == "" {
+		return ""
+	}
+	for i, f := range p.structs[tn] {
+		if f == parts[1] {
+			// structFT stores the BASE ident (captureTypeText strips
+			// "[]"/"*"); the RAW text keeps the slice prefix — use it
+			// for list dispatch (the field's raw is "[]string" etc.)
+			if raws := p.structRaw[tn]; i < len(raws) {
+				if strings.HasPrefix(raws[i], "[]") {
+					return raws[i]
+				}
+			}
+			if fts := p.structFT[tn]; i < len(fts) {
+				if strings.HasPrefix(fts[i], "[]") {
+					return fts[i]
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// memberSliceWord: x.f[lo:hi] over a []T struct field — listSlice over
+// the field's list ref; a NEW list (Go slice expressions copy).
+func (p *parser) memberSliceWord(e *expr) map[string]any {
+	parts := strings.Split(e.target.name, ".")
+	refW := map[string]any{
+		"type": "Call", "func": "objGet",
+		"args":   []any{p.structIDWord(parts[0]), strExpr(parts[1])},
+		"purity": "PureCpu",
+	}
+	loW := strExpr("0")
+	if e.idx1e != nil {
+		loW = p.exprToWord(e.idx1e)
+	} else if e.idx1 != "" {
+		loW = strExpr(e.idx1)
+	}
+	hiW := map[string]any{"type": "Call", "func": "listLen", "args": []any{refW}, "purity": "PureCpu"}
+	if e.idx2e != nil {
+		hiW = p.exprToWord(e.idx2e)
+	} else if e.idx2 != "" {
+		hiW = strExpr(e.idx2)
+	}
+	return map[string]any{
+		"type": "Call", "func": "listSlice",
+		"args":   []any{refW, loW, hiW},
+		"purity": "PureCpu",
+	}
+}
+
 func (p *parser) elemWord(a *expr, elemType string) any {
 	lit := a
 	if lit.kind == "addr" && lit.lhs != nil && lit.lhs.kind == "structlit" {
@@ -4248,6 +4336,16 @@ func (p *parser) parseAssignStmt() []map[string]any {
 		})}
 	}
 
+	// upd := append([]T{}, x.f[mark:]...) — the slice-COPY idiom over a
+	// MEMBER list: the fresh listSlice ref IS the new slice value (an
+	// empty array literal + exactly one member-slice spread).
+	if rhs.kind == "call" && rhs.callee == "append" && len(rhs.args) == 2 &&
+		rhs.args[0].kind == "arraylit" && len(rhs.args[0].elems) == 0 &&
+		rhs.args[1].spread && rhs.args[1].kind == "slice" &&
+		rhs.args[1].target != nil && p.memberListType(rhs.args[1].target) != "" {
+		p.registerVar(targets[0], "ListRef")
+		return []map[string]any{assignStmt(targets[0], p.memberSliceWord(rhs.args[1]))}
+	}
 	// a = append(a, "c", "d") → setArrayAppend (the `arr+=(c d)` shape)
 	if rhs.kind == "call" && rhs.callee == "append" {
 		if len(rhs.args) < 2 || (rhs.args[0].kind != "var" &&
@@ -6461,6 +6559,14 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 		if e.target != nil && e.target.kind == "var" {
 			return p.sliceWord(e)
 		}
+		// MEMBER-LIST slice: x.f[lo:hi] over a []T struct field →
+		// listSlice(objGet(id, f), lo, hi) — a NEW list ref holding the
+		// copied range (zig-sh-go's `x.out[:mark]` truncate /
+		// `x.out[mark:]` tail-copy idioms). Open bounds are explicit:
+		// 0 and listLen(ref).
+		if e.target != nil && p.memberListType(e.target) != "" {
+			return p.memberSliceWord(e)
+		}
 		// non-var slice target (`raws[off][vi+1:]` — an element read
 		// sliced): the drop-in SubStrExtract ext node. Go string-slice
 		// semantics: [lo:hi] = bytes lo..hi-1; a missing bound runs to
@@ -6521,6 +6627,16 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 		p.failf("len() arg must be a var (v2)")
 	case "arrlen":
 		if e.target != nil && e.target.kind == "var" {
+			// ListRef var: holds a list#N object ref — count via the
+			// runtime listLen (the ${#arr[@]} shape reads the A1 array
+			// store, which a ref-holding var doesn't populate)
+			if p.varTypes[p.resolveVar(e.target.name)] == "ListRef" {
+				return map[string]any{
+					"type": "Call", "func": "listLen",
+					"args":   []any{p.exprToWord(e.target)},
+					"purity": "PureCpu",
+				}
+			}
 			return joinCall(paramCall("slice", "#"+e.target.name, "@", ""))
 		}
 		if e.target != nil && e.target.kind == "member" {
@@ -6710,6 +6826,19 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 				// `strings.Join(redirects, " ")` form).
 				if e.args[0].kind == "var" && p.varTypes[e.args[0].name] == "Array" {
 					return joinCall(paramCall("slice", e.args[0].name, "@", ""))
+				}
+			}
+			// Join(memberSlice, sep) — `x.out[mark:]`: listSlice ref word
+			// joined with the separator (zig-sh-go's range-form capture)
+			if len(e.args) == 2 && e.args[0].kind == "slice" &&
+				e.args[0].target != nil && p.memberListType(e.args[0].target) != "" {
+				return map[string]any{
+					"type": "Call", "func": "joinSep",
+					"args": []any{
+						p.memberSliceWord(e.args[0]),
+						p.exprToWord(e.args[1]),
+					},
+					"purity": "PureCpu",
 				}
 			}
 			// Join(memberArr, sep) — a struct-FIELD slice (`x.out`, the
