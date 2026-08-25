@@ -439,6 +439,18 @@ Println(call) captures the sub instead of exec-ing it (Go evaluates f
 and prints its RETURN VALUE). Oracle: if/bool-param/type-assert
 programs byte-identical; gates green.
 
+### Next frontier (zig-sh-go:1304, named decision)
+
+`inner[i:i+len(spec.zig)] == spec.zig` — a SLICE in ==-comparison
+position. Slices now enter condOperandA1Word (sliceWord/memberSliceWord)
+but the computed bound `i+len(member)` needs shell-arithmetic text that
+evalArith cannot express over objGet chains. NAMED DECISION: lower the
+whole comparison as strings.HasPrefix(X[i:], Z) — semantically exact
+(the corpus's `&& i+len(z) <= len(inner)` guard implies the bound) —
+requiring the HasPrefix glob-test arm to accept non-literal needles
+(quoted operand + quoted needle word, no bare-glob). Blocked on the
+glob-test shape taking word operands.
+
 ### Remaining refusals by category (each with named blocking decision)
 
 **CGO-PATH → C frontend** (10 files): sitter.NewLanguage/NewParser,

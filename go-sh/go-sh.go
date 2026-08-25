@@ -8223,6 +8223,17 @@ func (p *parser) condOperandA1Word(e *expr) (map[string]any, bool) {
 
 func (p *parser) condOperandA1WordInner(e *expr) (map[string]any, bool) {
 	switch e.kind {
+	case "slice":
+		// a SLICED operand in comparison position (`inner[i:j] == spec.zig`
+		// — zig-sh-go's format-spec match): the slice word evaluates to
+		// the sliced TEXT, so the ==/!= compares strings natively
+		if e.target != nil && e.target.kind == "var" {
+			return p.sliceWord(e), true
+		}
+		if e.target != nil && p.memberListType(e.target) != "" {
+			return p.memberSliceWord(e), true
+		}
+		return nil, false
 	case "member":
 		if w, tag := p.structFieldWord(e.name); tag != "none" {
 			return w, true
