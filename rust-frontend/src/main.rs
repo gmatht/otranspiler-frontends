@@ -512,6 +512,8 @@ fn main() {
         match item {
             syn::Item::Fn(f) if f.sig.ident != "main" => {
                 cx.fns.push(f.sig.ident.to_string());
+                cx.fn_rets
+                    .insert(f.sig.ident.to_string(), ret_ty(&f.sig.output, &cx));
                 fns.push(FnSource::Free(f));
             }
             syn::Item::Impl(i) => {
@@ -695,6 +697,22 @@ fn lower_local(local: &syn::Local, cx: &Cx, out: &mut Vec<Value>) -> Option<Valu
             init.expr.span(),
         );
     }
+    // `let x = expr?;` — Option propagation under None≡"": an EMPTY
+    // value returns "" from the enclosing fn (propagation); otherwise x
+    // binds the unwrapped value. Exact when callers treat "" as None.
+    if let syn::Expr::Try(t) = &*init.expr {
+        let v = value_expr(&t.expr, cx);
+        out.push(assign_stmt(&name, v));
+        cx.vars.borrow_mut().insert(name.clone(), Ty::Unknown);
+        out.push(json!({
+            "cond": test_call(&format!("${name} = \"\"")),
+            "then": [json!({"type": "Exit", "value": null})],
+            "elsifs": [],
+            "else": [],
+            "type": "If",
+        }));
+        return Some(assign_stmt(&name, get_var(&name)));
+    }
     // array literals STORE via setArray (native array, no coercion)
     if let Some(elems) = array_literal_elems(&init.expr) {
         let elements = elems.iter().map(|e| value_expr(e, cx)).collect::<Vec<_>>();
@@ -795,6 +813,18 @@ fn infer_ty(e: &syn::Expr, cx: &Cx) -> Ty {
             }
         }
         // a TUPLE literal is an array of the first element's proven type
+        // REGISTERED-fn calls carry their declared return Ty
+        syn::Expr::Call(c) => {
+            
+            if let syn::Expr::Path(p2) = &*c.func {
+                if let Some(id) = single_path(p2) {
+                    if let Some(t) = cx.fn_rets.get(&id.to_string()) {
+                        return t.clone();
+                    }
+                }
+            }
+            Ty::Unknown
+        }
         // method-call result types (the small proven family)
         syn::Expr::MethodCall(m) => {
             let rty = infer_ty(&m.receiver, cx);
@@ -2532,6 +2562,65 @@ fn lower_print_macro(mac: &syn::Macro, cx: &Cx) -> Value {
     let (translated, n) =
         translate_format(&fmt).unwrap_or_else(|e| refuse(&e, fmt_args.fmt.span()));
     let args = &fmt_args.args;
+    // {:?} placeholders are EXACT when their argument is a PROVEN integer
+    // (Rust Debug == Display == decimal digits for ints). Strings gain
+    // quotes/escapes under Debug — those refuse. Walk the format string,
+    // mapping each placeholder group to its argument in order.
+    {
+        let mut chars = fmt.char_indices().peekable();
+        let mut ph_index = 0usize;
+        while let Some((i, c)) = chars.next() {
+            match c {
+                '{' => {
+                    // capture the spec up to the matching '}'
+                    let mut spec = String::new();
+                    let mut closed = false;
+                    for (_, c2) in chars.by_ref() {
+                        if c2 == '}' {
+                            closed = true;
+                            break;
+                        }
+                        if c2 == '{' {
+                            // "{{" escape inside scan: treat as literal
+                            spec.clear();
+                            closed = false;
+                            break;
+                        }
+                        spec.push(c2);
+                    }
+                    if !closed {
+                        break; // unbalanced; translate_format refuses later
+                    }
+                    if spec.is_empty() || spec == ":?" {
+                        let arg_ty = args
+                            .get(ph_index)
+                            .map(|a| infer_ty(a, cx))
+                            .unwrap_or(Ty::Unknown);
+                        if spec == ":?" && !matches!(arg_ty, Ty::Int | Ty::Unknown) {
+                            refuse(
+                                "{:?} on a non-proven-integer argument (Debug != Display)",
+                                fmt_args.fmt.span(),
+                            );
+                        }
+                        if spec.is_empty() {
+                            // plain {}: any proven type renders via %s;
+                            // unproven args were already the norm here
+                        }
+                        ph_index += 1;
+                    } else if spec.starts_with(':') {
+                        // other typed specs (width/precision/fill) refuse
+                        // EXCEPT :? handled above
+                        refuse(
+                            &format!("format specifier '{{:{}}}' unsupported", spec),
+                            fmt_args.fmt.span(),
+                        );
+                    }
+                }
+
+                _ => {}
+            }
+        }
+    }
     if n != args.len() {
         refuse(
             &format!("format string has {n} placeholders but {} arguments", args.len()),
@@ -2571,7 +2660,10 @@ fn translate_format(fmt: &str) -> Result<(String, usize), String> {
                         }
                         inner.push(c2);
                     }
-                    if inner.is_empty() {
+                    if inner.is_empty() || inner == ":?" {
+                        // {} and {:?} both position into the arg list;
+                        // {:?} renders EXACTLY like {} when the argument
+                        // is a proven integer (Debug == Display == decimal)
                         n += 1;
                         out.push_str("%s");
                     } else {
@@ -2861,10 +2953,22 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                 call_args.extend(m.args.iter().cloned());
                 return fn_call_expr_values(&target, call_args, "fnValue", cx);
             }
+            eprintln!("DBG4 recv_ty={:?} method={}", recv_ty, rust_name);
             // OPTION methods: under the None≡"" store convention,
             // as_deref / unwrap_or("") / unwrap_or_default are ALL the
             // plain variable read (Some(v) -> v, None -> ""). Exact when
             // no code distinguishes Some("") from None.
+            // a CALL receiver whose registered fn returns Opt also
+            // carries the option type (`echo(1).unwrap_or("")`)
+            let recv_ty = match (&recv_ty, &*m.receiver) {
+                (Ty::Unknown, syn::Expr::Call(c)) => match &*c.func {
+                    syn::Expr::Path(p2) => single_path(p2)
+                        .and_then(|id| cx.fn_rets.get(&id.to_string()).cloned())
+                        .unwrap_or(Ty::Unknown),
+                    _ => Ty::Unknown,
+                },
+                _ => recv_ty,
+            };
             if matches!(recv_ty, Ty::Opt(_)) {
                 match rust_name.as_str() {
                     "as_deref" | "unwrap_or_default" => {

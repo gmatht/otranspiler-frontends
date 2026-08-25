@@ -79,6 +79,9 @@ counts over the corpus (top entries):
 1o. DONE v0.16 — enumerate/rev steps + tuple-destructuring closure
     params (position = loop index; no materialized pairs). Oracle-gated
     on the param-len request like all array read-backs (t56 pending).
+1r. DONE v0.19 — `?` propagation under None≡"" + registered-fn return
+    types in cx.fn_rets (t60). Enables unwrap_or("") chains on call
+    results.
 1q. DONE v0.18 — .skip(K) window shifts composing with take/map/filter
     (t58 pending on param-len like t53/t56).
 1p. DONE v0.17 — Option<T> layer: Opt type + method family

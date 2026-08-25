@@ -372,6 +372,18 @@ Pinned by t57_option.rs (self-contained struct + params + locals).
   issue — getVar's scalar view of array vars under the ${#acc} fold
   (param-len request, evidence extended). t58 in testdata-pending/.
 
+## v0.19 additions — `?` propagation & registered-fn return types
+
+- `let x = expr?;` — Option propagation under None≡"": an EMPTY value
+  returns "" from the enclosing fn (Exit); otherwise x binds the
+  unwrapped value. Exact when callers treat "" as None (same
+  convention). Requires the enclosing fn to return Option (rustc
+  enforces).
+- Registered fns now carry their DECLARED RETURN TYPES (cx.fn_rets):
+  call results type-resolve (`echo(1).unwrap_or("")` chains work;
+  `.collect()` result typing was already via closure/fn inference).
+- Pinned by t60_try_option.rs.
+
 Refused loudly (testdata/*_refuse.rs — the emit MUST fail, t13–t23):
 borrows `&x`, user functions, `String::from`/method calls, `match`,
 `vec!`, `eprintln!`/`dbg!`, floats, `{:?}`/named/width format specs,
