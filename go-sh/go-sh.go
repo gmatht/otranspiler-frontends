@@ -5406,6 +5406,46 @@ func (p *parser) parseFor() []map[string]any {
 				"init": init, "cond": cond2, "step": step, "body": b2,
 			}}
 		}
+		if os.Getenv("RNGDBG") != "" {
+			fmt.Fprintln(os.Stderr, "RNGDBG rv.kind=", rv.kind, "name=", rv.name)
+		}
+		if rv.kind == "member" || rv.kind == "fieldof" {
+			// member of a COMPUTED base (`args[0].args` — an element
+			// read of a struct slice, then its list field): the
+			// container word evaluates natively (objGet chain over the
+			// element ref); index+value bind C-style like the index form
+			lw := p.exprToWord(rv)
+			p.registerVar(idxName, "Int")
+			p.registerVar(valName, "Str")
+			b4 := []map[string]any{assignStmt(valName, map[string]any{
+				"type": "Call", "func": "listGet",
+				"args":   []any{lw, getVarExpr(idxName)},
+				"purity": "PureCpu",
+			})}
+			b4 = append(b4, p.parseBlockStmts()...)
+			return []map[string]any{{
+				"type": "ForInit",
+				"init": []map[string]any{arithAssignStmt(idxName, 0)},
+				"cond": map[string]any{
+					"type": "BinOp", "op": "Lt",
+					"lhs": map[string]any{"type": "Arith", "ast": arithVar(idxName)},
+					"rhs": map[string]any{
+						"type": "Call", "func": "listLen",
+						"args":   []any{lw},
+						"purity": "PureCpu",
+					},
+				},
+				"step": []map[string]any{{
+					"type":    "Assign",
+					"targets": []any{map[string]any{"var": idxName, "sigil": nil, "indices": []any{}}},
+					"expr": map[string]any{
+						"type": "Arith",
+						"ast":  map[string]any{"type": "IncDec", "var": idxName, "delta": 1, "prefix": false},
+					},
+				}},
+				"body": b4,
+			}}
+		}
 		if rv.kind != "var" {
 			p.failf("range over a non-var (v2)")
 		}
@@ -5537,6 +5577,26 @@ func (p *parser) parseFor() []map[string]any {
 							"type": "ForInit",
 							"init": init2, "cond": cond2, "step": step2, "body": b2,
 						}}
+					}
+				}
+				// range over a COMPUTED member (`for _, a := range
+				// args[0].args` — element read of a struct slice, then
+				// its list field): the container word evaluates natively
+				// (objGet chain over the element ref)
+				if rv.kind == "member" || rv.kind == "fieldof" {
+					if _, tag := p.structFieldWord(rv.name); tag != "list" {
+						if cw := p.exprToWord(rv); cw != nil {
+							body := p.parseBlockStmts()
+							p.registerVar(v, "Str")
+							return []map[string]any{{
+								"type": "For",
+								"var":  v,
+								"iter": map[string]any{"type": "Array", "elements": []any{
+									map[string]any{"type": "Call", "func": "listItems", "args": []any{cw}, "purity": "PureCpu"},
+								}},
+								"body": body,
+							}}
+						}
 					}
 				}
 				// range over a LIST-object field (`for _, fv := range e.fieldVals`)
@@ -6727,6 +6787,25 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 				"side":   "right",
 			}
 		}
+		// strings.Replace(s, old, neu, n) — the COUNTED variant: at most
+		// the first n replacements (strReplaceN runtime twin; go-sh.go's
+		// own fmt fast-path uses it). Literal or computed operands ride.
+		if e.callee == "strings.Replace" && len(e.args) == 4 {
+			return map[string]any{
+				"type": "Call", "func": "strReplaceN",
+				"args":   []any{p.exprToWord(e.args[0]), p.exprToWord(e.args[1]), p.exprToWord(e.args[2]), p.exprToWord(e.args[3])},
+				"purity": "PureCpu",
+			}
+		}
+		// strings.Count(s, sub) — non-overlapping instance count
+		// (strCount runtime twin; go-sh.go's own fmt fast-path gate)
+		if e.callee == "strings.Count" && len(e.args) == 2 {
+			return map[string]any{
+				"type": "Call", "func": "strCount",
+				"args":   []any{p.exprToWord(e.args[0]), p.exprToWord(e.args[1])},
+				"purity": "PureCpu",
+			}
+		}
 		if e.callee == "strings.ReplaceAll" && len(e.args) == 3 {
 			return map[string]any{
 				"type": "Call", "func": "strReplaceAll",
@@ -7470,7 +7549,12 @@ func (p *parser) arithOrConcat(e *expr) map[string]any {
 func (p *parser) addHasString(e *expr) bool {
 	switch e.kind {
 	case "add":
-		return p.addHasString(e.lhs) || p.addHasString(e.rhs)
+		// nil-guard: a malformed/degenerate add node (nil side) must
+		// not crash the parser — treat the missing side as non-string
+		if e.rhs != nil && p.addHasString(e.rhs) {
+			return true
+		}
+		return e.lhs != nil && p.addHasString(e.lhs)
 	case "str", "rawstr":
 		return true
 	case "var":
@@ -7483,8 +7567,12 @@ func (p *parser) addHasString(e *expr) bool {
 // is itself pure arithmetic stays a single expr part (its Arith value).
 func (p *parser) addConcatParts(e *expr, parts *[]any) {
 	if e.kind == "add" && p.addHasString(e) {
-		p.addConcatParts(e.lhs, parts)
-		p.addConcatParts(e.rhs, parts)
+		if e.lhs != nil {
+			p.addConcatParts(e.lhs, parts)
+		}
+		if e.rhs != nil {
+			p.addConcatParts(e.rhs, parts)
+		}
 		return
 	}
 	*parts = append(*parts, p.concatPart(e))
@@ -7570,6 +7658,11 @@ func (p *parser) exprToArith(e *expr) map[string]any {
 		}
 		return arithVar(name)
 	case "add", "mul":
+		// nil-guard: a degenerate add/mul node (missing side) must
+		// failf cleanly, not crash the parser
+		if e.lhs == nil || e.rhs == nil {
+			p.failf("malformed arithmetic node (nil operand) (v2)")
+		}
 		return arithBin(p.exprToArith(e.lhs), e.op, p.exprToArith(e.rhs))
 	case "neg":
 		return arithBin(arithNum(0), "-", p.exprToArith(e.lhs))
