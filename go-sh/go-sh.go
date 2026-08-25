@@ -1790,6 +1790,18 @@ func (p *parser) paramNumber(name string) (int, bool) {
 	return 0, false
 }
 
+// condVarRef: the quoted shell read of a condition variable —
+// FUNCTION PARAMS ride as positionals ($1/$2, the exec-arg protocol;
+// a named $ok read would fold to "" under never-written analysis and
+// never see the caller's value), named store vars as $name.
+func (p *parser) condVarRef(name string) string {
+	rn := p.resolveVar(name)
+	if n, ok := p.paramNumber(rn); ok {
+		return "$" + strconv.Itoa(n)
+	}
+	return "$" + rn
+}
+
 // ── statement parsing ───────────────────────────────────────────────
 
 func (p *parser) parseTopLevel() []map[string]any {
@@ -1914,9 +1926,23 @@ func (p *parser) parseTopLevel() []map[string]any {
 			for _, prm := range params {
 				p.fnParams[prm] = true
 				p.fnParamOrd = append(p.fnParamOrd, prm)
-				if pt := p.paramTypes[prm]; p.isStructType(pt) {
-					rn := p.resolveVar(prm)
-					p.varStruct[rn] = pt
+				if pt := p.paramTypes[prm]; pt != "" {
+					if p.isStructType(pt) {
+						rn := p.resolveVar(prm)
+						p.varStruct[rn] = pt
+					}
+					// SCALAR param typing drives the condition lowerings
+					// (`if ok {` on a bool param tests "$1"=="true",
+					// not non-emptiness) and arith operand shapes
+					switch {
+					case pt == "bool":
+						p.registerVar(prm, "Bool")
+					case strings.HasPrefix(pt, "int"), strings.HasPrefix(pt, "uint"),
+						strings.HasPrefix(pt, "float"):
+						p.registerVar(prm, "Int")
+					case pt == "string":
+						p.registerVar(prm, "Str")
+					}
 				}
 			}
 			body := []map[string]any{}
@@ -2186,7 +2212,24 @@ func (p *parser) parseStmt() []map[string]any {
 		for _, e := range rexprs {
 			words = append(words, p.exprToWord(e))
 		}
-		return []map[string]any{execStmt("echo", words, "Emulable")}
+		out := []map[string]any{execStmt("echo", words, "Emulable")}
+		if p.inFunc {
+			// EARLY return inside a conditional: the echo writes the
+			// value channel (the sub-stdout convention), the bare
+			// return-call STOPS the sub — Go's `return` exits even when
+			// more statements follow (a tail return just ends anyway,
+			// so the extra stop is a no-op there). Without it an
+			// `if c { return x }` fell through to the tail code.
+			out = append(out, map[string]any{
+				"type": "Expr",
+				"expr": map[string]any{
+					"type": "Call", "func": "return",
+					"args":   []any{},
+					"purity": "Spawn",
+				},
+			})
+		}
+		return out
 	case "continue":
 		// A1 Continue node (mirrors Command::Continue(None) in the core):
 		// a bare `continue` inside a loop body. Labeled `continue L` is
@@ -3459,14 +3502,27 @@ func (p *parser) printlnStmt() []map[string]any {
 	if len(args) == 1 && args[0].kind == "rawstr" {
 		return []map[string]any{p.heredocStmt(args[0].text)}
 	}
-	// function call in Println: fmt.Println(greet(n)) → the call itself
-	// (the function's echo writes stdout — the `greet "$n"` shape)
+	// function call in Println: fmt.Println(f(x)) — Go EVALUATES f and
+	// prints its RETURN VALUE, so the sub runs inside a CAPTURE (`echo
+	// "$(f x)"`); a bare exec would interleave the sub's own stdout
+	// (its return echo) with Println's, doubling the line. The trailing
+	// newline: the capture strips it, echo re-adds one — exactly
+	// Println's byte contract.
 	if len(args) == 1 && args[0].kind == "call" && p.fnNames[args[0].callee] {
 		var words []map[string]any
 		for _, a := range args[0].args {
 			words = append(words, p.argToWord(a))
 		}
-		return []map[string]any{execStmtTA(args[0].callee, words, "Spawn", args[0].typeArgs)}
+		capW := map[string]any{
+			"type": "Call", "func": "capture",
+			"args": []any{map[string]any{
+				"type": "Arrow", "body": []any{
+					execStmtTA(args[0].callee, words, "Spawn", args[0].typeArgs),
+				},
+			}},
+			"purity": "Spawn",
+		}
+		return []map[string]any{execStmt("echo", []map[string]any{capW}, "Emulable")}
 	}
 	return []map[string]any{execStmt("echo", p.printlnWords(args), "Emulable")}
 }
@@ -4470,6 +4526,15 @@ func (p *parser) parseAssignStmt() []map[string]any {
 	// a bare Bool var condition lowers to `"$ok" = true`, condTestString).
 	if len(targets) == 2 && rhs.kind == "assert" {
 		k := goTypeKind(rhs.typeName)
+		if k == "" {
+			// NAMED struct types (*StrE, *LitStr, …): the object store
+			// records each allocation's declared type, so the runtime
+			// typeof vocabulary IS the struct name — assert against it
+			base := strings.TrimPrefix(strings.TrimSpace(rhs.typeName), "*")
+			if p.isStructType(base) {
+				k = base
+			}
+		}
 		if k == "" {
 			p.failf("unsupported type assertion to %q (v2)", rhs.typeName)
 		}
@@ -6518,8 +6583,14 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 		}
 	case "assert":
 		// TypeAssert ext node — checked passthrough; kind vocabulary =
-		// sh2.typeOf strings. Named/unknown types refuse (goTypeKind).
+		// sh2.typeOf strings + declared struct names (obj-store typed)
 		k := goTypeKind(e.typeName)
+		if k == "" {
+			base := strings.TrimPrefix(strings.TrimSpace(e.typeName), "*")
+			if p.isStructType(base) {
+				k = base
+			}
+		}
 		if k == "" {
 			p.failf("unsupported type assertion to %q (v2) — named types have no knowable dynamic kind", e.typeName)
 		}
@@ -7945,14 +8016,14 @@ func (p *parser) condTestString(c *expr) string {
 	// a bare BOOL var (the comma-ok `if ok {` idiom): the stored textual
 	// "true"/"false" compared against "true"
 	if c.kind == "var" && p.varTypes[p.resolveVar(c.name)] == "Bool" {
-		return `"$` + p.resolveVar(c.name) + `"="true"`
+		return `"` + p.condVarRef(c.name) + `"="true"`
 	}
 	if c.kind != "binop" {
 		if c.kind == "var" {
 			// bare VAR condition (the `if ok {` idiom): non-empty =
 			// truthy — matches Go's bool semantics for the "true"/""
 			// strings the lowering produces
-			return "-n \"$" + p.resolveVar(c.name) + "\""
+			return "-n \"" + p.condVarRef(c.name) + "\""
 		}
 		fmt.Fprintln(os.Stderr, "DBG CF3 kind=", c.kind, "callee=", c.callee)
 		p.failf("unsupported condition (v2): %s", c.kind)

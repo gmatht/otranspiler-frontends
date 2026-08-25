@@ -425,18 +425,19 @@ to stderr, os.Args[i] positional reads, os.Stdout.Write, regexp
 MustCompile tracking, SplitN param-op lowering, local type declarations,
 bare-switch or-chain flag-based lowering.
 
-### ACTIVE REGRESSION (found 2026-09-01, NOT frontend-caused)
+### RESOLVED (2026-09-01): bool-param if-return collapse
 
-`if <bool var> { return X }` + fallthrough return misrenders: the If's
-test-call cond collapses at ESTree render time to `String("") !== ""`
-(always false) — f(true)/f(false) print "no"/"no" instead of yes/no.
-Reproduces identically on BOTH trees' debashc binaries with identical
-shir input (the shir is CORRECT: cond=test("-n \"$ok\"")); the collapse
-happens in shir.rs render/fold machinery. Suspect: concurrent worker's
-"text_ops: construct-normalisation transforms" commit 44c350a (touched
-shir.rs). fail-go stays green because the snippet corpus lacks this
-shape. Needs a bisect against 44c350a^ (that parent has an unrelated
-compile error — seq_range_for duplicate — fix that first).
+The `String("") !== ""` collapse was a FRONTEND bug, not core: function
+params were read as NAMED store vars ($ok) in condition lowerings —
+but exec-call args bind POSITIONALLY ($1/$2), so $ok was never written
+and the core's never-written-read analysis correctly folded it to "".
+Four frontend fixes: condVarRef maps param names to their positional
+number in condition reads; typed params register scalar varTypes (bool
+→ Bool so `if ok {` tests "$1"=="true", not non-emptiness); early value
+returns emit echo + bare return-call (Go's return exits mid-function);
+Println(call) captures the sub instead of exec-ing it (Go evaluates f
+and prints its RETURN VALUE). Oracle: if/bool-param/type-assert
+programs byte-identical; gates green.
 
 ### Remaining refusals by category (each with named blocking decision)
 
