@@ -4285,8 +4285,10 @@ func (p *parser) parseAssignStmt() []map[string]any {
 				// exprToWord (getVar after resolve): one element per
 				// appended VALUE, no field-splitting (Go semantics).
 				elems = append(elems, p.exprToWord(a))
-			case "call", "index", "member", "fieldof":
-				// computed elements ride as words (captures/reads)
+			case "call", "index", "member", "fieldof", "add":
+				// computed elements ride as words (captures/reads;
+				// "add" = string concatenation: zig-sh-go's
+				// `params = append(params, pt+" "+pn.text)`)
 				elems = append(elems, p.exprToWord(a))
 			default:
 				if a.spread {
@@ -7734,6 +7736,9 @@ func (p *parser) condWordAny(e *expr) map[string]any {
 			return getVarExpr(strconv.Itoa(n))
 		}
 		return getVarExpr(name)
+	case "str", "rawstr":
+		// rawstr: backtick literal, content verbatim (see condOperandQ)
+		return strExpr(e.text)
 	case "num":
 		return strExpr(e.text)
 	case "member":
@@ -8032,7 +8037,10 @@ func (p *parser) condOperandQ(e *expr) string {
 	switch e.kind {
 	case "var":
 		return `"$` + p.resolveVar(e.name) + `"`
-	case "str":
+	case "str", "rawstr":
+		// rawstr: a backtick literal whose CONTENT is the token text
+		// verbatim (zig-sh-go's `mod.text != \`"std\"\`` — the text
+		// INCLUDES the quote chars, so the comparison is exact)
 		return `"` + e.text + `"`
 	case "num":
 		return `"` + e.text + `"`
@@ -8081,7 +8089,8 @@ func (p *parser) condOperandArg(e *expr) string {
 	switch e.kind {
 	case "var":
 		return `"$` + p.resolveVar(e.name) + `"`
-	case "str":
+	case "str", "rawstr":
+		// rawstr: backtick literal, content verbatim (see condOperandQ)
 		return `"` + e.text + `"`
 	case "num":
 		return e.text
