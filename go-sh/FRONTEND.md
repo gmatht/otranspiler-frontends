@@ -454,12 +454,17 @@ shir_passes/restructure.rs handle_nested, NOT the comparison lowering:
    enclosing JS loop after restructuring (the inner for), not the outer
    while Go intended — i never advances -> infinite refuse spam.
 
-FIX PATH (core, fresh session): handle_nested must walk the LABEL's
-containing loop chain too — emit break guards for EVERY loop strictly
-between the goto and the label's loop, and convert the label's
-trailing Continue into the outermost loop's continue (or emit the
-guards + explicit advance). The prefix-match comparison lowering itself
-(A1-word BinOp-eq + strSlice) is sound once jumps are structured.
+PARTIAL FIX LANDED (core commit fd6d159): handle_nested now drains the
+top-level tail between the goto's ancestor and the label into an
+If{cond: flag} guard, and CLEARS the flag at the label position —
+c-sh-go goto pins stay green. ng.go STILL SPINS: the remaining driver
+is the frontend bool-tree × restructure interaction — the compound
+condition `i+3 <= len && slice == spec` lowers to a __bt_0 flag chain
+where the goto's flag/break block sits under the bound-gate; when the
+spec never matches, iteration repeats with i unadvanced. NEXT: trace
+the bool-tree emission for compound conds containing word-operand
+comparisons (the A1-word BinOp-eq from 2026-09-01) inside for-loops,
+then re-test the prefix-match shape.
 
 ### Remaining refusals by category (each with named blocking decision)
 
