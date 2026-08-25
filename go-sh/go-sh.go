@@ -60,6 +60,7 @@ package golib
 import (
 	"fmt"
 	"os"
+	"runtime/debug"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -8248,6 +8249,7 @@ func Shir(src string) ([]byte, error) {
 		fnParamOrd: []string{},
 		fnLocals:  map[string]bool{},
 		paramTypes: map[string]string{},
+		regexpVars: map[string]string{},
 	}
 	p.prescanFuncNames()
 
@@ -8264,6 +8266,9 @@ func Shir(src string) ([]byte, error) {
 func (p *parser) run() (stmts []map[string]any, err error) {
 	defer func() {
 		if r := recover(); r != nil {
+			if os.Getenv("PANICSTACK") != "" {
+				debug.PrintStack()
+			}
 			fmt.Fprintln(os.Stderr, "PANIC:", r)
 			err = fmt.Errorf("%v", r)
 		}
