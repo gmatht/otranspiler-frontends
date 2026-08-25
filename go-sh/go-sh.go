@@ -8094,6 +8094,25 @@ func (p *parser) condTestString(c *expr) string {
 		}
 		return `"$?" -ne 0`
 	}
+	// OBJECT/NATIVE equality: BOTH operands lower to A1 words (slices,
+	// struct fields, helper calls — condOperandA1Word's vocabulary) —
+	// compare natively (BinOp Eq/Ne over the words; the runtime string-
+	// compares). zig-sh-go's `inner[i:i+len(spec.zig)] == spec.zig`
+	// format-spec match: the slice word evaluates to the sliced text.
+	if c.BOp == "==" || c.BOp == "!=" {
+		if lw, ok1 := p.condOperandA1Word(l); ok1 {
+			if rw, ok2 := p.condOperandA1Word(r); ok2 {
+				op := "Eq"
+				if c.BOp == "!=" {
+					op = "Ne"
+				}
+				return map[string]any{
+					"type": "BinOp", "op": op,
+					"lhs": lw, "rhs": rw,
+				}
+			}
+		}
+	}
 	ls, rs := p.condOperandQ(l), p.condOperandQ(r)
 	switch c.BOp {
 	case "==":
