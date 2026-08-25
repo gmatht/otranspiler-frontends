@@ -6709,6 +6709,20 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 					return joinCall(paramCall("slice", e.args[0].name, "@", ""))
 				}
 			}
+			// Join(memberArr, sep) — a struct-FIELD slice (`x.out`, the
+			// zig-sh-go emit-buffer accumulator): the field reads as
+			// objGet(id, field) (the same shape len(x.out) lowers to) and
+			// joinSep joins the resulting list verbatim.
+			if len(e.args) == 2 && (e.args[0].kind == "member" || e.args[0].kind == "fieldof") {
+				return map[string]any{
+					"type": "Call", "func": "joinSep",
+					"args": []any{
+						p.exprToWord(e.args[0]),
+						p.exprToWord(e.args[1]),
+					},
+					"purity": "PureCpu",
+				}
+			}
 			// Any other separator ("\n" — the app's dominant form,
 			// bat-sh-go's `strings.Join(bodyLines, "\n")`) has no
 			// separator arg on the A1 join — declared boundary
