@@ -4059,15 +4059,18 @@ func (p *parser) parseAssignStmt() []map[string]any {
 			p.skipNL()
 		}
 		p.expect(tPunct, ")")
+		// (value, error) shape: the FIRST non-_ target binds the value;
+		// every remaining target is an error return under an ARBITRARY
+		// name (err, err1, e2 — real code names them freely), dropped
+		// like Atoi's
 		name := ""
 		for _, tg := range targets {
-			if tg == "_" || tg == "err" {
+			if tg == "_" {
 				continue
 			}
-			if name != "" {
-				p.failf("strconv.%s returns (value, error) — one target (v2)", fnName)
+			if name == "" {
+				name = tg
 			}
-			name = tg
 		}
 		if name == "" {
 			p.failf("strconv.%s needs a target var (v2)", fnName)
@@ -6681,7 +6684,12 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 			}
 			// a computed hi (`s[lo:hiExpr]`) or literal hi: length = hi-lo
 			if e.idx2e != nil {
-				node["length"] = p.exprToWord(&expr{kind: "add", op: "-", lhs: e.idx2e, rhs: e.idx1e})
+				loE := e.idx1e
+				if loE == nil {
+					// open low bound (`s[:hiExpr]`): length = hi - 0
+					loE = &expr{kind: "num", text: "0"}
+				}
+				node["length"] = p.exprToWord(&expr{kind: "add", op: "-", lhs: e.idx2e, rhs: loE})
 			} else if e.idx2 != "" {
 				var loN int
 				if n, err := strconv.Atoi(e.idx1); err == nil {
@@ -8000,6 +8008,27 @@ func (p *parser) condWordAny(e *expr) map[string]any {
 		return strExpr(e.text)
 	case "num":
 		return strExpr(e.text)
+	case "arrlen", "strlen":
+		// len(...) in a comparison operand — the ${#arr[@]} / ${#s}
+		// length word as an A1 word
+		if e.target != nil && e.target.kind == "var" {
+			name := p.resolveVar(e.target.name)
+			if e.kind == "arrlen" {
+				return joinCall(paramCall("slice", "#"+name, "@", ""))
+			}
+			return getVarExpr("#" + name)
+		}
+		if w, tag := p.structFieldWord(e.target.name); e.target != nil && tag != "" {
+			fn := "strLen"
+			if e.kind == "arrlen" || tag == "list" {
+				fn = "listLen"
+			}
+			return map[string]any{
+				"type": "Call", "func": fn,
+				"args":   []any{w},
+				"purity": "PureCpu",
+			}
+		}
 	case "member":
 		if w, ok := p.structMemberWord(e.name); ok {
 			return w
