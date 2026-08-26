@@ -3168,7 +3168,44 @@ func (p *parser) parseIf() []map[string]any {
 	p.skipNL()
 	var pre []map[string]any
 	var cond *expr
-	if p.atIdent("_") {
+	if p.atIdent("_") && p.pos+4 < len(p.toks) &&
+		p.toks[p.pos+1].kind == tPunct && p.toks[p.pos+1].text == "," &&
+		p.toks[p.pos+3].kind == tOp && p.toks[p.pos+3].text == ":=" &&
+		!(p.toks[p.pos+4].kind == tIdent && p.toks[p.pos+4].text == "os") {
+		// if _, X := <expr>; cond { ... } — a GENERAL `_`-discard
+		// if-init (the golib's `if _, ok := p.structFields[callName(e)];
+		// !ok` map-presence checks): X = <expr> as a pre-statement, then
+		// the If on cond. A map-index RHS sets X to the PRESENCE bool
+		// (assocHas), so a later `!ok` / `ok` tests it correctly.
+		p.pos++ // _
+		p.pos++ // ,
+		p.skipNL()
+		xName := p.expect(tIdent, "").text
+		p.expect(tOp, ":=")
+		p.skipNL()
+		val := p.parseExpr()
+		var w map[string]any
+		if val.kind == "index" && val.target != nil && val.target.kind == "var" && p.maps[val.target.name] {
+			// `_, ok := m[k]` — ok is the PRESENCE bool (assocHas); the
+			// key is resolved at runtime (a member/call key lowers to its
+			// cmdsub word, which assocHas expandWord's).
+			var keyWord map[string]any
+			if val.idx1e != nil {
+				keyWord = p.exprToWord(val.idx1e)
+			} else {
+				keyWord = strExpr(val.idx1)
+			}
+			w = assocHasCall(val.target.name, keyWord)
+		} else {
+			w = p.exprToWord(val)
+		}
+		pre = append(pre, assignStmt(xName, w))
+		p.registerAssignType(xName, val, w)
+		p.skipNL()
+		p.expect(tPunct, ";")
+		p.skipNL()
+		cond = p.parseExpr()
+	} else if p.atIdent("_") {
 		// if _, err := os.Stat("path"); err == nil { → test("-e path")
 		// (-e = exists, ANY type — Go's os.Stat succeeds for devices,
 		// dirs and symlinks alike; bash `-f` is regular files only, and
@@ -3239,6 +3276,21 @@ func (p *parser) parseIf() []map[string]any {
 		}
 		p.registerVar(name, "Str")
 		cond = &expr{kind: "rawjson", rawJSON: p.readFileIfCond(name, p.exprToWord(path), neg)}
+	} else if p.tok().kind == tIdent && p.toks[p.pos+1].kind == tOp && p.toks[p.pos+1].text == ":=" {
+		// if t := expr; cond { ... } — an if-init ASSIGNMENT (the golib's
+		// `if t := p.tok(); (t.kind == tOp ...)`). The assignment lowers
+		// to a pre-`t = expr` statement, then the If on the condition.
+		name := p.next().text
+		p.pos++ // :=
+		p.skipNL()
+		val := p.parseExpr()
+		w := p.exprToWord(val)
+		pre = append(pre, assignStmt(name, w))
+		p.registerAssignType(name, val, w)
+		p.skipNL()
+		p.expect(tPunct, ";")
+		p.skipNL()
+		cond = p.parseExpr()
 	} else {
 		cond = p.parseExpr()
 	}
@@ -3429,6 +3481,16 @@ func (p *parser) parseFor() []map[string]any {
 			"cond": p.condToJSON(cond),
 			"body": body,
 		})
+	}
+	// `for { ... }` — an infinite loop (the golib's parse loops): the
+	// While with a constant-true cond.
+	if p.atPunct("{") {
+		body := p.parseBlockStmts()
+		return []map[string]any{{
+			"type": "While",
+			"cond": testCall("true"),
+			"body": body,
+		}}
 	}
 	// for cond {  → While
 	cond := p.parseExpr()
@@ -3760,12 +3822,29 @@ func (p *parser) isBoolExpr(e *expr) bool {
 	case "not":
 		return true
 	case "call":
-		// a bool-returning function call (isIdentStart/isIdentPart/...)
-		return true
+		// a bool-returning function call: a USER function/method
+		// (isIdentStart/isIdentPart/p.atPunct/...) or a bool-returning
+		// stdlib (strings.Contains/HasPrefix/HasSuffix). NOT a
+		// string/map returning call like b.String().
+		return p.isBoolFnCall(e) ||
+			e.callee == "strings.Contains" || e.callee == "strings.HasPrefix" || e.callee == "strings.HasSuffix"
 	case "var":
 		return e.name == "true" || e.name == "false"
 	}
 	return false
+}
+
+// isBoolFnCall — is the call a USER function or method (the golib's
+// isIdentStart/isIdentPart/atIdent/atPunct/...)? Methods (p.atPunct)
+// resolve to the method name.
+func (p *parser) isBoolFnCall(e *expr) bool {
+	fn := e.callee
+	if i := strings.LastIndex(fn, "."); i > 0 {
+		if p.varTypes[p.resolveVar(fn[:i])] == "Struct" {
+			fn = fn[i+1:]
+		}
+	}
+	return p.fnNames[fn]
 }
 
 // returnToStmt: `return expr` inside a func → echo of expr. A BOOLEAN
@@ -3819,6 +3898,11 @@ func (p *parser) indexArithText(e *expr) string {
 	switch e.kind {
 	case "var":
 		return p.resolveVar(e.name)
+	case "member":
+		// a struct field bound (p.pos) — the dotted name; the runtime's
+		// arithExpand resolves it via the struct's JSON (the golib's
+		// `p.toks[p.pos+1]` cursor arithmetic).
+		return strings.TrimPrefix(e.name, ".")
 	case "num":
 		return e.text
 	case "add", "mul":
@@ -4634,30 +4718,45 @@ func (p *parser) condToJSON(c *expr) map[string]any {
 	// "true"/"false" into a temp, then test it — the BinOp And of the
 	// assign-capture and the test (the assign runs as part of the cond;
 	// the And's status is the test's).
-	// only USER-DEFINED functions (stdlib strings.* has specific
-	// glob-test lowering below).
-	if c.kind == "call" && p.fnNames[c.callee] {
-		tmp := fmt.Sprintf("__r%d", p.tmpSeq)
-		p.tmpSeq++
-		var words []map[string]any
-		for _, a := range c.args {
-			words = append(words, p.exprToWord(a))
+	// only USER-DEFINED functions AND methods (stdlib strings.* has
+	// specific glob-test lowering below).
+	if c.kind == "call" {
+		fn := c.callee
+		rec := ""
+		if i := strings.LastIndex(fn, "."); i > 0 {
+			if p.varTypes[p.resolveVar(fn[:i])] == "Struct" {
+				// a METHOD call (`p.atPunct("(")`) — the receiver passed
+				// by name, the method name in fnNames.
+				rec = p.resolveVar(fn[:i])
+				fn = fn[i+1:]
+			}
 		}
-		inner := execStmt(c.callee, words, "Spawn")
-		capture := map[string]any{
-			"type": "Call", "func": "capture",
-			"args":   []any{map[string]any{"type": "Arrow", "body": []any{inner}}},
-			"purity": "Spawn",
-		}
-		assignCall := map[string]any{
-			"type": "Call", "func": "assign",
-			"args":   []any{strExpr(tmp), strExpr("="), capture},
-			"purity": "Emulable",
-		}
-		return map[string]any{
-			"type": "BinOp", "op": "And",
-			"lhs": assignCall,
-			"rhs": testCall(`"$` + tmp + `"="true"`),
+		if p.fnNames[fn] {
+			tmp := fmt.Sprintf("__r%d", p.tmpSeq)
+			p.tmpSeq++
+			var words []map[string]any
+			if rec != "" {
+				words = append(words, strExpr(rec))
+			}
+			for _, a := range c.args {
+				words = append(words, p.exprToWord(a))
+			}
+			inner := execStmt(fn, words, "Spawn")
+			capture := map[string]any{
+				"type": "Call", "func": "capture",
+				"args":   []any{map[string]any{"type": "Arrow", "body": []any{inner}}},
+				"purity": "Spawn",
+			}
+			assignCall := map[string]any{
+				"type": "Call", "func": "assign",
+				"args":   []any{strExpr(tmp), strExpr("="), capture},
+				"purity": "Emulable",
+			}
+			return map[string]any{
+				"type": "BinOp", "op": "And",
+				"lhs": assignCall,
+				"rhs": testCall(`"$` + tmp + `"="true"`),
+			}
 		}
 	}
 	if c.kind == "not" {
@@ -4713,20 +4812,102 @@ func (p *parser) condToJSON(c *expr) map[string]any {
 	// strings.HasPrefix(s, p) / strings.HasSuffix(s, p) → the `[[ $s ==
 	// p* ]]` / `[[ $s == *p ]]` glob-test shape (the core's `$s==p*`
 	// string; the operand stays quoted, the pattern bare so the glob
-	// engine sees it — t68).
+	// engine sees it — t68). The golib's lexer uses a SLICE haystack and
+	// a VAR pattern (`strings.HasPrefix(src[i:], op)`), both supported.
 	if c.kind == "call" && (c.callee == "strings.HasPrefix" || c.callee == "strings.HasSuffix") {
-		if len(c.args) != 2 || c.args[0].kind != "var" || c.args[1].kind != "str" {
-			p.failf("%s needs (var, str) (v2)", c.callee)
+		if len(c.args) != 2 {
+			p.failf("%s needs two args (v2)", c.callee)
 		}
-		pat := c.args[1].text
+		// the haystack: a var OR a slice (`src[i:]`)
+		hay := ""
+		switch c.args[0].kind {
+		case "var":
+			hay = p.condOperandQ(c.args[0])
+		case "slice":
+			e := c.args[0]
+			off := e.idx1
+			if e.idx1e != nil {
+				if t := p.indexArithText(e.idx1e); t != "" {
+					off = t
+				} else if e.idx1e.kind == "member" {
+					off = e.idx1e.name
+				} else {
+					p.failf("HasPrefix slice bound must be literal/arith (v2)")
+				}
+			}
+			if e.target == nil || e.target.kind != "var" {
+				p.failf("HasPrefix slice target must be a var (v2)")
+			}
+			hay = `"${` + p.resolveVar(e.target.name) + `:` + off + `}"`
+		default:
+			p.failf("%s haystack must be var|slice (v2)", c.callee)
+		}
+		// the pattern: a literal OR a var (`op` — the loop var)
+		pat := ""
+		switch c.args[1].kind {
+		case "str":
+			pat = c.args[1].text
+		case "var":
+			pat = `"$` + p.resolveVar(c.args[1].name) + `"`
+		default:
+			p.failf("%s pattern must be literal/var (v2)", c.callee)
+		}
 		if c.callee == "strings.HasSuffix" {
 			pat = "*" + pat
 		} else {
 			pat = pat + "*"
 		}
-		return testCall(p.condOperandQ(c.args[0]) + "=" + pat)
+		return testCall(hay + "=" + pat)
+	}
+	// a bare map-index / struct-member used as a TRUTHINESS (the golib's
+	// `exprBoundary[t.text]` / `t.kind` conditions): the value's boolean
+	// reading — `"$(sh2.assocGet …)"="true"` / `"$(sh2.jsonGet …)"="true"`
+	// (Go maps/fields carry true/false values; the runtime resolves dotted
+	// member keys via the nested cmdsub handler).
+	if c.kind == "index" && c.target != nil && c.target.kind == "var" && p.maps[c.target.name] {
+		key := ""
+		if c.idx1e != nil {
+			if c.idx1e.kind == "member" {
+				key = `$(sh2.jsonGet(` + strings.TrimPrefix(c.idx1e.name, ".") + `))`
+			} else if off := p.condTestText(c.idx1e); off != "" {
+				key = off
+			} else {
+				p.failf("map-index cond key must be member/literal (v2)")
+			}
+		} else {
+			key = c.idx1
+		}
+		return testCall(`"$(sh2.assocGet(` + p.resolveVar(c.target.name) + `, ` + key + `))"="true"`)
+	}
+	if c.kind == "member" && c.memberTarget == nil {
+		if i := strings.LastIndex(c.name, "."); i > 0 {
+			return testCall(`"$(sh2.jsonGet(` + p.resolveVar(c.name[:i]) + `, ` + c.name[i+1:] + `))"="true"`)
+		}
 	}
 	return testCall(p.condTestString(c))
+}
+
+// assocHasCall — `Call{func:"assocHas", args:[Str(map), <key-word>]}` — the
+// presence check (the golib's `_, ok := m[k]` if-inits); the key word is
+// resolved at runtime (expandWord handles member/call cmdsubs).
+func assocHasCall(name string, key map[string]any) map[string]any {
+	return map[string]any{
+		"type": "Call", "func": "assocHas",
+		"args":   []any{strExpr(name), key},
+		"purity": "PureCpu",
+	}
+}
+
+// condTestText — a bare value as a cmdsub key/name (var/num/str without
+// quotes — the runtime resolves them by name).
+func (p *parser) condTestText(e *expr) string {
+	switch e.kind {
+	case "var":
+		return p.resolveVar(e.name)
+	case "num", "str":
+		return e.text
+	}
+	return ""
 }
 
 // condTestString renders a comparison as the core's [ ] argument string
