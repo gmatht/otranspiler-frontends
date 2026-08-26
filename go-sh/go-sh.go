@@ -859,6 +859,68 @@ func (p *parser) parseFuncLit() *expr {
 	return &expr{kind: "func", params: params, body: body}
 }
 
+// skipType consumes a Go type expression as TOKENS (the type-position
+// erasure contract — types carry no runtime shape): plain idents,
+// pkg.Ident, []T / [N]T, *T, map[K]V, func(...) T, and (a, b) lists.
+// The cpp frontend's signatures (`func lex(src string) ([]tok, error)`,
+// `func translate(toks []tok) ([]tok, error)`) need the bracketed and
+// parenthesized forms; the old sweeps only handled `[` followed
+// directly by an ident, so `[]tok` broke at the empty bracket pair.
+func (p *parser) skipType() {
+	p.skipNL()
+	for {
+		t := p.tok()
+		switch {
+		case t.kind == tIdent:
+			p.pos++
+			p.skipNL()
+			if p.atPunct(".") {
+				p.pos++
+				p.skipNL()
+				p.expect(tIdent, "")
+				p.skipNL()
+			}
+		case t.text == "[":
+			p.pos++
+			p.skipNL()
+			for !p.atPunct("]") {
+				if p.tok().kind == tEOF {
+					p.failf("unterminated type (v2)")
+				}
+				p.pos++
+			}
+			p.pos++ // ]
+			p.skipNL()
+		case t.text == "*":
+			p.pos++
+			p.skipNL()
+		case t.text == "(":
+			// (a, b) return list or func(...) params — consume to the
+			// matching close (nested parens counted)
+			depth := 0
+			for {
+				if p.tok().kind == tEOF {
+					p.failf("unterminated type (v2)")
+				}
+				if p.atPunct("(") {
+					depth++
+				}
+				if p.atPunct(")") {
+					depth--
+					if depth == 0 {
+						p.pos++
+						break
+					}
+				}
+				p.pos++
+			}
+			p.skipNL()
+		default:
+			return
+		}
+	}
+}
+
 func (p *parser) parseFuncParams() []string {
 	var params []string
 	p.skipNL()
@@ -869,13 +931,8 @@ func (p *parser) parseFuncParams() []string {
 			continue
 		}
 		nm := p.expect(tIdent, "").text
-		// skip the type (ident, possibly bracketed/pointer)
-		for p.tok().kind == tIdent {
-			p.pos++
-		}
-		for p.atPunct("[") || p.atPunct("*") || p.atPunct("]") || p.atPunct(",") || p.atPunct("(") || p.atPunct(")") {
-			break
-		}
+		// skip the type (erased — the A1 subs bind by position)
+		p.skipType()
 		params = append(params, nm)
 		if p.acceptPunct(",") {
 			p.skipNL()
@@ -976,18 +1033,11 @@ func (p *parser) parseTopLevel() []map[string]any {
 			p.expect(tPunct, "(")
 			params := p.parseFuncParams()
 			p.skipNL()
-			// optional return type: ident | (a, b) | []T | *T
-			for p.tok().kind == tIdent && p.tok().text != "{" {
-				p.pos++
-				p.skipNL()
-			}
-			for p.atPunct("(") || p.atPunct("[") || p.atPunct("*") {
-				p.pos++
-				p.skipNL()
-				for p.tok().kind == tIdent {
-					p.pos++
-				}
-				p.skipNL()
+			// optional return type: ident | (a, b) | []T | *T — erased
+			// (skipType handles the bracketed/parenthesized forms the
+			// cpp frontend's signatures use: `([]tok, error)` etc.)
+			if !p.atPunct("{") {
+				p.skipType()
 			}
 			p.skipNL()
 			// function scope (mirrors parseFuncLit)
@@ -1027,6 +1077,26 @@ func (p *parser) parseTopLevel() []map[string]any {
 					break
 				}
 				p.failf("interface methods unsupported (v2) — method dispatch is a contract boundary")
+			}
+			// `type Name struct{...}` — a struct TYPE decl: compile-time
+			// only, erased under the type-position erasure contract (the
+			// cpp frontend's `type tok struct{ kind, text string }`). The
+			// struct VALUE (composite literals, member access) is the
+			// go-sh-structtype contract boundary — the type decl itself
+			// carries no runtime shape, exactly like `type Name int`.
+			if p.atIdent("struct") {
+				p.pos++
+				p.skipNL()
+				p.expect(tPunct, "{")
+				p.skipNL()
+				for !p.atPunct("}") {
+					if p.tok().kind == tEOF {
+						p.failf("unterminated struct type (v2)")
+					}
+					p.pos++
+				}
+				p.pos++ // }
+				break
 			}
 			// `type Name int` (string/bool/float64/…, or another named
 			// type) — a named SCALAR type: compile-time only, erased under
@@ -1345,6 +1415,20 @@ func (p *parser) parseVarDecl() []map[string]any {
 		if t.kind == tPunct && (t.text == "[" || t.text == "*") {
 			p.pos++
 			p.skipNL()
+			if t.text == "[" {
+				// []T / [N]T — consume through the closing bracket, then
+				// the element type (the cpp frontend's `var out []tok`;
+				// the old sweep only handled `[` followed directly by an
+				// ident, so `[]tok` broke at the empty bracket pair).
+				for !p.atPunct("]") {
+					if p.tok().kind == tEOF {
+						p.failf("unterminated array type (v2)")
+					}
+					p.pos++
+				}
+				p.pos++ // ]
+				p.skipNL()
+			}
 			for p.tok().kind == tIdent {
 				p.next()
 			}
@@ -1366,6 +1450,12 @@ func (p *parser) parseVarDecl() []map[string]any {
 	if p.atPunct("=") {
 		p.pos++
 		p.skipNL()
+		// var m = map[K]V{...} — the map literal (the cpp frontend's
+		// whitelist tables); parseExpr would choke on `map[string]`
+		// (the `string` type word hits the string(x) conversion path).
+		if p.atIdent("map") {
+			return p.parseMapLiteral(names)
+		}
 		rhs := p.parseExpr()
 		if len(names) != 1 {
 			p.failf("var decl initializer with multiple targets (v2)")
@@ -1846,54 +1936,7 @@ func (p *parser) parseAssignStmt() []map[string]any {
 	// map literal: name := map[K]V{ k: v, ... } → one assocSet per pair
 	// (the runtime's by-name associative-array store; t54).
 	if p.atIdent("map") {
-		p.pos++
-		p.expect(tPunct, "[")
-		for p.tok().kind == tIdent {
-			p.next()
-		}
-		p.expect(tPunct, "]")
-		for p.tok().kind == tIdent {
-			p.next()
-		}
-		p.skipNL()
-		p.expect(tPunct, "{")
-		if len(targets) > 1 {
-			p.failf("map literal with multiple targets (v2)")
-		}
-		p.maps[targets[0]] = true
-		p.registerVar(targets[0], "Map")
-		var body []map[string]any
-		for {
-			p.skipNL()
-			if p.atPunct("}") {
-				p.pos++
-				break
-			}
-			key := p.parseExpr()
-			if key.kind != "str" && key.kind != "num" && key.kind != "rawstr" {
-				p.failf("map keys must be literals (v2)")
-			}
-			p.expect(tPunct, ":")
-			p.skipNL()
-			val := p.parseExpr()
-			if val.kind != "str" && val.kind != "num" && val.kind != "rawstr" {
-				p.failf("map values must be literals (v2)")
-			}
-			body = append(body, map[string]any{
-				"type": "Expr",
-				"expr": map[string]any{
-					"type": "Call", "func": "assocSet",
-					"args":   []any{strExpr(targets[0]), strExpr(key.text), strExpr(val.text)},
-					"purity": "Emulable",
-				},
-			})
-			if !p.acceptPunct(",") {
-				p.skipNL()
-				p.expect(tPunct, "}")
-				break
-			}
-		}
-		return []map[string]any{{"type": "Block", "body": body}}
+		return p.parseMapLiteral(targets)
 	}
 	// cmd := exec.Command(a, b) [.Output()|.Run()]  /  x, _ := ....Output()
 	if p.atIdent("exec") {
@@ -2219,6 +2262,78 @@ func localVal(w map[string]any) string {
 		return w["value"].(string)
 	}
 	return ""
+}
+
+// parseMapLiteral: `map[K]V{ k: v, ... }` → one assocSet per pair (the
+// runtime's by-name associative-array store; t54). Shared by the
+// `name := map[...]...{...}` assign and the `var name = map[...]...{...}`
+// decl (the cpp frontend's `var refuseKeywords = map[string]string{...}`
+// and `var allowedKinds = map[string]bool{...}` whitelist tables). The
+// type position `map[K]V` is consumed as TOKENS, never parsed as
+// expressions — `string` inside `[string]` must not hit the `string(x)`
+// conversion path. Values accept bool literals (true/false) alongside
+// str/num/rawstr — a `map[string]bool` whitelist's `true` is a literal,
+// not a `$true` var read.
+func (p *parser) parseMapLiteral(targets []string) []map[string]any {
+	p.pos++ // map
+	p.expect(tPunct, "[")
+	for p.tok().kind == tIdent {
+		p.next()
+	}
+	p.expect(tPunct, "]")
+	for p.tok().kind == tIdent {
+		p.next()
+	}
+	p.skipNL()
+	p.expect(tPunct, "{")
+	if len(targets) > 1 {
+		p.failf("map literal with multiple targets (v2)")
+	}
+	p.maps[targets[0]] = true
+	p.registerVar(targets[0], "Map")
+	var body []map[string]any
+	for {
+		p.skipNL()
+		if p.atPunct("}") {
+			p.pos++
+			break
+		}
+		key := p.parseExpr()
+		if key.kind != "str" && key.kind != "num" && key.kind != "rawstr" {
+			p.failf("map keys must be literals (v2)")
+		}
+		p.expect(tPunct, ":")
+		p.skipNL()
+		val := p.parseExpr()
+		valText := ""
+		switch val.kind {
+		case "str", "num", "rawstr":
+			valText = val.text
+		case "var":
+			// bool literal values (map[string]bool whitelists)
+			if val.name == "true" || val.name == "false" {
+				valText = val.name
+				break
+			}
+			p.failf("map values must be literals (v2)")
+		default:
+			p.failf("map values must be literals (v2)")
+		}
+		body = append(body, map[string]any{
+			"type": "Expr",
+			"expr": map[string]any{
+				"type": "Call", "func": "assocSet",
+				"args":   []any{strExpr(targets[0]), strExpr(key.text), strExpr(valText)},
+				"purity": "Emulable",
+			},
+		})
+		if !p.acceptPunct(",") {
+			p.skipNL()
+			p.expect(tPunct, "}")
+			break
+		}
+	}
+	return []map[string]any{{"type": "Block", "body": body}}
 }
 
 // parseArrayLiteral parses `[]T{ e1, e2, ... }` and returns the element
@@ -2678,6 +2793,57 @@ func (p *parser) parseSwitch() []map[string]any {
 			"clauses": clauses,
 		}}
 	}
+	// boolean switch: `switch { case cond: ... }` — no discriminant
+	// (the cpp frontend's lexer dispatch: `switch { case c == ' ': ... }`).
+	// The A1 Case node needs a discriminant, so lower to the nested
+	// if-else chain — the faithful shape (each case condition is a
+	// boolean test; default is the final else).
+	if p.atPunct("{") {
+		p.pos++
+		var conds []*expr
+		var bodies [][]map[string]any
+		var defBody []map[string]any
+		hasDefault := false
+		for {
+			p.skipNL()
+			if p.atPunct("}") {
+				p.pos++
+				break
+			}
+			if p.atIdent("default") {
+				p.pos++
+				p.expect(tPunct, ":")
+				defBody = p.parseSwitchBody()
+				hasDefault = true
+			} else if p.atIdent("case") {
+				p.pos++
+				c := p.parseExpr()
+				p.expect(tPunct, ":")
+				conds = append(conds, c)
+				bodies = append(bodies, p.parseSwitchBody())
+			} else {
+				p.failf("expected case/default in boolean switch, got %q", p.tok().text)
+			}
+		}
+		var chain []map[string]any
+		for i := len(conds) - 1; i >= 0; i-- {
+			elseBody := defBody
+			if i < len(conds)-1 {
+				elseBody = chain
+			}
+			chain = []map[string]any{{
+				"type":   "If",
+				"cond":   p.condToJSON(conds[i]),
+				"then":   bodies[i],
+				"elsifs": []any{},
+				"else":   elseBody,
+			}}
+		}
+		if len(conds) == 0 && hasDefault {
+			chain = []map[string]any{{"type": "Block", "body": defBody}}
+		}
+		return chain
+	}
 	// value switch (existing path)
 	disc := p.parseExpr()
 	p.skipNL()
@@ -2895,6 +3061,32 @@ func (p *parser) wordType(w map[string]any) string {
 		return "Int"
 	}
 	return "Str"
+}
+
+// indexArithText renders an index expression as arithmetic text for the
+// runtime's sliceOff (var names resolve via arithExpand; + - * / chains
+// and unary minus). Returns "" for anything inexpressible (Refuse >
+// guess — the caller fails loudly).
+func (p *parser) indexArithText(e *expr) string {
+	switch e.kind {
+	case "var":
+		return p.resolveVar(e.name)
+	case "num":
+		return e.text
+	case "add", "mul":
+		l, r := p.indexArithText(e.lhs), p.indexArithText(e.rhs)
+		if l == "" || r == "" {
+			return ""
+		}
+		return l + e.op + r
+	case "neg":
+		l := p.indexArithText(e.lhs)
+		if l == "" {
+			return ""
+		}
+		return "-" + l
+	}
+	return ""
 }
 
 // exprToWord lowers an expression to its A1 word JSON.
@@ -3425,6 +3617,23 @@ func (p *parser) condToJSON(c *expr) map[string]any {
 		return c.rawJSON
 	}
 	if c.kind == "not" {
+		// !(a && b) → (!a) || (!b) — De Morgan: the test-string form
+		// can't express a nested and/or (the cpp frontend's
+		// `!(src[i] == '*' && src[i+1] == '/')` loop guards).
+		if c.lhs.kind == "binop" && c.lhs.BOpKind == "and" {
+			return map[string]any{
+				"type": "BinOp", "op": "Or",
+				"lhs": p.condToJSON(&expr{kind: "not", lhs: c.lhs.lhs}),
+				"rhs": p.condToJSON(&expr{kind: "not", lhs: c.lhs.rhs}),
+			}
+		}
+		if c.lhs.kind == "binop" && c.lhs.BOpKind == "or" {
+			return map[string]any{
+				"type": "BinOp", "op": "And",
+				"lhs": p.condToJSON(&expr{kind: "not", lhs: c.lhs.lhs}),
+				"rhs": p.condToJSON(&expr{kind: "not", lhs: c.lhs.rhs}),
+			}
+		}
 		return testCall("! " + strings.TrimSpace(p.condTestString(c.lhs)))
 	}
 	if c.kind == "binop" && c.BOpKind == "and" {
@@ -3548,6 +3757,14 @@ func (p *parser) condOperandQ(e *expr) string {
 		// (the statement-position lowering at emitExpr uses the same
 		// shape via join(param("slice", "#arr", "@", ""))).
 		return `"${#` + p.resolveVar(e.target.name) + `[@]}"`
+	case "add", "mul", "neg":
+		// arithmetic operand — the `"$((i+1))"` word (the cpp
+		// frontend's `i+1 < n` loop guards; the runtime's test
+		// evaluator expands the arith word).
+		if t := p.indexArithText(e); t != "" {
+			return `"$((` + t + `))"`
+		}
+		p.failf("unsupported comparison operand (v2): %s", e.kind)
 	case "index":
 		// a[0] → the quoted `${a[0]}` array-element word — the CLI's
 		// `filtered[0] != "--shir"` argv gate (frontends/go-sh/cmd/
@@ -3588,6 +3805,14 @@ func (p *parser) condOperandArg(e *expr) string {
 		// (e.g. `"${#arr[@]}" -gt 1`; a bare ${#arr[@]} would need the
 		// word-splitting the quoted form avoids).
 		return `"${#` + p.resolveVar(e.target.name) + `[@]}"`
+	case "add", "mul", "neg":
+		// arithmetic operand — the `"$((i+1))"` word (the cpp
+		// frontend's `i+1 < n` loop guards; the runtime's test
+		// evaluator expands the arith word).
+		if t := p.indexArithText(e); t != "" {
+			return `"$((` + t + `))"`
+		}
+		p.failf("unsupported comparison operand (v2): %s", e.kind)
 	case "index":
 		// a[0] in a numeric comparison — the quoted element word
 		// (`[ "${a[0]}" -gt 1 ]`; bare would need the word-splitting

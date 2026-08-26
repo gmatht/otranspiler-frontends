@@ -16,10 +16,11 @@ native behavior (`go run`). The gates:
 
 | gate | green |
 |---|---|
-| corpus Go→JS (`fail-go`) | **96/96** |
+| corpus Go→JS (`fail-go`) | **98/98** |
 | corpus Go→Rust (`fail-go --rust`) | 41/88 (rust backend `sh2.*` stubs: assoc arrays, argv, etc. — backend gap, per-target) |
 | Go idiom ladder (47 templates, mined from the app + seeded) | 42/47 (4 contract boundaries + 1 documented nondeterministic) |
 | app integration (the CLI, `fail-go --app`) | **green** — the no-args oracle (usage → stderr, exit 2) is reproduced by the translated JS |
+| cpp CLI integration (`fail-go --app frontends/cpp-sh-go/cmd/cpp-sh-go/main.go`) | **green** — the cpp frontend's CLI transpiles Go→JS and reproduces its no-args behavior |
 
 ### New idioms landed (this pass — the app gate)
 
