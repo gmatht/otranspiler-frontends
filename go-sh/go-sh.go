@@ -62,6 +62,8 @@ const (
 	tIdent
 	tNum
 	tStr    // "..."  (text = decoded, raw = verbatim between quotes)
+	tChar   // '...'  (a Go rune literal — an INTEGER in Go; the A1
+	        //         lowers it to its ASCII code in byte contexts)
 	tRawStr // `...`  (text = verbatim content)
 	tOp     // multi-char operator
 	tPunct  // single char
@@ -121,8 +123,9 @@ func lex(src string) ([]token, error) {
 			toks = append(toks, token{kind: tStr, raw: src[start+1 : i], text: src[start+1 : i], line: line})
 			i++
 		case c == '\'':
-			// single-quoted char literal (e.g. ReadString('\n')) — treated
-			// as a string token with the body between the quotes
+			// single-quoted char literal (e.g. ReadString('\n')) — a Go
+			// RUNE literal (an integer); tokenized as tChar so the parser
+			// can lower it to its ASCII code in byte contexts.
 			start := i
 			i++
 			for i < len(src) && src[i] != '\'' {
@@ -135,7 +138,7 @@ func lex(src string) ([]token, error) {
 			if i >= len(src) {
 				return nil, fmt.Errorf("unterminated char literal")
 			}
-			toks = append(toks, token{kind: tStr, raw: src[start+1 : i], text: src[start+1 : i], line: line})
+			toks = append(toks, token{kind: tChar, raw: src[start+1 : i], text: src[start+1 : i], line: line})
 			i++
 		case c == '`':
 			start := i
@@ -418,6 +421,14 @@ type expr struct {
 	callee   string
 	args     []*expr
 	typeArgs []string // generic instantiation `Name[TypeList](args)` (typeArgs)
+	// struct composite literal (`token{kind: tNL, line: line}`): the
+	// type name in `name`, the field VALUES in `args`, and the NAMED
+	// field names in `fieldNames` (empty for positional — resolved from
+	// the tracked struct type's fields).
+	fieldNames []string
+	// member access on a non-var base (`p.tok().line` — the method
+	// call's result field): the base expr (the name is ".field").
+	memberTarget *expr
 	// func literal (lowered body, params in args)
 	body   []map[string]any
 	params []string
@@ -441,6 +452,7 @@ type parser struct {
 	arrays     map[string]arrayInfo
 	maps       map[string]bool    // m := map[K]V{...} — assoc-array name
 	bufs       map[string]string  // b := bytes.Buffer — accumulated contents
+	runtimeBufs map[string]bool   // buffers with runtime-dependent contents (WriteByte of a runtime byte)
 	cmds       map[string][]*expr // cmd := exec.Command(...) -> args
 	stdinRdr   map[string]bool    // r := bufio.NewReader(os.Stdin)
 	fnNames    map[string]bool    // f := func(...){...} — callable subs
@@ -454,6 +466,23 @@ type parser struct {
 	// var resolve to the guarded var (getVar x), matching the contract's
 	// "v binds to getVar(\"x\")" lowering.
 	varAlias map[string]string
+	// struct field names by type name (`type tok struct{ kind, text
+	// string }` → ["kind", "text"]) — positional composite literals
+	// `tok{"a", "b"}` lower by position (the go-sh self-hosting
+	// contract: structs are JSON object strings).
+	structFields map[string][]string
+	// struct field ELEMENT types by type name (`toks []token` →
+	// "token"; `pos int` → "int") — a struct-field index read
+	// (`t := p.toks[p.pos]`) registers the target's type.
+	structFieldTypes map[string]map[string]string
+	// var → struct TYPE name (`p := &parser{...}` → "parser") — the
+	// field-type lookup key for member/index reads.
+	varStructTypes map[string]string
+	// method receiver → struct TYPE name (`func (p *parser) ...` →
+	// "parser").
+	receiverTypes map[string]string
+	// temp-var sequence for cond hoists (function-call conditions)
+	tmpSeq int
 }
 
 type arrayInfo struct {
@@ -481,6 +510,8 @@ func (p *parser) skipNL() {
 
 func (p *parser) expect(k tokKind, text string) token {
 	t := p.tok()
+
+
 	if text != "" {
 		if t.text != text {
 			p.failf("expected %q, got %q", text, t.text)
@@ -541,6 +572,7 @@ func (p *parser) parseOr() *expr {
 	l := p.parseAnd()
 	for p.atPunct("||") {
 		p.pos++
+		p.skipNL() // a trailing `||` at line end continues the chain
 		l = &expr{kind: "binop", BOp: "||", BOpKind: "or", lhs: l, rhs: p.parseAnd()}
 	}
 	return l
@@ -550,6 +582,7 @@ func (p *parser) parseAnd() *expr {
 	l := p.parseCmp()
 	for p.atPunct("&&") {
 		p.pos++
+		p.skipNL() // a trailing `&&` at line end continues the chain
 		l = &expr{kind: "binop", BOp: "&&", BOpKind: "and", lhs: l, rhs: p.parseCmp()}
 	}
 	return l
@@ -592,6 +625,12 @@ func (p *parser) parseUnary() *expr {
 		p.pos++
 		return &expr{kind: "neg", lhs: p.parseUnary()}
 	}
+	if p.atPunct("&") {
+		// `&parser{...}` — the address-of is erased (the A1 has no
+		// pointers; the composite literal IS the value).
+		p.pos++
+		return p.parseUnary()
+	}
 	return p.parsePostfix()
 }
 
@@ -599,6 +638,40 @@ func (p *parser) parsePostfix() *expr {
 	e := p.parsePrimary()
 	for {
 		switch {
+		case p.atPunct("{"):
+			// composite literal: `token{kind: tNL, line: line}` (named) or
+			// `tok{"a", "b"}` (positional) — a struct VALUE. Lowered to
+			// the jsonNew helper (the go-sh self-hosting contract: structs
+			// are JSON object strings). Only fires for a KNOWN struct type
+			// (a `3 {` for-body brace must not parse as a literal).
+			if _, ok := p.structFields[callName(e)]; !ok {
+				return e
+			}
+			p.pos++
+			p.skipNL()
+			var fields []*expr
+			var names []string
+			for {
+				p.skipNL()
+				if p.atPunct("}") {
+					p.pos++
+					break
+				}
+				if p.tok().kind == tIdent && p.toks[p.pos+1].kind == tPunct && p.toks[p.pos+1].text == ":" {
+					names = append(names, p.next().text)
+					p.pos++ // :
+					p.skipNL()
+					fields = append(fields, p.parseExpr())
+				} else {
+					fields = append(fields, p.parseExpr())
+				}
+				if !p.acceptPunct(",") {
+					p.skipNL()
+					p.expect(tPunct, "}")
+					break
+				}
+			}
+			e = &expr{kind: "structlit", name: callName(e), args: fields, fieldNames: names}
 		case p.atPunct("("):
 			p.pos++
 			args := p.parseArgs()
@@ -645,9 +718,24 @@ func (p *parser) parsePostfix() *expr {
 				e = &expr{kind: "index", target: e, idx1: lo, idx1e: loE}
 			}
 		case p.atPunct("."):
+			// a variadic spread `args...` — the `...` is erased (the A1
+			// subs bind the remaining args positionally); the base is the
+			// value.
+			if p.toks[p.pos+1].kind == tPunct && p.toks[p.pos+1].text == "." &&
+				p.toks[p.pos+2].kind == tPunct && p.toks[p.pos+2].text == "." {
+				p.pos += 3
+				return e
+			}
 			p.pos++
 			nm := p.expect(tIdent, "").text
-			e = &expr{kind: "member", name: callName(e) + "." + nm}
+			if cn := callName(e); cn != "" {
+				e = &expr{kind: "member", name: cn + "." + nm}
+			} else {
+				// member on a non-var base (`p.tok().line` — the method
+				// call's result field): keep the base for the jsonGet
+				// lowering.
+				e = &expr{kind: "member", name: "." + nm, memberTarget: e}
+			}
 		case p.atPunct("++"):
 			p.pos++
 			e = &expr{kind: "incr", target: e}
@@ -746,6 +834,14 @@ func (p *parser) parseArgs() []*expr {
 	p.skipNL()
 	for !p.atPunct(")") {
 		args = append(args, p.parseExpr())
+		// a variadic spread `args...` — the `...` is erased (the A1
+		// subs bind the remaining args positionally).
+		if p.tok().kind == tPunct && p.tok().text == "." &&
+			p.toks[p.pos+1].kind == tPunct && p.toks[p.pos+1].text == "." &&
+			p.toks[p.pos+2].kind == tPunct && p.toks[p.pos+2].text == "." {
+			p.pos += 3
+			p.skipNL()
+		}
 		if p.acceptPunct(",") {
 			p.skipNL()
 			continue
@@ -765,6 +861,12 @@ func (p *parser) parsePrimary() *expr {
 	case tStr:
 		p.pos++
 		return &expr{kind: "str", text: decodeGoStr(t.raw), raw: t.raw}
+	case tChar:
+		// a Go rune literal — an INTEGER (its ASCII code) in Go. The
+		// expr keeps the decoded char; byte contexts lower it to the
+		// code, string contexts to the char itself.
+		p.pos++
+		return &expr{kind: "char", text: decodeGoStr(t.raw), raw: t.raw}
 	case tRawStr:
 		p.pos++
 		return &expr{kind: "rawstr", text: t.text}
@@ -789,6 +891,45 @@ func (p *parser) parsePrimary() *expr {
 			return arg
 		case "func":
 			return p.parseFuncLit()
+		case "map":
+			// map[K]V{...} — a map literal in an EXPRESSION position (the
+			// golib's A1 builders return map[string]any{...}). Lowered to
+			// the jsonNew helper (the JSON object string) with the literal
+			// keys as field names.
+			p.pos++
+			p.expect(tPunct, "[")
+			for p.tok().kind == tIdent {
+				p.next()
+			}
+			p.expect(tPunct, "]")
+			for p.tok().kind == tIdent {
+				p.next()
+			}
+			p.skipNL()
+			p.expect(tPunct, "{")
+			var fields []*expr
+			var names []string
+			for {
+				p.skipNL()
+				if p.atPunct("}") {
+					p.pos++
+					break
+				}
+				key := p.parseExpr()
+				if key.kind != "str" && key.kind != "num" && key.kind != "rawstr" {
+					p.failf("map keys must be literals (v2)")
+				}
+				names = append(names, key.text)
+				p.expect(tPunct, ":")
+				p.skipNL()
+				fields = append(fields, p.parseExpr())
+				if !p.acceptPunct(",") {
+					p.skipNL()
+					p.expect(tPunct, "}")
+					break
+				}
+			}
+			return &expr{kind: "structlit", name: "", args: fields, fieldNames: names}
 		case "true", "false", "nil":
 			p.pos++
 			return &expr{kind: "var", name: t.text}
@@ -814,6 +955,21 @@ func (p *parser) parsePrimary() *expr {
 			p.skipNL()
 			p.expect(tPunct, ")")
 			return e
+		}
+		// []T{...} — an array literal in an EXPRESSION position (the
+		// golib's A1 builders' `[]any{...}`). Lowered to the jsonArrNew
+		// helper (the JSON array string of the element fragments).
+		if t.text == "[" && p.arrayLitAhead() {
+			elems, _ := p.parseArrayLiteral()
+			var args []any
+			for _, el := range elems {
+				args = append(args, el)
+			}
+			return &expr{kind: "arrlit", args: nil, fieldNames: nil, rawJSON: map[string]any{
+				"type": "Call", "func": "jsonArrNew",
+				"args":   args,
+				"purity": "PureCpu",
+			}}
 		}
 	}
 	p.failf("unexpected token %q in expression", t.text)
@@ -921,6 +1077,16 @@ func (p *parser) skipType() {
 	}
 }
 
+// structTypeOf — the struct TYPE name of a var (a structlit-assigned
+// var's type is the literal's type name; a method receiver's type is
+// recorded at the decl).
+func (p *parser) structTypeOf(name string) string {
+	if t, ok := p.varStructTypes[name]; ok {
+		return t
+	}
+	return p.receiverTypes[name]
+}
+
 func (p *parser) parseFuncParams() []string {
 	var params []string
 	p.skipNL()
@@ -931,8 +1097,29 @@ func (p *parser) parseFuncParams() []string {
 			continue
 		}
 		nm := p.expect(tIdent, "").text
-		// skip the type (erased — the A1 subs bind by position)
+		// skip the type (erased — the A1 subs bind by position); a
+		// `byte` param is a Go BYTE (an integer) — track it so char
+		// literals in its comparisons lower to ASCII codes. A variadic
+		// `args ...string` skips the `...` marker (the A1 subs bind the
+		// remaining args positionally) and registers the param as an
+		// ARRAY (the golib's `for i, s := range args`).
+		isByte := p.tok().kind == tIdent && p.tok().text == "byte"
+		isVariadic := false
+		isSlice := p.tok().kind == tPunct && p.tok().text == "["
+		if p.tok().kind == tPunct && p.tok().text == "." &&
+			p.toks[p.pos+1].kind == tPunct && p.toks[p.pos+1].text == "." &&
+			p.toks[p.pos+2].kind == tPunct && p.toks[p.pos+2].text == "." {
+			p.pos += 3 // ...
+			p.skipNL()
+			isVariadic = true
+		}
 		p.skipType()
+		if isByte {
+			p.varTypes[nm] = "Byte"
+		}
+		if isVariadic || isSlice {
+			p.varTypes[nm] = "Array"
+		}
 		params = append(params, nm)
 		if p.acceptPunct(",") {
 			p.skipNL()
@@ -958,6 +1145,24 @@ func (p *parser) paramNumber(name string) (int, bool) {
 // ── statement parsing ───────────────────────────────────────────────
 
 func (p *parser) parseTopLevel() []map[string]any {
+	// PRE-SCAN: register every top-level function NAME before parsing
+	// bodies, so a call to a later-defined function (the golib's
+	// `tokKindName(k)` used in expect, defined after it) lowers as a
+	// user-function call.
+	for i, t := range p.toks {
+		if t.kind == tIdent && t.text == "func" && i+1 < len(p.toks) {
+			j := i + 1
+			if j < len(p.toks) && p.toks[j].kind == tPunct && p.toks[j].text == "(" {
+				// a method decl — the receiver parens; skip to the name
+				for ; j < len(p.toks) && !(p.toks[j].kind == tPunct && p.toks[j].text == ")"); j++ {
+				}
+				j++
+			}
+			if j < len(p.toks) && p.toks[j].kind == tIdent {
+				p.fnNames[p.toks[j].text] = true
+			}
+		}
+	}
 	var out []map[string]any
 	for {
 		p.skipNL()
@@ -1004,13 +1209,30 @@ func (p *parser) parseTopLevel() []map[string]any {
 			// erased under the A1 erasure contract, which only lowers
 			// type-INDEPENDENT bodies (erasure is faithful there). `main`
 			// stays the entry: its body parses as top-level statements
-			// below. Method decls `func (r T) m(...)` stay skipped
-			// (methods are outside the subset, methodDecl ledgered).
+			// below. Method decls `func (r T) m(...)` lower the receiver as
+			// param 1 (the go-sh self-hosting contract: a method call
+			// `p.m(...)` passes the receiver BY NAME, and the body's field
+			// accesses resolve through the param).
 			p.pos++
 			p.skipNL()
+			receiver := ""
 			if p.atPunct("(") {
-				p.skipToLineEnd()
-				break
+				// the receiver `(p *parser)` — the name (the type is erased)
+				p.pos++
+				p.skipNL()
+				receiver = p.expect(tIdent, "").text
+				p.varTypes[receiver] = "Struct" // the receiver is a struct
+				// the receiver's TYPE name (`(p *parser)` → "parser") —
+				// the field-type lookup key.
+				if p.tok().kind == tPunct && p.tok().text == "*" {
+					p.pos++
+				}
+				if p.tok().kind == tIdent {
+					p.receiverTypes[receiver] = p.next().text
+				}
+				p.skipType()
+				p.expect(tPunct, ")")
+				p.skipNL()
 			}
 			nm := p.expect(tIdent, "").text
 			if nm == "main" {
@@ -1040,12 +1262,19 @@ func (p *parser) parseTopLevel() []map[string]any {
 				p.skipType()
 			}
 			p.skipNL()
-			// function scope (mirrors parseFuncLit)
+			// function scope (mirrors parseFuncLit); a method's receiver
+			// is param 1 (the go-sh self-hosting contract — the body's
+			// field accesses resolve through the param to the receiver's
+			// name).
 			saveParams, saveOrd, saveLocals, saveIn := p.fnParams, p.fnParamOrd, p.fnLocals, p.inFunc
 			p.fnParams = map[string]bool{}
 			p.fnParamOrd = nil
 			p.fnLocals = map[string]bool{}
 			p.inFunc = true
+			if receiver != "" {
+				p.fnParams[receiver] = true
+				p.fnParamOrd = append(p.fnParamOrd, receiver)
+			}
 			for _, prm := range params {
 				p.fnParams[prm] = true
 				p.fnParamOrd = append(p.fnParamOrd, prm)
@@ -1053,7 +1282,10 @@ func (p *parser) parseTopLevel() []map[string]any {
 			body := p.parseBlockStmts()
 			p.fnParams, p.fnParamOrd, p.fnLocals, p.inFunc = saveParams, saveOrd, saveLocals, saveIn
 			p.fnNames[nm] = true
-			out = append(out, map[string]any{"type": "Function", "name": nm, "body": body})
+			if receiver != "" {
+				params = append([]string{receiver}, params...)
+			}
+			out = append(out, map[string]any{"type": "Function", "name": nm, "params": params, "body": body})
 		case p.atIdent("type"):
 			// `type Name interface{}` — an EMPTY interface type decl:
 			// compile-time only, erased under the type-position erasure
@@ -1065,7 +1297,7 @@ func (p *parser) parseTopLevel() []map[string]any {
 			// refused loudly.
 			p.pos++
 			p.skipNL()
-			p.expect(tIdent, "") // Name
+			typeName := p.expect(tIdent, "").text // Name
 			p.skipNL()
 			if p.atIdent("interface") {
 				p.pos++
@@ -1080,22 +1312,84 @@ func (p *parser) parseTopLevel() []map[string]any {
 			}
 			// `type Name struct{...}` — a struct TYPE decl: compile-time
 			// only, erased under the type-position erasure contract (the
-			// cpp frontend's `type tok struct{ kind, text string }`). The
-			// struct VALUE (composite literals, member access) is the
-			// go-sh-structtype contract boundary — the type decl itself
-			// carries no runtime shape, exactly like `type Name int`.
+			// golib's `type token struct{ kind, text string }`). The field
+			// NAMES are tracked so positional composite literals
+			// (`token{"a", "b"}`) lower by position; the struct VALUE
+			// (composite literals, member access) lowers to the JSON
+			// object-string helpers (jsonNew/jsonGet/jsonSet — the go-sh
+			// self-hosting contract).
 			if p.atIdent("struct") {
 				p.pos++
 				p.skipNL()
 				p.expect(tPunct, "{")
 				p.skipNL()
+				var fields []string
+				ft := map[string]string{}
 				for !p.atPunct("}") {
+					p.skipNL() // a field's line end — advance to the next field
+					if p.atPunct("}") {
+						break
+					}
 					if p.tok().kind == tEOF {
 						p.failf("unterminated struct type (v2)")
 					}
-					p.pos++
+					// field decl: `name type` / `name, name type` — the
+					// names and the ELEMENT type (a `[]token` field's
+					// element type drives the index-read target type).
+					if p.tok().kind == tIdent {
+						var names []string
+						names = append(names, p.next().text)
+						for p.acceptPunct(",") {
+							p.skipNL()
+							names = append(names, p.expect(tIdent, "").text)
+						}
+						// the type: `[]T` → the element type T; `map[K]V` →
+						// "map"; a plain ident → the type name. The REST of the
+						// type is consumed to the LINE's end — struct field types
+						// don't span lines, and skipType's skipNL would eat the
+						// next field (`kind tokKind` + newline + `text string`).
+						elt := ""
+						switch {
+						case p.atPunct("["):
+							p.pos++
+							p.expect(tPunct, "]")
+							p.skipNL()
+							if p.atPunct("*") {
+								p.pos++
+							}
+							if p.tok().kind == tIdent {
+								elt = p.next().text
+							}
+						case p.atIdent("map"):
+							p.pos++
+							elt = "map"
+						case p.atPunct("*"):
+							p.pos++
+							if p.tok().kind == tIdent {
+								elt = p.next().text
+							}
+						case p.tok().kind == tIdent:
+							elt = p.next().text
+						}
+						// consume the rest of the type to the line end / `;` / `}`
+						for p.tok().kind != tNL && p.tok().kind != tEOF &&
+							!(p.tok().kind == tPunct && (p.tok().text == ";" || p.tok().text == "}")) {
+							p.pos++
+						}
+						for _, n := range names {
+							fields = append(fields, n)
+							ft[n] = elt
+						}
+					}
+					// a `;` field separator (NOT an unconditional advance — the
+					// last field's `}` must stop the loop)
+					if p.atPunct(";") {
+						p.pos++
+					}
 				}
 				p.pos++ // }
+				p.structFields[typeName] = fields
+				p.structFieldTypes[typeName] = ft
 				break
 			}
 			// `type Name int` (string/bool/float64/…, or another named
@@ -1148,7 +1442,16 @@ func (p *parser) parseStmt() []map[string]any {
 		return p.parseSwitch()
 	case "return":
 		p.pos++
-		return []map[string]any{p.returnToStmt(p.parseExpr())}
+		// multi-value return: `return a, b` — the caller's multi-return
+		// lowering captures the FIRST value (the error return is
+		// dropped), so echo the first and skip the rest (the golib's
+		// `return nil, fmt.Errorf(...)` error paths).
+		first := p.parseExpr()
+		for p.acceptPunct(",") {
+			p.skipNL()
+			p.parseExpr()
+		}
+		return []map[string]any{p.returnToStmt(first)}
 	case "continue":
 		// A1 Continue node (mirrors Command::Continue(None) in the core):
 		// a bare `continue` inside a loop body. Labeled `continue L` is
@@ -1378,6 +1681,8 @@ func (p *parser) parseVarDecl() []map[string]any {
 	// optional type: pkg.Ident (bytes.Buffer) | plain ident | []T | *T
 	p.skipNL()
 	isBuf := false
+	if len(names) > 0 && names[0] == "f" {
+	}
 	for {
 		t := p.tok()
 		if t.kind == tIdent && p.toks[p.pos+1].kind == tPunct && p.toks[p.pos+1].text == "." {
@@ -1412,6 +1717,37 @@ func (p *parser) parseVarDecl() []map[string]any {
 			p.skipNL()
 			continue
 		}
+		if t.kind == tIdent && t.text == "func" {
+			// func(...) Ret — a function type (t82/t84/t85: `var f
+			// func(int) int = nil`); erased (skipType handles the
+			// bracket/paren forms). The func params are consumed to the
+			// matching paren; the return type to the line end / `=`.
+			p.pos++
+			if p.atPunct("(") {
+				depth := 0
+				for {
+					if p.tok().kind == tEOF {
+						p.failf("unterminated func type (v2)")
+					}
+					if p.atPunct("(") {
+						depth++
+					}
+					if p.atPunct(")") {
+						depth--
+						if depth == 0 {
+							p.pos++
+							break
+						}
+					}
+					p.pos++
+				}
+			}
+			for p.tok().kind != tNL && p.tok().kind != tEOF &&
+				!(p.tok().kind == tPunct && p.tok().text == "=") {
+				p.pos++
+			}
+			continue
+		}
 		if t.kind == tPunct && (t.text == "[" || t.text == "*") {
 			p.pos++
 			p.skipNL()
@@ -1432,7 +1768,10 @@ func (p *parser) parseVarDecl() []map[string]any {
 			for p.tok().kind == tIdent {
 				p.next()
 			}
-			p.skipNL()
+			// NO skipNL here: the newline terminates the type — skipping
+			// it would let the sweep's `continue` consume the NEXT line's
+			// identifier as a plain type (`var toks []string` followed by
+			// `line := 1` ate `line`).
 			continue
 		}
 		break
@@ -1456,6 +1795,23 @@ func (p *parser) parseVarDecl() []map[string]any {
 		if p.atIdent("map") {
 			return p.parseMapLiteral(names)
 		}
+		// var a = []T{...} — the array literal (the golib's
+		// `var multiOps = []string{...}`); parseExpr would choke on the
+		// `[]` type word.
+		if p.atPunct("[") {
+			elems, _ := p.parseArrayLiteral()
+			p.arrays[names[0]] = arrayInfo{elems: elems, typ: "Str"}
+			p.registerVar(names[0], "Array")
+			if len(names) > 1 {
+				p.failf("array literal with multiple targets (v2)")
+			}
+			return []map[string]any{assignStmt(names[0],
+				map[string]any{
+					"type": "Call", "func": "setArray",
+					"args":   []any{strExpr(names[0]), map[string]any{"type": "Array", "elements": elems}},
+					"purity": "Emulable",
+				})}
+		}
 		rhs := p.parseExpr()
 		if len(names) != 1 {
 			p.failf("var decl initializer with multiple targets (v2)")
@@ -1476,6 +1832,10 @@ func (p *parser) parseBlockStmts() []map[string]any {
 			p.pos++
 			return out
 		}
+		if p.atPunct(";") {
+			p.pos++ // a `;` statement separator (the golib's one-line bodies)
+			continue
+		}
 		if p.tok().kind == tEOF {
 			p.failf("unterminated block")
 		}
@@ -1489,6 +1849,33 @@ func (p *parser) parseDottedStmt() []map[string]any {
 	first := p.next().text
 	p.expect(tPunct, ".")
 	method := p.expect(tIdent, "").text
+	// p.pos++ — a member INCREMENT (the golib's 91 `p.pos++`): the
+	// jsonSet write-back, NOT a method call.
+	if p.atPunct("++") {
+		p.pos++
+		p.registerVar(first, "Struct")
+		return []map[string]any{assignStmt(first, map[string]any{
+			"type": "Call", "func": "jsonSet",
+			"args": []any{
+				strExpr(p.resolveVar(first)), strExpr(method),
+				arithWrap(arithBin(arithVar(first), "+", arithNum(1))),
+			},
+			"purity": "PureCpu",
+		})}
+	}
+	// p.parseExpr() — a METHOD call on a struct (the go-sh self-hosting
+	// contract): the receiver is passed BY NAME (the method body's field
+	// accesses resolve through the param to the caller's var).
+	if p.varTypes[p.resolveVar(first)] == "Struct" {
+		p.expect(tPunct, "(")
+		args := p.parseArgs()
+		var words []map[string]any
+		words = append(words, strExpr(p.resolveVar(first)))
+		for _, a := range args {
+			words = append(words, p.exprToWord(a))
+		}
+		return []map[string]any{execStmt(method, words, "Spawn")}
+	}
 	switch first + "." + method {
 	case "fmt.Println", "fmt.Print":
 		return p.printlnStmt()
@@ -1518,6 +1905,47 @@ func (p *parser) parseDottedStmt() []map[string]any {
 			}
 			p.bufs[first] += a.text
 			return nil
+		case "WriteByte":
+			// b.WriteByte(c) — append ONE byte (the golib's decodeGoStr
+			// escape decoder). The byte is a CODE (Go bytes are
+			// integers); the buffer appends the char. A literal char
+			// folds at emit time; a runtime byte (from `c := raw[i]`)
+			// appends via the sh2.chr helper.
+			p.expect(tPunct, "(")
+			p.skipNL()
+			a := p.parseExpr()
+			p.skipNL()
+			p.expect(tPunct, ")")
+			if a.kind == "char" {
+				p.bufs[first] += charCode(a)
+				return nil
+			}
+			if a.kind == "str" || a.kind == "num" {
+				p.bufs[first] += a.text
+				return nil
+			}
+			// a runtime byte var — the buffer becomes runtime-dependent:
+			// emit `b = <acc> + chr(c)` (the sh2.chr helper) and mark the
+			// buffer so .String() reads the runtime value.
+			chrCall := map[string]any{
+				"type": "Call", "func": "chr",
+				"args":   []any{p.exprToWord(a)},
+				"purity": "PureCpu",
+			}
+			if p.runtimeBufs[first] {
+				// already runtime — append to the runtime value
+				return []map[string]any{assignStmt(first, interpParts([]any{
+					partExpr(getVarExpr(first)), partExpr(chrCall),
+				}))}
+			}
+			p.runtimeBufs[first] = true
+			p.registerVar(first, "Str")
+			var parts []any
+			if p.bufs[first] != "" {
+				parts = append(parts, partLit(p.bufs[first]))
+			}
+			parts = append(parts, partExpr(chrCall))
+			return []map[string]any{assignStmt(first, interpParts(parts))}
 		}
 		p.failf("unsupported bytes.Buffer.%s (v2)", method)
 	}
@@ -1758,7 +2186,11 @@ func (p *parser) stdoutWriteStmt() []map[string]any {
 				p.pos++
 				break
 			}
-			t := p.expect(tStr, "")
+			t := p.tok()
+			if t.kind != tStr && t.kind != tChar {
+				p.failf("byte-slice elements must be char/string literals (v2)")
+			}
+			p.pos++
 			content += decodeGoStr(t.raw)
 			if !p.acceptPunct(",") {
 				p.skipNL()
@@ -1847,9 +2279,53 @@ func (p *parser) parseAssignStmt() []map[string]any {
 			p.failf("indexed assign with multiple targets (v2)")
 		}
 		p.pos++
-		idx := p.expect(tNum, "").text
+		idx := ""
+		if p.tok().kind == tNum {
+			idx = p.next().text
+		} else if p.tok().kind == tStr {
+			// a map-keyed assign: call["typeArgs"] = ta — the runtime's
+			// setVar("call[typeArgs]") assoc-store write.
+			idx = decodeGoStr(p.next().raw)
+		} else {
+			ie := p.parseExpr()
+			if off := p.indexArithText(ie); off != "" {
+				idx = off
+			} else {
+				p.failf("indexed assign key must be literal or arith (v2)")
+			}
+		}
 		p.expect(tPunct, "]")
 		targets[0] = targets[0] + "[" + idx + "]"
+	}
+	// member assign: p.pos = 5 → p = jsonSet("p", "pos", 5) (the go-sh
+	// self-hosting contract: structs are JSON object strings; the write
+	// lands on the resolved var).
+	memberBase, memberField := "", ""
+	memberIndex := "" // p.varTypes[name] — the map-field key
+	if p.atPunct(".") {
+		if len(targets) != 1 {
+			p.failf("member assign with multiple targets (v2)")
+		}
+		p.pos++
+		memberField = p.expect(tIdent, "").text
+		memberBase = targets[0]
+		targets[0] = memberBase + "." + memberField
+		if p.atPunct("[") {
+			p.pos++
+			p.skipNL()
+			if p.tok().kind == tNum {
+				memberIndex = p.next().text
+			} else {
+				ie := p.parseExpr()
+				if off := p.indexArithText(ie); off != "" {
+					memberIndex = off
+				} else {
+					p.failf("struct field index must be literal or arith (v2)")
+				}
+			}
+			p.expect(tPunct, "]")
+			targets[0] = memberBase + "." + memberField + "[" + memberIndex + "]"
+		}
 	}
 	// function call statement: f(args)
 	if p.atPunct("(") {
@@ -1866,6 +2342,19 @@ func (p *parser) parseAssignStmt() []map[string]any {
 		p.pos++
 		if len(targets) != 1 {
 			p.failf("++ needs one target")
+		}
+		if memberBase != "" {
+			// p.pos++ → p = jsonSet("p", "pos", p.pos + 1) — the
+			// go-sh self-hosting contract (the golib's 91 `p.pos++`).
+			p.registerVar(memberBase, "Struct")
+			return []map[string]any{assignStmt(memberBase, map[string]any{
+				"type": "Call", "func": "jsonSet",
+				"args": []any{
+					strExpr(p.resolveVar(memberBase)), strExpr(memberField),
+					arithWrap(arithBin(arithVar(memberBase), "+", arithNum(1))),
+				},
+				"purity": "PureCpu",
+			})}
 		}
 		p.registerVar(targets[0], "Int")
 		return []map[string]any{assignStmt(targets[0],
@@ -1933,10 +2422,79 @@ func (p *parser) parseAssignStmt() []map[string]any {
 				"purity": "Emulable",
 			})}
 	}
-	// map literal: name := map[K]V{ k: v, ... } → one assocSet per pair
-	// (the runtime's by-name associative-array store; t54).
+	// map literal: name := map[K]V{ k: v, ... } — the runtime's
+	// by-name associative-array store (t54) when the values are
+	// literals; the JSON object string (jsonNew — the golib's A1
+	// builders' map[string]any{...} fragments) when the values are
+	// expressions.
 	if p.atIdent("map") {
-		return p.parseMapLiteral(targets)
+		me := p.parsePrimary() // the structlit expr (parsePrimary's map case)
+		allLit := true
+		for _, f := range me.args {
+			if f.kind != "str" && f.kind != "num" && f.kind != "rawstr" &&
+				!(f.kind == "var" && (f.name == "true" || f.name == "false")) {
+				allLit = false
+				break
+			}
+		}
+		if allLit {
+			// the assocSet lowering (t54) — reuse parseMapLiteral's body
+			// by re-parsing: the tokens are already consumed, so emit the
+			// assocSet calls directly.
+			if len(targets) > 1 {
+				p.failf("map literal with multiple targets (v2)")
+			}
+			p.maps[targets[0]] = true
+			p.registerVar(targets[0], "Map")
+			var body []map[string]any
+			for i, f := range me.args {
+				valText := f.text
+				if f.kind == "var" {
+					valText = f.name
+				}
+				body = append(body, map[string]any{
+					"type": "Expr",
+					"expr": map[string]any{
+						"type": "Call", "func": "assocSet",
+						"args":   []any{strExpr(targets[0]), strExpr(me.fieldNames[i]), strExpr(valText)},
+						"purity": "Emulable",
+					},
+				})
+			}
+			return []map[string]any{{"type": "Block", "body": body}}
+		}
+		// expression values — the jsonNew lowering (the golib's A1
+		// fragments).
+		p.registerVar(targets[0], "Map")
+		return []map[string]any{assignStmt(targets[0], p.exprToWord(me))}
+	}
+	// a := make([]T, n) — the make builtin: an empty array (the golib's
+	// `a := make([]any, len(args))` + indexed-fill pattern; the runtime's
+	// array store grows on the indexed assigns).
+	if p.atIdent("make") {
+		p.pos++
+		p.expect(tPunct, "(")
+		p.skipNL()
+		p.expect(tPunct, "[")
+		p.expect(tPunct, "]")
+		for p.tok().kind == tIdent {
+			p.next()
+		}
+		p.expect(tPunct, ",")
+		p.skipNL()
+		p.parseExpr() // the length
+		p.expect(tPunct, ")")
+		if len(targets) > 1 {
+			p.failf("make with multiple targets (v2)")
+		}
+		p.arrays[targets[0]] = arrayInfo{elems: []map[string]any{}, typ: "Str"}
+		p.registerVar(targets[0], "Array")
+		return []map[string]any{assignStmt(targets[0],
+			map[string]any{
+				"type": "Call", "func": "setArray",
+				"args":   []any{strExpr(targets[0]), map[string]any{"type": "Array", "elements": []any{}}},
+				"purity": "Emulable",
+			})}
 	}
 	// cmd := exec.Command(a, b) [.Output()|.Run()]  /  x, _ := ....Output()
 	if p.atIdent("exec") {
@@ -2131,8 +2689,8 @@ func (p *parser) parseAssignStmt() []map[string]any {
 		var elems []any
 		for _, a := range rhs.args[1:] {
 			switch a.kind {
-			case "str", "num", "rawstr":
-				elems = append(elems, strExpr(a.text))
+			case "str", "num", "rawstr", "char":
+				elems = append(elems, p.exprToWord(a))
 			case "var":
 				// s = append(s, v) with a VARIABLE element — the dogfood
 				// CLI's argv filter (`filtered = append(filtered, a)`) and
@@ -2143,9 +2701,37 @@ func (p *parser) parseAssignStmt() []map[string]any {
 				// exprToWord (getVar after resolve): one element per
 				// appended VALUE, no field-splitting (Go semantics).
 				elems = append(elems, p.exprToWord(a))
+			case "structlit":
+				// append(toks, token{...}) — a struct VALUE element (the
+				// golib's lexer). The jsonNew result is the element.
+				elems = append(elems, p.exprToWord(a))
 			default:
 				p.failf("append elements must be literals or vars (v2)")
 			}
+		}
+		if memberBase != "" {
+			// p.toks = append(p.toks, t) → p = jsonSet("p", "toks",
+			// jsonArrAppend(jsonGet("p", "toks"), t)) — the go-sh
+			// self-hosting contract (the golib's `p.fnParamOrd = append(...)`).
+			p.registerVar(memberBase, "Struct")
+			inner := map[string]any{
+				"type": "Call", "func": "jsonGet",
+				"args":   []any{strExpr(p.resolveVar(memberBase)), strExpr(memberField)},
+				"purity": "PureCpu",
+			}
+			var appArgs []any
+			appArgs = append(appArgs, inner)
+			for _, el := range elems {
+				appArgs = append(appArgs, el)
+			}
+			return []map[string]any{assignStmt(memberBase, map[string]any{
+				"type": "Call", "func": "jsonSet",
+				"args": []any{
+					strExpr(p.resolveVar(memberBase)), strExpr(memberField),
+					map[string]any{"type": "Call", "func": "jsonArrAppend", "args": appArgs, "purity": "PureCpu"},
+				},
+				"purity": "PureCpu",
+			})}
 		}
 		p.registerVar(rhs.args[0].name, "Array")
 		return []map[string]any{assignStmt(rhs.args[0].name, map[string]any{
@@ -2189,6 +2775,22 @@ func (p *parser) parseAssignStmt() []map[string]any {
 		fn := rhs.callee
 		if i := strings.LastIndex(fn, "."); i >= 0 {
 			fn = fn[i+1:]
+		}
+		// shiremit.Emit(prog) — the A1 emitter (the golib's Shir): a
+		// DIRECT call to the sh2.a1Emit helper (the sorted-key JSON
+		// marshal), not a shell-command capture — the emitter is a
+		// runtime function, not a command.
+		if rhs.callee == "shiremit.Emit" {
+			var words []map[string]any
+			for _, a := range rhs.args {
+				words = append(words, p.exprToWord(a))
+			}
+			p.registerVar(name, "Str")
+			return []map[string]any{assignStmt(name, map[string]any{
+				"type": "Call", "func": "a1Emit",
+				"args":   words,
+				"purity": "PureCpu",
+			})}
 		}
 		var words []map[string]any
 		for _, a := range rhs.args {
@@ -2234,19 +2836,98 @@ func (p *parser) parseAssignStmt() []map[string]any {
 
 	// single assign
 	w := p.exprToWord(rhs)
+	if memberBase != "" {
+		// p.pos = 5 → p = jsonSet("p", "pos", 5); p.varTypes[name] = typ
+		// → p = jsonSet("p", "varTypes", jsonSet(jsonGet("p",
+		// "varTypes"), name, typ)) — the go-sh self-hosting contract
+		// (the write lands on the resolved var).
+		p.registerVar(memberBase, "Struct")
+		if memberIndex != "" {
+			inner := map[string]any{
+				"type": "Call", "func": "jsonGet",
+				"args":   []any{strExpr(p.resolveVar(memberBase)), strExpr(memberField)},
+				"purity": "PureCpu",
+			}
+			return []map[string]any{assignStmt(memberBase, map[string]any{
+				"type": "Call", "func": "jsonSet",
+				"args": []any{
+					strExpr(p.resolveVar(memberBase)), strExpr(memberField),
+					map[string]any{
+						"type": "Call", "func": "jsonSet",
+						"args":   []any{inner, strExpr(memberIndex), w},
+						"purity": "PureCpu",
+					},
+				},
+				"purity": "PureCpu",
+			})}
+		}
+		return []map[string]any{assignStmt(memberBase, map[string]any{
+			"type": "Call", "func": "jsonSet",
+			"args":   []any{strExpr(p.resolveVar(memberBase)), strExpr(memberField), w},
+			"purity": "PureCpu",
+		})}
+	}
 	if op == "+=" {
 		p.registerVar(targets[0], "Int")
+		// i += len(op) — a string/array LENGTH in arithmetic: the Arith
+		// AST can't express `${#op}`, so lower to the arith-TEXT form
+		// (the runtime's evalArith expands ${#...} — the golib's
+		// `i += len(op)` operator-length advance).
+		if rhs.kind == "strlen" || rhs.kind == "arrlen" {
+			lenWord := ""
+			if rhs.kind == "strlen" {
+				lenWord = "${#" + p.resolveVar(rhs.target.name) + "}"
+			} else {
+				lenWord = "${#" + p.resolveVar(rhs.target.name) + "[@]}"
+			}
+			return []map[string]any{assignStmt(targets[0], map[string]any{
+				"type": "Call", "func": "arith",
+				"args":   []any{strExpr(targets[0] + " + " + lenWord)},
+				"purity": "PureCpu",
+			})}
+		}
 		return []map[string]any{assignStmt(targets[0],
 			arithWrap(arithBin(arithVar(targets[0]), "+", p.exprToArith(rhs))))}
 	}
 	// inside a func: `name := lit` on a fresh var → local name=lit
 	if p.inFunc && op == ":=" && !p.fnParams[targets[0]] && !p.outer[targets[0]] && !p.fnLocals[targets[0]] {
 		p.fnLocals[targets[0]] = true
+		// register the type FIRST (a byte read / struct element read
+		// must be tracked even for locals — the golib's `t :=
+		// p.toks[p.pos]` token locals).
+		p.registerAssignType(targets[0], rhs, w)
 		return []map[string]any{execStmt("local",
 			[]map[string]any{strExpr(targets[0] + "=" + localVal(w))}, "Emulable")}
 	}
-	p.registerVar(targets[0], p.wordType(w))
+	p.registerAssignType(targets[0], rhs, w)
 	return []map[string]any{assignStmt(targets[0], w)}
+}
+
+// registerAssignType — the target's type for an assign RHS: a byte read
+// (`c := src[i]`), a struct VALUE (`p := &parser{...}`), a struct-field
+// ELEMENT read (`t := p.toks[p.pos]` — the field's element type), or the
+// word type.
+func (p *parser) registerAssignType(name string, rhs *expr, w map[string]any) {
+	if rhs.kind == "index" && rhs.target != nil && rhs.target.kind == "var" &&
+		p.varTypes[p.resolveVar(rhs.target.name)] != "Array" {
+		p.registerVar(name, "Byte")
+	} else if rhs.kind == "structlit" {
+		p.registerVar(name, "Struct")
+		p.varStructTypes[name] = rhs.name
+	} else if rhs.kind == "index" && rhs.target != nil && rhs.target.kind == "member" {
+		if i := strings.LastIndex(rhs.target.name, "."); i > 0 {
+			base, field := rhs.target.name[:i], rhs.target.name[i+1:]
+			if elt := p.structFieldTypes[p.structTypeOf(base)][field]; elt != "" {
+				if _, ok := p.structFields[elt]; ok {
+					p.registerVar(name, "Struct")
+					return
+				}
+			}
+		}
+		p.registerVar(name, p.wordType(w))
+	} else {
+		p.registerVar(name, p.wordType(w))
+	}
 }
 
 // localVal renders the value text for `local name=val`.
@@ -2334,6 +3015,25 @@ func (p *parser) parseMapLiteral(targets []string) []map[string]any {
 		}
 	}
 	return []map[string]any{{"type": "Block", "body": body}}
+}
+
+// arrayLitAhead: the token stream at pos is `[ ] <type> {` — an array
+// literal in an EXPRESSION position (the golib's A1 builders' `[]any{...}`).
+func (p *parser) arrayLitAhead() bool {
+	if p.tok().kind != tPunct || p.tok().text != "[" ||
+		p.toks[p.pos+1].kind != tPunct || p.toks[p.pos+1].text != "]" {
+		return false
+	}
+	for i := p.pos + 2; i < len(p.toks); i++ {
+		t := p.toks[i]
+		if t.kind == tPunct && t.text == "{" {
+			return true
+		}
+		if t.kind == tNL || t.kind == tEOF {
+			return false
+		}
+	}
+	return false
 }
 
 // parseArrayLiteral parses `[]T{ e1, e2, ... }` and returns the element
@@ -2592,11 +3292,23 @@ func (p *parser) parseFor() []map[string]any {
 		}}
 	}
 	// range forms
-	if p.atIdent("_") || p.atIdent("range") {
+	if p.atIdent("_") || p.atIdent("range") ||
+		(p.tok().kind == tIdent && p.toks[p.pos+1].kind == tPunct && p.toks[p.pos+1].text == ",") {
 		var v string
+		idxVar := ""
 		if p.atIdent("_") {
 			p.pos++
 			p.expect(tPunct, ",")
+			p.skipNL()
+			v = p.expect(tIdent, "").text
+			p.expect(tPunct, ":=")
+		} else if p.tok().kind == tIdent && p.toks[p.pos+1].kind == tPunct && p.toks[p.pos+1].text == "," {
+			// for i, s := range arr — the index+value form: the index is a
+			// COUNTER (i=0; the body increments it), the value is the A1
+			// For loop var (the go-sh self-hosting contract — the golib's
+			// 37 `for i, s := range` loops).
+			idxVar = p.next().text
+			p.pos++ // ,
 			p.skipNL()
 			v = p.expect(tIdent, "").text
 			p.expect(tPunct, ":=")
@@ -2632,14 +3344,9 @@ func (p *parser) parseFor() []map[string]any {
 				// Untyped vars stay a loud refusal (Refuse > guess).
 				body := p.parseBlockStmts()
 				p.registerVar(v, "Str")
-				return []map[string]any{{
-					"type": "For",
-					"var":  v,
-					"iter": map[string]any{"type": "Array", "elements": []any{
-						paramCall("slice", rv.name, "@", ""),
-					}},
-					"body": body,
-				}}
+				return p.rangeFor(idxVar, v, map[string]any{"type": "Array", "elements": []any{
+					paramCall("slice", rv.name, "@", ""),
+				}}, body)
 			} else {
 				p.failf("range over unknown array %q (v2)", rv.name)
 			}
@@ -2650,12 +3357,7 @@ func (p *parser) parseFor() []map[string]any {
 		for i, el := range iter {
 			elems[i] = el
 		}
-		return []map[string]any{{
-			"type": "For",
-			"var":  v,
-			"iter": map[string]any{"type": "Array", "elements": elems},
-			"body": body,
-		}}
+		return p.rangeFor(idxVar, v, map[string]any{"type": "Array", "elements": elems}, body)
 	}
 	// for sc.Scan() { → While(read sc) — bufio.Scanner stdin loop
 	if p.pos+3 < len(p.toks) && p.tok().kind == tIdent && p.stdinRdr[p.tok().text] &&
@@ -2736,6 +3438,22 @@ func (p *parser) parseFor() []map[string]any {
 		"cond": p.condToJSON(cond),
 		"body": body,
 	}}
+}
+
+// rangeFor: build the A1 For (with the index COUNTER when the loop is
+// `for i, s := range arr` — the go-sh self-hosting contract: i=0 before,
+// i++ after the body; the golib's 37 index+value ranges).
+func (p *parser) rangeFor(idxVar, v string, iter map[string]any, body []map[string]any) []map[string]any {
+	if idxVar == "" {
+		return []map[string]any{{"type": "For", "var": v, "iter": iter, "body": body}}
+	}
+	p.registerVar(idxVar, "Int")
+	body = append(body, assignStmt(idxVar,
+		arithWrap(arithBin(arithVar(idxVar), "+", arithNum(1)))))
+	return []map[string]any{
+		assignStmt(idxVar, strExpr("0")),
+		{"type": "For", "var": v, "iter": iter, "body": body},
+	}
 }
 
 func (p *parser) parseSwitch() []map[string]any {
@@ -3032,7 +3750,37 @@ func (p *parser) captureAssign(targets []string, args []*expr) map[string]any {
 }
 
 // returnToStmt: `return expr` inside a func → echo of expr.
+// isBoolExpr — a Go boolean expression (a comparison, a logical
+// and/or chain, a negation, or a bool-returning function call): the
+// golib's `return isIdentStart(c) || (c >= '0' && c <= '9')`.
+func (p *parser) isBoolExpr(e *expr) bool {
+	switch e.kind {
+	case "binop":
+		return true
+	case "not":
+		return true
+	case "call":
+		// a bool-returning function call (isIdentStart/isIdentPart/...)
+		return true
+	case "var":
+		return e.name == "true" || e.name == "false"
+	}
+	return false
+}
+
+// returnToStmt: `return expr` inside a func → echo of expr. A BOOLEAN
+// expression echoes "true"/"false" (the caller's condition test
+// compares the captured output — the go-sh self-hosting contract).
 func (p *parser) returnToStmt(e *expr) map[string]any {
+	if p.isBoolExpr(e) {
+		return map[string]any{
+			"type": "If",
+			"cond": p.condToJSON(e),
+			"then": []map[string]any{execStmt("echo", []map[string]any{strExpr("true")}, "Emulable")},
+			"elsifs": []any{},
+			"else":  []map[string]any{execStmt("echo", []map[string]any{strExpr("false")}, "Emulable")},
+		}
+	}
 	return execStmt("echo", []map[string]any{p.exprToWord(e)}, "Emulable")
 }
 
@@ -3096,6 +3844,35 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 		return interpLit(e.text)
 	case "rawstr":
 		return interpLit(e.text)
+	case "char":
+		// a Go rune literal is an INTEGER — its ASCII code (the A1 is
+		// string-flavored, so the code is the value; `c := ' '` → c =
+		// "32", and byte comparisons `c == ' '` → `"$c"="32"`).
+		return strExpr(charCode(e))
+	case "structlit":
+		// a struct VALUE — the JSON object string (jsonNew). The field
+		// names: the NAMED fields, or the tracked struct type's fields
+		// (positional `tok{"a", "b"}`).
+		names := e.fieldNames
+		if len(names) == 0 {
+			names = p.structFields[e.name]
+		}
+		if len(names) != len(e.args) {
+			p.failf("struct literal %q field count mismatch (v2)", e.name)
+		}
+		var args []any
+		for i, f := range e.args {
+			args = append(args, strExpr(names[i]), p.exprToWord(f))
+		}
+		return map[string]any{
+			"type": "Call", "func": "jsonNew",
+			"args":   args,
+			"purity": "PureCpu",
+		}
+	case "arrlit":
+		// an array literal in an expression position — the jsonArrNew
+		// call (carried in rawJSON).
+		return e.rawJSON
 	case "num":
 		return strExpr(e.text)
 	case "var":
@@ -3117,6 +3894,16 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 		}
 		return getVarExpr(name)
 	case "member":
+		// p.tok().line — a field read on a METHOD CALL's result (the
+		// golib's parser methods): jsonGet of the captured result.
+		if e.memberTarget != nil {
+			field := strings.TrimPrefix(e.name, ".")
+			return map[string]any{
+				"type": "Call", "func": "jsonGet",
+				"args":   []any{p.exprToWord(e.memberTarget), strExpr(field)},
+				"purity": "PureCpu",
+			}
+		}
 		// c.Args on a stored exec.Command → the Go-style bracketed argv
 		// ("[echo hi]"). exec.Command args are string literals by the
 		// frontend contract, so the argv is statically known (t53).
@@ -3136,11 +3923,64 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 					return strExpr(b.String())
 				}
 			}
+			// p.toks — a struct field read → the jsonGet helper (the
+			// go-sh self-hosting contract: structs are JSON object
+			// strings; the receiver is resolved by name — a param holding
+			// the receiver's name follows).
+			if p.varTypes[p.resolveVar(base)] == "Struct" {
+				return map[string]any{
+					"type": "Call", "func": "jsonGet",
+					"args":   []any{strExpr(p.resolveVar(base)), strExpr(field)},
+					"purity": "PureCpu",
+				}
+			}
 		}
 		p.failf("bare member %q (v2)", e.name)
 	case "add", "mul", "neg":
 		return p.arithOrConcat(e)
 	case "index":
+		// p.varTypes[name] / p.toks[p.pos] — an index into a STRUCT FIELD
+		// (the go-sh self-hosting contract: structs are JSON object
+		// strings; a map field is a JSON object, an array field a JSON
+		// array). Lower to jsonGet(jsonGet(...)) / jsonArrGet(jsonGet(...)).
+		if e.target != nil && e.target.kind == "member" {
+			if i := strings.LastIndex(e.target.name, "."); i > 0 {
+				base, field := e.target.name[:i], e.target.name[i+1:]
+				if p.varTypes[p.resolveVar(base)] == "Struct" {
+					inner := map[string]any{
+						"type": "Call", "func": "jsonGet",
+						"args":   []any{strExpr(p.resolveVar(base)), strExpr(field)},
+						"purity": "PureCpu",
+					}
+					key := e.idx1
+					if e.idx1e != nil {
+						// the index is an EXPRESSION (a struct field read like
+						// `p.toks[p.pos]` — the jsonGet call result is the
+						// key, which the runtime evalAriths for an array
+						// field or uses as a name for a map field).
+						key = ""
+						if off := p.indexArithText(e.idx1e); off != "" {
+							key = off
+						} else if e.idx1e.kind == "member" {
+							// p.pos — a struct field index: the jsonGet call
+							// result is the key (the runtime evalAriths it).
+							return map[string]any{
+								"type": "Call", "func": "jsonGet",
+								"args":   []any{inner, p.exprToWord(e.idx1e)},
+								"purity": "PureCpu",
+							}
+						} else {
+							p.failf("struct field index must be literal or arith (v2)")
+						}
+					}
+					return map[string]any{
+						"type": "Call", "func": "jsonGet",
+						"args":   []any{inner, strExpr(key)},
+						"purity": "PureCpu",
+					}
+				}
+			}
+		}
 		// m["key"] on a map var → assocGet (the runtime's by-name
 		// associative-array read; t54).
 		if e.target != nil && e.target.kind == "var" && p.maps[e.target.name] {
@@ -3160,10 +4000,35 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 			}
 		}
 		if e.idx1e != nil {
+			// src[i] with a VAR/arith index — byte access (the golib's
+			// lexer: `src[i+1] == '/'`). The index renders as arithmetic
+			// text (the runtime's byteAt evalAriths it).
+			if e.target != nil && e.target.kind == "var" && p.varTypes[p.resolveVar(e.target.name)] != "Array" {
+				if off := p.indexArithText(e.idx1e); off != "" {
+					return map[string]any{
+						"type": "Call", "func": "byteAt",
+						"args":   []any{strExpr(p.resolveVar(e.target.name)), strExpr(off)},
+						"purity": "PureCpu",
+					}
+				}
+			}
 			p.failf("index key must be a number literal (v2)")
 		}
 		if e.target != nil && e.target.kind == "var" {
-			return joinCall(paramCall("", e.target.name+"["+e.idx1+"]"))
+			// src[i] — Go byte access into a string (the golib's lexer:
+			// `c := src[i]`). Go bytes are INTEGERS (the ASCII code); the
+			// A1 is string-flavored, so the value is the code as a string.
+			// Lower to the sh2.byteAt helper (the runtime resolves the var
+			// name and the arithmetic index; the same text form renders
+			// inside test strings).
+			if p.varTypes[p.resolveVar(e.target.name)] == "Array" {
+				return joinCall(paramCall("", e.target.name+"["+e.idx1+"]"))
+			}
+			return map[string]any{
+				"type": "Call", "func": "byteAt",
+				"args":   []any{strExpr(p.resolveVar(e.target.name)), strExpr(e.idx1)},
+				"purity": "PureCpu",
+			}
 		}
 		p.failf("index target must be a var (v2)")
 	case "slice":
@@ -3187,6 +4052,41 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 		}
 		p.failf("len() of array must be a var (v2)")
 	case "call":
+		// a call to a USER-DEFINED function (the golib's A1 builders:
+		// strExpr, getVarExpr, testCall, ...) — the capture of exec (the
+		// function echoes its return value; the caller captures it).
+		if p.fnNames[e.callee] {
+			var words []map[string]any
+			for _, a := range e.args {
+				words = append(words, p.exprToWord(a))
+			}
+			inner := execStmt(e.callee, words, "Spawn")
+			return map[string]any{
+				"type": "Call", "func": "capture",
+				"args":   []any{map[string]any{"type": "Arrow", "body": []any{inner}}},
+				"purity": "Spawn",
+			}
+		}
+		// p.parseExpr() — a METHOD call on a struct (the go-sh
+		// self-hosting contract): the receiver is passed BY NAME; the
+		// method's echoed return is captured (the value twin of the
+		// statement form).
+		if i := strings.LastIndex(e.callee, "."); i > 0 {
+			base, method := e.callee[:i], e.callee[i+1:]
+			if p.varTypes[p.resolveVar(base)] == "Struct" {
+				var words []map[string]any
+				words = append(words, strExpr(p.resolveVar(base)))
+				for _, a := range e.args {
+					words = append(words, p.exprToWord(a))
+				}
+				inner := execStmt(method, words, "Spawn")
+				return map[string]any{
+					"type": "Call", "func": "capture",
+					"args":   []any{map[string]any{"type": "Arrow", "body": []any{inner}}},
+					"purity": "Spawn",
+				}
+			}
+		}
 		switch e.callee {
 		case "os.Getenv":
 			if len(e.args) == 1 && e.args[0].kind == "str" {
@@ -3311,6 +4211,22 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 					"purity": "Spawn",
 				}
 			}
+			// a VAR format (`fmt.Sprintf(f, args...)` — the golib's failf
+			// error paths): the capture of printf with the var format (the
+			// runtime's printfFormat handles it).
+			if len(e.args) >= 1 && e.args[0].kind == "var" {
+				var words []map[string]any
+				words = append(words, p.exprToWord(e.args[0]))
+				for _, a := range e.args[1:] {
+					words = append(words, p.exprToWord(a))
+				}
+				inner := execStmt("printf", words, "Emulable")
+				return map[string]any{
+					"type": "Call", "func": "capture",
+					"args":   []any{map[string]any{"type": "Arrow", "body": []any{inner}}},
+					"purity": "Spawn",
+				}
+			}
 			p.failf("fmt.Sprintf needs a literal format (v2)")
 		}
 		// err.Error() — the error value's message. The A1 has no error
@@ -3332,6 +4248,10 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 		if strings.HasSuffix(e.callee, ".String") {
 			base := strings.TrimSuffix(e.callee, ".String")
 			if _, ok := p.bufs[base]; ok {
+				if p.runtimeBufs[base] {
+					// a runtime-dependent buffer — read the runtime value
+					return getVarExpr(base)
+				}
 				return strExpr(p.bufs[base])
 			}
 		}
@@ -3442,7 +4362,30 @@ func (p *parser) sliceWord(e *expr) map[string]any {
 		}
 	}
 	if e.idx1e != nil || e.idx2e != nil {
-		p.failf("unsupported computed slice bound (v2)")
+		// computed bounds — the `${src:off:len}` slice with arithmetic
+		// text (the golib's `src[start+1 : i]`; the runtime's sliceOff
+		// evalAriths the offset and length).
+		off := "0"
+		if e.idx1e != nil {
+			if t := p.indexArithText(e.idx1e); t != "" {
+				off = t
+			} else {
+				p.failf("unsupported computed slice bound (v2)")
+			}
+		} else if e.idx1 != "" {
+			off = e.idx1
+		}
+		length := ""
+		if e.idx2e != nil {
+			if t := p.indexArithText(e.idx2e); t != "" {
+				length = t + "-(" + off + ")"
+			} else {
+				p.failf("unsupported computed slice bound (v2)")
+			}
+		} else if e.idx2 != "" {
+			length = e.idx2 + "-(" + off + ")"
+		}
+		return joinCall(paramCall("slice", name, off, length))
 	}
 	lo, loErr := strconv.Atoi(e.idx1)
 	hi, hiErr := strconv.Atoi(e.idx2)
@@ -3593,15 +4536,23 @@ func (p *parser) exprToArrayElem(e *expr) map[string]any {
 	switch e.kind {
 	case "str", "num", "var":
 		return strExpr(e.text)
+	case "char":
+		return strExpr(charCode(e))
+	default:
+		// a call/structlit/arrlit element (the golib's A1 builders'
+		// `[]any{strExpr(name)}`) — the lowered word (a JSON fragment).
+		return p.exprToWord(e)
 	}
-	p.failf("unsupported array element %q (v2)", e.kind)
-	return nil
 }
 
 func (p *parser) switchPattern(e *expr) string {
 	switch e.kind {
 	case "str", "num", "var":
 		return e.text
+	case "char":
+		// a Go rune literal is an INTEGER — its ASCII code (the golib's
+		// `switch raw[i] { case 'n': ... }` escape decoder).
+		return charCode(e)
 	}
 	p.failf("unsupported case pattern (v2)")
 	return ""
@@ -3609,12 +4560,105 @@ func (p *parser) switchPattern(e *expr) string {
 
 // ── condition lowering ──────────────────────────────────────────────
 
+// hasMemberCall — does the expr contain a member-on-call (`p.tok().kind`)?
+func (p *parser) hasMemberCall(e *expr) bool {
+	if e == nil {
+		return false
+	}
+	if e.kind == "member" && e.memberTarget != nil {
+		return true
+	}
+	return p.hasMemberCall(e.lhs) || p.hasMemberCall(e.rhs) || p.hasMemberCall(e.target) ||
+		p.hasMemberCall(e.idx1e) || p.hasMemberCall(e.idx2e)
+}
+
+// hoistMemberCalls — rewrite member-on-call exprs to temp-var jsonGet
+// reads, emitting the assign-capture into pre (the cond's BinOp And
+// chain runs the assigns before the test).
+func (p *parser) hoistMemberCalls(e *expr, pre *[]map[string]any) *expr {
+	if e == nil {
+		return nil
+	}
+	if e.kind == "member" && e.memberTarget != nil {
+		tmp := fmt.Sprintf("__t%d", p.tmpSeq)
+		p.tmpSeq++
+		field := strings.TrimPrefix(e.name, ".")
+		capture := p.exprToWord(e.memberTarget) // the method-call capture
+		*pre = append(*pre, map[string]any{
+			"type": "Call", "func": "assign",
+			"args":   []any{strExpr(tmp), strExpr("="), capture},
+			"purity": "Emulable",
+		})
+		return &expr{kind: "member", name: tmp + "." + field}
+	}
+	e.lhs = p.hoistMemberCalls(e.lhs, pre)
+	e.rhs = p.hoistMemberCalls(e.rhs, pre)
+	e.target = p.hoistMemberCalls(e.target, pre)
+	e.idx1e = p.hoistMemberCalls(e.idx1e, pre)
+	e.idx2e = p.hoistMemberCalls(e.idx2e, pre)
+	return e
+}
+
 func (p *parser) condToJSON(c *expr) map[string]any {
 	if c.kind == "cond" {
 		return testCall(c.text)
 	}
 	if c.kind == "rawjson" {
 		return c.rawJSON
+	}
+	// a comparison with a member-on-call operand (`p.tok().kind ==
+	// tNL` — the golib's parser methods): hoist the method call into a
+	// temp via the assign-capture, then test the temp's field — the
+	// BinOp And of the assign and the test (the assign runs as part of
+	// the cond; the And's status is the test's).
+	if c.kind == "binop" && c.BOpKind == "cmp" {
+		if p.hasMemberCall(c.lhs) || p.hasMemberCall(c.rhs) {
+			var pre []map[string]any
+			l := p.hoistMemberCalls(c.lhs, &pre)
+			r := p.hoistMemberCalls(c.rhs, &pre)
+			// the rewritten comparison
+			test := testCall(p.condTestString(&expr{kind: "binop", BOp: c.BOp, BOpKind: "cmp", lhs: l, rhs: r}))
+			// chain the pre-assigns with the test via And
+			out := test
+			for i := len(pre) - 1; i >= 0; i-- {
+				out = map[string]any{
+					"type": "BinOp", "op": "And",
+					"lhs": pre[i], "rhs": out,
+				}
+			}
+			return out
+		}
+	}
+	// a bool-returning function call in a condition (the golib's
+	// `isIdentPart(src[i])`): capture the function's echoed
+	// "true"/"false" into a temp, then test it — the BinOp And of the
+	// assign-capture and the test (the assign runs as part of the cond;
+	// the And's status is the test's).
+	// only USER-DEFINED functions (stdlib strings.* has specific
+	// glob-test lowering below).
+	if c.kind == "call" && p.fnNames[c.callee] {
+		tmp := fmt.Sprintf("__r%d", p.tmpSeq)
+		p.tmpSeq++
+		var words []map[string]any
+		for _, a := range c.args {
+			words = append(words, p.exprToWord(a))
+		}
+		inner := execStmt(c.callee, words, "Spawn")
+		capture := map[string]any{
+			"type": "Call", "func": "capture",
+			"args":   []any{map[string]any{"type": "Arrow", "body": []any{inner}}},
+			"purity": "Spawn",
+		}
+		assignCall := map[string]any{
+			"type": "Call", "func": "assign",
+			"args":   []any{strExpr(tmp), strExpr("="), capture},
+			"purity": "Emulable",
+		}
+		return map[string]any{
+			"type": "BinOp", "op": "And",
+			"lhs": assignCall,
+			"rhs": testCall(`"$` + tmp + `"="true"`),
+		}
 	}
 	if c.kind == "not" {
 		// !(a && b) → (!a) || (!b) — De Morgan: the test-string form
@@ -3743,6 +4787,16 @@ func (p *parser) condTestString(c *expr) string {
 	return ""
 }
 
+// charCode — the ASCII code of a Go rune literal (a char expr's text
+// is the decoded char; Go chars are integers, so the code is the value
+// in byte contexts).
+func charCode(e *expr) string {
+	if e == nil || e.text == "" {
+		return "0"
+	}
+	return strconv.Itoa(int(e.text[0]))
+}
+
 // condOperandQ: `==`/`!=` operand — quoted: `"$x"` / `"lit"` / `"42"`.
 func (p *parser) condOperandQ(e *expr) string {
 	switch e.kind {
@@ -3750,13 +4804,38 @@ func (p *parser) condOperandQ(e *expr) string {
 		return `"$` + p.resolveVar(e.name) + `"`
 	case "str":
 		return `"` + e.text + `"`
+	case "char":
+		// a Go rune literal is an INTEGER — its ASCII code (the golib's
+		// `c == ' '` byte tests; c holds the code from byteAt).
+		return `"` + charCode(e) + `"`
 	case "num":
 		return `"` + e.text + `"`
+	case "call":
+		// src[i] in a comparison — the sh2.byteAt helper rendered in a
+		// cmdsub word (the runtime's test evaluator resolves it in JS).
+		if e.callee == "byteAt" && len(e.args) == 2 {
+			return `"$(sh2.byteAt(` + e.args[0].text + `, ` + e.args[1].text + `))"`
+		}
+		p.failf("unsupported comparison operand (v2): %s", e.kind)
+	case "member":
+		// t.kind — a struct field read in a comparison (the golib's
+		// `t.kind != tEOF` token-kind tests): the jsonGet helper in a
+		// cmdsub word.
+		if e.memberTarget == nil {
+			if i := strings.LastIndex(e.name, "."); i > 0 {
+				return `"$(sh2.jsonGet(` + p.resolveVar(e.name[:i]) + `, ` + e.name[i+1:] + `))"`
+			}
+		}
+		p.failf("unsupported comparison operand (v2): %s", e.kind)
 	case "arrlen":
 		// len(arr) → the `${#arr[@]}` length word, quoted like `"$x"`
 		// (the statement-position lowering at emitExpr uses the same
 		// shape via join(param("slice", "#arr", "@", ""))).
 		return `"${#` + p.resolveVar(e.target.name) + `[@]}"`
+	case "strlen":
+		// len(s) → the quoted `${#s}` length word (the golib's
+		// `i < len(src)` loop guards).
+		return `"${#` + p.resolveVar(e.target.name) + `}"`
 	case "add", "mul", "neg":
 		// arithmetic operand — the `"$((i+1))"` word (the cpp
 		// frontend's `i+1 < n` loop guards; the runtime's test
@@ -3766,6 +4845,18 @@ func (p *parser) condOperandQ(e *expr) string {
 		}
 		p.failf("unsupported comparison operand (v2): %s", e.kind)
 	case "index":
+		// src[i] in a comparison — the sh2.byteAt helper rendered in a
+		// cmdsub word (the golib's `src[i] != '\n'` byte tests; the
+		// runtime's test evaluator resolves the sh2.* call in JS).
+		if e.target != nil && e.target.kind == "var" && p.varTypes[p.resolveVar(e.target.name)] != "Array" {
+			if e.idx1e != nil {
+				if off := p.indexArithText(e.idx1e); off != "" {
+					return `"$(sh2.byteAt(` + p.resolveVar(e.target.name) + `, ` + off + `))"`
+				}
+				p.failf("index key must be a number literal (v2)")
+			}
+			return `"$(sh2.byteAt(` + p.resolveVar(e.target.name) + `, ` + e.idx1 + `))"`
+		}
 		// a[0] → the quoted `${a[0]}` array-element word — the CLI's
 		// `filtered[0] != "--shir"` argv gate (frontends/go-sh/cmd/
 		// go-sh/main.go:24; the refusal surfaced with the line
@@ -3798,13 +4889,26 @@ func (p *parser) condOperandArg(e *expr) string {
 		return `"$` + p.resolveVar(e.name) + `"`
 	case "str":
 		return `"` + e.text + `"`
+	case "char":
+		// a Go rune literal is an INTEGER — its ASCII code (the golib's
+		// `c >= '0'` digit tests).
+		return `"` + charCode(e) + `"`
 	case "num":
 		return e.text
+	case "call":
+		if e.callee == "byteAt" && len(e.args) == 2 {
+			return `"$(sh2.byteAt(` + e.args[0].text + `, ` + e.args[1].text + `))"`
+		}
+		p.failf("unsupported comparison operand (v2): %s", e.kind)
 	case "arrlen":
 		// len(arr) in a numeric comparison — the quoted length word
 		// (e.g. `"${#arr[@]}" -gt 1`; a bare ${#arr[@]} would need the
 		// word-splitting the quoted form avoids).
 		return `"${#` + p.resolveVar(e.target.name) + `[@]}"`
+	case "strlen":
+		// len(s) in a numeric comparison — the quoted `${#s}` length
+		// word (the golib's `i < len(src)` loop guards).
+		return `"${#` + p.resolveVar(e.target.name) + `}"`
 	case "add", "mul", "neg":
 		// arithmetic operand — the `"$((i+1))"` word (the cpp
 		// frontend's `i+1 < n` loop guards; the runtime's test
@@ -3814,6 +4918,17 @@ func (p *parser) condOperandArg(e *expr) string {
 		}
 		p.failf("unsupported comparison operand (v2): %s", e.kind)
 	case "index":
+		// src[i] in a numeric comparison — the sh2.byteAt cmdsub word
+		// (the golib's byte tests).
+		if e.target != nil && e.target.kind == "var" && p.varTypes[p.resolveVar(e.target.name)] != "Array" {
+			if e.idx1e != nil {
+				if off := p.indexArithText(e.idx1e); off != "" {
+					return `"$(sh2.byteAt(` + p.resolveVar(e.target.name) + `, ` + off + `))"`
+				}
+				p.failf("index key must be a number literal (v2)")
+			}
+			return `"$(sh2.byteAt(` + p.resolveVar(e.target.name) + `, ` + e.idx1 + `))"`
+		}
 		// a[0] in a numeric comparison — the quoted element word
 		// (`[ "${a[0]}" -gt 1 ]`; bare would need the word-splitting
 		// the quoted form avoids). Literal keys only, like the
@@ -3857,6 +4972,11 @@ func Shir(src string) ([]byte, error) {
 		fnNames:   map[string]bool{},
 		outer:     map[string]bool{},
 		varAlias:  map[string]string{},
+		structFields:     map[string][]string{},
+		structFieldTypes: map[string]map[string]string{},
+		varStructTypes:   map[string]string{},
+		receiverTypes:    map[string]string{},
+		runtimeBufs:      map[string]bool{},
 	}
 	stmts, err := p.run()
 	if err != nil {
