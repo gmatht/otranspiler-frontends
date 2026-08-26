@@ -1465,6 +1465,17 @@ func (p *parser) parseDottedStmt() []map[string]any {
 			return nil
 		}
 	}
+	// two-level dotted call: os.Stdout.Write(x) — the os.Stdout writer
+	// methods (the CLI's raw stdout writes).
+	if p.atPunct(".") {
+		p.pos++
+		m2 := p.expect(tIdent, "").text
+		switch first + "." + method + "." + m2 {
+		case "os.Stdout.Write":
+			return p.stdoutWriteStmt()
+		}
+		p.failf("unsupported call %s.%s.%s (v2)", first, method, m2)
+	}
 	p.failf("unsupported call %s.%s (v2)", first, method)
 	return nil
 }
@@ -1638,6 +1649,43 @@ func (p *parser) heredocStmt(content string) map[string]any {
 }
 
 // setenvStmt: os.Setenv("K", "v") → the export shape (`X=v` + `export X`).
+// stdoutWriteStmt: os.Stdout.Write(x) → printf "%s" "$x" — the raw
+// byte write WITHOUT the trailing newline echo adds (the A1 has no
+// raw-write node; printf with a %s format is the faithful shape). The
+// arg may be a []byte{...} byte-slice literal (the CLI's
+// os.Stdout.Write([]byte{'\n'}) — the newline terminator), whose char
+// elements decode to the literal bytes.
+func (p *parser) stdoutWriteStmt() []map[string]any {
+	p.expect(tPunct, "(")
+	p.skipNL()
+	var words []map[string]any
+	if p.atPunct("[") && p.byteSliceLitAhead() {
+		p.pos += 4 // [ ] byte {
+		content := ""
+		for {
+			p.skipNL()
+			if p.atPunct("}") {
+				p.pos++
+				break
+			}
+			t := p.expect(tStr, "")
+			content += decodeGoStr(t.raw)
+			if !p.acceptPunct(",") {
+				p.skipNL()
+				p.expect(tPunct, "}")
+				break
+			}
+		}
+		words = append(words, interpLit(content))
+	} else {
+		arg := p.parseExpr()
+		words = append(words, p.exprToWord(arg))
+	}
+	p.skipNL()
+	p.expect(tPunct, ")")
+	return []map[string]any{execStmt("printf", words, "Emulable")}
+}
+
 // exitStmt: os.Exit(N) → the A1 Exit statement ({"type":"Exit","value":N})
 // — the `exit` builtin's shape, so all backends terminate with bash's
 // exit code semantics (the CLI's `os.Exit(2)` on usage errors).
@@ -1648,7 +1696,11 @@ func (p *parser) exitStmt() []map[string]any {
 	switch p.tok().kind {
 	case tNum:
 		n, _ := strconv.Atoi(p.next().text)
-		value = map[string]any{"type": "Num", "value": n}
+		// the A1 expr type is "Int" ({"type":"Int","value":N} — the
+		// core's IrExpr::Int), NOT the arith "Num" node: the Exit
+		// value is a full expr, and "Num" is only a KNOWN_ARITH
+		// sub-node (shir_json_in.rs rejects it at the expr boundary).
+		value = map[string]any{"type": "Int", "value": n}
 	case tIdent:
 		name := p.next().text
 		if n, ok := p.paramNumber(name); ok {
@@ -2069,6 +2121,46 @@ func (p *parser) parseAssignStmt() []map[string]any {
 		p.failf("unknown command %q (v2)", base)
 	}
 
+	// out, err := golib.Shir(src) — a multi-target assign from a SINGLE
+	// call returning (value, error): the value target captures the
+	// call's stdout (the function-call shape — the A1 has no
+	// cross-package calls, so a package-qualified callee lowers to a
+	// shell sub of its last name component), the error target is
+	// dropped (mirroring strconv.Atoi/os.ReadFile). A comma-separated
+	// value list (`a, b := x, y`) falls through to the generic
+	// multi-assign below.
+	if len(targets) > 1 && rhs.kind == "call" && !p.atPunct(",") {
+		name := ""
+		for _, tg := range targets {
+			if tg == "_" || tg == "err" {
+				continue
+			}
+			if name != "" {
+				p.failf("call returns (value, error) — one value target (v2)")
+			}
+			name = tg
+		}
+		if name == "" {
+			p.failf("call needs a value target (v2)")
+		}
+		fn := rhs.callee
+		if i := strings.LastIndex(fn, "."); i >= 0 {
+			fn = fn[i+1:]
+		}
+		var words []map[string]any
+		for _, a := range rhs.args {
+			words = append(words, p.exprToWord(a))
+		}
+		inner := execStmt(fn, words, "Spawn")
+		capture := map[string]any{
+			"type": "Call", "func": "capture",
+			"args":   []any{map[string]any{"type": "Arrow", "body": []any{inner}}},
+			"purity": "Spawn",
+		}
+		p.registerVar(name, "Str")
+		return []map[string]any{assignStmt(name, capture)}
+	}
+
 	// multi-assign: a, b := x, y → Block of Assigns (A=x B=y shape)
 	if len(targets) > 1 {
 		values := []*expr{rhs}
@@ -2167,7 +2259,9 @@ func (p *parser) parseArrayLiteral() ([]map[string]any, string) {
 		p.skipNL()
 	}
 	p.expect(tPunct, "{")
-	var elems []map[string]any
+	// non-nil so an EMPTY literal marshals to `[]`, never `null` — the
+	// core's Array.elements is a Vec (shir_json.rs always collects).
+	elems := []map[string]any{}
 	for {
 		p.skipNL()
 		if p.atPunct("}") {
@@ -2816,6 +2910,15 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 		if e.name == "nil" {
 			return strExpr("")
 		}
+		// true/false are bool LITERALS, not var reads — `raw := false`
+		// must lower to `raw = "false"`, never `raw = $false` (a read
+		// of a var named "false", which the runtime resolves to "").
+		if e.name == "true" {
+			return strExpr("true")
+		}
+		if e.name == "false" {
+			return strExpr("false")
+		}
 		name := p.resolveVar(e.name)
 		if n, ok := p.paramNumber(name); ok {
 			return getVarExpr(strconv.Itoa(n))
@@ -3017,6 +3120,14 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 				}
 			}
 			p.failf("fmt.Sprintf needs a literal format (v2)")
+		}
+		// err.Error() — the error value's message. The A1 has no error
+		// objects; an error return is dropped at the call site, so err
+		// is a plain var whose value IS the message (in the expressible
+		// subset it is never assigned — the error branch is dead code).
+		if strings.HasSuffix(e.callee, ".Error") && len(e.args) == 0 {
+			base := strings.TrimSuffix(e.callee, ".Error")
+			return getVarExpr(base)
 		}
 		// sc.Text() inside a scanner read-loop → the read var
 		if strings.HasSuffix(e.callee, ".Text") {
@@ -3373,6 +3484,19 @@ func (p *parser) condTestString(c *expr) string {
 	}
 	if c.kind == "not" {
 		return "! " + strings.TrimSpace(p.condTestString(c.lhs))
+	}
+	// bare var condition: `if raw` where raw is a bool var → the
+	// `"$raw"="true"` test (Go conditions are bools; the var holds
+	// "true"/"false" — the `if !raw` twin wraps this in the Not
+	// prefix above). `if true` / `if false` are the literal tests.
+	if c.kind == "var" {
+		if c.name == "true" {
+			return "true"
+		}
+		if c.name == "false" {
+			return "false"
+		}
+		return p.condOperandQ(c) + "=" + `"true"`
 	}
 	if c.kind != "binop" {
 		p.failf("unsupported condition (v2): %s", c.kind)
