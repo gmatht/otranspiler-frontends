@@ -26,6 +26,7 @@ package pylib
 import (
 	"bytes"
 	"fmt"
+	"math/big"
 	"sort"
 	"strconv"
 	"strings"
@@ -41,6 +42,7 @@ type Expr interface{}
 
 type LitStr struct{ Value string } // de-escaped Python string literal
 type LitInt struct{ Text string }
+type LitFloat struct{ Text string } // de-tokenized Python float literal (e.g. "0.5")
 type NameE struct{ Name string }
 type BoolLit struct{ Value bool }
 type FStrE struct{ Parts []FStrPart }
@@ -272,6 +274,14 @@ func lexLine(src string) []tok {
 			j := i
 			for j < n && isDigit(src[j]) {
 				j++
+			}
+			// float literal: digits '.' digits ("0.5", "3.14"). A '.' NOT
+			// followed by a digit stays an attribute-access token.
+			if j < n && src[j] == '.' && j+1 < n && isDigit(src[j+1]) {
+				j++
+				for j < n && isDigit(src[j]) {
+					j++
+				}
 			}
 			toks = append(toks, tok{tNum, src[i:j], i})
 			i = j
@@ -1213,7 +1223,7 @@ func (e *exprParser) parseMul() (Expr, error) {
 	}
 	for {
 		t := e.peek()
-		if t.kind == tOp && (t.text == "*" || t.text == "/" || t.text == "%") {
+		if t.kind == tOp && (t.text == "*" || t.text == "/" || t.text == "%" || t.text == "//") {
 			e.next()
 			rhs, err := e.parseUnary()
 			if err != nil {
@@ -1251,7 +1261,22 @@ func (e *exprParser) parseUnary() (Expr, error) {
 		e.next()
 		return e.parseUnary()
 	}
-	return e.parsePostfix()
+	// Python precedence: power binds TIGHTER than unary minus
+	// (-2**2 == -4) and is right-associative (2**3**2 == 2**9); the
+	// exponent side recurses through parseUnary so `2**-1` parses too.
+	lhs, err := e.parsePostfix()
+	if err != nil {
+		return nil, err
+	}
+	if e.isOp("**") {
+		e.next()
+		rhs, err := e.parseUnary()
+		if err != nil {
+			return nil, err
+		}
+		return &BinOpE{Op: "**", Lhs: lhs, Rhs: rhs}, nil
+	}
+	return lhs, nil
 }
 
 func (e *exprParser) parsePostfix() (Expr, error) {
@@ -1410,6 +1435,9 @@ func (e *exprParser) parsePrimary() (Expr, error) {
 	t := e.next()
 	switch t.kind {
 	case tNum:
+		if strings.Contains(t.text, ".") {
+			return &LitFloat{Text: t.text}, nil
+		}
 		return &LitInt{Text: t.text}, nil
 	case tStr:
 		v, ok := deescapeString(t.text)
@@ -1751,7 +1779,7 @@ func parseFString(raw string) ([]FStrPart, error) {
 
 type lowerer struct {
 	fns       map[string]bool     // defined function names
-	types     map[string]string   // var → int|str|list
+	types     map[string]string   // var → int|big|float|str|list|dict
 	params    map[string][]string // function name → params (for scoping)
 	curParams map[string]string   // active function: param → positional string
 	// pending Popen pipe chains (the `a | b` idiom): tail var → ordered
@@ -1761,15 +1789,172 @@ type lowerer struct {
 	// concurrent chains.
 	pipes     map[string][][]map[string]any
 	pipeOrder []string
+	// bigint regime (2026-09, t86/t87): proven per-var value intervals
+	// ([lo, hi], both non-nil when present). Python ints are unbounded,
+	// so an integer whose interval is NOT proven within ±2^53 lowers to
+	// the bigint domain (exact JS BigInt arith); everything proven stays
+	// on the fast Number path. fnSites feeds the param intervals.
+	ranges  map[string][2]*big.Int
+	fnSites map[string][][]Expr // function name → per-call arg lists
+	fnRet   map[string]string   // function name → inferred return type ("list", …)
+	hoistN  int                 // float-path/bound hoist temp counter
+}
+
+var two53 = func() *big.Int { return big.NewInt(9007199254740992) }() // 2^53
+
+// foldInt constant-folds an integer expression with exact big.Int
+// arithmetic (literals, + - * // % ** over foldable operands). ok=false
+// when any operand is not a compile-time integer (vars, floats, calls).
+func foldInt(e Expr) (*big.Int, bool) {
+	switch t := e.(type) {
+	case *LitInt:
+		n, ok := new(big.Int).SetString(t.Text, 10)
+		return n, ok
+	case *BinOpE:
+		a, ok1 := foldInt(t.Lhs)
+		b, ok2 := foldInt(t.Rhs)
+		if !ok1 || !ok2 {
+			return nil, false
+		}
+		switch t.Op {
+		case "+":
+			return new(big.Int).Add(a, b), true
+		case "-":
+			return new(big.Int).Sub(a, b), true
+		case "*":
+			return new(big.Int).Mul(a, b), true
+		case "//":
+			if b.Sign() == 0 {
+				return nil, false
+			}
+			q, r := new(big.Int).QuoRem(a, b, new(big.Int))
+			// Python floor division: round toward -inf
+			if r.Sign() != 0 && (r.Sign() < 0) != (b.Sign() < 0) {
+				q.Sub(q, big.NewInt(1))
+			}
+			return q, true
+		case "%":
+			if b.Sign() == 0 {
+				return nil, false
+			}
+			r := new(big.Int).Rem(a, b)
+			if r.Sign() != 0 && (r.Sign() < 0) != (b.Sign() < 0) {
+				r.Add(r, b)
+			}
+			return r, true
+		case "**":
+			if !b.IsInt64() || b.Int64() < 0 || b.Int64() > 4096 || a.Abs(a).Cmp(big.NewInt(1<<20)) > 0 {
+				return nil, false
+			}
+			return new(big.Int).Exp(a, b, nil), true
+		}
+		return nil, false
+	}
+	return nil, false
 }
 
 func (l *lowerer) collectFuncs(stmts []Stmt) {
-	for _, s := range stmts {
-		if f, ok := s.(*FuncS); ok {
-			l.fns[f.Name] = true
-			l.params[f.Name] = f.Params
+	var walkStmts func(stmts []Stmt, fn string)
+	var walkExpr func(e Expr)
+	walkExpr = func(e Expr) {
+		switch t := e.(type) {
+		case *BinOpE:
+			walkExpr(t.Lhs)
+			walkExpr(t.Rhs)
+		case *CompareE:
+			walkExpr(t.Lhs)
+			walkExpr(t.Rhs)
+		case *NotE:
+			walkExpr(t.Arg)
+		case *BoolE:
+			walkExpr(t.Lhs)
+			walkExpr(t.Rhs)
+		case *TernaryE:
+			walkExpr(t.Cond)
+			walkExpr(t.Then)
+			walkExpr(t.Else)
+		case *ListE:
+			for _, el := range t.Elems {
+				walkExpr(el)
+			}
+		case *CallE:
+			if len(t.Path) == 1 && l.fns[t.Path[0]] {
+				l.fnSites[t.Path[0]] = append(l.fnSites[t.Path[0]], t.Args)
+			}
+			for _, a := range t.Args {
+				walkExpr(a)
+			}
+			for _, kw := range t.Kwargs {
+				walkExpr(kw.Value)
+			}
+		case *MethodCallE:
+			walkExpr(t.Obj)
+			for _, a := range t.Args {
+				walkExpr(a)
+			}
+		case *SubscriptE:
+			walkExpr(t.Obj)
+			if t.Index != nil {
+				walkExpr(t.Index)
+			}
+			if t.SliceStart != nil {
+				walkExpr(t.SliceStart)
+			}
+			if t.SliceEnd != nil {
+				walkExpr(t.SliceEnd)
+			}
+		case *AttrE:
+			walkExpr(t.Obj)
 		}
 	}
+	walkStmts = func(stmts []Stmt, fn string) {
+		for _, s := range stmts {
+			switch t := s.(type) {
+			case *FuncS:
+				l.fns[t.Name] = true
+				l.params[t.Name] = t.Params
+				walkStmts(t.Body, t.Name)
+			case *PrintS:
+				for _, a := range t.Args {
+					walkExpr(a)
+				}
+			case *AssignS:
+				walkExpr(t.Expr)
+			case *IfS:
+				walkExpr(t.Cond)
+				walkStmts(t.Then, fn)
+				walkStmts(t.Else, fn)
+				for _, el := range t.Elifs {
+					walkExpr(el.Cond)
+					walkStmts(el.Body, fn)
+				}
+			case *WhileS:
+				walkExpr(t.Cond)
+				walkStmts(t.Body, fn)
+			case *ForS:
+				walkExpr(t.Iter)
+				walkStmts(t.Body, fn)
+			case *ReturnS:
+				if t.Value != nil {
+					if ty := l.typeOf(t.Value); ty == "list" {
+						l.fnRet[fn] = ty
+					}
+				}
+			case *ExprS:
+				walkExpr(t.Expr)
+			case *WithS:
+				walkStmts(t.Body, fn)
+			case *TryS:
+				walkStmts(t.Body, fn)
+				for _, ex := range t.Except {
+					walkStmts(ex.Body, fn)
+				}
+				walkStmts(t.ElseBody, fn)
+				walkStmts(t.Finally, fn)
+			}
+		}
+	}
+	walkStmts(stmts, "")
 }
 
 func (l *lowerer) setType(name, t string) {
@@ -1781,7 +1966,9 @@ func (l *lowerer) typeOf(e Expr) string {
 	case *CompE:
 		return "list"
 	case *LitInt:
-		return "int"
+		return l.intDom(t)
+	case *LitFloat:
+		return "float"
 	case *LitStr, *FStrE, *PercentE:
 		return "str"
 	case *BoolLit:
@@ -1792,11 +1979,22 @@ func (l *lowerer) typeOf(e Expr) string {
 		}
 		return "str"
 	case *BinOpE:
+		// a float path (x ** 0.5, int(x ** 0.5)) is a float expr
+		if (t.Op == "+" || t.Op == "-" || t.Op == "*" || t.Op == "//" ||
+			t.Op == "%" || t.Op == "**") && floatPath(t) {
+			return "float"
+		}
 		if t.Op == "+" {
-			if l.typeOf(t.Lhs) == "int" && l.typeOf(t.Rhs) == "int" {
-				return "int"
+			lt, rt := l.typeOf(t.Lhs), l.typeOf(t.Rhs)
+			if (lt == "int" || lt == "big") && (rt == "int" || rt == "big") {
+				return l.intDom(t)
 			}
+			// anything with a string operand concatenates (the shell has
+			// no string/number split)
 			return "str"
+		}
+		if t.Op == "//" || t.Op == "%" || t.Op == "*" || t.Op == "-" || t.Op == "**" {
+			return l.intDom(t)
 		}
 		return "int"
 	case *CompareE, *NotE, *BoolE:
@@ -1815,9 +2013,25 @@ func (l *lowerer) typeOf(e Expr) string {
 		switch path {
 		case "len":
 			return "int"
+		case "int":
+			if len(t.Args) == 1 && floatPath(t.Args[0]) {
+				return "int"
+			}
+			if len(t.Args) == 1 {
+				return l.intDom(t.Args[0])
+			}
+			return "int"
+		case "sorted", "set", "list":
+			return "list"
 		case "subprocess.run", "subprocess.Popen":
 			return "str"
 		case "os.environ":
+			return "str"
+		}
+		if len(t.Path) == 1 && l.fns[t.Path[0]] {
+			if rt, ok := l.fnRet[t.Path[0]]; ok {
+				return rt
+			}
 			return "str"
 		}
 		return "str"
@@ -1833,6 +2047,426 @@ func (l *lowerer) typeOf(e Expr) string {
 		return "str"
 	}
 	return "str"
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Integer domains: Python ints are unbounded, so an integer expression
+// whose value cannot be PROVEN within ±2^53 lowers to the bigint domain
+// (exact JS BigInt arith — Cast(Int64, Num) leaves render BigInt("N")
+// literals, proven-big vars read raw from their lifted BigInt bindings,
+// and / % compose through the runtime's BigInt-aware idiv/imod). Values
+// with a proven interval inside ±2^53 stay on the fast Number path.
+// ─────────────────────────────────────────────────────────────────────
+
+// rangeOf returns the proven [lo, hi] value interval of an integer
+// expression, or ok=false when nothing can be proven (the caller must
+// then treat the value as unbounded → bigint).
+func (l *lowerer) rangeOf(e Expr) (*big.Int, *big.Int, bool) {
+	if n, ok := foldInt(e); ok {
+		return n, new(big.Int).Set(n), true
+	}
+	switch t := e.(type) {
+	case *NameE:
+		if iv, present := l.ranges[t.Name]; present {
+			return iv[0], iv[1], true
+		}
+	case *BinOpE:
+		aLo, aHi, ok1 := l.rangeOf(t.Lhs)
+		bLo, bHi, ok2 := l.rangeOf(t.Rhs)
+		if !ok1 || !ok2 {
+			// int()/sqrt bounds are provable from ONE side's interval
+			if t.Op == "**" {
+				if fl, ok := t.Rhs.(*LitFloat); ok && fl.Text == "0.5" {
+					if lo, hi, ok3 := l.rangeOf(t.Lhs); ok3 && lo.Sign() >= 0 {
+						// int-side handled by the int() case; x**0.5 itself
+						// is float — only reachable through int(...), so
+						// refuse a bare interval here.
+						_ = lo
+						_ = hi
+					}
+				}
+			}
+			return nil, nil, false
+		}
+		switch t.Op {
+		case "+":
+			return new(big.Int).Add(aLo, bLo), new(big.Int).Add(aHi, bHi), true
+		case "-":
+			return new(big.Int).Sub(aLo, bHi), new(big.Int).Sub(aHi, bLo), true
+		case "*":
+			p := []*big.Int{
+				new(big.Int).Mul(aLo, bLo), new(big.Int).Mul(aLo, bHi),
+				new(big.Int).Mul(aHi, bLo), new(big.Int).Mul(aHi, bHi),
+			}
+			mn, mx := p[0], p[0]
+			for _, v := range p[1:] {
+				if v.Cmp(mn) < 0 {
+					mn = v
+				}
+				if v.Cmp(mx) > 0 {
+					mx = v
+				}
+			}
+			return mn, mx, true
+		case "**":
+			// base interval to a constant nonneg exponent (base ≥ 0)
+			if e2, ok := foldInt(t.Rhs); ok && e2.IsInt64() && e2.Int64() >= 0 && e2.Int64() <= 256 && aLo.Sign() >= 0 {
+				exp := uint(e2.Int64())
+				return new(big.Int).Exp(aLo, big.NewInt(int64(exp)), nil),
+					new(big.Int).Exp(aHi, big.NewInt(int64(exp)), nil), true
+			}
+		case "//":
+			// floor division with a proven-positive divisor:
+			// [floor(lo_a / hi_b), floor(hi_a / lo_b)] (both operands ≥ 0)
+			if aLo.Sign() >= 0 && bLo.Sign() > 0 {
+				q := new(big.Int).Quo(aLo, bHi)
+				r := new(big.Int).Quo(aHi, bLo)
+				return q, r, true
+			}
+		case "%":
+			// Python modulo with a proven-positive divisor: result ∈ [0, hi_b - 1]
+			if bLo.Sign() > 0 {
+				return big.NewInt(0), new(big.Int).Sub(bHi, big.NewInt(1)), true
+			}
+		case "/":
+			if aLo.Sign() >= 0 && bLo.Sign() > 0 {
+				// bash-trunc == Python floor for nonneg operands
+				q := new(big.Int).Quo(aLo, bHi)
+				r := new(big.Int).Quo(aHi, bLo)
+				return q, r, true
+			}
+		}
+	case *CallE:
+		if len(t.Path) == 1 && t.Path[0] == "int" && len(t.Args) == 1 {
+			// int(x): trunc toward zero — monotone, so the interval maps
+			// endpoint-wise. int(x ** 0.5) — the isqrt idiom: sqrt is
+			// monotone too.
+			arg := t.Args[0]
+			if b, ok := arg.(*BinOpE); ok && b.Op == "**" {
+				if fl, ok := b.Rhs.(*LitFloat); ok && fl.Text == "0.5" {
+					if lo, hi, ok3 := l.rangeOf(b.Lhs); ok3 && lo.Sign() >= 0 {
+						return isqrtBig(lo), isqrtBig(hi), true
+					}
+				}
+			}
+			if lo, hi, ok3 := l.rangeOf(arg); ok3 {
+				return truncBig(lo), truncBig(hi), true
+			}
+		}
+	}
+	return nil, nil, false
+}
+
+// isqrtBig — floor square root of a nonneg big.Int (bit-by-bit).
+func isqrtBig(n *big.Int) *big.Int {
+	if n.Sign() <= 0 {
+		return big.NewInt(0)
+	}
+	// Newton on floats for the seed, exact fixup with big.Int
+	x := new(big.Int).Set(n)
+	y := new(big.Int).Rsh(x, uint((x.BitLen()+1)/2))
+	for {
+		y.Div(x, y)
+		y.Add(y, x)
+		y.Rsh(y, 1)
+		if y.Cmp(x) >= 0 {
+			return x
+		}
+		x.Set(y)
+	}
+}
+
+// truncBig — truncation toward zero (python int() of a float interval
+// endpoint; the interval endpoints are integers standing in for reals).
+func truncBig(n *big.Int) *big.Int {
+	return new(big.Int).Set(n)
+}
+
+// intDom — the integer domain of an expression: "int" (proven ±2^53,
+// exact JS Number) or "big" (unproven/proven-huge — exact JS BigInt).
+// OPERAND domains dominate: a small-RANGE result over huge operands
+// (x % 7 where x = 2**100) is still a bigint operation — the leaves must
+// be in the same domain or the JS op throws.
+func (l *lowerer) intDom(e Expr) string {
+	switch t := e.(type) {
+	case *BinOpE:
+		if l.intDom(t.Lhs) == "big" || l.intDom(t.Rhs) == "big" {
+			return "big"
+		}
+		if t.Op == "**" {
+			// pow: unprovable growth — only a proven-small fold stays Number
+			if lo, hi, ok := l.rangeOf(e); ok && hi.Cmp(two53) <= 0 && lo.Cmp(new(big.Int).Neg(two53)) >= 0 {
+				return "int"
+			}
+			return "big"
+		}
+		if lo, hi, ok := l.rangeOf(e); ok {
+			if hi.Cmp(two53) <= 0 && lo.Cmp(new(big.Int).Neg(two53)) >= 0 {
+				return "int"
+			}
+			return "big"
+		}
+		return "int"
+	case *CallE:
+		if len(t.Path) == 1 && t.Path[0] == "int" && len(t.Args) == 1 {
+			if !floatPath(t.Args[0]) {
+				return l.intDom(t.Args[0])
+			}
+			return "int" // float-path int() results are double-derived
+		}
+	}
+	if lo, hi, ok := l.rangeOf(e); ok {
+		if hi.Cmp(two53) <= 0 && lo.Cmp(new(big.Int).Neg(two53)) >= 0 {
+			return "int"
+		}
+		return "big"
+	}
+	switch t := e.(type) {
+	case *NameE:
+		switch l.types[t.Name] {
+		case "big":
+			return "big"
+		case "int":
+			return "int"
+		}
+		return "big"
+	}
+	return "big"
+}
+
+// floatPath — does this integer-context expression contain a float
+// operation (a float literal under **, int() of such)? Those lower to a
+// runtime arith-string evaluated with JS doubles (the exact computation
+// native python does), not the integer Arith AST.
+func floatPath(e Expr) bool {
+	switch t := e.(type) {
+	case *LitFloat:
+		return true
+	case *LitInt, *NameE, *BoolLit:
+		return false
+	case *BinOpE:
+		return floatPath(t.Lhs) || floatPath(t.Rhs)
+	case *CallE:
+		if len(t.Path) == 1 && t.Path[0] == "int" && len(t.Args) == 1 {
+			return floatPath(t.Args[0])
+		}
+		return false
+	}
+	return false
+}
+
+// arithCast — an A1 arith Cast node ({"kind": Int64} renders BigInt(...)
+// for a Num arg — exact past 2^53 — and BigInt.asIntN(64, BigInt(x)) for
+// a Var arg — exact for proven-±2^63 values).
+func arithCast(kind string, arg map[string]any) map[string]any {
+	return map[string]any{"type": "Cast", "ty": map[string]any{"kind": kind}, "arg": arg}
+}
+
+// bigLitAst — a bigint-domain integer literal: Cast(Int64, Num) when it
+// fits i64 (renders the exact BigInt("N") literal); a Horner decomposition
+// ((d·10+d')·10+…) of Cast-wrapped digits otherwise (the A1 Num node is
+// i64-only, so a >i64 literal is only expressible as an exact expression).
+func bigLitAst(text string) (map[string]any, error) {
+	n, ok := new(big.Int).SetString(text, 10)
+	if !ok {
+		return nil, fmt.Errorf("bad integer literal %q", text)
+	}
+	if n.IsInt64() {
+		return arithCast("Int64", arithNum(n.Int64())), nil
+	}
+	cur := arithCast("Int64", arithNum(0))
+	for _, ch := range text {
+		if ch < '0' || ch > '9' {
+			return nil, fmt.Errorf("bad integer literal %q", text)
+		}
+		d := ch - '0'
+		cur = arithBin("+",
+			arithBin("*", cur, arithCast("Int64", arithNum(10))),
+			arithCast("Int64", arithNum(int64(d))))
+	}
+	return cur, nil
+}
+
+// arithIRDom — the domain-aware arith lowering. dom == "big" wraps
+// literals as exact BigInt leaves and composes Python's floor division /
+// modulo (sign-of-divisor semantics JS lacks) out of + - * % over the
+// runtime's BigInt-aware idiv/imod helpers. zeroCmp marks the direct
+// child of an `== 0` comparison: Python `a % b == 0` equals JS `a % b ==
+// 0` for EVERY sign (zero is zero), so the uncomposed form renders — the
+// core's zero-compare native path (no per-iteration helper dispatch).
+func (l *lowerer) arithIRDom(e Expr, dom string, zeroCmp bool) (map[string]any, error) {
+	switch t := e.(type) {
+	case *LitInt:
+		if dom == "big" {
+			ast, err := bigLitAst(t.Text)
+			if err != nil {
+				return nil, err
+			}
+			return arithExpr(ast), nil
+		}
+		n, err := strconv.ParseInt(t.Text, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("int literal %q out of i64 range in Number context", t.Text)
+		}
+		return arithExpr(arithNum(n)), nil
+	case *LitFloat:
+		return nil, fmt.Errorf("float literal outside the float path")
+	case *NameE:
+		if dom == "big" && l.typeOf(t) != "big" {
+			// a var whose binding may hold a Number/string must coerce up:
+			// BigInt(x) is exact for any integral value within ±2^63.
+			return arithExpr(arithCast("Int64", arithVar(t.Name))), nil
+		}
+		return arithExpr(arithVar(t.Name)), nil
+	case *CallE:
+		if len(t.Path) == 1 && t.Path[0] == "len" && len(t.Args) == 1 {
+			if n, ok := t.Args[0].(*NameE); ok {
+				return call("arrayLen", []any{st(n.Name)}), nil
+			}
+		}
+		if len(t.Path) == 1 && t.Path[0] == "int" && len(t.Args) == 1 {
+			return l.arithIRDom(t.Args[0], dom, zeroCmp)
+		}
+		return nil, fmt.Errorf("unsupported call in arithmetic")
+	case *BinOpE:
+		la, err := l.arithIRDom(t.Lhs, dom, false)
+		if err != nil {
+			return nil, err
+		}
+		ra, err := l.arithIRDom(t.Rhs, dom, false)
+		if err != nil {
+			return nil, err
+		}
+		lhsAst := la["ast"].(map[string]any)
+		rhsAst := ra["ast"].(map[string]any)
+		op := t.Op
+		if op == "//" || op == "%" {
+			// plain when Python's semantics match the JS operators: both
+			// operands proven nonneg and the divisor proven positive
+			plain := false
+			if aLo, _, ok1 := l.rangeOf(t.Lhs); ok1 && aLo.Sign() >= 0 {
+				if bLo, _, ok2 := l.rangeOf(t.Rhs); ok2 && bLo.Sign() > 0 {
+					plain = true
+				}
+			}
+			if op == "%" && zeroCmp {
+				plain = true // `a % b == 0` is sign-independent
+			}
+			if !plain {
+				// Python modulo: ((a % b) + b) % b; floor division:
+				// (a - pythonmod) / b (exact — the remainder is subtracted)
+				m1 := arithBin("%", lhsAst, rhsAst)
+				m2 := arithBin("+", m1, rhsAst)
+				pm := arithBin("%", m2, rhsAst)
+				if op == "%" {
+					return arithExpr(pm), nil
+				}
+				return arithExpr(arithBin("/", arithBin("-", lhsAst, pm), rhsAst)), nil
+			}
+			op = map[string]string{"//": "/", "%": "%"}[op]
+		}
+		return arithExpr(arithBin(op, lhsAst, rhsAst)), nil
+	case *SubscriptE:
+		return l.subscriptIR(t)
+	}
+	return nil, fmt.Errorf("unsupported arithmetic")
+}
+
+// toArithText renders an integer-context expression (one with a float
+// path) as an evalArith source string: doubles throughout — the SAME
+// IEEE-754 computation native python performs for float math. x**0.5
+// renders sqrt(x) (Math.sqrt is exactly rounded, matching glibc's
+// correctly-rounded pow(x, 0.5) CPython uses); other float pows REFUSE
+// (an ulp-level Math.pow vs glibc pow mismatch would silently corrupt
+// int() truncation). Inside a function body a param reads its POSITIONAL
+// ($1) so the arith text never store-marks the param var (a store-marked
+// param loses its lifted BigInt/Number binding and every loop-iteration
+// read re-parses the store string).
+func (l *lowerer) toArithText(e Expr) (string, error) {
+	switch t := e.(type) {
+	case *LitInt:
+		return t.Text, nil
+	case *LitFloat:
+		return t.Text, nil
+	case *NameE:
+		if pos, ok := l.curParams[t.Name]; ok {
+			return "$" + pos, nil
+		}
+		return "$" + t.Name, nil
+	case *CallE:
+		if len(t.Path) == 1 && t.Path[0] == "int" && len(t.Args) == 1 {
+			x, err := l.toArithText(t.Args[0])
+			if err != nil {
+				return "", err
+			}
+			return "int(" + x + ")", nil
+		}
+		return "", fmt.Errorf("unsupported call in float arithmetic")
+	case *BinOpE:
+		if t.Op == "**" {
+			if fl, ok := t.Rhs.(*LitFloat); ok && fl.Text == "0.5" {
+				x, err := l.toArithText(t.Lhs)
+				if err != nil {
+					return "", err
+				}
+				return "sqrt(" + x + ")", nil
+			}
+			return "", fmt.Errorf("float pow: only the x ** 0.5 (sqrt) form is supported")
+		}
+		x, err := l.toArithText(t.Lhs)
+		if err != nil {
+			return "", err
+		}
+		y, err := l.toArithText(t.Rhs)
+		if err != nil {
+			return "", err
+		}
+		if t.Op == "/" {
+			return "", fmt.Errorf("float division unsupported (evalArith truncates)")
+		}
+		return "(" + x + " " + t.Op + " " + y + ")", nil
+	}
+	return "", fmt.Errorf("unsupported float-path expression")
+}
+
+// hoistFloatIR — the runtime arith-string call for a float-path
+// expression (returns the printed double result as a string).
+func (l *lowerer) hoistFloatIR(e Expr) (map[string]any, error) {
+	text, err := l.toArithText(e)
+	if err != nil {
+		return nil, err
+	}
+	return call("arith", []any{st(text)}), nil
+}
+
+// hoistIntOperand — pre-lowering for one side of an integer comparison /
+// range bound: a float-path expression evaluates ONCE into a temp pair
+// (the arith-string result, then Number/BigInt-ized so the per-iteration
+// cond reads a plain binding instead of re-parsing a store string).
+// Returns the pre-statements and the int-typed read expression.
+func (l *lowerer) hoistIntOperand(e Expr, dom string) ([]map[string]any, Expr, error) {
+	if !floatPath(e) {
+		return nil, e, nil
+	}
+	ir, err := l.hoistFloatIR(e)
+	if err != nil {
+		return nil, nil, err
+	}
+	s := fmt.Sprintf("__fl%d", l.hoistN)
+	n := fmt.Sprintf("__fl%dv", l.hoistN)
+	l.hoistN++
+	plus := arithNum(0)
+	if dom == "big" {
+		// BigInt-ize: Cast(store-string) + Cast(0) — exact any size ≤ 2^63
+		return []map[string]any{assignStmt(s, ir),
+				assignStmt(n, arithExpr(arithBin("+",
+					arithCast("Int64", arithVar(s)), arithCast("Int64", arithNum(0)))))},
+			&NameE{Name: n}, nil
+	}
+	_ = plus
+	return []map[string]any{assignStmt(s, ir),
+			assignStmt(n, arithExpr(arithBin("+", arithVar(s), arithNum(0))))},
+		&NameE{Name: n}, nil
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1910,6 +2544,9 @@ func execCall(cmd string, words []any) map[string]any {
 }
 
 func array(elems []any) map[string]any {
+	if elems == nil {
+		elems = []any{}
+	}
 	return map[string]any{"type": "Array", "elements": elems}
 }
 
@@ -2069,6 +2706,11 @@ func (l *lowerer) argIR(e Expr) (map[string]any, error) {
 		if t.Op == "+" && (l.typeOf(t) == "str") {
 			return l.concatIR(t), nil
 		}
+		if floatPath(t) {
+			// a float-path subexpression inside a string/word context
+			// (print("bound=", int(n**0.5) + 1)) — the runtime arith-string
+			return l.hoistFloatIR(t)
+		}
 		return l.arithIR(t)
 	case *SubscriptE:
 		return l.subscriptIR(t)
@@ -2146,39 +2788,7 @@ func (l *lowerer) interpIR(parts []FStrPart) map[string]any {
 
 // arithIR converts a numeric Python expression to the Arith AST.
 func (l *lowerer) arithIR(e Expr) (map[string]any, error) {
-	switch t := e.(type) {
-	case *LitInt:
-		n, err := strconv.ParseInt(t.Text, 10, 64)
-		if err != nil {
-			return nil, err
-		}
-		return arithExpr(arithNum(n)), nil
-	case *NameE:
-		return arithExpr(arithVar(t.Name)), nil
-	case *BinOpE:
-		lhs, err := l.arithIR(t.Lhs)
-		if err != nil {
-			return nil, err
-		}
-		rhs, err := l.arithIR(t.Rhs)
-		if err != nil {
-			return nil, err
-		}
-		lhsAst := lhs["ast"].(map[string]any)
-		rhsAst := rhs["ast"].(map[string]any)
-		return arithExpr(arithBin(t.Op, lhsAst, rhsAst)), nil
-	case *SubscriptE:
-		// array element in arith — rare; treat as var read
-		return l.subscriptIR(t)
-	case *CallE:
-		if len(t.Path) == 1 && t.Path[0] == "len" && len(t.Args) == 1 {
-			if n, ok := t.Args[0].(*NameE); ok {
-				return call("arrayLen", []any{st(n.Name)}), nil
-			}
-		}
-		return nil, fmt.Errorf("call in arithmetic")
-	}
-	return nil, fmt.Errorf("unsupported arithmetic")
+	return l.arithIRDom(e, l.intDom(e), false)
 }
 
 func (l *lowerer) subscriptIR(t *SubscriptE) (map[string]any, error) {
@@ -2376,6 +2986,30 @@ func (l *lowerer) callIR(t *CallE, isStmt bool) (map[string]any, error) {
 			}
 		}
 		return nil, fmt.Errorf("os.path.exists: expected a string")
+	case "sorted", "list":
+		// sorted(x) / sorted(list(x)) — the Python sorted-list repr: the
+		// set/array's values, numerically sorted, deduped (set semantics),
+		// comma-space-joined. A capture of `printf '%s\n' "${x[@]}" |
+		// sort -n -u | awk …` — real GNU sort -n handles arbitrary
+		// precision (BigInt values stringify exactly), and the awk stage
+		// joins the lines with ", " (paste -sd can't: its delimiter list
+		// would cycle chars). The value is the list repr — print() wraps
+		// it in brackets; the capture strips trailing newlines.
+		if len(t.Args) == 1 {
+			arg := t.Args[0]
+			if lc, ok := arg.(*CallE); ok && len(lc.Path) == 1 && lc.Path[0] == "list" && len(lc.Args) == 1 {
+				arg = lc.Args[0]
+			}
+			if n, ok := arg.(*NameE); ok {
+				pipe := map[string]any{"type": "Pipeline", "stages": []any{
+					[]map[string]any{exprStmt(execCall("printf", []any{st("%s\n"), call("param", []any{st("slice"), st(n.Name), st("@"), st("")})}))},
+					[]map[string]any{exprStmt(execCall("sort", []any{st("-n"), st("-u")}))},
+					[]map[string]any{exprStmt(execCall("awk", []any{st("NR>1{printf \"%s\",\", \"}{printf \"%s\",$0}")}))},
+				}}
+				return capture(arrow([]map[string]any{pipe})), nil
+			}
+		}
+		return nil, fmt.Errorf("sorted: expected a list variable")
 	default:
 		if len(t.Path) == 1 && l.fns[t.Path[0]] {
 			// call to a script-defined function
@@ -2523,6 +3157,199 @@ func (l *lowerer) methodIR(t *MethodCallE) (map[string]any, error) {
 // testIR lowers a Python condition to the IR test expression (the core's
 // `[ ... ]` raw-string form inside Call("test", [Str])).
 func (l *lowerer) testIR(e Expr) (map[string]any, error) {
+	pre, cond, err := l.condIR(e)
+	if err != nil {
+		return nil, err
+	}
+	if len(pre) != 0 {
+		return nil, fmt.Errorf("float-path condition in string-test position")
+	}
+	return cond, nil
+}
+
+// paramRange — the proven value interval of a function's i-th parameter
+// from its call sites: every site's arg must constant-fold, and the
+// union of the folded values is the interval. Any non-foldable site
+// (recursion, runtime args) leaves the param unprovable → bigint.
+func (l *lowerer) paramRange(fn string, i int) ([2]*big.Int, bool) {
+	sites := l.fnSites[fn]
+	if len(sites) == 0 {
+		return [2]*big.Int{}, false
+	}
+	var lo, hi *big.Int
+	for _, args := range sites {
+		if i >= len(args) {
+			return [2]*big.Int{}, false
+		}
+		n, ok := foldInt(args[i])
+		if !ok {
+			return [2]*big.Int{}, false
+		}
+		if lo == nil {
+			lo, hi = new(big.Int).Set(n), new(big.Int).Set(n)
+			continue
+		}
+		if n.Cmp(lo) < 0 {
+			lo = new(big.Int).Set(n)
+		}
+		if n.Cmp(hi) > 0 {
+			hi = new(big.Int).Set(n)
+		}
+	}
+	return [2]*big.Int{lo, hi}, true
+}
+
+// rangeWhile — `for v in range(a, b)` with a computed (non-literal) end:
+// a While loop over an int-typed counter with a native arith comparison
+// (Python's end is exclusive). The bound evaluates once (float-path
+// bounds hoist into a temp pair); the counter steps via the native
+// IncDec lowering in the Number domain, an exact arith assign in the
+// bigint domain.
+func (l *lowerer) rangeWhile(t *ForS, c *CallE) ([]map[string]any, error) {
+	var loE, hiE Expr
+	if len(c.Args) == 1 {
+		loE = &LitInt{Text: "0"}
+		hiE = c.Args[0]
+	} else {
+		loE = c.Args[0]
+		hiE = c.Args[1]
+	}
+	dom := "int"
+	if l.intDom(hiE) == "big" || l.intDom(loE) == "big" {
+		dom = "big"
+	}
+	preL, loX, err := l.hoistIntOperand(loE, dom)
+	if err != nil {
+		return nil, err
+	}
+	preH, hiX, err := l.hoistIntOperand(hiE, dom)
+	if err != nil {
+		return nil, err
+	}
+	l.setType(t.Var, dom)
+	if dom == "int" {
+		if lo, hi, ok := l.rangeOf(hiE); ok {
+			// counter ∈ [lo, hi-1] (exclusive end)
+			l.ranges[t.Var] = [2]*big.Int{lo, new(big.Int).Sub(hi, big.NewInt(1))}
+		} else {
+			delete(l.ranges, t.Var)
+		}
+	} else {
+		delete(l.ranges, t.Var)
+	}
+	loIR, err := l.arithIRDom(loX, dom, false)
+	if err != nil {
+		return nil, err
+	}
+	hiIR, err := l.arithIRDom(hiX, dom, false)
+	if err != nil {
+		return nil, err
+	}
+	var step []map[string]any
+	if dom == "int" {
+		step = []map[string]any{exprStmt(arithExpr(map[string]any{"type": "IncDec", "var": t.Var, "delta": 1, "prefix": false}))}
+	} else {
+		one, err := bigLitAst("1")
+		if err != nil {
+			return nil, err
+		}
+		step = []map[string]any{assignStmt(t.Var, arithExpr(arithBin("+", arithVar(t.Var), one)))}
+	}
+	body, err := l.stmtsIR(t.Body)
+	if err != nil {
+		return nil, err
+	}
+	body = append(body, step...)
+	cond := arithExpr(arithBin("<", arithVar(t.Var), hiIR["ast"].(map[string]any)))
+	out := append(preL, preH...)
+	out = append(out, assignStmt(t.Var, loIR))
+	out = append(out, whileStmt(cond, body))
+	return out, nil
+}
+
+// condIR lowers a condition to (pre-statements, cond expression). Integer
+// comparisons (both operands int-typed) lower to the A1 Arith AST — the
+// ESTree render is a NATIVE JS comparison (exact for BigInt-domain
+// operands, no per-iteration string-test dispatch); anything else keeps
+// the shell `[ ... ]` string-test form.
+func (l *lowerer) condIR(e Expr) ([]map[string]any, map[string]any, error) {
+	switch t := e.(type) {
+	case *CompareE:
+		switch t.Op {
+		case "==", "!=", "<", "<=", ">", ">=":
+			lt, rt := l.typeOf(t.Lhs), l.typeOf(t.Rhs)
+			if (lt == "int" || lt == "big") && (rt == "int" || rt == "big") {
+				dom := "int"
+				if lt == "big" || rt == "big" {
+					dom = "big"
+				}
+				preL, lhsE, err := l.hoistIntOperand(t.Lhs, dom)
+				if err != nil {
+					return nil, nil, err
+				}
+				preR, rhsE, err := l.hoistIntOperand(t.Rhs, dom)
+				if err != nil {
+					return nil, nil, err
+				}
+				la, err := l.arithIRDom(lhsE, dom, false)
+				if err != nil {
+					return nil, nil, err
+				}
+				ra, err := l.arithIRDom(rhsE, dom, false)
+				if err != nil {
+					return nil, nil, err
+				}
+				// `X == 0` with X holding the %: the zero-compare form —
+				// Python `a % b == 0` is sign-independent, so the uncomposed
+				// % renders (the core's native zero-compare path — the hot
+				// divisibility loop's fast form).
+				zeroCmp := false
+				if t.Op == "==" {
+					if _, isZero := foldInt(t.Rhs); isZero && isZeroInt(t.Rhs) {
+						zeroCmp = true
+					} else if _, isZero := foldInt(t.Lhs); isZero && isZeroInt(t.Lhs) {
+						zeroCmp = true
+					}
+				}
+				lhsAst := la["ast"].(map[string]any)
+				rhsAst := ra["ast"].(map[string]any)
+				lSide := lhsAst
+				rSide := rhsAst
+				if zeroCmp {
+					// rebuild the %-carrying side with zeroCmp=true
+					var modSide Expr
+					if isZeroInt(t.Rhs) {
+						modSide = t.Lhs
+					} else {
+						modSide = t.Rhs
+					}
+					ms, err := l.arithIRDom(modSide, dom, true)
+					if err != nil {
+						return nil, nil, err
+					}
+					if isZeroInt(t.Rhs) {
+						lSide = ms["ast"].(map[string]any)
+					} else {
+						rSide = ms["ast"].(map[string]any)
+					}
+				}
+				cond := arithExpr(arithBin(t.Op, lSide, rSide))
+				return append(preL, preR...), cond, nil
+			}
+		}
+	}
+	cond, err := l.testIRFallback(e)
+	return nil, cond, err
+}
+
+// isZeroInt — is the expression the integer literal 0?
+func isZeroInt(e Expr) bool {
+	n, ok := foldInt(e)
+	return ok && n.Sign() == 0
+}
+
+// testIRFallback — the string-test lowering (the pre-bigint testIR body).
+func (l *lowerer) testIRFallback(e Expr) (map[string]any, error) {
 	switch t := e.(type) {
 	case *CompareE:
 		lt, err := l.testOperand(t.Lhs)
@@ -2782,7 +3609,7 @@ func (l *lowerer) stmtIR(s Stmt) ([]map[string]any, error) {
 	case *IfS:
 		return l.ifIR(t)
 	case *WhileS:
-		cond, err := l.testIR(t.Cond)
+		pre, cond, err := l.condIR(t.Cond)
 		if err != nil {
 			return nil, err
 		}
@@ -2790,7 +3617,7 @@ func (l *lowerer) stmtIR(s Stmt) ([]map[string]any, error) {
 		if err != nil {
 			return nil, err
 		}
-		return []map[string]any{whileStmt(cond, body)}, nil
+		return append(pre, whileStmt(cond, body)), nil
 	case *ForS:
 		// for line in sys.stdin → `while read line; do ...; done` —
 		// the shell read-loop (the read builtin returns false at EOF,
@@ -2803,6 +3630,24 @@ func (l *lowerer) stmtIR(s Stmt) ([]map[string]any, error) {
 					return nil, err
 				}
 				return []map[string]any{whileStmt(execCall("read", []any{st(t.Var)}), body)}, nil
+			}
+		}
+		// range() with NON-literal bounds — the native-counter Range
+		// lowering needs literal ints, so a computed bound (the t86
+		// `range(1, int(n**0.5) + 1)` idiom) lowers to a While loop over
+		// an int-typed counter with a NATIVE arith comparison (exact in
+		// both the Number and BigInt domains; the float-path bound
+		// evaluates ONCE into a temp pair).
+		if c, ok := t.Iter.(*CallE); ok && len(c.Path) == 1 && c.Path[0] == "range" && len(c.Args) >= 1 && len(c.Args) <= 2 {
+			litBounds := true
+			for _, a := range c.Args {
+				if _, isLit := a.(*LitInt); !isLit {
+					litBounds = false
+					break
+				}
+			}
+			if !litBounds {
+				return l.rangeWhile(t, c)
 			}
 		}
 		iter, err := l.iterIR(t.Iter)
@@ -2823,19 +3668,47 @@ func (l *lowerer) stmtIR(s Stmt) ([]map[string]any, error) {
 		}
 		return []map[string]any{forStmt(t.Var, iter, body)}, nil
 	case *FuncS:
-		// params map to positional getVar("1").. — typed as str
+		// params materialize at function entry: `p = $1` (arith) — the
+		// positional value becomes a REAL var so arith Var reads see it
+		// (the pre-materialization lowering read arith Var p with the
+		// value still in the positional — an unset-var 0). The materialized
+		// domain comes from the call sites: every site's arg folding into
+		// a ±2^53 interval keeps the param on the Number path; otherwise
+		// the param is bigint-exact (Cast(Int64, Var("1")) — BigInt of the
+		// positional string).
 		saved := l.curParams
 		l.curParams = map[string]string{}
+		var pre []map[string]any
 		for i, prm := range t.Params {
-			l.types[prm] = "str"
-			l.curParams[prm] = strconv.Itoa(i + 1)
+			pos := strconv.Itoa(i + 1)
+			l.curParams[prm] = pos
+			iv, iok := l.paramRange(t.Name, i)
+			if !iok {
+				// not provably integer-valued (a string/ unfoldable call
+				// arg, no call sites, recursion) — the shell-string param:
+				// reads redirect to the positional (the pre-bigint path)
+				l.setType(prm, "str")
+				continue
+			}
+			dom := "big"
+			if iv[1].Cmp(two53) <= 0 && iv[0].Cmp(new(big.Int).Neg(two53)) >= 0 {
+				dom = "int"
+			}
+			l.ranges[prm] = iv
+			if dom == "int" {
+				l.setType(prm, "int")
+				pre = append(pre, assignStmt(prm, arithExpr(arithVar(pos))))
+			} else {
+				l.setType(prm, "big")
+				pre = append(pre, assignStmt(prm, arithExpr(arithCast("Int64", arithVar(pos)))))
+			}
 		}
 		body, err := l.stmtsIR(t.Body)
 		l.curParams = saved
 		if err != nil {
 			return nil, err
 		}
-		return []map[string]any{functionStmt(t.Name, body)}, nil
+		return []map[string]any{functionStmt(t.Name, append(pre, body...))}, nil
 	case *ReturnS:
 		if t.Value == nil {
 			return []map[string]any{map[string]any{"type": "Return", "value": nil}}, nil
@@ -2958,9 +3831,21 @@ func (l *lowerer) printIR(t *PrintS) ([]map[string]any, error) {
 			return append(pre, exprStmt(execCall("printf", words))), nil
 		}
 	}
-	words, err := l.argListIR(nt.Args)
-	if err != nil {
-		return nil, err
+	words := make([]any, 0, len(nt.Args))
+	for _, a := range nt.Args {
+		ir, err := l.argIR(a)
+		if err != nil {
+			return nil, err
+		}
+		// Python print of a LIST value — `print([1, 2])` renders the
+		// repr: `[e1, e2]` (elements comma-space-joined). The list
+		// repr is the newline/comma-joined capture string, so the word
+		// is one Interpolate: "[" + value + "]".
+		if l.typeOf(a) == "list" {
+			words = append(words, interpolate([]any{interpLit("["), interpExpr(ir), interpLit("]")}))
+			continue
+		}
+		words = append(words, ir)
 	}
 	return append(pre, exprStmt(execCall("echo", words))), nil
 }
@@ -3125,10 +4010,13 @@ func (l *lowerer) assignOne(target, op string, val Expr) ([]map[string]any, erro
 		ac := map[string]any{"type": "ArrayComp", "var": cp.Var, "iter": iter, "elem": elem, "cond": cond}
 		return []map[string]any{assignStmt(target, call("setArray", []any{st(target), ac}))}, nil
 	}
-	// list literal → setArray / setArrayAppend (arr += (...))
-	if lst, ok := val.(*ListE); ok {
+	// list literal → setArray / setArrayAppend (arr += (...)). `set()` —
+	// an empty Python set — lowers to the empty array (dedup + ordering
+	// happen at sorted(): sort -nu).
+	if lst, ok := val.(*ListE); ok || (func() bool { c, okc := val.(*CallE); return okc && len(c.Path) == 1 && c.Path[0] == "set" && len(c.Args) == 0 })() {
 		var elems []any
-		for _, el := range lst.Elems {
+		if lst != nil {
+			for _, el := range lst.Elems {
 			if s, ok := el.(*LitStr); ok {
 				elems = append(elems, st(s.Value))
 				continue
@@ -3143,6 +4031,7 @@ func (l *lowerer) assignOne(target, op string, val Expr) ([]map[string]any, erro
 			}
 			elems = append(elems, ir)
 		}
+		}
 		l.setType(target, "list")
 		if op == "+=" {
 			// arr += (...) — the core's PlusAssign-Array lowering
@@ -3152,13 +4041,29 @@ func (l *lowerer) assignOne(target, op string, val Expr) ([]map[string]any, erro
 	}
 	// aug-assign
 	if op == "+=" {
-		if l.typeOf(val) == "int" {
-			rhs, err := l.arithIR(val)
+		vty := l.typeOf(val)
+		dom := vty
+		if dom != "big" && l.typeOf(&NameE{Name: target}) == "big" {
+			dom = "big"
+		}
+		if dom == "int" || dom == "big" {
+			rhs, err := l.arithIRDom(val, dom, false)
 			if err != nil {
 				return nil, err
 			}
-			ast := arithBin("+", arithVar(target), rhs["ast"].(map[string]any))
-			l.setType(target, "int")
+			var rhsAst map[string]any
+			if dom == "big" {
+				ra := rhs["ast"].(map[string]any)
+				rhsAst = ra
+				l.setType(target, "big")
+				delete(l.ranges, target)
+			} else {
+				ra := rhs["ast"].(map[string]any)
+				rhsAst = ra
+				l.setType(target, "int")
+				delete(l.ranges, target)
+			}
+			ast := arithBin("+", arithVar(target), rhsAst)
 			return []map[string]any{assignStmt(target, arithExpr(ast))}, nil
 		}
 		// string += → concat
@@ -3181,7 +4086,26 @@ func (l *lowerer) assignSimple(target string, val Expr) ([]map[string]any, error
 		l.setType(target, "str")
 		return []map[string]any{assignStmt(target, st(v.Value))}, nil
 	case *LitInt:
+		if l.intDom(val) == "big" {
+			// a literal past i64 (or past 2^53): the exact BigInt value is
+			// only expressible as an arith expression — a string assign
+			// would read back through Number() and silently round.
+			ir, err := l.arithIRDom(val, "big", false)
+			if err != nil {
+				return nil, err
+			}
+			l.setType(target, "big")
+			if lo, hi, ok := l.rangeOf(val); ok {
+				l.ranges[target] = [2]*big.Int{lo, hi}
+			} else {
+				delete(l.ranges, target)
+			}
+			return []map[string]any{assignStmt(target, ir)}, nil
+		}
 		l.setType(target, "int")
+		if lo, hi, ok := l.rangeOf(val); ok {
+			l.ranges[target] = [2]*big.Int{lo, hi}
+		}
 		return []map[string]any{assignStmt(target, st(v.Text))}, nil
 	case *BoolLit:
 		l.setType(target, "int")
@@ -3190,11 +4114,32 @@ func (l *lowerer) assignSimple(target string, val Expr) ([]map[string]any, error
 		}
 		return []map[string]any{assignStmt(target, st("0"))}, nil
 	}
-	// numeric arithmetic
-	if l.typeOf(val) == "int" {
-		ir, err := l.arithIR(val)
+	// float-path arithmetic (int(x ** 0.5), …) — the runtime arith-string
+	// with JS doubles; the result is an integer-valued string the target
+	// reads back numerically.
+	if floatPath(val) {
+		ir, err := l.hoistFloatIR(val)
+		if err != nil {
+			return nil, err
+		}
+		l.setType(target, "int")
+		if lo, hi, ok := l.rangeOf(val); ok {
+			l.ranges[target] = [2]*big.Int{lo, hi}
+		} else {
+			delete(l.ranges, target)
+		}
+		return []map[string]any{assignStmt(target, ir)}, nil
+	}
+	// numeric arithmetic (int or bigint domain)
+	if ty := l.typeOf(val); ty == "int" || ty == "big" {
+		ir, err := l.arithIRDom(val, ty, false)
 		if err == nil {
-			l.setType(target, "int")
+			l.setType(target, ty)
+			if lo, hi, ok := l.rangeOf(val); ok {
+				l.ranges[target] = [2]*big.Int{lo, hi}
+			} else {
+				delete(l.ranges, target)
+			}
 			return []map[string]any{assignStmt(target, ir)}, nil
 		}
 	}
@@ -3202,16 +4147,12 @@ func (l *lowerer) assignSimple(target string, val Expr) ([]map[string]any, error
 	if err != nil {
 		return nil, err
 	}
-	if _, ok := val.(*NameE); ok {
-		l.setType(target, l.typeOf(val))
-	} else {
-		l.setType(target, l.typeOf(val))
-	}
+	l.setType(target, l.typeOf(val))
 	return []map[string]any{assignStmt(target, ir)}, nil
 }
 
 func (l *lowerer) ifIR(t *IfS) ([]map[string]any, error) {
-	cond, err := l.testIR(t.Cond)
+	pre, cond, err := l.condIR(t.Cond)
 	if err != nil {
 		return nil, err
 	}
@@ -3227,10 +4168,11 @@ func (l *lowerer) ifIR(t *IfS) ([]map[string]any, error) {
 		var build func(i int) ([]map[string]any, error)
 		build = func(i int) ([]map[string]any, error) {
 			el := t.Elifs[i]
-			c, err := l.testIR(el.Cond)
+			preE, c, err := l.condIR(el.Cond)
 			if err != nil {
 				return nil, err
 			}
+			_ = preE
 			b, err := l.stmtsIR(el.Body)
 			if err != nil {
 				return nil, err
@@ -3259,7 +4201,7 @@ func (l *lowerer) ifIR(t *IfS) ([]map[string]any, error) {
 			return nil, err
 		}
 	}
-	return []map[string]any{ifStmt(cond, then, elsIR)}, nil
+	return append(pre, ifStmt(cond, then, elsIR)), nil
 }
 
 func (l *lowerer) iterIR(e Expr) (map[string]any, error) {
@@ -3338,9 +4280,10 @@ func (l *lowerer) exprStmtIR(e Expr) ([]map[string]any, error) {
 		if t.Name == "wait" {
 			return []map[string]any{exprStmt(execCall("wait", []any{}))}, nil
 		}
-		if t.Name == "append" {
-			// l.append(x) — list append → arr+=(x): the same
-			// Assign(setArrayAppend) shape `a += [x]` lowers to (t56).
+		if t.Name == "append" || t.Name == "add" {
+			// l.append(x) / s.add(x) — list/set element add → arr+=(x): the
+			// same Assign(setArrayAppend) shape `a += [x]` lowers to (t56).
+			// Python set.add dedups at sorted() time (sort -nu).
 			if len(t.Args) == 1 {
 				if n, ok := t.Obj.(*NameE); ok {
 					ir, err := l.argIR(t.Args[0])
@@ -3396,21 +4339,27 @@ func (l *lowerer) withIR(t *WithS) ([]map[string]any, error) {
 
 func buildProgram(stmts []Stmt) (*shiremit.Program, error) {
 	l := &lowerer{
-		fns:    map[string]bool{},
-		types:  map[string]string{},
-		params: map[string][]string{},
-		pipes:  map[string][][]map[string]any{},
+		fns:     map[string]bool{},
+		types:   map[string]string{},
+		params:  map[string][]string{},
+		pipes:   map[string][][]map[string]any{},
+		ranges:  map[string][2]*big.Int{},
+		fnSites: map[string][][]Expr{},
+		fnRet:   map[string]string{},
 	}
 	l.collectFuncs(stmts)
 	irs, err := l.stmtsIR(stmts)
 	if err != nil {
 		return nil, err
 	}
-	// A2 var_types: every assigned variable, sorted by name
+	// A2 var_types: every assigned variable, sorted by name ("big" vars
+	// stay "Int" — the widthless kind the estree backend homes as an
+	// exact-precision binding; the C-only Int64 object kind would wrap
+	// assignments mod 2^64, breaking unbounded Python ints)
 	byName := map[string]string{}
 	for name, ty := range l.types {
 		t := "Str"
-		if ty == "int" {
+		if ty == "int" || ty == "big" {
 			t = "Int"
 		}
 		byName[name] = t
