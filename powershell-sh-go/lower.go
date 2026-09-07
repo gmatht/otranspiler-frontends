@@ -985,7 +985,7 @@ func lowerWhileStatement(n *sitter.Node, src []byte) (any, error) {
 // §1): `foreach ($x in $list) { B }` lowers to the A1 For statement
 // `{var: x, iter: Array [ split [ getVar "list" ] ], body: B}` — the
 // CORE's exact shape for bash `for i in $list; do …; done` (verified
-// byte-identical against `debashc file --shir`), because the iter
+// byte-identical against `otranspilerl-cli file --shir`), because the iter
 // pipeline has the SAME single-pipeline shape as the t06/t07
 // conditions (verified against node-types.json), so the `in` collection
 // lowers through the same lowerCondPipeline subset: a bare variable
@@ -1071,7 +1071,7 @@ func lowerForEachStatement(n *sitter.Node, src []byte) (any, error) {
 // when the grammar closes the gap" — and the vendored grammar parses
 // the full shape (verified against the CST), so the rung lands the
 // plan's "clib switch lowering": the A1 Case node, the shape the core
-// emits for bash `case` (byte-identical, verified against `debashc
+// emits for bash `case` (byte-identical, verified against `otranspilerl-cli
 // --shir --raw`).
 //
 // The t31 subset pins: a discriminant that is a bare variable read (the
@@ -1493,7 +1493,7 @@ func lowerSingleChain(chain *sitter.Node, src []byte) ([]any, error) {
 // `Write-Output "c" || Write-Output "d"` prints c only. Lowering:
 // the A1 BinOp And/Or — {"type":"BinOp","op":"And"|"Or",
 // "lhs":call,"rhs":call} — byte-identical to the core's `echo a &&
-// echo b` / `echo c || echo d` emission (verified against `debashc
+// echo b` / `echo c || echo d` emission (verified against `otranspilerl-cli
 // --shir --raw`): the A1→ESTree renderer lowers the BinOp to an `if
 // (sh2.lastExit === 0)` / `if (sh2.lastExit !== 0)` guard, and within
 // the v1 subset every expressible command SUCCEEDS on both sides — the
@@ -2195,7 +2195,7 @@ func lowerParenTernary(e *sitter.Node, src []byte) ([]any, bool, error) {
 // `Write-Output (1 + 2)` prints `3`, `Write-Output (7 / 2)` prints
 // `3.5` — the standard v1 single-object echo mapping, so the argument
 // lowers to ONE A1 Arith expression (the core's `echo $((1+2))`
-// emission, byte-identical — verified against `debashc --shir --raw`;
+// emission, byte-identical — verified against `otranspilerl-cli --shir --raw`;
 // the A1→ESTree renderer lowers + - * to native JS arithmetic and %
 // to the bash-semantics runtime helper, and the executed-stdout oracle
 // matches live pwsh by construction). The t36 subset pins an
@@ -3332,7 +3332,7 @@ func lowerExpandableHereStringParts(n *sitter.Node, src []byte) ([]any, error) {
 // `echo "a $(echo b) c"` as exec echo with an Interpolate part whose
 // expr is `{"func":"capture","args":[{"type":"Arrow","body":
 // [Expr echo b]}],"purity":"Spawn","type":"Call"}` (verified
-// against `debashc --shir --raw`), and the A1→ESTree renderer lowers
+// against `otranspilerl-cli --shir --raw`), and the A1→ESTree renderer lowers
 // that shape to a runtime capture (the executed-stdout oracle matches
 // live pwsh by construction: both print `a b c`). The t30 subset pins
 // the body as exactly ONE plain command (the t26 chainOperand

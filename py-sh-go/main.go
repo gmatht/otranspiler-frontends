@@ -15,7 +15,7 @@
 //	with open(...) as fh: fh.write(...)      → Redirect (echo > file)
 //
 // The emitted A1 shIR JSON uses EXACTLY the node shapes the core's
-// `debashc --shir` produces for the equivalent shell source, so the
+// `otranspilerl-cli --shir` produces for the equivalent shell source, so the
 // ESTree backend (`--shir-in-estree` + harness/estree-runner.mjs)
 // renders and executes it. Only statements the ESTree renderer accepts
 // are emitted (Expr/Assign/If/While/For/Function/... — the Perl-only

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # demo.sh — the REAL language frontends → ShIR → the JS backend.
 #
-# Pipeline:  source → <frontend> → ShIR JSON (A1 contract) → debashc
-#            --shir-in-estree → ESTree JSON → estree-runner → JS output
+# Pipeline:  source → <frontend> → ShIR JSON (A1 contract) → otranspilerl-cli
+#            - --target estree → ESTree JSON → estree-runner → JS output
 #
 # Frontends (frontends/, each a hand-rolled lexer+parser+emitter):
 #   posix-sh-go  — a POSIX-shell-subset frontend (the strongest)
@@ -12,10 +12,10 @@
 #
 # Evaluation: (1) does the pipeline run, (2) does the JS output match the
 # reference, (3) frontend ShIR byte-equality vs the CORE frontend
-# (debashc --shir — the frontends' oracle).
+# (otranspilerl-cli --shir — the frontends' oracle).
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-DEBASHC="$ROOT/sh2perl/target/debug/debashc"
+CLI="$ROOT/otranspilerl/target/debug/otranspilerl-cli"
 RUNNER="node $ROOT/harness/estree-runner.mjs"
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 
@@ -28,7 +28,7 @@ EOF
 
 echo "=== 1. the pipeline (posix-sh-go → ShIR → JS backend) ==="
 frontends/posix-sh-go/posix-sh-go --shir "$TMP/in.sh" --raw 2>/dev/null > "$TMP/p.json"
-$DEBASHC --shir-in-estree "$TMP/p.json" 2>/dev/null > "$TMP/p_e.json"
+$(CLI) - --target estree < "$TMP/p.json" 2>/dev/null > "$TMP/p_e.json"
 echo "--- the generated JS (estree-gen view):"
 node --input-type=module -e "
 import { generate } from '$ROOT/harness/estree-gen.mjs';
@@ -45,7 +45,7 @@ echo "=== 2. all shell frontends on a small battery ==="
 run_one() { # frontend input → JS output
   local f=$1 src=$2
   if frontends/$f/$f --shir "$src" --raw 2>/dev/null > "$TMP/o.json"; then
-    $DEBASHC --shir-in-estree "$TMP/o.json" 2>/dev/null > "$TMP/o_e.json" \
+    $(CLI) - --target estree < "$TMP/o.json" 2>/dev/null > "$TMP/o_e.json" \
       && $RUNNER "$TMP/o_e.json" --source "$src" 2>/dev/null | tr '\n' '|'
   else
     printf 'FRONTEND-ERR'
@@ -77,7 +77,7 @@ EOF
 if frontends/go-sh/go-sh --shir "$TMP/in.go" --raw 2>/dev/null > "$TMP/g.json"; then
   echo "--- the Go source lowered to ShIR (stmts):"
   node -e "const j=JSON.parse(require('fs').readFileSync('$TMP/g.json','utf8')); console.log(j.stmts.map(s=>s.type).join(','));"
-  $DEBASHC --shir-in-estree "$TMP/g.json" 2>/dev/null > "$TMP/g_e.json" \
+  $(CLI) - --target estree < "$TMP/g.json" 2>/dev/null > "$TMP/g_e.json" \
     && $RUNNER "$TMP/g_e.json" --source "$TMP/in.go" 2>/dev/null
 else
   echo "(go-sh rejected the input — its v1 subset is fmt.Println / := / = of LITERALS; a non-literal expression like n+2 is refused)"
@@ -87,7 +87,7 @@ echo
 echo "=== 4. the frontends' oracle: byte-equality with the CORE frontend ==="
 for f in posix-sh-go perl-sh-go py-sh-go; do
   if frontends/$f/$f --shir "$TMP/in.sh" --raw 2>/dev/null > "$TMP/f.json"; then
-    $DEBASHC --shir "$TMP/in.sh" --raw 2>/dev/null > "$TMP/core.json"
+    "$CLI" "$TMP/in.sh" --source-lang sh --target shir --raw 2>/dev/null > "$TMP/core.json"
     if diff -q "$TMP/f.json" "$TMP/core.json" >/dev/null 2>&1; then
       echo "$f: byte-identical to the core frontend ✓"
     else

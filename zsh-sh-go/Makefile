@@ -4,15 +4,15 @@
 # var-type analysis + A1 JSON emitter in analysis.go), extended for the zsh
 # corpus: `[[ ]]`/`(( ))` conditions, bare `$a[2]` array indexes,
 # `f() {` bodies, heredocs (`<<EOF`). `test` runs the BYTE-EQUALITY ORACLE
-# vs the core's `debashc --shir FILE --raw` — the emitted JSON must be
+# vs the core's `otranspilerl-cli --shir FILE --raw` — the emitted JSON must be
 # byte-identical (the A1 contract). A passing test = real progress
 # (correct output); a mismatch = the gap to fix.
 
 ANTLR4 ?= antlr4
-DEBASHC ?= $(abspath ../../sh2perl/target/debug/debashc)
+CLI ?= $(abspath ../../otranspilerl/target/debug/otranspilerl-cli)
 GO ?= /snap/go/current/bin/go
-# Per-gate oracle snapshot (see harness/snapshot-debashc.sh): concurrent
-# workers rebuild target/debug/debashc mid-gate (estree worker core
+# Per-gate oracle snapshot (see harness/snapshot-otranspilerl-cli.sh): concurrent
+# workers rebuild target/debug/otranspilerl-cli mid-gate (estree worker core
 # changes; other gates' self-heal rules), and a torn binary wedges ONE
 # test with a misleading FAIL (t71_var_name_mods, 2026-08-12 20:55:24).
 # The byte-equality phase and the stdout harness both run the stable
@@ -22,14 +22,14 @@ GO ?= /snap/go/current/bin/go
 # invocation (build/all/clean/gen) leak one ~20MB dir; the worker only
 # runs `make test` (trap-cleaned below), but a manual `make build` leaked
 # one dir per run. $(if) expands only the taken branch, so a non-test
-# goal never runs mktemp. (GATE_DEBASHC is a `:=` after this, so the
+# goal never runs mktemp. (GATE_CLI is a `:=` after this, so the
 # value is fixed at parse for test/worker runs.)
 GATE_TMP := $(if $(filter test worker,$(MAKECMDGOALS)),$(shell mktemp -d /tmp/zsh-sh-go-gate.XXXXXX),/nonexistent-gate-tmp)
-GATE_DEBASHC := $(GATE_TMP)/debashc
+GATE_CLI := $(GATE_TMP)/otranspilerl-cli
 
-$(GATE_DEBASHC): $(DEBASHC)
-	@bash "$(abspath ../../harness/snapshot-debashc.sh)" $(DEBASHC) $@ \
-	  || { echo "FAIL: no verified debashc snapshot (concurrent rebuild?)"; exit 1; }
+$(GATE_CLI): $(CLI)
+	@bash "$(abspath ../../harness/snapshot-otranspilerl-cli.sh)" $(CLI) $@ \
+	  || { echo "FAIL: no verified otranspilerl-cli snapshot (concurrent rebuild?)"; exit 1; }
 
 .PHONY: all gen build test worker clean
 
@@ -71,15 +71,15 @@ build:
 # byte-equality (executed-stdout is the semantic anchor; byte-equality is
 # only a conformance net where the core parses faithfully). `${#x}` /
 # `${#a[@]}` (length) have no subscript and stay byte-compared.
-# Self-heal the byte-equality oracle too: a missing core debashc binary
+# Self-heal the byte-equality oracle too: a missing core otranspilerl-cli binary
 # (fresh checkout, interrupted core build) wedges the gate as a confusing
 # "FAIL <file> (core)". Build it on demand; the oracle is read-only here.
-$(DEBASHC):
-	cd $(abspath ../../sh2perl) && cargo build --bin debashc
+$(CLI):
+	cd $(abspath ../../otranspilerl) && cargo build --bin otranspilerl-cli
 
-test: build $(GATE_DEBASHC)
+test: build $(GATE_CLI)
 	# GATE_TMP is a per-invocation mktemp dir; without a trap the worker's
-	# 5-min gate loop leaks one ~20MB debashc snapshot per run (~5.8GB/day
+	# 5-min gate loop leaks one ~20MB otranspilerl-cli snapshot per run (~5.8GB/day
 	# when /tmp fills, mktemp fails and the gate wedges with a spurious
 	# FAIL). Clean it on exit (success or failure) from ONE shell covering
 	# both phases.
@@ -87,7 +87,7 @@ test: build $(GATE_DEBASHC)
 	for f in testdata/*.zsh; do \
 	  bn=$$(basename $$f); \
 	  ./zsh-sh-go --shir $$f --raw > /tmp/$$bn.mine 2>/dev/null || { echo "FAIL $$bn (frontend)"; exit 1; }; \
-	  $(GATE_DEBASHC) --shir $$f --raw > /tmp/$$bn.core 2>/dev/null || { echo "FAIL $$bn (core)"; exit 1; }; \
+	  $(GATE_CLI) --shir $$f --raw > /tmp/$$bn.core 2>/dev/null || { echo "FAIL $$bn (core)"; exit 1; }; \
 	  if grep -qEf "$(abspath ../../harness/zsh-subscript.ere)" "$$f"; then \
 	    echo "OK $$bn (array-subscript file — byte-equality waived; stdout oracle only)"; \
 	  elif diff -q /tmp/$$bn.mine /tmp/$$bn.core > /dev/null; then \
@@ -99,7 +99,7 @@ test: build $(GATE_DEBASHC)
 	  fi; \
 	done; \
 	echo "--- executed-stdout comparison (native vs JS/ESTree) ---"; \
-	bash "$(abspath ../../harness/frontend-stdout.sh)" zsh ./zsh-sh-go testdata "$(GATE_DEBASHC)"
+	bash "$(abspath ../../harness/frontend-stdout.sh)" zsh ./zsh-sh-go testdata "$(GATE_CLI)"
 
 worker: test
 	@echo "zsh-sh-go worker gate: ingress acceptance + executed-stdout passed"

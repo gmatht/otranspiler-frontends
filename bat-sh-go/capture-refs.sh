@@ -27,7 +27,7 @@ set -euo pipefail
 dir="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$dir/../.." && pwd)"
 refs="$dir/refs"
-debashc="$root/sh2perl/target/debug/debashc"
+cli="$root/otranspilerl/target/debug/otranspilerl-cli"
 runner="$root/harness/estree-runner.mjs"
 
 stage_refs() {
@@ -79,7 +79,7 @@ verify_refs() {
       # a frontend REFUSAL (unsupported construct) is not a semantics bug —
       # report SKIP and move on, so --verify only flags true mismatches
       if ! "$dir/bat-sh-go" --shir "$f" --raw 2>/dev/null \
-          | "$debashc" --shir-in-estree - 2>/dev/null > /tmp/refs_estree.json; then
+          | "$cli" - --target estree 2>/dev/null > /tmp/refs_estree.json; then
         echo "SKIP $bn (frontend refuses — unsupported construct)"
         continue
       fi

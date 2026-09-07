@@ -5,11 +5,11 @@
 # (cmd) subs); `build` compiles it (the antlr4 generation from
 # grammars/FishLexer.g4 + FishParser.g4 is the WORKER's job). `test` runs
 # the INGRESS-ACCEPTANCE gate: the emitted A1 shIR JSON must be VALID (the
-# core's deserializer accepts it via --shir-in-estree). Fish is not
-# POSIX-compatible, so byte-equality vs debashc --shir is impossible —
+# core's deserializer accepts it via `- --target estree`). Fish is not
+# POSIX-compatible, so byte-equality vs otranspilerl-cli --shir is impossible —
 # the progress signal is valid A1 shIR from the renderer-safe subset.
 ANTLR4 ?= antlr4
-DEBASHC ?= $(abspath ../../sh2perl/target/debug/debashc)
+CLI ?= $(abspath ../../otranspilerl/target/debug/otranspilerl-cli)
 GO ?= /snap/go/current/bin/go
 
 .PHONY: all gen build test worker clean
@@ -23,22 +23,22 @@ gen:
 build:
 	$(GO) build -o fish-sh-go ./cmd/fish-sh-go
 
-# Self-heal the ingress oracle too: a missing core debashc binary (fresh
+# Self-heal the ingress oracle too: a missing core otranspilerl-cli binary (fresh
 # checkout, interrupted core build) wedges the gate as a confusing
 # "FAIL <file> (emit is not valid A1 shIR)". Build it on demand; the
 # oracle is read-only here (mirrors zsh-sh-go/Makefile).
-$(DEBASHC):
-	cd $(abspath ../../sh2perl) && cargo build --bin debashc
+$(CLI):
+	cd $(abspath ../../otranspilerl) && cargo build --bin otranspilerl-cli
 
-test: build $(DEBASHC)
+test: build $(CLI)
 	@for f in testdata/*.fish; do \
 	  bn=$$(basename $$f); \
 	  ./fish-sh-go --shir $$f --raw > /tmp/$$bn.mine 2>/dev/null || { echo "FAIL $$bn (frontend emit)"; exit 1; }; \
-	  if $(DEBASHC) --shir-in-estree /tmp/$$bn.mine > /dev/null 2>&1; then \
+	  if $(CLI) - --target estree < /tmp/$$bn.mine > /dev/null 2>&1; then \
 	    echo "OK $$bn (valid A1 shIR — the core deserializer accepts it)"; \
 	  else \
 	    sleep 3; \
-	    if $(DEBASHC) --shir-in-estree /tmp/$$bn.mine > /dev/null 2>&1; then \
+	    if $(CLI) - --target estree < /tmp/$$bn.mine > /dev/null 2>&1; then \
 	      echo "OK $$bn (valid A1 shIR — the core deserializer accepts it)"; \
 	    else \
 	      echo "FAIL $$bn (emit is not valid A1 shIR — the gap the worker fixes)"; \
@@ -47,7 +47,7 @@ test: build $(DEBASHC)
 	  fi; \
 	done
 	@echo "--- executed-stdout comparison (native vs JS/ESTree) ---"
-	@bash "$(abspath ../../harness/frontend-stdout.sh)" fish ./fish-sh-go testdata "$(DEBASHC)" || exit 1
+	@bash "$(abspath ../../harness/frontend-stdout.sh)" fish ./fish-sh-go testdata "$(CLI)" || exit 1
 
 worker: test
 	@echo "fish-sh-go worker gate: ingress acceptance + executed-stdout passed"

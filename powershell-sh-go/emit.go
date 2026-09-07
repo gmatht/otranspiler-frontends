@@ -97,7 +97,7 @@ func arrowExpr(body []any) any {
 // output — `Write-Output "a $(Write-Output b) c"` prints `a b c` —
 // EXACTLY the core's bash command-substitution semantics, so the
 // lowering is the core's capture shape, byte-identical to `echo "a
-// $(echo b) c"` (verified against `debashc --shir --raw`):
+// $(echo b) c"` (verified against `otranspilerl-cli --shir --raw`):
 // {"func":"capture","args":[{"type":"Arrow","body":[...]}],
 // "purity":"Spawn","type":"Call"}.
 func captureExpr(body []any) any {

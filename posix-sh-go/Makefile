@@ -2,12 +2,12 @@
 # WORKER REWRITE (2026-08-05): main.go is a faithful hand-rolled port of the
 # core frontend (lexer+parser in main.go, lowering in lowering.go, A2
 # var-type analysis + A1 JSON emitter in analysis.go). `test` runs the
-# BYTE-EQUALITY ORACLE vs the core's `debashc --shir FILE --raw` — the
+# BYTE-EQUALITY ORACLE vs the core's `otranspilerl-cli --shir FILE --raw` — the
 # emitted JSON must be byte-identical (the A1 contract). A passing test =
 # real progress (correct output); a mismatch = the gap to fix.
 
 ANTLR4 ?= antlr4
-DEBASHC ?= $(abspath ../../sh2perl/target/debug/debashc)
+CLI ?= $(abspath ../../otranspilerl/target/debug/otranspilerl-cli)
 GO ?= /snap/go/current/bin/go
 
 .PHONY: all gen build test worker clean
@@ -41,7 +41,7 @@ test: build
 	@for f in testdata/*.sh; do \
 	  bn=$$(basename $$f); \
 	  ./posix-sh-go --shir $$f --raw > /tmp/$$bn.mine 2>/dev/null || { echo "FAIL $$bn (frontend)"; exit 1; }; \
-	  $(DEBASHC) --shir $$f --raw > /tmp/$$bn.core 2>/dev/null || { echo "FAIL $$bn (core)"; exit 1; }; \
+	  $(CLI) $$f --source-lang sh --target shir --raw > /tmp/$$bn.core 2>/dev/null || { echo "FAIL $$bn (core)"; exit 1; }; \
 	  if diff -q /tmp/$$bn.mine /tmp/$$bn.core > /dev/null; then \
 	    echo "OK $$bn (byte-equal)"; \
 	  else \
@@ -51,7 +51,7 @@ test: build
 	  fi; \
 	done
 	@echo "--- executed-stdout comparison (native vs JS/ESTree) ---"
-	@bash "$(abspath ../../harness/frontend-stdout.sh)" sh ./posix-sh-go testdata "$(DEBASHC)" || exit 1
+	@bash "$(abspath ../../harness/frontend-stdout.sh)" sh ./posix-sh-go testdata "$(CLI)" || exit 1
 
 worker: test
 	@echo "posix-sh-go worker gate: byte-equality + executed-stdout passed"

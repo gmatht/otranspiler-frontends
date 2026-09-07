@@ -3,15 +3,15 @@
 # shell-flavored subset; `build` compiles it (the antlr4 generation from
 # grammars/GoLexer.g4 + GoParser.g4 is the WORKER's job — not a build
 # blocker). `test` runs the BYTE-EQUALITY ORACLE vs the core's
-# `debashc --shir`. A passing test = real progress (correct output); a
+# `otranspilerl-cli --shir`. A passing test = real progress (correct output); a
 # mismatch = the gap the worker's pi should fix.
 
 ANTLR4 ?= antlr4
-DEBASHC ?= $(abspath ../../sh2perl/target/debug/debashc)
+CLI ?= $(abspath ../../otranspilerl/target/debug/otranspilerl-cli)
 BUILD_LOCK ?= $(abspath ../../harness/build-lock.sh)
 GO ?= /snap/go/current/bin/go
 
-.PHONY: all gen build test debashc-oracle worker clean
+.PHONY: all gen build test otranspilerl-cli-oracle worker clean
 
 all: build
 
@@ -25,18 +25,18 @@ all: build
 # not valid A1 shIR". Known stale-cache failure (serde 1.0.229 artifacts
 # vs a reverted 1.0.226 lockfile) is retried once after cleaning just
 # those packages; a genuinely broken core tree still fails honestly.
-debashc-oracle:
-	@if [ -x "$(DEBASHC)" ]; then :; else \
-	  echo "oracle $$(basename $(DEBASHC)) missing — rebuilding via build-lock.sh"; \
-	  if "$(BUILD_LOCK)" --role backend -- cargo build --manifest-path "$(abspath ../../sh2perl/Cargo.toml)" --bin debashc; then \
+otranspilerl-cli-oracle:
+	@if [ -x "$(CLI)" ]; then :; else \
+	  echo "oracle $$(basename $(CLI)) missing — rebuilding via build-lock.sh"; \
+	  if "$(BUILD_LOCK)" --role backend -- cargo build --manifest-path "$(abspath ../../otranspilerl/Cargo.toml)" --bin otranspilerl-cli; then \
 	    echo "oracle rebuilt"; \
 	  else \
 	    echo "oracle build failed — stale serde cache? cleaning serde artifacts and retrying once"; \
-	    if "$(BUILD_LOCK)" --role backend -- cargo clean --manifest-path "$(abspath ../../sh2perl/Cargo.toml)" -p serde_derive -p serde -p serde_core \
-	        && "$(BUILD_LOCK)" --role backend -- cargo build --manifest-path "$(abspath ../../sh2perl/Cargo.toml)" --bin debashc; then \
+	    if "$(BUILD_LOCK)" --role backend -- cargo clean --manifest-path "$(abspath ../../otranspilerl/Cargo.toml)" -p serde_derive -p serde -p serde_core \
+	        && "$(BUILD_LOCK)" --role backend -- cargo build --manifest-path "$(abspath ../../otranspilerl/Cargo.toml)" --bin otranspilerl-cli; then \
 	      echo "oracle rebuilt after serde cache clean"; \
 	    else \
-	      echo "FAIL (oracle unavailable — could not build debashc; the core tree may be mid-WIP)"; \
+	      echo "FAIL (oracle unavailable — could not build otranspilerl-cli; the core tree may be mid-WIP)"; \
 	      exit 1; \
 	    fi; \
 	  fi; \
@@ -52,15 +52,15 @@ gen:
 build:
 	$(GO) build -o go-sh ./cmd/go-sh
 
-test: build debashc-oracle
+test: build otranspilerl-cli-oracle
 	@mkdir -p .test-tmp && trap 'rm -rf .test-tmp' EXIT; \
 	for f in testdata/*.go; do \
 	  bn=$$(basename $$f); \
 	  ./go-sh --shir $$f --raw > .test-tmp/$$bn.mine 2>/dev/null || { echo "FAIL $$bn (frontend emit)"; exit 1; }; \
 	  # Ingress acceptance: the core consumes SHELL, not go source, so \
-	  # byte-equality vs debashc --shir is impossible. The progress signal \
+	  # byte-equality vs otranspilerl-cli --shir is impossible. The progress signal \
 	  # is: the emitted A1 shIR JSON is VALID (the core's deserializer \
-	  # accepts it via --shir-in-estree). \
+	  # accepts it via `- --target estree`). \
 	  # A non-empty emit is required: an empty/truncated file (e.g. a full \
 	  # scratch disk) must report "frontend emit", never a misleading \
 	  # "not valid A1 shIR". The corpus dir is repo-local so a full /tmp \
@@ -68,7 +68,7 @@ test: build debashc-oracle
 	  if [ ! -s .test-tmp/$$bn.mine ]; then \
 	    echo "FAIL $$bn (frontend emit — empty/truncated output)"; exit 1; \
 	  fi; \
-	  if $(DEBASHC) --shir-in-estree .test-tmp/$$bn.mine > /dev/null 2>&1; then \
+	  if $(CLI) - --target estree < .test-tmp/$$bn.mine > /dev/null 2>&1; then \
 	    echo "OK $$bn (valid A1 shIR — the core deserializer accepts it)"; \
 	  else \
 	    echo "FAIL $$bn (emit is not valid A1 shIR — the gap the worker fixes)"; \
@@ -76,7 +76,7 @@ test: build debashc-oracle
 	  fi; \
 	done
 	@echo "--- executed-stdout comparison (native vs JS/ESTree) ---"
-	@bash "$(abspath ../../harness/frontend-stdout.sh)" go ./go-sh testdata "$(DEBASHC)" || exit 1
+	@bash "$(abspath ../../harness/frontend-stdout.sh)" go ./go-sh testdata "$(CLI)" || exit 1
 
 worker: test
 	@echo "go-sh worker gate: ingress acceptance + executed-stdout passed"

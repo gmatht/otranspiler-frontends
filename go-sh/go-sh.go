@@ -4,7 +4,7 @@
 // real tokenizer + recursive-descent parser for the v2 Go subset, with a
 // lowering pass that emits the EXACT A1 node shapes the core frontend
 // produces for the equivalent shell construct (verified against
-// `debashc file --shir` on the paired posix-sh-go testdata, which shares
+// `otranspilerl-cli file --shir` on the paired posix-sh-go testdata, which shares
 // the t01..t52 corpus). The A1 contract (sh2perl/src/shir_json.rs +
 // shir_json_in.rs) is the source of truth; the deserializer's ingress
 // gate is the Makefile test's acceptance criterion.
@@ -6108,7 +6108,7 @@ func (p *parser) ifInitStatAhead() bool {
 
 // readFileIfCond: the `if b, err := os.ReadFile(p); err (==|!=) nil`
 // cond — byte-identical to the core's `if b=$(cat p); then` /
-// `if ! b=$(cat p); then` lowering (verified against `debashc file
+// `if ! b=$(cat p); then` lowering (verified against `otranspilerl-cli file
 // --shir`): Call{func:"assign", args:[Str(name), Str("="),
 // Capture{native:false, expr:Arrow{body:[Expr exec cat …]}}]}, wrapped
 // in the Not BinOp for err != nil (lhs+rhs both carry the assign,
@@ -6319,7 +6319,7 @@ func (p *parser) parseIf() []map[string]any {
 		// whole-file read: the read's SUCCESS is the branch condition,
 		// the `if b=$(cat p); then` shape (Call func=assign wrapping a
 		// Capture — byte-identical to the core's own lowering of the
-		// shell form, verified against debashc file --shir). err == nil
+		// shell form, verified against otranspilerl-cli file --shir). err == nil
 		// → the assign cond; err != nil → the core's `if ! b=$(cat p)`
 		// Not BinOp (lhs+rhs both carry the assign). Any other
 		// condition refuses loudly (Refuse > guess).

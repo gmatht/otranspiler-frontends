@@ -4,7 +4,7 @@
 # `test` runs INGRESS-ACCEPTANCE (the core deserializer accepts the
 # emitted A1) + the EXECUTED-STDOUT gate (native gcc run vs the A1->
 # ESTree->JS run must match). Unsupported constructs REFUSE (exit 1).
-DEBASHC ?= $(abspath ../../sh2perl/target/debug/debashc)
+CLI ?= $(abspath ../../otranspilerl/target/debug/otranspilerl-cli)
 GO ?= /snap/go/current/bin/go
 # per-gate scratch dir (unique via mktemp -d): concurrent gates never
 # share filenames (the shared-scratch race that caused transient FAILs).
@@ -29,19 +29,19 @@ build:
 	    || { rm -f c-sh-go.new.$$; exit 1; }; \
 	fi
 
-# Self-heal the ingress oracle too: a missing core debashc binary (fresh
+# Self-heal the ingress oracle too: a missing core otranspilerl-cli binary (fresh
 # checkout, interrupted core build) wedges the gate as a confusing
 # "FAIL <file> (emit is not valid A1 shIR)". Build it on demand; the
 # oracle is read-only here.
-$(DEBASHC):
-	cd $(abspath ../../sh2perl) && cargo build --bin debashc
+$(CLI):
+	cd $(abspath ../../otranspilerl) && cargo build --bin otranspilerl-cli
 
-test: build $(DEBASHC)
+test: build $(CLI)
 	@for f in testdata/*.c; do \
 	  bn=$$(basename $$f); \
 	  ./c-sh-go --shir $$f --raw > $(SCRATCH)/$$bn.mine 2>/dev/null || { echo "FAIL $$bn (frontend emit)"; exit 1; }; \
 	  python3 $(abspath ../../harness/outparam_to_returns.py) < $(SCRATCH)/$$bn.mine > $(SCRATCH)/$$bn.out.json 2>/dev/null && mv $(SCRATCH)/$$bn.out.json $(SCRATCH)/$$bn.mine; \
-	  if $(DEBASHC) --shir-in-estree $(SCRATCH)/$$bn.mine > /dev/null 2>&1; then \
+	  if $(CLI) - --target estree < $(SCRATCH)/$$bn.mine > /dev/null 2>&1; then \
 	    echo "OK $$bn (valid A1 shIR — the core deserializer accepts it)"; \
 	  else \
 	    echo "FAIL $$bn (emit is not valid A1 shIR — the gap the worker fixes)"; \
@@ -50,7 +50,7 @@ test: build $(DEBASHC)
 	done
 	@rm -rf $(SCRATCH)
 	@echo "--- executed-stdout comparison (native gcc vs JS/ESTree) ---"
-	@bash "$(abspath ../../harness/frontend-stdout.sh)" c ./c-sh-go testdata "$(DEBASHC)" || exit 1
+	@bash "$(abspath ../../harness/frontend-stdout.sh)" c ./c-sh-go testdata "$(CLI)" || exit 1
 
 worker: test
 	@echo "c-sh-go worker gate: ingress acceptance + executed-stdout passed"

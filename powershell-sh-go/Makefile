@@ -6,7 +6,7 @@
 # expectations — pwsh is not installed on the fleet boxes, so
 # harness/frontend-stdout.sh compares the transpiled run against the
 # native_limits_powershell records, the bat precedent).
-DEBASHC ?= $(abspath ../../sh2perl/target/debug/debashc)
+CLI ?= $(abspath ../../otranspilerl/target/debug/otranspilerl-cli)
 GO ?= go
 SCRATCH := $(shell { [ -w $(abspath .gate-tmp) ] || rm -rf $(abspath .gate-tmp); mkdir -p $(abspath .gate-tmp) && mktemp -d $(abspath .gate-tmp)/gate.XXXXXX; } 2>/dev/null || mktemp -d /tmp/powershell-sh-go-gate.XXXXXX)
 
@@ -23,10 +23,10 @@ build:
 	    || { rm -f powershell-sh-go.new.$$; exit 1; }; \
 	fi
 
-$(DEBASHC):
-	cd $(abspath ../../sh2perl) && cargo build --bin debashc
+$(CLI):
+	cd $(abspath ../../otranspilerl) && cargo build --bin otranspilerl-cli
 
-test: build $(DEBASHC)
+test: build $(CLI)
 	@test -n "$(SCRATCH)" || { echo "FAIL: cannot create gate scratch dir"; exit 1; }
 	@echo "--- refusals: testdata_refuse/*.ps1 must FAIL loudly ---"
 	@for f in testdata_refuse/*.ps1; do \
@@ -37,18 +37,18 @@ test: build $(DEBASHC)
 	    echo "OK $$bn (refused loudly: $$(head -1 $(SCRATCH)/refuse.err))"; \
 	  fi; \
 	done
-	@echo "--- expressible: ingress acceptance (debashc --shir-in-estree) ---"
+	@echo "--- expressible: ingress acceptance (otranspilerl-cli - --target estree) ---"
 	@for f in testdata/*.ps1; do \
 	  bn=$$(basename $$f); \
 	  ./powershell-sh-go --shir $$f --raw > $(SCRATCH)/$$bn.mine 2>/dev/null || { echo "FAIL $$bn (frontend emit)"; exit 1; }; \
-	  if $(DEBASHC) --shir-in-estree $(SCRATCH)/$$bn.mine > /dev/null 2>&1; then \
+	  if $(CLI) - --target estree < $(SCRATCH)/$$bn.mine > /dev/null 2>&1; then \
 	    echo "OK $$bn (valid A1 shIR — the core deserializer accepts it)"; \
 	  else \
 	    echo "FAIL $$bn (emit is not valid A1 shIR)"; exit 1; \
 	  fi; \
 	done
 	@echo "--- executed-stdout comparison (live pwsh vs JS/ESTree) ---"
-	@bash "$(abspath ../../harness/frontend-stdout.sh)" powershell ./powershell-sh-go testdata "$(DEBASHC)" || exit 1
+	@bash "$(abspath ../../harness/frontend-stdout.sh)" powershell ./powershell-sh-go testdata "$(CLI)" || exit 1
 	@rm -rf $(SCRATCH)
 
 worker: test
