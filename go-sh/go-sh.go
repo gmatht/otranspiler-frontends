@@ -5318,10 +5318,11 @@ func (p *parser) parseAssignStmt() []map[string]any {
 				// exprToWord (getVar after resolve): one element per
 				// appended VALUE, no field-splitting (Go semantics).
 				elems = append(elems, p.exprToWord(a))
-			case "call", "index", "member", "fieldof", "add":
-				// computed elements ride as words (captures/reads;
-				// "add" = string concatenation: zig-sh-go's
-				// `params = append(params, pt+" "+pn.text)`)
+			case "call", "index", "member", "fieldof", "add", "slice":
+				// computed elements ride as words (captures/reads; "add" =
+				// string concatenation: zig-sh-go's
+				// `params = append(params, pt+" "+pn.text)`; "slice" = the
+				// golib's `append(parts, src[i:])` A1-builder calls)
 				elems = append(elems, p.exprToWord(a))
 			default:
 				if a.spread {
@@ -6172,6 +6173,29 @@ func (p *parser) parseIf() []map[string]any {
 				keyWord = strExpr(val.idx1)
 			}
 			w = assocHasCall(val.target.name, keyWord)
+		} else if val.kind == "index" && val.target != nil && val.target.kind == "member" {
+			// `_, ok := p.structFields[k]` — presence in a STRUCT's map
+			// field (jsonHas). The key word resolves at runtime.
+			if i := strings.LastIndex(val.target.name, "."); i > 0 {
+				base, field := val.target.name[:i], val.target.name[i+1:]
+				if p.varTypes[p.resolveVar(base)] == "Struct" {
+					var keyWord map[string]any
+					if val.idx1e != nil {
+						keyWord = p.exprToWord(val.idx1e)
+					} else {
+						keyWord = strExpr(val.idx1)
+					}
+					w = map[string]any{
+						"type": "Call", "func": "jsonHas",
+						"args":   []any{strExpr(p.resolveVar(base)), strExpr(field), keyWord},
+						"purity": "PureCpu",
+					}
+				} else {
+					w = p.exprToWord(val)
+				}
+			} else {
+				w = p.exprToWord(val)
+			}
 		} else {
 			w = p.exprToWord(val)
 		}
