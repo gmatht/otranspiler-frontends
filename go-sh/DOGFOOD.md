@@ -16,10 +16,62 @@ native behavior (`go run`). The gates:
 
 | gate | green |
 |---|---|
-| corpus Go→JS (`fail-go`) | **93/93** |
+| corpus Go→JS (`fail-go`) | **98/98** |
 | corpus Go→Rust (`fail-go --rust`) | 41/88 (rust backend `sh2.*` stubs: assoc arrays, argv, etc. — backend gap, per-target) |
 | Go idiom ladder (47 templates, mined from the app + seeded) | 42/47 (4 contract boundaries + 1 documented nondeterministic) |
-| app integration (the CLI, `fail-go --app`) | red — EMIT-FAIL (frontier, see below) |
+| app integration (the CLI, `fail-go --app`) | **green** — the no-args oracle (usage → stderr, exit 2) is reproduced by the translated JS |
+| cpp CLI integration (`fail-go --app frontends/cpp-sh-go/cmd/cpp-sh-go/main.go`) | **green** — the cpp frontend's CLI transpiles Go→JS and reproduces its no-args behavior |
+
+### New idioms landed (this pass — the app gate)
+
+**The CLI (`cmd/go-sh/main.go`) now transpiles Go→JS end-to-end** and the
+translated JS reproduces the native no-args behavior (usage message to
+stderr, `os.Exit(2)`). The `fail-go --app` gate is green. Landed
+constructs (all probe-verified in the ladder, t93–t95):
+
+- **bool literals**: `raw := false` lowers to `raw = "false"` — a
+  LITERAL, never a `$false` var read (the old lowering read a var named
+  "false", which the runtime resolves to ""). `true`/`false` are
+  keywords, not vars (probe `t93_bool_literal`).
+- **bare-var conditions**: `if raw` / `if !raw` on a bool var → the
+  `"$raw"="true"` test (the Not twin wraps it in `!`). Go conditions
+  are bools, so any bare-var condition IS a bool var (probe
+  `t93_bool_literal`).
+- **multi-target assign from a single call**: `out, err :=
+  golib.Shir(src)` — a call returning (value, error) lowers to
+  `out = $(Shir "$src")` (the function-call capture shape; the A1 has
+  no cross-package calls, so a package-qualified callee lowers to a
+  shell sub of its last name component), the error target dropped
+  (mirroring strconv.Atoi/os.ReadFile). DOCUMENTED APPROXIMATION: the
+  callee is never executed in the app's no-args path (the CLI exits
+  before reaching it), so the gate verifies parse + valid A1 + dead
+  code, not the call's semantics — the golib's full translation stays
+  the (a)/(d) contract boundary below.
+- **`err.Error()`**: the error value's message → the error var's value
+  (the A1 has no error objects; an error return is dropped at the call
+  site, so err is a plain var — never assigned in the expressible
+  subset, the error branch is dead code).
+- **`os.Stdout.Write(x)`**: the raw byte write WITHOUT the trailing
+  newline echo adds → `printf "%s" "$x"` (the A1 has no raw-write
+  node). The `[]byte{...}` byte-slice literal form (the CLI's
+  `os.Stdout.Write([]byte{'\n'})` newline terminator) decodes its char
+  elements to the literal bytes (probe `t94_stdout_write`).
+- **empty array literal**: `a := []string{}` — the A1 Array.elements
+  must marshal to `[]`, never `null` (the core's deserializer rejects
+  null elements; shir_json.rs always collects a Vec) (probe
+  `t95_empty_array`).
+- **`os.Exit(N)` value type**: the A1 Exit value is a full expr —
+  `{"type":"Int","value":N}` (IrExpr::Int), NOT the arith "Num"
+  sub-node (shir_json_in.rs rejects "Num" at the expr boundary).
+
+**Harness (`fail-go`)**: the app oracle now runs in the go-sh module
+context — the golib import resolves only through go.mod replace
+directives (a dependency's own replaces are ignored; the main module
+must repeat them), and the app is BUILT (not `go run`, which wraps any
+non-zero exit as rc=1 + "exit status N"). The verdict now requires
+stdout AND exit code to match the oracle (the app's `os.Exit(2)` is
+part of its observable behavior); node's rc is captured directly (a
+pipeline's rc is the last command's — `tr` masked it).
 
 ### New idioms mined from the app (this pass)
 
@@ -105,19 +157,13 @@ Fixes landed in this effort (in-scope surface only):
 
 Remaining app-construct gaps (classified, queued):
 
-- **(b) frontend gaps to grow next**: `os.ReadFile`, `os.Stdout.Write`,
-  `os.Exit(code)`, `string([]byte)` conversions. LANDED this pass
-  (probe `fprintln_stderr`, green): `fmt.Fprintln(os.Stderr, …)` —
-  see the Status section. LANDED this pass (probe `range_args`, green):
-  `for _, a := range args` over a runtime-loaded array (`args :=
-  os.Args[1:]` — the CLI's argv filter loop) now lowers to the
-  `${arr[@]}` For-iter shape, ONE array-valued
-  `param("slice", name, "@", "")` element that the runtime's
-  forLoop flattens (the core emits exactly this for
-  `for x in "${arr[@]}"` — the A1 For iter is a static element
-  list whose elements are EXPRESSIONS, so the runtime-array form was
-  never a contract boundary; go-sh.go parseFor). `for i, s := range`
-  (index+value) still REFUSED — the index-binding For boundary (§1).
+- **(b) frontend gaps**: LANDED this pass (the app gate went green):
+  `os.ReadFile` (statement + if-init forms), `os.Exit(code)`,
+  `string([]byte)` conversions, `os.Stdout.Write` (var + `[]byte{...}`
+  literal forms), bool literals + bare-var conditions, multi-target
+  assign from a single (value, error) call, `err.Error()`, empty array
+  literals — see the Status section. `for i, s := range` (index+value)
+  still REFUSED — the index-binding For boundary (§1).
 - **(a)/(d) contract boundary**: structs, methods, interfaces,
   `encoding/json`, `sort` — no A1 shape; the CLI's behavior depends on
   the golib's JSON marshaler, so the full app cannot translate until the

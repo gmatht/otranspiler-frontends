@@ -59,6 +59,49 @@ C-invariant** (the c-sh-go corpus stays green — the hard line, CPP_PLAN
 §5). `make test-cpp` runs just the cpp gate; `make test-c-invariant`
 just the C-invariant.
 
+## JS-target dogfood (TRANSLATE_ONE_APPLICATION)
+
+The cpp frontend's Go source is a dogfood target of the go-sh frontend
+(the Go→JS pipeline): `./fail-go --app
+frontends/cpp-sh-go/cmd/cpp-sh-go/main.go` — the CLI transpiles Go→JS
+end-to-end and the translated JS reproduces the native no-args behavior
+(usage → stderr, exit 2). The CLI is a thin wrapper (os.Args filter,
+os.ReadFile, cppshgo.Shir call, os.Stdout.Write) — the same construct
+set the go-sh CLI's app gate exercises.
+
+The LIBRARY (`main.go` + `parser.go`) is **explicitly bounded for the
+JS target** — its full transpilation + testdata_cpp reproduction is
+blocked on four boundaries, none forkable in the frontend (Refuse >
+guess):
+
+1. **struct values** — `type tok struct{ kind, text string }`, 17
+   `tok{...}` composite literals, 36 `t.kind`/`t.text` field reads
+   (mostly on array elements: `toks[i].text`). The A1 has no struct
+   value shape — category-1 A1-EXTENSION, core request
+   `go-sh-structtype-20260814-054454` (the dotted member-key contract).
+   The go-sh frontend erases the struct TYPE decl (compile-time only)
+   but refuses the VALUE forms.
+2. **byte semantics** — `src[i]` byte access: Go bytes are integers
+   (the lexer's `c >= '0' && c <= '9'` digit test needs the ASCII
+   VALUE), the A1 is string-flavored. A char-string lowering is
+   faithful for `c == ' '` equality but silently mis-lowers the digit
+   test (evalArith("a") = 0 passes `-ge 0`), so the construct stays
+   REFUSED (Refuse > guess — no silent mis-lower).
+3. **cgo tree-sitter** — `parser.go`'s `treeCheck` links
+   tree-sitter-cpp via cgo; cgo cannot transpile to JS. The whitelist
+   refusal is a parser concern that stays native (the CPP_PLAN §2 wasm
+   packaging is the deferred resolution).
+4. **clib dependency** — `clib.Shir` (c-sh-go, ~5k lines) is the shared
+   C lowering, a separate Go module; the A1 emission depends on it.
+   Transpiling it is its own dogfood effort (c-sh-go's), not the cpp
+   surface's.
+
+Landed in the go-sh frontend for the cpp surface's expressible parts
+(probes t96/t98): `var m = map[K]V{...}` map literals (with bool
+values), struct type decl erasure, `[]T` types, boolean switches
+(`switch { case cond: }` → if-else chain), arithmetic comparison
+operands (`"$((i+1))" -lt "$n"`), and De Morgan `!(a && b)`.
+
 ## Worker
 
 `run_frontend_worker.sh` — failure-driven (mirror of c-sh-go's): gate
