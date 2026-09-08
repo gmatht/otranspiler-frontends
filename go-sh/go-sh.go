@@ -10109,6 +10109,12 @@ func (p *parser) condWordAny(e *expr) map[string]any {
 		return w
 	}
 	switch e.kind {
+	case "char":
+		// a Go rune literal as a comparison operand (`c == '\t'` — the
+		// golib's own lexer switch): same convention as condOperandQ —
+		// the byte's numeric-string code (byteAt renders the code, so
+		// the test compares code vs code)
+		return strExpr(charCode(e))
 	case "var":
 		name := p.resolveVar(e.name)
 		if n, ok := p.paramNumber(name); ok {

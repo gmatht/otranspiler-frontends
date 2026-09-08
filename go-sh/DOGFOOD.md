@@ -19,7 +19,7 @@ native behavior (`go run`). The gates:
 | corpus Go→JS (`fail-go`) | **98/98** |
 | corpus Go→Rust (`fail-go --rust`) | 41/88 (rust backend `sh2.*` stubs: assoc arrays, argv, etc. — backend gap, per-target) |
 | Go idiom ladder (47 templates, mined from the app + seeded) | 42/47 (4 contract boundaries + 1 documented nondeterministic) |
-| app integration (the CLI, `fail-go --app`) | **green** — the no-args oracle (usage → stderr, exit 2) is reproduced by the translated JS |
+| app integration (the CLI, `fail-go --app`) | **RED — self-parse** (2026-08-25 audit): the package-mode concat (main.go + go-sh.go + emit.go) must PARSE before the CLI's behavior can be compared, and the golib's own lexer blocked it. Landed: rune literals as comparison operands in `condWordAny` (`c == '\t'` — condOperandQ's code-vs-code convention; the lexer switch now lowers, the self-parse advanced line 115 → 898). Current blocker: **plain/field compound assign** — `p.pos += 3`, `n++`/`n--` (308 sites in the golib); only map/list-element `+=` is lowered today. The table's earlier "green" predates the golib's v2-pipeline growth; keep the gate red until the concat parses end-to-end |
 | cpp CLI integration (`fail-go --app frontends/cpp-sh-go/cmd/cpp-sh-go/main.go`) | **green** — the cpp frontend's CLI transpiles Go→JS and reproduces its no-args behavior |
 
 ### New idioms landed (this pass — the app gate)
