@@ -728,11 +728,23 @@ func (p *parser) parsePostfix() *expr {
 		switch {
 		case p.atPunct("{"):
 			// composite literal: `token{kind: tNL, line: line}` (named) or
-			// `tok{"a", "b"}` (positional) — a struct VALUE. Lowered to
-			// the jsonNew helper (the go-sh self-hosting contract: structs
-			// are JSON object strings). Only fires for a KNOWN struct type
-			// (a `3 {` for-body brace must not parse as a literal).
-			if _, ok := p.structFields[callName(e)]; !ok {
+		// `tok{"a", "b"}` (positional) — a struct VALUE. Lowered to
+		// the jsonNew helper (the go-sh self-hosting contract: structs
+		// are JSON object strings). Only fires for a KNOWN struct type
+		// (a `3 {` for-body brace must not parse as a literal).
+			// PACKAGE MODE: `&shiremit.Program{...}` — a cross-package
+		// type is qualified; the layout is keyed by the LAST segment
+		// (the concatenated package's own type decls register bare
+		// names).
+			cname := callName(e)
+			if _, ok := p.structFields[cname]; !ok {
+				if dot := strings.LastIndex(cname, "."); dot >= 0 {
+					if _, ok2 := p.structFields[cname[dot+1:]]; ok2 {
+						cname = cname[dot+1:]
+					}
+				}
+			}
+			if _, ok := p.structFields[cname]; !ok {
 				return e
 			}
 			p.pos++
@@ -759,7 +771,7 @@ func (p *parser) parsePostfix() *expr {
 					break
 				}
 			}
-			e = &expr{kind: "structlit", name: callName(e), args: fields, fieldNames: names}
+			e = &expr{kind: "structlit", name: cname, args: fields, fieldNames: names}
 		case p.atPunct("("):
 			p.pos++
 			args := p.parseArgs()
@@ -1507,6 +1519,34 @@ func (p *parser) structFieldWord(name string) (map[string]any, string) {
 }
 
 // structMemberWord: the scalar/reference read form.
+// mapRefWord: the WORD for a map VALUE reached through a struct field
+// (`p.m`) or a chained map read (`p.m[k]` → the inner mapGet's result).
+// The A1 map model stores maps by NAME, so an objGet of a map-valued
+// field yields the map's name and the inner mapGet call IS the map
+// reference for the next mapGet. Tag "map" when the target is a
+// map-typed field or a (recursively) map-typed index; "none" otherwise
+// (the caller keeps its other handlers).
+func (p *parser) mapRefWord(t *expr) (map[string]any, string) {
+	switch t.kind {
+	case "member":
+		if w, tag := p.structFieldWord(t.name); tag == "map" {
+			return w, "map"
+		}
+	case "index":
+		if t.target == nil {
+			return nil, "none"
+		}
+		if mw, tag := p.mapRefWord(t.target); tag == "map" {
+			return map[string]any{
+				"type": "Call", "func": "mapGet",
+				"args":   []any{mw, p.exprToWord(t.idx1e)},
+				"purity": "PureCpu",
+			}, "map"
+		}
+	}
+	return nil, "none"
+}
+
 func (p *parser) structMemberWord(name string) (map[string]any, bool) {
 	w, tag := p.structFieldWord(name)
 	if tag != "ref" {
@@ -3065,7 +3105,13 @@ func (p *parser) parseDottedStmt() []map[string]any {
 	// p.parseExpr() — a METHOD call on a struct (the go-sh self-hosting
 	// contract): the receiver is passed BY NAME (the method body's field
 	// accesses resolve through the param to the caller's var).
-	if p.varTypes[p.resolveVar(first)] == "Struct" {
+	// The `(` is REQUIRED: without it the statement is a field WRITE
+	// (`p.pos += 3`, `p.f = v`) on a registered receiver — after any
+	// `p.x++` the receiver's varTypes entry is "Struct", and letting
+	// this branch hijack the write made the lexer's `p.pos += 3` die
+	// with `expected "(", got "+="` (the objAdd lowering lives further
+	// down in the struct-write block, which this branch shadowed).
+	if p.varTypes[p.resolveVar(first)] == "Struct" && p.atPunct("(") {
 		p.expect(tPunct, "(")
 		args := p.parseArgs()
 		var words []map[string]any
@@ -4349,7 +4395,9 @@ func (p *parser) parseMapLiteralBody(name string) []map[string]any {
 	p.expect(tPunct, "{")
 	p.maps[name] = true
 	p.registerVar(name, "Map")
-	var body []map[string]any
+	// non-nil init: an EMPTY literal must marshal body as [],
+		// never null (the ingress rejects Block.body: not an array)
+		body := []map[string]any{}
 	for {
 		p.skipNL()
 		if p.atPunct("}") {
@@ -4685,6 +4733,55 @@ func (p *parser) parseAssignStmt() []map[string]any {
 	// map literal: name := map[K]V{ k: v, ... } → one assocSet per pair
 	// (the runtime's by-name associative-array store; t54). The body
 	// parser is shared with the `var m = map[K]V{…}` initializer path.
+	// TYPED NIL conversion `map[K]V(nil)` (the golib's
+	// `keyWord := map[string]any(nil)` placeholder): not a literal — a
+	// zero-value map. The A1 map model has no empty-map object; an inert
+	// "" placeholder reads like an absent key (mapGet of a missing key
+	// is "" — faithful). A non-nil inner expr needs a real composite
+	// (Refuse > guess).
+	if p.atIdent("map") && p.toks[p.pos+1].kind == tPunct && p.toks[p.pos+1].text == "[" {
+		// scan past the balanced [K]V type text; a `(` there = conversion.
+		// (No labeled break — the frontend parses itself, and labels are
+		// outside its Go subset.)
+		done := false
+		depth, j := 0, p.pos+1
+		for j < len(p.toks) && !done {
+			if p.toks[j].kind == tPunct {
+				switch p.toks[j].text {
+				case "[":
+					depth++
+				case "]":
+					depth--
+					if depth == 0 {
+						// the VALUE type rides after [K]: map[string]any( —
+						// skip the V ident/selector before the paren
+						for j+1 < len(p.toks) && (p.toks[j+1].kind == tIdent ||
+							(p.toks[j+1].kind == tPunct && (p.toks[j+1].text == "." || p.toks[j+1].text == "*"))) {
+							j++
+						}
+						j++
+						if j < len(p.toks) && p.toks[j].kind == tPunct && p.toks[j].text == "(" {
+							p.pos = j + 1
+							p.skipNL()
+							if !(p.atIdent("nil")) {
+								p.failf("map conversion of a non-nil expr unsupported (v2)")
+							}
+							p.pos++
+							p.skipNL()
+							p.expect(tPunct, ")")
+							if len(targets) > 1 {
+								p.failf("map conversion with multiple targets (v2)")
+							}
+							p.registerVar(targets[0], "Map")
+							return []map[string]any{assignStmt(targets[0], strExpr(""))}
+						}
+						done = true // a literal follows — the maplit path below
+					}
+				}
+			}
+			j++
+		}
+	}
 	if p.atIdent("map") {
 		me := p.parsePrimary() // the structlit expr (parsePrimary's map case)
 		allLit := true
@@ -4699,12 +4796,62 @@ func (p *parser) parseAssignStmt() []map[string]any {
 			// the assocSet lowering (t54) — reuse parseMapLiteral's body
 			// by re-parsing: the tokens are already consumed, so emit the
 			// assocSet calls directly.
+			// INLINE INDEX suffix (`op := map[string]string{…}[e.BOp]` —
+			// the golib's own op-table lookups): the map is TRANSIENT —
+			// allocate a temp name, emit its assocSets as pre-stmts, and
+			// the assign target gets mapGet(temp, key) (a missing key is
+			// "", Go's zero value for map[string]string — faithful).
+			if p.atPunct("[") {
+				if len(targets) > 1 {
+					p.failf("indexed map literal with multiple targets (v2)")
+				}
+				p.pos++
+				p.skipNL()
+				keyE := p.parseExpr()
+				p.skipNL()
+				p.expect(tPunct, "]")
+				tmp := "__tmp_map" + strconv.Itoa(p.tmpN)
+				p.tmpN++
+				p.maps[tmp] = true
+				p.registerVar(tmp, "Map")
+				// non-nil init: an EMPTY literal must marshal body as [],
+				// never null (the ingress rejects Block.body: not an array)
+				body := []map[string]any{}
+				for i, f := range me.args {
+					valText := f.text
+					if f.kind == "var" {
+						valText = f.name
+					}
+					body = append(body, map[string]any{
+						"type": "Expr",
+						"expr": map[string]any{
+							"type": "Call", "func": "assocSet",
+							"args":   []any{strExpr(tmp), strExpr(me.fieldNames[i]), strExpr(valText)},
+							"purity": "Emulable",
+						},
+					})
+				}
+				body = append(body, assignStmt(targets[0], map[string]any{
+					// assocGet — NOT mapGet: the temp map lives in the
+					// ASSOC store (the assocSet writes above read through
+					// the named assoc array; mapGet reads the object
+					// store and would always yield "" — the established
+					// m[k] convention, verified by the word-position read
+					"type": "Call", "func": "assocGet",
+					"args":   []any{strExpr(tmp), p.exprToWord(keyE)},
+					"purity": "PureCpu",
+				}))
+				p.registerVar(targets[0], "Str")
+				return []map[string]any{{"type": "Block", "body": body}}
+			}
 			if len(targets) > 1 {
 				p.failf("map literal with multiple targets (v2)")
 			}
 			p.maps[targets[0]] = true
 			p.registerVar(targets[0], "Map")
-			var body []map[string]any
+			// non-nil init: an EMPTY literal must marshal body as [],
+			// never null (the ingress rejects Block.body: not an array)
+			body := []map[string]any{}
 			for i, f := range me.args {
 				valText := f.text
 				if f.kind == "var" {
@@ -5471,7 +5618,9 @@ func (p *parser) parseAssignStmt() []map[string]any {
 			p.skipNL()
 			values = append(values, p.parseExpr())
 		}
-		var body []map[string]any
+		// non-nil init: an EMPTY literal must marshal body as [],
+		// never null (the ingress rejects Block.body: not an array)
+		body := []map[string]any{}
 		for i, tg := range targets {
 			if tg == "_" {
 				continue
@@ -5757,7 +5906,9 @@ func (p *parser) parseMapLiteral(targets []string) []map[string]any {
 	}
 	p.maps[targets[0]] = true
 	p.registerVar(targets[0], "Map")
-	var body []map[string]any
+	// non-nil init: an EMPTY literal must marshal body as [],
+		// never null (the ingress rejects Block.body: not an array)
+		body := []map[string]any{}
 	for {
 		p.skipNL()
 		if p.atPunct("}") {
@@ -8030,7 +8181,11 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 		if len(names) != len(e.args) {
 			p.failf("struct literal %q field count mismatch (v2)", e.name)
 		}
-		var args []any
+		// []any{} — NOT var args []any: an empty field list must
+		// marshal as [] (a nil slice marshals as null, and the estree
+		// ingress rejects ext-child.args: not an array — the same
+		// empty-composite contract the CLI's []string{} hit)
+		args := []any{}
 		for i, f := range e.args {
 			args = append(args, strExpr(names[i]), p.exprToWord(f))
 		}
@@ -8267,6 +8422,23 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 				// evaluates it with evalArith. Strings read ONE element
 				// (${s:$i:1}; Go bytes ≡ chars for the ASCII corpus —
 				// documented caveat).
+				// MAP reads through a struct field or a chained index
+				// (`p.m[k]`, `p.m[k1][k2]` — the golib's own
+				// `p.structFieldTypes[t][f]`): the A1 map model stores
+				// maps by NAME, so the inner read (objGet → the field's
+				// map name, or the inner index's mapGet word) is the map
+				// reference and the outer read is mapGet(ref, key) — the
+				// key rides the WORD channel (map keys are strings),
+				// unlike the array paths below (arith keys).
+				if e.target != nil && (e.target.kind == "member" || e.target.kind == "index") {
+					if mw, tag := p.mapRefWord(e.target); tag == "map" {
+						return map[string]any{
+							"type": "Call", "func": "mapGet",
+							"args":   []any{mw, p.exprToWord(e.idx1e)},
+							"purity": "PureCpu",
+						}
+					}
+				}
 				if e.target == nil || e.target.kind != "var" {
 					p.failf("unsupported index key (v2) — must be a number literal")
 				}
