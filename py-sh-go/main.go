@@ -1795,6 +1795,13 @@ type lowerer struct {
 	// the bigint domain (exact JS BigInt arith); everything proven stays
 	// on the fast Number path. fnSites feeds the param intervals.
 	ranges  map[string][2]*big.Int
+	// setElemDom tracks set/list element domains for sorted(): var →
+	// "int" (every recorded element proven within ±2^53) or "big".
+	// Recorded at add()/append() and all-int literals; POISONED
+	// (deleted) by setType — every rebinding re-records or falls back
+	// to the legacy pipeline, so a stale verdict can never survive a
+	// reassignment to non-int content.
+	setElemDom map[string]string
 	fnSites map[string][][]Expr // function name → per-call arg lists
 	fnRet   map[string]string   // function name → inferred return type ("list", …)
 	hoistN  int                 // float-path/bound hoist temp counter
@@ -1959,6 +1966,20 @@ func (l *lowerer) collectFuncs(stmts []Stmt) {
 
 func (l *lowerer) setType(name, t string) {
 	l.types[name] = t
+	delete(l.setElemDom, name)
+}
+
+// noteElemAdd records an integer element domain for set/list adds:
+// int-typed values join the verdict (big wins); anything else poisons
+// the entry (unknown → legacy pipeline at sorted()).
+func (l *lowerer) noteElemAdd(name string, e Expr) {
+	if ty := l.typeOf(e); ty != "int" && ty != "big" {
+		delete(l.setElemDom, name)
+		return
+	}
+	if cur, ok := l.setElemDom[name]; !ok || cur == "int" {
+		l.setElemDom[name] = l.intDom(e)
+	}
 }
 
 func (l *lowerer) typeOf(e Expr) string {
@@ -2312,12 +2333,20 @@ func (l *lowerer) arithIRDom(e Expr, dom string, zeroCmp bool) (map[string]any, 
 	case *LitFloat:
 		return nil, fmt.Errorf("float literal outside the float path")
 	case *NameE:
+		// inside a function body a param reads its POSITIONAL ($1) —
+		// mirror toArithText/argIR so the AST never store-marks the
+		// param name (a store-marked param loses its lifted BigInt/
+		// Number binding; the C backend reads Var("1") as _sh_argv[1]).
+		pos := t.Name
+		if p, ok := l.curParams[t.Name]; ok {
+			pos = p
+		}
 		if dom == "big" && l.typeOf(t) != "big" {
 			// a var whose binding may hold a Number/string must coerce up:
 			// BigInt(x) is exact for any integral value within ±2^63.
-			return arithExpr(arithCast("Int64", arithVar(t.Name))), nil
+			return arithExpr(arithCast("Int64", arithVar(pos))), nil
 		}
-		return arithExpr(arithVar(t.Name)), nil
+		return arithExpr(arithVar(pos)), nil
 	case *CallE:
 		if len(t.Path) == 1 && t.Path[0] == "len" && len(t.Args) == 1 {
 			if n, ok := t.Args[0].(*NameE); ok {
@@ -2499,7 +2528,7 @@ func callPurity(func_ string, args []any) string {
 	switch func_ {
 	case "contains", "join", "brace", "idiv", "imod", "arith", "arithEval",
 		"trimCapture", "dirname", "basename", "not", "guard", "caseMatch",
-		"param", "callDirect":
+		"param", "callDirect", "sortedIntJoin", "sortedBigintJoin":
 		return "PureCpu"
 	case "getVar", "setVar", "setLastExit", "assign", "test", "grepText",
 		"listVar", "setArray", "setArrayAppend", "arrayItems", "arrayKeys",
@@ -3001,6 +3030,17 @@ func (l *lowerer) callIR(t *CallE, isStmt bool) (map[string]any, error) {
 				arg = lc.Args[0]
 			}
 			if n, ok := arg.(*NameE); ok {
+				// typed sorted-join node when the element domain is
+				// proven (int/big): backends lower natively (exact
+				// numeric sort, no fork/exec). Otherwise the legacy
+				// pipeline below (unchanged behavior).
+				if dom, ok := l.setElemDom[n.Name]; ok && (dom == "int" || dom == "big") {
+					fn := "sortedIntJoin"
+					if dom == "big" {
+						fn = "sortedBigintJoin"
+					}
+					return call(fn, []any{st(n.Name)}), nil
+				}
 				pipe := map[string]any{"type": "Pipeline", "stages": []any{
 					[]map[string]any{exprStmt(execCall("printf", []any{st("%s\n"), call("param", []any{st("slice"), st(n.Name), st("@"), st("")})}))},
 					[]map[string]any{exprStmt(execCall("sort", []any{st("-n"), st("-u")}))},
@@ -4033,6 +4073,11 @@ func (l *lowerer) assignOne(target, op string, val Expr) ([]map[string]any, erro
 		}
 		}
 		l.setType(target, "list")
+		if lst != nil {
+			for _, el := range lst.Elems {
+				l.noteElemAdd(target, el)
+			}
+		}
 		if op == "+=" {
 			// arr += (...) — the core's PlusAssign-Array lowering
 			return []map[string]any{assignStmt(target, call("setArrayAppend", []any{st(target), array(elems)}))}, nil
@@ -4291,6 +4336,7 @@ func (l *lowerer) exprStmtIR(e Expr) ([]map[string]any, error) {
 						return nil, err
 					}
 					l.setType(n.Name, "list")
+					l.noteElemAdd(n.Name, t.Args[0])
 					return []map[string]any{assignStmt(n.Name, call("setArrayAppend", []any{st(n.Name), array([]any{ir})}))}, nil
 				}
 			}
@@ -4344,6 +4390,7 @@ func buildProgram(stmts []Stmt) (*shiremit.Program, error) {
 		params:  map[string][]string{},
 		pipes:   map[string][][]map[string]any{},
 		ranges:  map[string][2]*big.Int{},
+		setElemDom: map[string]string{},
 		fnSites: map[string][][]Expr{},
 		fnRet:   map[string]string{},
 	}
