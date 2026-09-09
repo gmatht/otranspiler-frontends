@@ -2044,6 +2044,8 @@ func (l *lowerer) typeOf(e Expr) string {
 			return "int"
 		case "sorted", "set", "list":
 			return "list"
+		case "max", "min", "sum":
+			return "int"
 		case "subprocess.run", "subprocess.Popen":
 			return "str"
 		case "os.environ":
@@ -2341,13 +2343,18 @@ func (l *lowerer) arithIRDom(e Expr, dom string, zeroCmp bool) (map[string]any, 
 		if p, ok := l.curParams[t.Name]; ok {
 			pos = p
 		}
-		if dom == "big" && l.typeOf(t) != "big" {
-			// a var whose binding may hold a Number/string must coerce up:
-			// BigInt(x) is exact for any integral value within ±2^63.
-			return arithExpr(arithCast("Int64", arithVar(pos))), nil
-		}
+		// A bigint-domain read of a "big"-typed var: the var is typed Int64
+		// in VarTypes, so the core's arith_var_read reads it exactly as
+		// BigInt(raw) (no asIntN wrap — Int64 vars are exact in estree) and
+		// writes it natively (no wrap). A plain Var read is correct: a
+		// 2**100 value survives (t91_set_sum_fallback).
 		return arithExpr(arithVar(pos)), nil
 	case *CallE:
+		if len(t.Path) == 1 && (t.Path[0] == "max" || t.Path[0] == "min" || t.Path[0] == "sum") && len(t.Args) == 1 {
+			if n, ok := t.Args[0].(*NameE); ok {
+				return call(t.Path[0], []any{st(n.Name)}), nil
+			}
+		}
 		if len(t.Path) == 1 && t.Path[0] == "len" && len(t.Args) == 1 {
 			if n, ok := t.Args[0].(*NameE); ok {
 				return call("arrayLen", []any{st(n.Name)}), nil
@@ -3049,6 +3056,18 @@ func (l *lowerer) callIR(t *CallE, isStmt bool) (map[string]any, error) {
 			}
 		}
 		return nil, fmt.Errorf("os.path.exists: expected a string")
+	case "max", "min", "sum":
+		// max(x) / min(x) / sum(x) over a list/set variable — a typed
+		// reduction node. Backends lower natively over an int array
+		// (O(1) with maintained aggregates, else a native scan); the
+		// consumption-profile pass keeps the array int-typed when it is
+		// only reduced this way.
+		if len(t.Args) == 1 {
+			if n, ok := t.Args[0].(*NameE); ok {
+				return call(path, []any{st(n.Name)}), nil
+			}
+		}
+		return nil, fmt.Errorf("%s: expected a list variable", path)
 	case "sorted", "list":
 		// sorted(x) / sorted(list(x)) — the Python sorted-list repr: the
 		// set/array's values, numerically sorted, deduped (set semantics),
@@ -3733,6 +3752,16 @@ func (l *lowerer) stmtIR(s Stmt) ([]map[string]any, error) {
 			l.setType(t.Var, l.typeOf(lst.Elems[0]))
 		} else if c, ok := t.Iter.(*CallE); ok && len(c.Path) == 1 && c.Path[0] == "range" {
 			l.setType(t.Var, "int")
+		} else if n, ok := t.Iter.(*NameE); ok {
+			// iterating a set/list variable: type the loop var from the
+			// element domain (int/big) so arithmetic on it stays numeric
+			// (t91_set_sum_fallback: `total += x` over a set of ints must
+			// add, not string-concat).
+			if dom, ok := l.setElemDom[n.Name]; ok && (dom == "int" || dom == "big") {
+				l.setType(t.Var, dom)
+			} else {
+				l.setType(t.Var, "str")
+			}
 		} else {
 			l.setType(t.Var, "str")
 		}
@@ -4142,6 +4171,10 @@ func (l *lowerer) assignOne(target, op string, val Expr) ([]map[string]any, erro
 				l.setType(target, "int")
 				delete(l.ranges, target)
 			}
+			// The accumulator is bigint-typed (Int64 in VarTypes): the core
+			// reads it exactly as BigInt on read and writes it natively (no
+			// wrap), so `total + BigInt(x)` stays in the BigInt domain and a
+			// 2**100 value survives (t91_set_sum_fallback).
 			ast := arithBin("+", arithVar(target), rhsAst)
 			return []map[string]any{assignStmt(target, arithExpr(ast))}, nil
 		}
@@ -4433,15 +4466,21 @@ func buildProgram(stmts []Stmt) (*shiremit.Program, error) {
 	if err != nil {
 		return nil, err
 	}
-	// A2 var_types: every assigned variable, sorted by name ("big" vars
-	// stay "Int" — the widthless kind the estree backend homes as an
-	// exact-precision binding; the C-only Int64 object kind would wrap
-	// assignments mod 2^64, breaking unbounded Python ints)
-	byName := map[string]string{}
+	// A2 var_types: every assigned variable, sorted by name. "int" vars
+	// (proven within ±2^53) stay "Int" — the widthless kind the estree
+	// backend homes as an exact-precision Number binding. "big" vars
+	// (unbounded Python ints) are typed {"kind":"Int64"}: in estree an
+	// Int64 var reads exactly as BigInt(raw) and writes natively (no
+	// asIntN wrap), so a 2**100 value survives (t91_set_sum_fallback).
+	// (The C-only backend would wrap Int64 mod 2^64 — but py-sh-go
+	// targets estree, where Int64 vars are exact.)
+	byName := map[string]any{}
 	for name, ty := range l.types {
-		t := "Str"
-		if ty == "int" || ty == "big" {
+		t := any("Str")
+		if ty == "int" {
 			t = "Int"
+		} else if ty == "big" {
+			t = map[string]any{"kind": "Int64"}
 		}
 		byName[name] = t
 	}
