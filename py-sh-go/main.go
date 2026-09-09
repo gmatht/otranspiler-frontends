@@ -2468,6 +2468,29 @@ func (l *lowerer) hoistFloatIR(e Expr) (map[string]any, error) {
 	return call("arith", []any{st(text)}), nil
 }
 
+// floatTag — a short, meaningful tag for a hoisted float-path
+// expression: the first identifier in the arith text (e.g.
+// "trunc(sqrt(n)) + 1" -> "trunc"). Falls back to "fl".
+func floatTag(text string) string {
+	for i := 0; i < len(text); i++ {
+		c := text[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+			j := i
+			for j < len(text) && ((text[j] >= 'a' && text[j] <= 'z') ||
+				(text[j] >= 'A' && text[j] <= 'Z') ||
+				(text[j] >= '0' && text[j] <= '9')) {
+				j++
+			}
+			tag := text[i:j]
+			if len(tag) > 8 {
+				tag = tag[:8]
+			}
+			return tag
+		}
+	}
+	return "h"
+}
+
 // hoistIntOperand — pre-lowering for one side of an integer comparison /
 // range bound: a float-path expression evaluates ONCE into a temp pair
 // (the arith-string result, then Number/BigInt-ized so the per-iteration
@@ -2481,8 +2504,19 @@ func (l *lowerer) hoistIntOperand(e Expr, dom string) ([]map[string]any, Expr, e
 	if err != nil {
 		return nil, nil, err
 	}
-	s := fmt.Sprintf("__fl%d", l.hoistN)
-	n := fmt.Sprintf("__fl%dv", l.hoistN)
+	// meaningful temp name: `__h_<tag>_<seq>` where the tag is the
+	// first identifier of the hoisted expression (e.g. `sqrt(n) + 1` ->
+	// `__h_sqrt_0`), so the temp reads as what it holds instead of the
+	// opaque `__fl0`. The `h` prefix means "hoisted" — the value is a
+	// long long (the float-path result is truncated to an integer), so
+	// a "float" prefix would be wrong.
+	text, err := l.toArithText(e)
+	if err != nil {
+		return nil, nil, err
+	}
+	tag := floatTag(text)
+	s := fmt.Sprintf("__h_%s_%d", tag, l.hoistN)
+	n := fmt.Sprintf("__h_%s_%dv", tag, l.hoistN)
 	l.hoistN++
 	plus := arithNum(0)
 	if dom == "big" {
