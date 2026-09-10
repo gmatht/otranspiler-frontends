@@ -11688,6 +11688,25 @@ func (p *parser) condWordAny(e *expr) map[string]any {
 			}
 			name := p.paramName(e.target.name)
 			if e.kind == "arrlen" {
+				// SLICE-param len (list id) — listLen, not the
+				// positional array-length word.
+				rn := p.resolveVar(e.target.name)
+				if p.paramSlice[e.target.name] || p.paramSlice[rn] {
+					if n, ok := p.paramNumber(rn); ok {
+						return map[string]any{
+							"type": "Call", "func": "listLen",
+							"args":   []any{getVarExpr(strconv.Itoa(n))},
+							"purity": "PureCpu",
+						}
+					}
+					if n, ok := p.paramNumber(e.target.name); ok {
+						return map[string]any{
+							"type": "Call", "func": "listLen",
+							"args":   []any{getVarExpr(strconv.Itoa(n))},
+							"purity": "PureCpu",
+						}
+					}
+				}
 				return joinCall(paramCall("slice", "#"+name, "@", ""))
 			}
 			return getVarExpr("#" + name)
