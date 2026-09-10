@@ -11017,6 +11017,18 @@ func (p *parser) exprToArith(e *expr) map[string]any {
 		// (getVar("#s") counts chars/bytes; a param maps to its $N
 		// positional — the dogfood app's own `i < len(src)` lexer loops)
 		if e.target != nil && e.target.kind == "var" {
+			// SLICE param misclassified here (forward-ref order) —
+			// listLen beats string length.
+			rn := p.resolveVar(e.target.name)
+			if p.paramSlice[e.target.name] || p.paramSlice[rn] {
+				if n, ok := p.paramNumber(rn); ok {
+					return map[string]any{
+						"type": "Call", "func": "listLen",
+						"args":   []any{getVarExpr(strconv.Itoa(n))},
+						"purity": "PureCpu",
+					}
+				}
+			}
 			return arithVar("#" + p.paramName(e.target.name))
 		}
 	case "arrlen":
@@ -11034,6 +11046,24 @@ func (p *parser) exprToArith(e *expr) map[string]any {
 					"type": "Call", "func": "listLen",
 					"args":   []any{p.exprToWord(e.target)},
 					"purity": "PureCpu",
+				}
+			}
+			// SLICE-param len in arithmetic (list id).
+			rn := p.resolveVar(e.target.name)
+			if p.paramSlice[e.target.name] || p.paramSlice[rn] {
+				if n, ok := p.paramNumber(rn); ok {
+					return map[string]any{
+						"type": "Call", "func": "listLen",
+						"args":   []any{getVarExpr(strconv.Itoa(n))},
+						"purity": "PureCpu",
+					}
+				}
+				if n, ok := p.paramNumber(e.target.name); ok {
+					return map[string]any{
+						"type": "Call", "func": "listLen",
+						"args":   []any{getVarExpr(strconv.Itoa(n))},
+						"purity": "PureCpu",
+					}
 				}
 			}
 			return arithVar("#" + p.paramName(e.target.name))
