@@ -4788,6 +4788,64 @@ func (p *parser) setenvStmt() []map[string]any {
 // parseMapLiteralBody parses `map[K]V{ k: v, … }` (the `map` keyword
 // and key/value type already consumed by the caller) for target `name`,
 // lowering each pair to an assocSet Call (the drop-in A1 shape; t54).
+// mapPairWord: the assocSet value word for one map-literal pair —
+// shared by the token-parsing parseMapLiteralBody and the
+// already-parsed me shape in parseAssignStmt (non-literal values:
+// calls, vars, nested composites). Allocation preludes append to
+// *prelude so temps exist before the pair references them.
+func (p *parser) mapPairWord(val *expr, prelude *[]map[string]any) map[string]any {
+	// GENERAL values: any word-lowerable expression rides assocSet;
+	// nested composites (map/slice literals) pre-allocate into temps
+	// whose REFERENCE ID becomes the stored value (object-store model)
+	var valWord map[string]any
+	if val.kind == "maplit" || val.kind == "arraylit" {
+		tmp, alloc := p.allocComposite(val)
+		*prelude = append(*prelude, alloc...)
+		valWord = getVarExpr(tmp)
+	} else if val.kind == "var" && p.varTypes[p.resolveVar(val.name)] == "Array" {
+		// an ARRAY-typed var as a map value (`"imports": imports`
+		// — shir-emit-go's Emit): the param-slice word returns a JS
+		// ARRAY (the var-store read is empty; the array lives in
+		// the array store) — assocSet stores it as-is and
+		// jsonMarshal serializes it as a JSON array
+		valWord = paramCall("slice", p.resolveVar(val.name), "@", "")
+	} else if val.kind == "call" && p.callTargetName(val.callee) != "" {
+		// a SLICE-returning call as a map value (`"stmts":
+		// toAnyStmts(...)` — shir-emit-go's Emit): the capture
+		// returns the echoed items as a string — strSplit back into
+		// an ARRAY so jsonMarshal emits a JSON array
+		w := p.exprToWord(val)
+		tn := p.callTargetName(val.callee)
+		ret := ""
+		if sig, ok := p.fnSig[tn]; ok {
+			ret = sig[1]
+		} else {
+			ret = p.prescanRet[tn]
+		}
+		if strings.HasPrefix(ret, "[]") {
+			// LIST-id echo (struct/any slice calls) rides as-is —
+			// the id is a plain string and jsonMarshal resolves
+			// it structurally. Only space-joined ARRAY echoes
+			// need the strSplit rebuild (which would double-nest
+			// an id: [[items]]).
+			if le := p.callFirstListElem(tn, p.fnRetIdents[tn]); le != "" {
+				valWord = w
+			} else {
+				valWord = map[string]any{
+					"type": "Call", "func": "strSplit",
+					"args":   []any{w, strExpr(" ")},
+					"purity": "PureCpu",
+				}
+			}
+		} else {
+			valWord = w
+		}
+	} else {
+		valWord = p.exprToWord(val)
+	}
+	return valWord
+}
+
 func (p *parser) parseMapLiteralBody(name string) []map[string]any {
 	p.skipNL()
 	p.expect(tPunct, "{")
@@ -4815,55 +4873,7 @@ func (p *parser) parseMapLiteralBody(name string) []map[string]any {
 		if val.kind == "var" && (val.name == "true" || val.name == "false") {
 			val = &expr{kind: "str", text: val.name}
 		}
-		// GENERAL values: any word-lowerable expression rides assocSet;
-		// nested composites (map/slice literals) pre-allocate into temps
-		// whose REFERENCE ID becomes the stored value (object-store model)
-		var valWord map[string]any
-		if val.kind == "maplit" || val.kind == "arraylit" {
-			tmp, alloc := p.allocComposite(val)
-			body = append(body, alloc...)
-			valWord = getVarExpr(tmp)
-		} else if val.kind == "var" && p.varTypes[p.resolveVar(val.name)] == "Array" {
-			// an ARRAY-typed var as a map value (`"imports": imports`
-			// — shir-emit-go's Emit): the param-slice word returns a JS
-			// ARRAY (the var-store read is empty; the array lives in
-			// the array store) — assocSet stores it as-is and
-			// jsonMarshal serializes it as a JSON array
-			valWord = paramCall("slice", p.resolveVar(val.name), "@", "")
-		} else if val.kind == "call" && p.callTargetName(val.callee) != "" {
-			// a SLICE-returning call as a map value (`"stmts":
-			// toAnyStmts(...)` — shir-emit-go's Emit): the capture
-			// returns the echoed items as a string — strSplit back into
-			// an ARRAY so jsonMarshal emits a JSON array
-			w := p.exprToWord(val)
-			tn := p.callTargetName(val.callee)
-			ret := ""
-			if sig, ok := p.fnSig[tn]; ok {
-				ret = sig[1]
-			} else {
-				ret = p.prescanRet[tn]
-			}
-			if strings.HasPrefix(ret, "[]") {
-				// LIST-id echo (struct/any slice calls) rides as-is —
-				// the id is a plain string and jsonMarshal resolves
-				// it structurally. Only space-joined ARRAY echoes
-				// need the strSplit rebuild (which would double-nest
-				// an id: [[items]]).
-				if le := p.callFirstListElem(tn, p.fnRetIdents[tn]); le != "" {
-					valWord = w
-				} else {
-					valWord = map[string]any{
-						"type": "Call", "func": "strSplit",
-						"args":   []any{w, strExpr(" ")},
-						"purity": "PureCpu",
-					}
-				}
-			} else {
-				valWord = w
-			}
-		} else {
-			valWord = p.exprToWord(val)
-		}
+		valWord := p.mapPairWord(val, &body)
 		body = append(body, map[string]any{
 			"type": "Expr",
 			"expr": map[string]any{
@@ -5355,6 +5365,32 @@ func (p *parser) parseAssignStmt() []map[string]any {
 					"expr": map[string]any{
 						"type": "Call", "func": "assocSet",
 						"args":   []any{strExpr(targets[0]), strExpr(me.fieldNames[i]), strExpr(valText)},
+						"purity": "Emulable",
+					},
+				})
+			}
+			return []map[string]any{{"type": "Block", "body": body}}
+		}
+		// DYNAMIC values (calls, vars — shir-emit-go's Emit map with
+		// toAnyStmts/toAnySlice call values): assoc pairs with word
+		// values via the shared mapPairWord (calls ride captures or
+		// list ids; nested composites pre-allocate). Plain targets
+		// only — dotted/indexed targets keep the legacy jsonObject
+		// value lowering below.
+		if !strings.ContainsAny(targets[0], ".[") {
+			p.maps[targets[0]] = true
+			p.registerVar(targets[0], "Map")
+			body := []map[string]any{}
+			for i, k := range me.keys {
+				if k.kind != "str" && k.kind != "num" && k.kind != "rawstr" {
+					p.failf("unsupported map key %q (v2) — keys must be literals", k.text)
+				}
+				valWord := p.mapPairWord(me.vals[i], &body)
+				body = append(body, map[string]any{
+					"type": "Expr",
+					"expr": map[string]any{
+						"type": "Call", "func": "assocSet",
+						"args":   []any{strExpr(targets[0]), strExpr(k.text), valWord},
 						"purity": "Emulable",
 					},
 				})
