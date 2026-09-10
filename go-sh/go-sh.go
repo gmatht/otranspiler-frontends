@@ -4622,12 +4622,6 @@ func (p *parser) printlnStmt() []map[string]any {
 	if len(args) == 0 {
 		p.failf("Println/Print with no args (v2)")
 	}
-	// single plain string (`Println("hi")` — tiny): direct echo,
-	// bypassing printlnWords (its Go word-slice rides a list id that
-	// execStmt cannot iterate self-hosted).
-	if len(args) == 1 && args[0].kind == "str" {
-		return []map[string]any{execStmt("echo", []map[string]any{interpLit(args[0].text)}, "Emulable")}
-	}
 	// heredoc: Println(`...`) → Redirect(cat <<EOF ...)
 	if len(args) == 1 && args[0].kind == "rawstr" {
 		return []map[string]any{p.heredocStmt(args[0].text)}
