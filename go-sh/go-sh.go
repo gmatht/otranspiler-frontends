@@ -2807,6 +2807,25 @@ func (p *parser) parseStmt() []map[string]any {
 		var words []map[string]any
 		var preEcho []map[string]any
 		for _, e := range rexprs {
+			// unwrap the addr wrapper (`return &T{...}` — parseUnary
+			// always wraps; newstructStmts unwraps the same way).
+			lit := e
+			if lit.kind == "addr" && lit.lhs != nil {
+				lit = lit.lhs
+			}
+			if lit != nil && lit.kind == "structlit" && lit.structType != "" {
+				// ARENA-shape struct value (parsePrimary T{...} —
+				// every `return &expr{...}` in self-host): allocate
+				// the object via the store, exactly like the assign
+				// path, into a temp and echo its id — the caller
+				// reads fields via objGet, identical to `p := T{}`.
+				tmpS := "__tmp_s" + strconv.Itoa(p.tmpN)
+				p.tmpN++
+				p.registerVar(tmpS, "Str")
+				preEcho = append(preEcho, p.newstructStmts(tmpS, lit)...)
+				words = append(words, getVarExpr(tmpS))
+				continue
+			}
 			if e.kind == "maplit" {
 				// a map literal as a return VALUE (shir-emit-go's
 				// EmitToMap): allocate a temp assoc array (one assocSet
@@ -10039,7 +10058,9 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 			// the runtime's printf verb table.
 			if len(e.args) >= 2 && e.args[0].kind == "var" {
 				var words []map[string]any
-				words = append(words, getVarExpr(p.resolveVar(e.args[0].name)))
+				// param-aware read (a param format like failf's `f`
+				// rides positional $N, not the var store).
+				words = append(words, p.structIDWord(e.args[0].name))
 				for _, a := range e.args[1:] {
 					words = append(words, p.argToWord(a))
 				}
