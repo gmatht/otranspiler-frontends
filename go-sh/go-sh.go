@@ -94,10 +94,14 @@ type token struct {
 	line int
 }
 
-var multiOps = []string{"...", ":=", "==", "!=", "<=", ">=", "&&", "||", "+=", "++", "--"}
+// multiOps lives INSIDE lex (not top-level): top-level vars lower to
+// native JS lets invisible to store reads, but lex's range needs the
+// array store (self-host `:=` split without it).
 
 func lex(src string) ([]token, error) {
 	var toks []token
+	// operator table (local so the range sees an array-store var)
+	multiOps := []string{"...", ":=", "==", "!=", "<=", ">=", "&&", "||", "+=", "++", "--"}
 	line := 1
 	i := 0
 	for i < len(src) {
