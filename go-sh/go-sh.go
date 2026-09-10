@@ -1777,6 +1777,23 @@ func (p *parser) anyListVar(name string) string {
 	return ""
 }
 
+// anyListReadWord: the word reading an any-list's id — a PARAM holds
+// it positionally ($N), a plain var in the store. (anyListVar returns
+// the NAME for map-key uses (anyElem); readers need this instead.)
+func (p *parser) anyListReadWord(name string) map[string]any {
+	if ln := p.anyListVar(name); ln != "" {
+		rn := p.resolveVar(name)
+		if n, ok := p.paramNumber(name); ok {
+			return getVarExpr(strconv.Itoa(n))
+		}
+		if n, ok := p.paramNumber(rn); ok {
+			return getVarExpr(strconv.Itoa(n))
+		}
+		return getVarExpr(ln)
+	}
+	return nil
+}
+
 // isAnyListElem: slice element types whose values ride objStore LIST
 // ids (not shell arrays, which String-coerce elements on write —
 // structs as object refs, `any` (may hold objects), maps (assoc refs
@@ -9244,6 +9261,29 @@ func (p *parser) argToWord(e *expr) map[string]any {
 			},
 		}
 	}
+	// ARRAY var passed to a call (non-spread `f(arr)` — Go only allows
+	// a slice here, so the callee's slice param): freeze to a list id
+	// (the slice-param protocol — single opaque value, reentrant; the
+	// callee reads listGet/listLen). any-lists already ride ids.
+	if e.kind == "var" && !e.spread {
+		rn := p.resolveVar(e.name)
+		if p.varTypes[rn] == "Array" && p.anyListVar(e.name) == "" {
+			return map[string]any{
+				"type": "Call", "func": "arrayToList",
+				"args":   []any{strExpr(rn)},
+					"purity": "PureCpu",
+				}
+		}
+		if e.name == p.variadicParam && p.variadicParam != "" {
+			// forwarding the current variadic (`g(parts)` — a shell
+			// array from the entry prologue).
+			return map[string]any{
+				"type": "Call", "func": "arrayToList",
+				"args":   []any{strExpr(rn)},
+					"purity": "PureCpu",
+				}
+			}
+	}
 	return p.exprToWord(e)
 }
 
@@ -9571,12 +9611,26 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 				if ln := p.anyListVar(e.target.name); ln != "" {
 					return map[string]any{
 						"type": "Call", "func": "listGet",
-						"args":   []any{getVarExpr(ln), p.exprToWord(e.idx1e)},
+						"args":   []any{p.anyListReadWord(e.target.name), p.exprToWord(e.idx1e)},
 						"purity": "PureCpu",
 					}
 				}
 				key := p.arithKeyText(e.idx1e)
 				name := p.resolveVar(e.target.name)
+				// SLICE-param element (`args[0]` — the param holds a
+				// list id under the slice-param protocol): listGet,
+				// not the positional subscript (getVar "N[i]" never
+				// resolves). any-lists handled above; this is the
+				// scalar-slice remainder.
+				if p.paramSlice[e.target.name] || p.paramSlice[name] {
+					if n, ok := p.paramNumber(name); ok {
+						return map[string]any{
+							"type": "Call", "func": "listGet",
+							"args":   []any{getVarExpr(strconv.Itoa(n)), strExpr(key)},
+							"purity": "PureCpu",
+						}
+					}
+				}
 				if n, ok := p.paramNumber(name); ok {
 					name = strconv.Itoa(n)
 				}
@@ -9596,6 +9650,16 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 		}
 		if e.target != nil && e.target.kind == "var" {
 			name := p.resolveVar(e.target.name)
+			// SLICE-param element, literal key — listGet (see above).
+			if p.paramSlice[e.target.name] || p.paramSlice[name] {
+				if n, ok := p.paramNumber(name); ok {
+					return map[string]any{
+						"type": "Call", "func": "listGet",
+						"args":   []any{getVarExpr(strconv.Itoa(n)), strExpr(e.idx1)},
+						"purity": "PureCpu",
+					}
+				}
+			}
 			if n, ok := p.paramNumber(name); ok {
 				name = strconv.Itoa(n)
 			}
@@ -9604,7 +9668,7 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 			if ln := p.anyListVar(e.target.name); ln != "" {
 				return map[string]any{
 					"type": "Call", "func": "listGet",
-					"args":   []any{getVarExpr(ln), strExpr(e.idx1)},
+					"args":   []any{p.anyListReadWord(e.target.name), strExpr(e.idx1)},
 					"purity": "PureCpu",
 				}
 			}
@@ -9734,8 +9798,26 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 			if ln := p.anyListVar(e.target.name); ln != "" {
 				return map[string]any{
 					"type": "Call", "func": "listLen",
-					"args":   []any{getVarExpr(ln)},
+					"args":   []any{p.anyListReadWord(e.target.name)},
 					"purity": "PureCpu",
+				}
+			}
+			// SLICE-param len (list id under the slice-param protocol).
+			rn := p.resolveVar(e.target.name)
+			if p.paramSlice[e.target.name] || p.paramSlice[rn] {
+				if n, ok := p.paramNumber(rn); ok {
+					return map[string]any{
+						"type": "Call", "func": "listLen",
+						"args":   []any{getVarExpr(strconv.Itoa(n))},
+						"purity": "PureCpu",
+					}
+				}
+				if n, ok := p.paramNumber(e.target.name); ok {
+					return map[string]any{
+						"type": "Call", "func": "listLen",
+						"args":   []any{getVarExpr(strconv.Itoa(n))},
+						"purity": "PureCpu",
+					}
 				}
 			}
 			name := p.resolveVar(e.target.name)
@@ -11537,6 +11619,25 @@ func (p *parser) condWordAny(e *expr) map[string]any {
 		// len(...) in a comparison operand — the ${#arr[@]} / ${#s}
 		// length word as an A1 word
 		if e.target != nil && e.target.kind == "var" {
+			// SLICE-param len (list id): listLen in a cmdsub (the
+			// positional array-length word would read $N as an array).
+			rn := p.resolveVar(e.target.name)
+			if e.kind == "arrlen" && (p.paramSlice[e.target.name] || p.paramSlice[rn]) {
+				if n, ok := p.paramNumber(rn); ok {
+					return map[string]any{
+						"type": "Call", "func": "listLen",
+						"args":   []any{getVarExpr(strconv.Itoa(n))},
+						"purity": "PureCpu",
+					}
+				}
+				if n, ok := p.paramNumber(e.target.name); ok {
+					return map[string]any{
+						"type": "Call", "func": "listLen",
+						"args":   []any{getVarExpr(strconv.Itoa(n))},
+						"purity": "PureCpu",
+					}
+				}
+			}
 			name := p.paramName(e.target.name)
 			if e.kind == "arrlen" {
 				return joinCall(paramCall("slice", "#"+name, "@", ""))
@@ -11733,6 +11834,24 @@ func (p *parser) condOperandA1WordInner(e *expr) (map[string]any, bool) {
 		// len(src) over a STRING → ${#src}; arrays use the length word;
 		// MEMBER targets (object fields) use the strLen runtime helper
 		if e.target != nil && e.target.kind == "var" {
+			// SLICE-param len (list id) — listLen, not the array word.
+			rn := p.resolveVar(e.target.name)
+			if p.paramSlice[e.target.name] || p.paramSlice[rn] {
+				if n, ok := p.paramNumber(rn); ok {
+					return map[string]any{
+						"type": "Call", "func": "listLen",
+						"args":   []any{getVarExpr(strconv.Itoa(n))},
+						"purity": "PureCpu",
+					}, true
+				}
+				if n, ok := p.paramNumber(e.target.name); ok {
+					return map[string]any{
+						"type": "Call", "func": "listLen",
+						"args":   []any{getVarExpr(strconv.Itoa(n))},
+						"purity": "PureCpu",
+					}, true
+				}
+			}
 			name := p.paramName(e.target.name)
 			if p.varTypes[p.resolveVar(e.target.name)] == "Array" {
 				return joinCall(paramCall("slice", "#"+name, "@", "")), true
