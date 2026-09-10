@@ -1804,7 +1804,12 @@ type lowerer struct {
 	setElemDom map[string]string
 	fnSites map[string][][]Expr // function name → per-call arg lists
 	fnRet   map[string]string   // function name → inferred return type ("list", …)
-	hoistN  int                 // float-path/bound hoist temp counter
+	// float-path/bound hoist temp names: the base is context-derived
+	// (floatName — `int(n**0.5)` -> `i_sqrt_n`), a per-context sequence
+	// disambiguates only on collision (usedHoist tracks the names in
+	// use; hoistSeq counts per-base collisions).
+	usedHoist map[string]bool
+	hoistSeq  map[string]int
 }
 
 var two53 = func() *big.Int { return big.NewInt(9007199254740992) }() // 2^53
@@ -2475,27 +2480,75 @@ func (l *lowerer) hoistFloatIR(e Expr) (map[string]any, error) {
 	return call("arith", []any{st(text)}), nil
 }
 
-// floatTag — a short, meaningful tag for a hoisted float-path
-// expression: the first identifier in the arith text (e.g.
-// "trunc(sqrt(n)) + 1" -> "trunc"). Falls back to "fl".
-func floatTag(text string) string {
-	for i := 0; i < len(text); i++ {
-		c := text[i]
-		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
-			j := i
-			for j < len(text) && ((text[j] >= 'a' && text[j] <= 'z') ||
-				(text[j] >= 'A' && text[j] <= 'Z') ||
-				(text[j] >= '0' && text[j] <= '9')) {
-				j++
-			}
-			tag := text[i:j]
-			if len(tag) > 8 {
-				tag = tag[:8]
-			}
-			return tag
-		}
+// floatName — a meaningful, context-derived name for a hoisted
+// float-path expression: the call chain and variable names, constants
+// skipped (`int(n**0.5) + 1` -> `i_sqrt_n`). Disambiguation is by
+// CONTEXT (the expression's shape), not by a global sequence number;
+// the sequence only kicks in on collision (see hoistIntOperand). Falls
+// back to "h" when the expression has no identifiers.
+func floatName(e Expr) string {
+	parts := floatNameParts(e)
+	if len(parts) == 0 {
+		return "h"
 	}
-	return "h"
+	return strings.Join(parts, "_")
+}
+
+// floatNameParts — the name fragments of a float-path expression: a
+// call contributes its abbreviated function name, a variable its name,
+// constants nothing. `int(x)` -> `i` + x's parts; `x ** 0.5` -> `sqrt` +
+// x's parts (mirrors toArithText's lowering).
+func floatNameParts(e Expr) []string {
+	switch t := e.(type) {
+	case *LitInt, *LitFloat:
+		return nil // constants don't add meaning
+	case *NameE:
+		return []string{t.Name}
+	case *CallE:
+		if len(t.Path) == 1 && t.Path[0] == "int" && len(t.Args) == 1 {
+			return append([]string{"i"}, floatNameParts(t.Args[0])...)
+		}
+		fn := abbrevFloatFn(t.Path[len(t.Path)-1])
+		parts := []string{fn}
+		for _, a := range t.Args {
+			parts = append(parts, floatNameParts(a)...)
+		}
+		return parts
+	case *BinOpE:
+		if t.Op == "**" {
+			if fl, ok := t.Rhs.(*LitFloat); ok && fl.Text == "0.5" {
+				return append([]string{"sqrt"}, floatNameParts(t.Lhs)...)
+			}
+		}
+		return append(floatNameParts(t.Lhs), floatNameParts(t.Rhs)...)
+	}
+	return nil
+}
+
+// abbrevFloatFn — a short tag for a float-path function name: `int` ->
+// `i`, `trunc` -> `tr`; other short single words stay whole (`sqrt`),
+// multi-word names abbreviate to first letters, long single words to
+// their first 3 chars.
+func abbrevFloatFn(name string) string {
+	switch name {
+	case "int":
+		return "i"
+	case "trunc":
+		return "tr"
+	}
+	if strings.Contains(name, "_") {
+		var b strings.Builder
+		for _, w := range strings.Split(name, "_") {
+			if w != "" {
+				b.WriteByte(w[0])
+			}
+		}
+		return b.String()
+	}
+	if len(name) <= 6 {
+		return name
+	}
+	return name[:3]
 }
 
 // hoistIntOperand — pre-lowering for one side of an integer comparison /
@@ -2511,20 +2564,22 @@ func (l *lowerer) hoistIntOperand(e Expr, dom string) ([]map[string]any, Expr, e
 	if err != nil {
 		return nil, nil, err
 	}
-	// meaningful temp name: `__h_<tag>_<seq>` where the tag is the
-	// first identifier of the hoisted expression (e.g. `sqrt(n) + 1` ->
-	// `__h_sqrt_0`), so the temp reads as what it holds instead of the
-	// opaque `__fl0`. The `h` prefix means "hoisted" — the value is a
-	// long long (the float-path result is truncated to an integer), so
-	// a "float" prefix would be wrong.
-	text, err := l.toArithText(e)
-	if err != nil {
-		return nil, nil, err
+	// meaningful temp name: `_<context>` where the context is the
+	// expression's shape (`int(n**0.5) + 1` -> `_i_sqrt_n`), so the
+	// temp reads as what it holds instead of the opaque `__fl0` or a
+	// sequence-numbered `__h_int_0`. The `v` suffix marks the numeric
+	// (long long) form; the bare name is the arith-string form. A
+	// per-context sequence disambiguates only on collision.
+	base := floatName(e)
+	s := "_" + base
+	n := s + "v"
+	if l.usedHoist[s] || l.usedHoist[n] {
+		l.hoistSeq[base]++
+		s = fmt.Sprintf("_%s_%d", base, l.hoistSeq[base])
+		n = s + "v"
 	}
-	tag := floatTag(text)
-	s := fmt.Sprintf("__h_%s_%d", tag, l.hoistN)
-	n := fmt.Sprintf("__h_%s_%dv", tag, l.hoistN)
-	l.hoistN++
+	l.usedHoist[s] = true
+	l.usedHoist[n] = true
 	plus := arithNum(0)
 	if dom == "big" {
 		// BigInt-ize: Cast(store-string) + Cast(0) — exact any size ≤ 2^63
@@ -4458,8 +4513,10 @@ func buildProgram(stmts []Stmt) (*shiremit.Program, error) {
 		pipes:   map[string][][]map[string]any{},
 		ranges:  map[string][2]*big.Int{},
 		setElemDom: map[string]string{},
-		fnSites: map[string][][]Expr{},
-		fnRet:   map[string]string{},
+		fnSites:   map[string][][]Expr{},
+		fnRet:     map[string]string{},
+		usedHoist: map[string]bool{},
+		hoistSeq:  map[string]int{},
 	}
 	l.collectFuncs(stmts)
 	irs, err := l.stmtsIR(stmts)
