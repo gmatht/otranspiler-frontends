@@ -495,6 +495,10 @@ type parser struct {
 	idxKey      *expr                 // computed index expr (nil when the key is a literal)
 	idxLit      string                // literal index text ("" when computed)
 	maps        map[string]bool    // m := map[K]V{...} — assoc-array name
+	nodeTemps   map[string]bool    // compile-time node temps (`return
+	// map[string]any{...}` in builders — strExpr/assignStmt/...):
+	// freezeStmts resolves exactly these at the stmt-list boundary
+	// (other assoc names are runtime refs and must stay names)
 	bufs        map[string]string  // b := bytes.Buffer — accumulated contents
 	runtimeBufs map[string]bool    // buffers with runtime-dependent contents (WriteByte of a runtime byte)
 	cmds        map[string][]*expr // cmd := exec.Command(...) -> args
@@ -2835,6 +2839,10 @@ func (p *parser) parseStmt() []map[string]any {
 				tmpM := "__tmp_m" + strconv.Itoa(p.tmpN)
 				p.tmpN++
 				p.maps[tmpM] = true
+				// compile-time node temp: freezeStmts resolves exactly
+				// these (by name) into plain objects at the stmt-list
+				// boundary — other assoc names are runtime refs.
+				p.nodeTemps[tmpM] = true
 				p.registerVar(tmpM, "Map")
 				for i, k := range e.keys {
 					kw := strExpr(strings.Trim(strings.TrimSpace(k.text), "\""))
@@ -9078,7 +9086,24 @@ func (p *parser) returnAppendList(e *expr) (stmts []map[string]any, tmp string, 
 		}
 		stmts = append(stmts, p.listPushStmt(tmp, p.exprToWord(a)))
 	}
-	return stmts, tmp, true
+	// STMT-LIST BOUNDARY (self-host echo protocol): the list holds
+	// compile-time node temps (temp-assoc names) alongside live ids —
+	// freezeStmts resolves exactly the marked node temps into plain
+	// objects (null-restoring sigil/params), passing everything else
+	// (obj#/list# refs, words, runtime names) through. In plain-func
+	// bodies $1 is not the parser — objGet yields "" and the helper
+	// returns the input unchanged.
+	frozen := "__ret_f" + strconv.Itoa(p.tmpN)
+	p.tmpN++
+	stmts = append(stmts, assignStmt(frozen,
+		map[string]any{"type": "Call", "func": "freezeStmts",
+			"args": []any{getVarExpr(tmp),
+				map[string]any{"type": "Call", "func": "objGet",
+					"args":   []any{getVarExpr("1"), strExpr("nodeTemps")},
+					"purity": "PureCpu"},
+				strExpr("sigil,params")},
+			"purity": "PureCpu"}))
+	return stmts, frozen, true
 }
 
 // listExtendStmt appends all of the word's items onto the tmp list.
@@ -12132,6 +12157,7 @@ func Shir(src string) ([]byte, error) {
 		anyLists:    map[string]bool{},
 		anyElem:     map[string]string{},
 		maps:        map[string]bool{},
+		nodeTemps:   map[string]bool{},
 		bufs:        map[string]string{},
 		cmds:        map[string][]*expr{},
 		stdinRdr:    map[string]bool{},
