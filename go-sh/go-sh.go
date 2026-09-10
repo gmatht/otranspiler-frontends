@@ -3496,7 +3496,24 @@ func (p *parser) parseDottedStmt() []map[string]any {
 		for _, a := range args {
 			words = append(words, p.exprToWord(a))
 		}
-		return []map[string]any{execStmt(method, words, "Spawn")}
+		stmt := execStmt(method, words, "Spawn")
+		if p.methodReturnsValue(method) {
+			// BARE call to a value-returning method (Go discards
+			// the value): swallow the callee's stdout echo (its
+			// return channel) in a capture, else it leaks into an
+			// enclosing capture (self-host: `p.expect(tIdent,
+			// "var")` echoed the var token into declStmts,
+			// corrupting the Program stmts).
+			stmt = map[string]any{
+				"type": "Expr",
+				"expr": map[string]any{
+					"type": "Call", "func": "capture",
+					"args":   []any{map[string]any{"type": "Arrow", "body": []any{stmt}}},
+					"purity": "Spawn",
+				},
+			}
+		}
+		return []map[string]any{stmt}
 	}
 	switch first + "." + method {
 	case "fmt.Println", "fmt.Print":
@@ -3972,6 +3989,19 @@ func (p *parser) structIDWord(name string) map[string]any {
 		return getVarExpr(strconv.Itoa(n))
 	}
 	return getVarExpr(rn)
+}
+
+// methodReturnsValue: the method declares a Go return value (fnSig
+// return text, prescan for forward refs) — a bare statement call
+// discards it, so the frontend must swallow the callee's stdout echo.
+func (p *parser) methodReturnsValue(meth string) bool {
+	if sig, ok := p.fnSig[meth]; ok {
+		return sig[1] != ""
+	}
+	if r, ok := p.prescanRet[meth]; ok {
+		return r != ""
+	}
+	return false
 }
 
 // callTargetName: the sub a call expression resolves to ("l.cur" ->
