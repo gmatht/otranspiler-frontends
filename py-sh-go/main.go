@@ -2478,6 +2478,13 @@ func (l *lowerer) toArithText(e Expr) (string, error) {
 // hoistFloatIR — the runtime arith-string call for a float-path
 // expression (returns the printed double result as a string).
 func (l *lowerer) hoistFloatIR(e Expr) (map[string]any, error) {
+	// integer-sqrt idiom first: a bare `int(Y**0.5)` (int-domain Y)
+	// lowers to the structured `isqrt` Call — no arith-string. The
+	// ±K-bound wrapper is handled by hoistIntOperand (two native
+	// temps); other callers splice the bare node directly.
+	if isq, ok := l.tryIsqrtIR(e); ok {
+		return isq, nil
+	}
 	text, err := l.toArithText(e)
 	if err != nil {
 		return nil, err
@@ -2561,9 +2568,119 @@ func abbrevFloatFn(name string) string {
 // (the arith-string result, then Number/BigInt-ized so the per-iteration
 // cond reads a plain binding instead of re-parsing a store string).
 // Returns the pre-statements and the int-typed read expression.
+// tryIsqrtIR recognizes the integer-sqrt idiom `int(Y ** 0.5)` with an
+// int-domain Y and lowers it to a STRUCTURED `isqrt` Call — no
+// arith-string detour (`arith("int(sqrt(..))")` + string temp + `+0`
+// re-numerify). Only int-domain (intDom(Y) == "int", no float in Y);
+// anything else (bigint/float Y, other shapes) reports false and the
+// caller keeps the legacy float-string path. A nonneg constant Y folds
+// to its exact isqrt (isqrtBig); negative constants abort (preserve the
+// legacy path exactly — Python raises, runtimes clamp/garbage).
+func (l *lowerer) tryIsqrtIR(e Expr) (map[string]any, bool) {
+	c, ok := e.(*CallE)
+	if !ok || len(c.Path) != 1 || c.Path[0] != "int" || len(c.Args) != 1 {
+		return nil, false
+	}
+	b, ok := c.Args[0].(*BinOpE)
+	if !ok || b.Op != "**" {
+		return nil, false
+	}
+	fl, ok := b.Rhs.(*LitFloat)
+	if !ok || fl.Text != "0.5" {
+		return nil, false
+	}
+	y := b.Lhs
+	if l.intDom(y) != "int" || floatPath(y) {
+		return nil, false
+	}
+	if lit, ok := y.(*LitInt); ok {
+		n, ok := new(big.Int).SetString(lit.Text, 10)
+		if !ok || n.Sign() < 0 {
+			return nil, false
+		}
+		r := isqrtBig(n)
+		if !r.IsInt64() {
+			return nil, false
+		}
+		return arithExpr(arithNum(r.Int64())), true
+	}
+	yIR, err := l.arithIRDom(y, "int", false)
+	if err != nil {
+		return nil, false
+	}
+	if _, ok := yIR["ast"].(map[string]any); !ok {
+		return nil, false
+	}
+	return call("isqrt", []any{yIR}), true
+}
+
+// tryIsqrtHoist lowers an isqrt-idiom bound (`int(Y**0.5)` or
+// `int(Y**0.5)±K`, int-domain) to native-int temps holding the
+// structured `isqrt` Call — compute-once for hot loop bounds, no
+// strings. The ±K folds in a second temp via Arith Var+Num (a Call can
+// never nest inside ArithAst, and the bound cond must stay a plain Var
+// for fold_range_pair/cstyle). Reports false for any other shape
+// (caller keeps the legacy float path).
+func (l *lowerer) tryIsqrtHoist(e Expr) (pre []map[string]any, ex Expr, ok bool) {
+	inner := e
+	var k int64
+	hasK := false
+	kneg := false
+	if b, isBin := e.(*BinOpE); isBin && (b.Op == "+" || b.Op == "-") {
+		if lit, isLit := b.Rhs.(*LitInt); isLit {
+			if kk, err := strconv.ParseInt(lit.Text, 10, 64); err == nil {
+				inner, k, hasK, kneg = b.Lhs, kk, true, b.Op == "-"
+			}
+		}
+	}
+	isq, ok := l.tryIsqrtIR(inner)
+	if !ok {
+		return nil, nil, false
+	}
+	if hasK && k == 0 {
+		hasK = false
+	}
+	// meaningful temp name from the expression shape
+	// (`int(n**0.5)+1` -> `_i_sqrt_nv`, matching the legacy temp).
+	base := floatName(e)
+	s := "_" + base
+	n := s + "v"
+	if l.usedHoist[s] || l.usedHoist[n] {
+		l.hoistSeq[base]++
+		s = fmt.Sprintf("_%s_%d", base, l.hoistSeq[base])
+		n = s + "v"
+	}
+	l.usedHoist[s] = true
+	l.usedHoist[n] = true
+	l.setType(s, "int")
+	pre = []map[string]any{assignStmt(s, isq)}
+	if !hasK {
+		return pre, &NameE{Name: s}, true
+	}
+	// second temp folds ±K via Arith Var+Num (a Call can never nest
+	// inside ArithAst, and the bound cond must stay a plain Var:
+	// fold_range_pair/cstyle only handle Var/Num bound text).
+	kop := "+"
+	if kneg {
+		kop = "-"
+	}
+	pre = append(pre, assignStmt(n, arithExpr(arithBin(kop, arithVar(s), arithNum(k)))))
+	l.setType(n, "int")
+	return pre, &NameE{Name: n}, true
+}
+
 func (l *lowerer) hoistIntOperand(e Expr, dom string) ([]map[string]any, Expr, error) {
 	if !floatPath(e) {
 		return nil, e, nil
+	}
+	// integer-sqrt idiom (`int(Y**0.5)[±K]`, int-domain): a SINGLE
+	// native-int temp holding the structured `isqrt` Call — no
+	// arith-string, no string temp, no `+0` re-numerify. Big-domain
+	// and all other shapes keep the legacy float path below.
+	if dom == "int" {
+		if pre, ex, ok := l.tryIsqrtHoist(e); ok {
+			return pre, ex, nil
+		}
 	}
 	ir, err := l.hoistFloatIR(e)
 	if err != nil {
@@ -2629,7 +2746,7 @@ func callPurity(func_ string, args []any) string {
 	switch func_ {
 	case "contains", "join", "brace", "idiv", "imod", "arith", "arithEval",
 		"trimCapture", "dirname", "basename", "not", "guard", "caseMatch",
-		"param", "callDirect", "sortedIntJoin", "sortedBigintJoin":
+		"param", "callDirect", "sortedIntJoin", "sortedBigintJoin", "isqrt":
 		return "PureCpu"
 	case "getVar", "setVar", "setLastExit", "assign", "test", "grepText",
 		"listVar", "setArray", "setArrayAppend", "arrayItems", "arrayKeys",
