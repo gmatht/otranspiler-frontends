@@ -4659,13 +4659,13 @@ func (p *parser) printlnStmt() []map[string]any {
 		// identity.
 		return []map[string]any{execStmt("echo", []map[string]any{p.displayCallWord(capW)}, "Emulable")}
 	}
-	return []map[string]any{execStmt("echo", p.printlnWords(args), "Emulable")}
+	return []map[string]any{execStmt("echo", p.printlnWords(args...), "Emulable")}
 }
 
 // printlnWords: Println/Print/Fprintln operand separation — Go separates
 // operands with a space, which IS shell word separation — one word per
 // operand (t40 fixes the old interpParts concat that printed "$i$j").
-func (p *parser) printlnWords(args []*expr) []map[string]any {
+func (p *parser) printlnWords(args ...*expr) []map[string]any {
 	var words []map[string]any
 	if len(args) > 1 {
 		allStr := true
@@ -4732,7 +4732,7 @@ func (p *parser) fprintlnStmt() []map[string]any {
 	if len(args) == 0 {
 		p.failf("Fprintln with no args (v2)")
 	}
-	echo := execStmt("echo", p.printlnWords(args), "Emulable")
+	echo := execStmt("echo", p.printlnWords(args...), "Emulable")
 	return []map[string]any{{
 		"type":  "Redirect",
 		"inner": []any{echo},
@@ -11017,18 +11017,6 @@ func (p *parser) exprToArith(e *expr) map[string]any {
 		// (getVar("#s") counts chars/bytes; a param maps to its $N
 		// positional — the dogfood app's own `i < len(src)` lexer loops)
 		if e.target != nil && e.target.kind == "var" {
-			// SLICE param misclassified here (forward-ref order) —
-			// listLen beats string length.
-			rn := p.resolveVar(e.target.name)
-			if p.paramSlice[e.target.name] || p.paramSlice[rn] {
-				if n, ok := p.paramNumber(rn); ok {
-					return map[string]any{
-						"type": "Call", "func": "listLen",
-						"args":   []any{getVarExpr(strconv.Itoa(n))},
-						"purity": "PureCpu",
-					}
-				}
-			}
 			return arithVar("#" + p.paramName(e.target.name))
 		}
 	case "arrlen":
@@ -11046,24 +11034,6 @@ func (p *parser) exprToArith(e *expr) map[string]any {
 					"type": "Call", "func": "listLen",
 					"args":   []any{p.exprToWord(e.target)},
 					"purity": "PureCpu",
-				}
-			}
-			// SLICE-param len in arithmetic (list id).
-			rn := p.resolveVar(e.target.name)
-			if p.paramSlice[e.target.name] || p.paramSlice[rn] {
-				if n, ok := p.paramNumber(rn); ok {
-					return map[string]any{
-						"type": "Call", "func": "listLen",
-						"args":   []any{getVarExpr(strconv.Itoa(n))},
-						"purity": "PureCpu",
-					}
-				}
-				if n, ok := p.paramNumber(e.target.name); ok {
-					return map[string]any{
-						"type": "Call", "func": "listLen",
-						"args":   []any{getVarExpr(strconv.Itoa(n))},
-						"purity": "PureCpu",
-					}
 				}
 			}
 			return arithVar("#" + p.paramName(e.target.name))
