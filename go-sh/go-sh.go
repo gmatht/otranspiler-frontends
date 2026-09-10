@@ -2923,6 +2923,21 @@ func (p *parser) parseStmt() []map[string]any {
 						},
 					})
 				}
+				// SNAPSHOT the finished node (immune to temp reuse:
+				// later builds overwrite tmpM before end-freeze).
+				// Stored raw (objects survive assocSet).
+				preEcho = append(preEcho, map[string]any{
+					"type": "Expr",
+					"expr": map[string]any{
+						"type": "Call", "func": "assocSet",
+						"args": []any{strExpr("__nodeSnaps"), strExpr(tmpM), map[string]any{
+							"type": "Call", "func": "snapshotTemp",
+							"args":   []any{strExpr(tmpM), strExpr("nodeTemps"), strExpr("sigil,params")},
+							"purity": "PureCpu",
+						}},
+						"purity": "Emulable",
+					},
+				})
 				words = append(words, strExpr(tmpM))
 				continue
 			}
@@ -9264,7 +9279,8 @@ func (p *parser) returnAppendList(e *expr) (stmts []map[string]any, tmp string, 
 		map[string]any{"type": "Call", "func": "freezeStmts",
 			"args": []any{getVarExpr(tmp),
 				strExpr("nodeTemps"),
-				strExpr("sigil,params")},
+				strExpr("sigil,params"),
+				strExpr("__nodeSnaps")},
 			"purity": "PureCpu"}))
 	return stmts, frozen, true
 }
