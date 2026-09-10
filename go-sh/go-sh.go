@@ -6071,6 +6071,47 @@ func (p *parser) parseAssignStmt() []map[string]any {
 				delete(p.anyElem, name)
 				p.registerVar(name, "Array")
 				p.varTypes[name] = "Array"
+				// SCALAR slice (`args := p.parseArgs()`): the
+				// capture holds space-joined items (single array
+				// slot) — rebuild the ARRAY store from the split
+				// (mirrors the multi-target slot-0 path). Binding
+				// the raw capture strand arrayLen/arrayIndex reads
+				// (self-host Println("hi") saw len 0).
+				tmpMr2 := "__mr_" + strconv.Itoa(p.tmpN)
+				p.tmpN++
+				p.registerVar(tmpMr2, "Str")
+				seg0 := map[string]any{
+					"type": "Call", "func": "listGet",
+					"args": []any{
+						map[string]any{
+							"type": "Call", "func": "strSplit",
+							"args":   []any{getVarExpr(tmpMr2), strExpr("\036")},
+							"purity": "PureCpu",
+						},
+						map[string]any{"type": "Int", "value": 0},
+					},
+					"purity": "PureCpu",
+				}
+				itemsArr := map[string]any{
+					"type": "Call", "func": "listItems",
+					"args": []any{map[string]any{
+						"type": "Call", "func": "strSplit",
+						"args":   []any{seg0, strExpr(" ")},
+						"purity": "PureCpu",
+					}},
+					"purity": "PureCpu",
+				}
+				return []map[string]any{
+					assignStmt(tmpMr2, capture),
+					assignStmt(name, map[string]any{
+						"type": "Call", "func": "setArray",
+						"args": []any{strExpr(name), map[string]any{
+							"type":     "Array",
+							"elements": []any{itemsArr},
+						}},
+						"purity": "Emulable",
+					}),
+				}
 			}
 		} else {
 			delete(p.anyLists, name)
