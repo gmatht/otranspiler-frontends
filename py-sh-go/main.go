@@ -2696,6 +2696,24 @@ func assignStmt(vr string, e map[string]any) map[string]any {
 	}
 }
 
+// declareStmt builds a bare Declare node (scope annotation, no init):
+// the var is function-scoped when local is true (Python params and
+// function-body locals — backends render true C/JS locals from it),
+// module-scoped otherwise. It carries no value semantics on its own;
+// the initializing Assign is always emitted alongside, so analyses
+// keyed off Assign (ranges, liveness, nonnull) see an unchanged IR.
+func declareStmt(vr string, local bool) map[string]any {
+	return map[string]any{
+		"type": "Declare",
+		"vars": []any{map[string]any{
+			"name":  vr,
+			"sigil": nil,
+		}},
+		"init":  nil,
+		"local": local,
+	}
+}
+
 func ifStmt(cond map[string]any, then, els []map[string]any) map[string]any {
 	return map[string]any{
 		"type":   "If",
@@ -3415,6 +3433,15 @@ func (l *lowerer) rangeWhile(t *ForS, c *CallE) ([]map[string]any, error) {
 	body = append(body, step...)
 	cond := arithExpr(arithBin("<", arithVar(t.Var), hiIR["ast"].(map[string]any)))
 	out := append(preL, preH...)
+	// function-scoped loop counter: a bare Declare pins locals in
+	// backends with function scope (C/JS). Only inside functions and
+	// int-domain — top-level loop vars keep the existing global hoist
+	// (Python module-scope leak), and bigint counters keep the
+	// file-scope mpz_t baseline (no Declare+mpz render path yet).
+	// The counter Assign below is unchanged.
+	if l.curParams != nil && dom == "int" {
+		out = append(out, declareStmt(t.Var, true))
+	}
 	out = append(out, assignStmt(t.Var, loIR))
 	out = append(out, whileStmt(cond, body))
 	return out, nil
@@ -3860,6 +3887,15 @@ func (l *lowerer) stmtIR(s Stmt) ([]map[string]any, error) {
 			l.ranges[prm] = iv
 			if dom == "int" {
 				l.setType(prm, "int")
+				// function-scoped param: bare Declare pins the C
+				// backend (and friends) to a true function local
+				// instead of the shell-global default; the Assign
+				// below is unchanged so all Assign-keyed analyses
+				// see exactly what they saw before. Int-domain only:
+				// bigint params keep the file-scope mpz_t baseline
+				// (the backend has no Declare+mpz render path yet —
+				// a bare Declare would misrender as long long).
+				pre = append(pre, declareStmt(prm, true))
 				pre = append(pre, assignStmt(prm, arithExpr(arithVar(pos))))
 			} else {
 				l.setType(prm, "big")
