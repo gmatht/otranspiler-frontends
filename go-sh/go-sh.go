@@ -7780,12 +7780,14 @@ func (p *parser) parseFor() []map[string]any {
 			}}
 		}
 		if rv.kind == "var" {
-			if ln := p.anyListVar(rv.name); ln != "" {
+			if ln := p.anyListVar(rv.name); ln != "" || p.paramSlice[rv.name] || p.paramSlice[p.resolveVar(rv.name)] {
 				// ANY-LIST var index+value range (`for i, s := range
 				// stmts` — toAnyStmts over a list id): C-style over
 				// listLen; the value binds listGet (RAW — objects
 				// survive for member reads). The container reads
 				// through paramName so positional params resolve.
+				// Scalar-slice params (paramSlice, list ids) share
+				// this shape (no struct typing — anyElem misses).
 				p.registerVar(idxName, "Int")
 				p.registerVar(valName, "Str")
 				if et := p.anyElem[ln]; et != "" && p.isStructType(et) {
@@ -8038,13 +8040,27 @@ func (p *parser) parseFor() []map[string]any {
 				p.failf("range over a non-var (v2)")
 			}
 			if p.varTypes[p.resolveVar(rv.name)] == "" && rv.kind == "var" {
-				// untyped var: array items if populated, else newline-split
-				// string (rangeItems covers forward refs like the lexer's
-				// multiOps, where static typing lags the runtime store).
-				lw2 := map[string]any{
-					"type": "Call", "func": "rangeItems",
-					"args":   []any{strExpr(p.resolveVar(rv.name))},
-					"purity": "PureCpu",
+				// SLICE-param value range (`for _, a := range args` —
+				// the param holds a list id positionally): iterate it
+				// directly, not via rangeItems (which reads arrays).
+				var lw2 map[string]any
+				rn := p.resolveVar(rv.name)
+				if p.paramSlice[rv.name] || p.paramSlice[rn] {
+					if n, ok := p.paramNumber(rn); ok {
+						lw2 = getVarExpr(strconv.Itoa(n))
+					} else if n, ok := p.paramNumber(rv.name); ok {
+						lw2 = getVarExpr(strconv.Itoa(n))
+					}
+				}
+				if lw2 == nil {
+					// untyped var: array items if populated, else newline-split
+					// string (rangeItems covers forward refs like the lexer's
+					// multiOps, where static typing lags the runtime store).
+					lw2 = map[string]any{
+						"type": "Call", "func": "rangeItems",
+						"args":   []any{strExpr(p.resolveVar(rv.name))},
+						"purity": "PureCpu",
+					}
 				}
 				cnt := "__ri_" + strconv.Itoa(p.tmpN)
 				p.tmpN++
