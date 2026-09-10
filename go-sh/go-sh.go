@@ -2181,6 +2181,11 @@ func (p *parser) parseFuncParams() []string {
 				if p.isAnyListElem(pelem) {
 					p.anyLists[nm2] = true
 					p.anyElem[nm2] = pelem
+				} else {
+					// a shadowing param rebinds storage (see
+					// parseVarDecl).
+					delete(p.anyLists, nm2)
+					delete(p.anyElem, nm2)
 				}
 			}
 		}
@@ -2842,6 +2847,17 @@ func (p *parser) parseStmt() []map[string]any {
 				words = append(words, paramCall("slice", p.resolveVar(e.name), "@", ""))
 				continue
 			}
+			if e.kind == "call" && e.callee == "append" {
+				// `return append(...)` over an any-list base
+				// (parseTopLevel's decl/func/out assembly): list
+				// concatenation into a temp whose id echoes (the
+				// legacy array-flatten would String-coerce objects).
+				if pre, tmp, ok := p.returnAppendList(e); ok {
+					preEcho = append(preEcho, pre...)
+					words = append(words, getVarExpr(tmp))
+					continue
+				}
+			}
 			words = append(words, p.exprToWord(e))
 		}
 		// MULTI-slot return (`return a, b`): the value channel is ONE
@@ -3228,6 +3244,13 @@ func (p *parser) parseVarSpec() []map[string]any {
 	}
 	var out []map[string]any
 	for _, n := range names {
+		// a fresh declaration ESTABLISHES storage: clear any stale
+		// list marking from another function's same-named local (the
+		// parser's maps are global — objNewCall's `names := []any{}`
+		// poisoned parseVarSpec's `var names []string` into listPush).
+		// Branches below re-mark genuine lists.
+		delete(p.anyLists, n)
+		delete(p.anyElem, n)
 		if isSliceDecl {
 			p.registerVar(n, "Array")
 		} else if isMapDecl {
@@ -5107,6 +5130,9 @@ func (p *parser) parseAssignStmt() []map[string]any {
 			return []map[string]any{assignStmt(targets[0],
 				map[string]any{"type": "Call", "func": "listNew", "args": []any{}, "purity": "PureCpu"})}
 		}
+		// rebinding clears stale list marks (see parseVarDecl).
+		delete(p.anyLists, targets[0])
+		delete(p.anyElem, targets[0])
 		p.registerVar(targets[0], "Array")
 		return []map[string]any{assignStmt(targets[0], map[string]any{
 			"type": "Call", "func": "setArray",
@@ -5172,6 +5198,9 @@ func (p *parser) parseAssignStmt() []map[string]any {
 			elems, typ := p.parseArrayLiteral()
 			p.arrays[targets[i]] = arrayInfo{elems: elems, typ: typ}
 			p.registerVar(targets[i], "Array")
+			// rebinding clears stale list marks (see parseVarDecl).
+			delete(p.anyLists, targets[i])
+			delete(p.anyElem, targets[i])
 			if p.isAnyListElem(litElem) {
 				// LIST-element slice (`[]tok{...}`, `[]any{...}`): elements
 				// ride a LIST id (shell arrays String-coerce objects).
@@ -5817,6 +5846,11 @@ func (p *parser) parseAssignStmt() []map[string]any {
 				p.anyLists[tg] = true
 				p.anyElem[tg] = listElem
 				listBound = true
+			} else if !listBound {
+				// rebinding clears stale list marks (see parseVarDecl).
+				delete(p.anyLists, tg)
+				delete(p.anyElem, tg)
+				listBound = true
 			}
 			if retSlice && listElem == "" && !sliceDone {
 				// the FIRST target of a SLICE-returning callee gets the
@@ -5932,10 +5966,15 @@ func (p *parser) parseAssignStmt() []map[string]any {
 				p.anyLists[name] = true
 				p.anyElem[name] = le
 			} else {
+				// rebinding clears stale list marks (see parseVarDecl).
+				delete(p.anyLists, name)
+				delete(p.anyElem, name)
 				p.registerVar(name, "Array")
 				p.varTypes[name] = "Array"
 			}
 		} else {
+			delete(p.anyLists, name)
+			delete(p.anyElem, name)
 			p.registerVar(name, "Str")
 		}
 		return []map[string]any{assignStmt(name, capture)}
@@ -6365,6 +6404,9 @@ func (p *parser) parseAssignStmt() []map[string]any {
 				p.anyLists[targets[0]] = true
 				p.anyElem[targets[0]] = le
 			} else if sig, ok := p.fnSig[tn]; ok && strings.HasPrefix(sig[1], "[]") {
+				// rebinding clears stale list marks (see parseVarDecl).
+				delete(p.anyLists, targets[0])
+				delete(p.anyElem, targets[0])
 				p.registerVar(targets[0], "Array")
 			}
 			// a func returning a MAP (`map[string]any` — the golib's own
@@ -6418,6 +6460,10 @@ func (p *parser) parseAssignStmt() []map[string]any {
 	// inside a func: `name := lit` on a fresh var → local name=lit
 	if p.inFunc && op == ":=" && !p.fnParams[targets[0]] && !p.outer[targets[0]] && !p.fnLocals[targets[0]] {
 		p.fnLocals[targets[0]] = true
+		// rebinding clears stale list marks (see parseVarDecl);
+		// branches below re-mark genuine lists.
+		delete(p.anyLists, targets[0])
+		delete(p.anyElem, targets[0])
 		// register the type (byte reads `c := src[i]`, struct values,
 		// field-element reads) so later lowerings (string(c) → chr,
 		// char compares) see it — the shared registerAssignType path
@@ -8901,6 +8947,113 @@ func (p *parser) appendEls(e *expr) []any {
 		}
 	}
 	return out
+}
+
+// appendChainParts flattens append(append(A, Bs...), Cs...) into the
+// ordered part list [A, Bs..., Cs...] (spread flags ride the exprs).
+func appendChainParts(e *expr) []*expr {
+	if e.kind == "call" && e.callee == "append" && len(e.args) >= 1 {
+		return append(appendChainParts(e.args[0]), e.args[1:]...)
+	}
+	return []*expr{e}
+}
+
+// returnAppendList lowers `return append(...)` over an any-list base
+// (parseTopLevel's `return append(append(declStmts, funcStmts...),
+// out...)`): the legacy appendEls array-flattening would
+// String-coerce object elements. Instead a temp list concatenates
+// (listExtend for spreads, listPush for singletons) and the caller
+// echoes/binds its id. ok=false → legacy path (non-list base).
+func (p *parser) returnAppendList(e *expr) (stmts []map[string]any, tmp string, ok bool) {
+	parts := appendChainParts(e)
+	if len(parts) == 0 {
+		return nil, "", false
+	}
+	// the ultimate base must ride a list id (any-list var, or a
+	// list-element slice call result).
+	var baseW map[string]any
+	baseSet := false
+	b := parts[0]
+	if b.kind == "var" && p.anyListVar(b.name) != "" {
+		baseW = getVarExpr(p.paramName(b.name))
+		baseSet = true
+	}
+	if !baseSet && b.kind == "call" && p.callTargetName(b.callee) != "" {
+		if le := p.callFirstListElem(p.callTargetName(b.callee), p.fnRetIdents[p.callTargetName(b.callee)]); le != "" {
+			baseW = p.exprToWord(b)
+			baseSet = true
+		}
+	}
+	if !baseSet {
+		return nil, "", false
+	}
+	tmp = "__ret_l" + strconv.Itoa(p.tmpN)
+	p.tmpN++
+	stmts = append(stmts, assignStmt(tmp,
+		map[string]any{"type": "Call", "func": "listNew", "args": []any{}, "purity": "PureCpu"}))
+	stmts = append(stmts, p.listExtendStmt(tmp, baseW))
+	for _, a := range parts[1:] {
+		if a.spread {
+			sub, ok := p.spreadAppendPart(tmp, a)
+			if !ok {
+				p.failf("spread append into a list needs a list value (v2)")
+			}
+			stmts = append(stmts, sub...)
+			continue
+		}
+		stmts = append(stmts, p.listPushStmt(tmp, p.exprToWord(a)))
+	}
+	return stmts, tmp, true
+}
+
+// listExtendStmt appends all of the word's items onto the tmp list.
+func (p *parser) listExtendStmt(tmp string, w map[string]any) map[string]any {
+	return map[string]any{
+		"type": "Expr",
+		"expr": map[string]any{
+			"type": "Call", "func": "listExtend",
+			"args":   []any{getVarExpr(tmp), w},
+			"purity": "PureCpu",
+		},
+	}
+}
+
+// listPushStmt pushes one element word onto the tmp list.
+func (p *parser) listPushStmt(tmp string, w map[string]any) map[string]any {
+	return map[string]any{
+		"type": "Expr",
+		"expr": map[string]any{
+			"type": "Call", "func": "listPush",
+			"args":   []any{getVarExpr(tmp), w},
+			"purity": "PureCpu",
+		},
+	}
+}
+
+// spreadAppendPart lowers one spread constituent of a list-building
+// append into statements extending tmp: any-list vars and list-result
+// calls extend directly; a nested append call recurses (its own base
+// is always spliced). ok=false means caller refuses.
+func (p *parser) spreadAppendPart(tmp string, a *expr) (stmts []map[string]any, ok bool) {
+	if a.kind == "call" && a.callee == "append" {
+		subStmts, subTmp, subOk := p.returnAppendList(a)
+		if !subOk {
+			return nil, false
+		}
+		stmts = append(stmts, subStmts...)
+		stmts = append(stmts, p.listExtendStmt(tmp, getVarExpr(subTmp)))
+		return stmts, true
+	}
+	if a.kind == "var" && p.anyListVar(a.name) != "" {
+		return []map[string]any{p.listExtendStmt(tmp, getVarExpr(p.paramName(a.name)))}, true
+	}
+	if a.kind == "call" && p.callTargetName(a.callee) != "" {
+		callee := p.callTargetName(a.callee)
+		if le := p.callFirstListElem(callee, p.fnRetIdents[callee]); le != "" {
+			return []map[string]any{p.listExtendStmt(tmp, p.exprToWord(a))}, true
+		}
+	}
+	return nil, false
 }
 
 // argToWord lowers a CALL ARGUMENT: a spread-marked arg (f(args...))
