@@ -8025,9 +8025,12 @@ func (p *parser) parseFor() []map[string]any {
 				p.failf("range over a non-var (v2)")
 			}
 			if p.varTypes[p.resolveVar(rv.name)] == "" && rv.kind == "var" {
+				// untyped var: array items if populated, else newline-split
+				// string (rangeItems covers forward refs like the lexer's
+				// multiOps, where static typing lags the runtime store).
 				lw2 := map[string]any{
-					"type": "Call", "func": "strSplit",
-					"args":   []any{p.exprToWord(rv), strExpr("\n")},
+					"type": "Call", "func": "rangeItems",
+					"args":   []any{strExpr(p.resolveVar(rv.name))},
 					"purity": "PureCpu",
 				}
 				cnt := "__ri_" + strconv.Itoa(p.tmpN)
