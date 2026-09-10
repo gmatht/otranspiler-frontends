@@ -376,21 +376,31 @@ func execStmtTA(cmd string, words []map[string]any, purity string, typeArgs []st
 	for i, w := range words {
 		elems[i] = w
 	}
-	call := map[string]any{
-		"type": "Call", "func": "exec",
-		"args":   []any{strExpr(cmd), map[string]any{"type": "Array", "elements": elems}},
-		"purity": purity,
-	}
+	// NOTE: no `call` local — a mutated Go map materializes as a
+	// named assoc whose var-read sees "" (self-host execStmtTA lost
+	// its expr); inline both variants so nesting stays plain.
 	if len(typeArgs) > 0 {
 		ta := make([]any, len(typeArgs))
 		for i, s := range typeArgs {
 			ta[i] = s
 		}
-		call["typeArgs"] = ta
+		return map[string]any{
+			"type": "Expr",
+			"expr": map[string]any{
+				"type": "Call", "func": "exec",
+				"args":     []any{strExpr(cmd), map[string]any{"type": "Array", "elements": elems}},
+				"purity":   purity,
+				"typeArgs": ta,
+				},
+			}
 	}
 	return map[string]any{
 		"type": "Expr",
-		"expr": call,
+		"expr": map[string]any{
+			"type": "Call", "func": "exec",
+			"args":   []any{strExpr(cmd), map[string]any{"type": "Array", "elements": elems}},
+			"purity": purity,
+		},
 	}
 }
 
@@ -4611,6 +4621,12 @@ func (p *parser) printlnStmt() []map[string]any {
 	args := p.parseArgs()
 	if len(args) == 0 {
 		p.failf("Println/Print with no args (v2)")
+	}
+	// single plain string (`Println("hi")` — tiny): direct echo,
+	// bypassing printlnWords (its Go word-slice rides a list id that
+	// execStmt cannot iterate self-hosted).
+	if len(args) == 1 && args[0].kind == "str" {
+		return []map[string]any{execStmt("echo", []map[string]any{interpLit(args[0].text)}, "Emulable")}
 	}
 	// heredoc: Println(`...`) → Redirect(cat <<EOF ...)
 	if len(args) == 1 && args[0].kind == "rawstr" {
@@ -9414,12 +9430,6 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 		if n, ok := p.paramNumber(name); ok {
 			return getVarExpr(strconv.Itoa(n))
 		}
-		// MAP vars (named assocs — `call := map...` locals, user maps)
-		// hold the assoc NAME, not a vars-store string: read the name
-		// itself (freeze/assocGet resolve it; getVar sees only "").
-		if p.maps[e.name] || p.maps[name] {
-			return strExpr(name)
-		}
 		return getVarExpr(name)
 	case "member":
 		// STRUCT FIELD ACCESS: a dotted name whose base is a
@@ -11652,11 +11662,6 @@ func (p *parser) condWordAny(e *expr) map[string]any {
 		name := p.resolveVar(e.name)
 		if n, ok := p.paramNumber(name); ok {
 			return getVarExpr(strconv.Itoa(n))
-		}
-		// MAP vars hold assoc names (truthy when present) — same
-		// store correction as exprToWord.
-		if p.maps[e.name] || p.maps[name] {
-			return strExpr(name)
 		}
 		return getVarExpr(name)
 	case "str", "rawstr":
