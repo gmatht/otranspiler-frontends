@@ -491,6 +491,9 @@ type parser struct {
 	arrays      map[string]arrayInfo
 	anyLists    map[string]bool       // vars holding objStore list ids (struct/any elements)
 	anyElem     map[string]string     // var -> list element struct type
+	idxBase     string                // indexed-assign base (`out` in `out[i] = …`) — consumed by the maplit hook below
+	idxKey      *expr                 // computed index expr (nil when the key is a literal)
+	idxLit      string                // literal index text ("" when computed)
 	maps        map[string]bool    // m := map[K]V{...} — assoc-array name
 	bufs        map[string]string  // b := bytes.Buffer — accumulated contents
 	runtimeBufs map[string]bool    // buffers with runtime-dependent contents (WriteByte of a runtime byte)
@@ -748,6 +751,18 @@ func (p *parser) parsePostfix() *expr {
 				}
 			}
 			if _, ok := p.structFields[cname]; !ok {
+				// DOTTED unknown type (`foo.Bar{...}`,
+				// `&shiremit.Program{Stmts: stmts}` — the Shir entry):
+				// a keyed composite with synthetic layout.
+				// parseGenericStructLit refuses non-keyed forms via
+				// its lookahead, so a following block brace stays a
+				// block (plain vars never take a composite here).
+				if e.kind == "member" {
+					if e2 := p.parseGenericStructLit(callName(e)); e2 != nil {
+						e = e2
+						break
+					}
+				}
 				return e
 			}
 			p.pos++
@@ -872,20 +887,6 @@ func (p *parser) parsePostfix() *expr {
 			// SpreadElement; array-typed vars only — see argToWord).
 			p.pos++
 			e.spread = true
-		case p.atPunct("{"):
-			// pkg.T{...} composite on a DOTTED name (`&shiremit.Program{
-			// Stmts: stmts}` — the golib's Emit call, shir-emit-go in the
-			// concatenated source): a KEYED struct literal whose layout
-			// comes from the literal's own keys. Plain vars never get a
-			// composite here (a following `{` is a block, not a literal).
-			if e.kind == "member" {
-				e2 := p.parseGenericStructLit(callName(e))
-				if e2 != nil {
-					e = e2
-					break
-				}
-			}
-			return e
 		case p.atPunct("++"):
 			p.pos++
 			e = &expr{kind: "incr", target: e}
@@ -1104,7 +1105,8 @@ func (p *parser) parsePrimary() *expr {
 			arg := p.parseExpr()
 			p.expect(tPunct, ")")
 			if arg.kind == "var" && (p.varTypes[arg.name] == "Array" ||
-				p.varTypes[p.resolveVar(arg.name)] == "ListRef") {
+				p.varTypes[p.resolveVar(arg.name)] == "ListRef" ||
+				p.anyListVar(arg.name) != "") {
 				return &expr{kind: "arrlen", target: arg}
 			}
 			if arg.kind == "member" {
@@ -1747,7 +1749,10 @@ func (p *parser) captureTypeText() string {
 }
 
 func (p *parser) isStructType(name string) bool {
-	_, ok := p.structs[name]
+	// POINTER returns (`*expr` — parseUnary/parseExpr/parsePrimary):
+	// the pointee is the struct type (the golib's own `e :=
+	// p.parseUnary()` then `e.isAddrOf = true` field write).
+	_, ok := p.structs[strings.TrimPrefix(name, "*")]
 	return ok
 }
 
@@ -1761,6 +1766,21 @@ func (p *parser) anyListVar(name string) string {
 		return rn
 	}
 	return ""
+}
+
+// isAnyListElem: slice element types whose values ride objStore LIST
+// ids (not shell arrays, which String-coerce elements on write —
+// structs as object refs, `any` (may hold objects), maps (assoc refs
+// or inline objects)). Pointers (`*`, `*T`) ride shell arrays as
+// arena-id strings; scalars ride as items. "" never qualifies.
+func (p *parser) isAnyListElem(elem string) bool {
+	if elem == "" || elem == "*" || strings.HasPrefix(elem, "*") {
+		return false
+	}
+	if elem == "any" || elem == "map" || strings.HasPrefix(elem, "map[") {
+		return true
+	}
+	return p.isStructType(elem)
 }
 
 // peekSliceElem: the element type of a `[]T` / `[N]T` slice literal or
@@ -1791,7 +1811,10 @@ func (p *parser) peekSliceElem() string {
 		}
 		return t.text
 	}
-	return "any"
+	// NESTED or exotic element shapes (`[][]byte`, `[]func()`) stay on
+	// the shell-array path ("") — only plain ident/dotted/star
+	// elements route to list storage via isAnyListElem.
+	return ""
 }
 
 // callFirstListElem: element base when the callee's FIRST result slot
@@ -1800,17 +1823,46 @@ func (p *parser) peekSliceElem() string {
 // arrays (space-joined items); struct elements ride list ids, which bind
 // directly through the generic positional path (no item split).
 func (p *parser) callFirstListElem(callee string, retIds []string) string {
-	if len(retIds) == 0 {
+	// LIST-riding results are SLICE-typed first slots with non-scalar
+	// elements (`[]token`, `[]any`, `[]map[string]any` — elements ride
+	// a list id, not space-joined items). Scalar/pointer elements ride
+	// shell arrays; plain (non-slice) struct/map values ride their own
+	// assoc/object paths — so slice-ness gates every arm below (a
+	// `(token, bool)` multi-return must NOT mark its target a list).
+	sliceRet := false
+	if sig, ok := p.fnSig[callee]; ok && len(sig) > 1 && strings.HasPrefix(sig[1], "[]") {
+		sliceRet = true
+	}
+	if strings.HasPrefix(p.prescanRet[callee], "[]") {
+		sliceRet = true
+	}
+	if !sliceRet {
 		return ""
 	}
-	rt := retIds[0]
-	if i := strings.LastIndex(rt, "."); i >= 0 {
-		rt = rt[i+1:]
+	rt := ""
+	if len(retIds) > 0 {
+		rt = retIds[0]
+		if i := strings.LastIndex(rt, "."); i >= 0 {
+			rt = rt[i+1:]
+		}
+	} else {
+		// forward ref with only raw text: element after the [] prefix
+		// (`[]any` → `any`, `[]map[string]any` → `map`, `[]pkg.T` → T).
+		rt = strings.TrimPrefix(p.prescanRet[callee], "[]")
+		if i := strings.LastIndex(rt, "."); i >= 0 && !strings.HasPrefix(rt, "map[") {
+			rt = rt[i+1:]
+		}
+		if strings.HasPrefix(rt, "map[") {
+			rt = "map"
+		}
 	}
 	if strings.HasPrefix(rt, "*") {
 		// pointer elements (`[]*expr`) ride shell arrays as arena-id
 		// strings — the items path, never the list-id path.
 		return ""
+	}
+	if rt == "any" || rt == "map" {
+		return rt
 	}
 	if rt == "" || !p.isStructType(rt) {
 		return ""
@@ -2017,7 +2069,15 @@ func (p *parser) captureReturnTypeText() string {
 	}
 	for i := start; i < p.pos && i < len(p.toks); i++ {
 		if p.toks[i].kind == tIdent {
-			ids = append(ids, p.toks[i].text)
+			id := p.toks[i].text
+			// a POINTER element (`[]*expr`) keeps its `*` so
+			// callFirstListElem returns "" (pointer elements ride shell
+			// arrays as arena-id strings, never the list-id path) —
+			// without it `[]*expr` is misread as a struct-slice.
+			if i > 0 && p.toks[i-1].kind == tPunct && p.toks[i-1].text == "*" {
+				id = "*" + id
+			}
+			ids = append(ids, id)
 		}
 		if (p.toks[i].kind == tPunct || p.toks[i].kind == tOp) && p.toks[i].text == "[" {
 			slice = true
@@ -2110,6 +2170,18 @@ func (p *parser) parseFuncParams() []string {
 			// execFromArgs) ranges over an array store
 			if p.lastTypeRaw != "" && strings.HasPrefix(p.lastTypeRaw, "[]") && p.paramSlice != nil {
 				p.paramSlice[nm2] = true
+				// LIST-element slice params (`[]any`,
+				// `[]map[string]any`, `[]tok` — toAnyStmts): the arg
+				// rides a list id — mark it so len/index/range
+				// lower through listGet.
+				pelem := strings.TrimPrefix(p.lastTypeRaw, "[]")
+				if strings.HasPrefix(pelem, "map[") {
+					pelem = "map"
+				}
+				if p.isAnyListElem(pelem) {
+					p.anyLists[nm2] = true
+					p.anyElem[nm2] = pelem
+				}
 			}
 		}
 		params = append(params, names...)
@@ -3171,9 +3243,10 @@ func (p *parser) parseVarSpec() []map[string]any {
 			continue
 		}
 		if isSliceDecl {
-			if sliceElem != "" && p.isStructType(sliceElem) {
-				// STRUCT-element slice (`var out []tok`): elements ride
-				// a LIST id (shell arrays String-coerce object elements).
+			if p.isAnyListElem(sliceElem) {
+				// LIST-element slice (`var out []tok`, `var out []any`,
+				// `var out []map[string]any`): elements ride a LIST id
+				// (shell arrays String-coerce object elements).
 				p.anyLists[n] = true
 				p.anyElem[n] = sliceElem
 				out = append(out, assignStmt(n,
@@ -3336,6 +3409,24 @@ func (p *parser) parseDottedStmt() []map[string]any {
 	if p.atPunct("++") {
 		p.pos++
 		p.registerVar(first, "Struct")
+		// STRUCT-typed base with a KNOWN field (`r.n++`, the golib's
+		// `p.pos++`): the field lives in the OBJECT STORE
+		// (objNew-allocated) — objAdd reads the field, adds 1, writes
+		// back. The jsonSet write-back below targets JSON-string
+		// structs; on a store id it JSON-parses "" and clobbers the
+		// binding to "" (self-host infinite loop).
+		if rn := p.resolveVar(first); p.varStruct[rn] != "" {
+			if off := structFieldIndex(p.structs[p.varStruct[rn]], method); off >= 0 {
+				return []map[string]any{{
+					"type": "Expr",
+					"expr": map[string]any{
+						"type": "Call", "func": "objAdd",
+						"args":   []any{p.structIDWord(first), strExpr(method), strExpr("1")},
+						"purity": "PureCpu",
+					},
+				}}
+			}
+		}
 		return []map[string]any{assignStmt(first, map[string]any{
 			"type": "Call", "func": "jsonSet",
 			"args": []any{
@@ -3346,8 +3437,9 @@ func (p *parser) parseDottedStmt() []map[string]any {
 		})}
 	}
 	// p.parseExpr() — a METHOD call on a struct (the go-sh self-hosting
-	// contract): the receiver is passed BY NAME (the method body's field
-	// accesses resolve through the param to the caller's var).
+	// contract): the receiver rides BY VALUE (structIDWord — the
+	// method body's field accesses use positional[0] as the object id
+	// directly; 1546 such uses vs zero name-resolutions).
 	// The `(` is REQUIRED: without it the statement is a field WRITE
 	// (`p.pos += 3`, `p.f = v`) on a registered receiver — after any
 	// `p.x++` the receiver's varTypes entry is "Struct", and letting
@@ -3358,7 +3450,7 @@ func (p *parser) parseDottedStmt() []map[string]any {
 		p.expect(tPunct, "(")
 		args := p.parseArgs()
 		var words []map[string]any
-		words = append(words, strExpr(p.resolveVar(first)))
+		words = append(words, p.structIDWord(first))
 		for _, a := range args {
 			words = append(words, p.exprToWord(a))
 		}
@@ -4752,10 +4844,19 @@ func (p *parser) parseMapLiteralBody(name string) []map[string]any {
 				ret = p.prescanRet[tn]
 			}
 			if strings.HasPrefix(ret, "[]") {
-				valWord = map[string]any{
-					"type": "Call", "func": "strSplit",
-					"args":   []any{w, strExpr(" ")},
-					"purity": "PureCpu",
+				// LIST-id echo (struct/any slice calls) rides as-is —
+				// the id is a plain string and jsonMarshal resolves
+				// it structurally. Only space-joined ARRAY echoes
+				// need the strSplit rebuild (which would double-nest
+				// an id: [[items]]).
+				if le := p.callFirstListElem(tn, p.fnRetIdents[tn]); le != "" {
+					valWord = w
+				} else {
+					valWord = map[string]any{
+						"type": "Call", "func": "strSplit",
+						"args":   []any{w, strExpr(" ")},
+						"purity": "PureCpu",
+					}
 				}
 			} else {
 				valWord = w
@@ -4781,6 +4882,9 @@ func (p *parser) parseMapLiteralBody(name string) []map[string]any {
 }
 
 func (p *parser) parseAssignStmt() []map[string]any {
+	// indexed-target parts from the previous statement must not leak:
+	// the maplit hook below consumes them within this call only.
+	p.idxBase, p.idxKey, p.idxLit = "", nil, ""
 	if p.tok().kind == tIdent && p.tok().text == "be" {
 	}
 	// writes through a reference (*p = v / &x = …) have no snapshot-
@@ -4842,6 +4946,10 @@ func (p *parser) parseAssignStmt() []map[string]any {
 				idx = p.arithKeyText(keyE)
 			}
 		}
+		// stash the structural parts for the maplit hook below (an
+		// indexed write of a map literal onto an any-list lowers to
+		// listSet, not assocSet). The base is targets[0] as-is here.
+		p.idxBase, p.idxKey, p.idxLit = targets[0], keyE, idx
 		targets[0] = targets[0] + "[" + idx + "]"
 	}
 	// member assign: p.pos = 5 → p = jsonSet("p", "pos", 5) (the go-sh
@@ -4850,6 +4958,9 @@ func (p *parser) parseAssignStmt() []map[string]any {
 	memberBase, memberField := "", ""
 	memberIndex := "" // p.varTypes[name] — the map-field key
 	if p.atPunct(".") {
+		// a member write (`a[i].f = …`) supersedes any indexed-target
+		// parts stashed above — the maplit hook below must not fire.
+		p.idxBase, p.idxKey, p.idxLit = "", nil, ""
 		if len(targets) != 1 {
 			p.failf("member assign with multiple targets (v2)")
 		}
@@ -4900,6 +5011,25 @@ func (p *parser) parseAssignStmt() []map[string]any {
 			// p.pos++ → p = jsonSet("p", "pos", p.pos + 1) — the
 			// go-sh self-hosting contract (the golib's 91 `p.pos++`).
 			p.registerVar(memberBase, "Struct")
+			// STRUCT-typed base with a KNOWN field: the object-store
+			// objAdd (delta carries --'s direction; the jsonSet
+			// below always adds and clobbers store ids to "").
+			if rn := p.resolveVar(memberBase); p.varStruct[rn] != "" {
+				if off := structFieldIndex(p.structs[p.varStruct[rn]], memberField); off >= 0 {
+					d := "1"
+					if op == "--" {
+						d = "-1"
+					}
+					return []map[string]any{{
+						"type": "Expr",
+						"expr": map[string]any{
+							"type": "Call", "func": "objAdd",
+							"args":   []any{p.structIDWord(memberBase), strExpr(memberField), strExpr(d)},
+							"purity": "PureCpu",
+						},
+					}}
+				}
+			}
 			return []map[string]any{assignStmt(memberBase, map[string]any{
 				"type": "Call", "func": "jsonSet",
 				"args": []any{
@@ -4940,6 +5070,12 @@ func (p *parser) parseAssignStmt() []map[string]any {
 			// []T slice form (map[K]V starts with "map")
 			isMap = false
 		}
+		// LIST-element slice (`make([]any, n)`, `make([]tok, n)`):
+		// elements ride a LIST id — peek before skipType consumes it.
+		makeElem := ""
+		if p.atPunct("[") {
+			makeElem = p.peekSliceElem()
+		}
 		p.skipType() // the full type argument
 		for p.acceptPunct(",") {
 			p.skipNL()
@@ -4954,6 +5090,12 @@ func (p *parser) parseAssignStmt() []map[string]any {
 		if isMap {
 			p.registerVar(targets[0], "Str")
 			return []map[string]any{assignStmt(targets[0], strExpr(""))}
+		}
+		if p.isAnyListElem(makeElem) {
+			p.anyLists[targets[0]] = true
+			p.anyElem[targets[0]] = makeElem
+			return []map[string]any{assignStmt(targets[0],
+				map[string]any{"type": "Call", "func": "listNew", "args": []any{}, "purity": "PureCpu"})}
 		}
 		p.registerVar(targets[0], "Array")
 		return []map[string]any{assignStmt(targets[0], map[string]any{
@@ -5020,9 +5162,9 @@ func (p *parser) parseAssignStmt() []map[string]any {
 			elems, typ := p.parseArrayLiteral()
 			p.arrays[targets[i]] = arrayInfo{elems: elems, typ: typ}
 			p.registerVar(targets[i], "Array")
-			if litElem != "" && p.isStructType(litElem) {
-				// STRUCT-element slice (`[]tok{...}`): elements ride a
-				// LIST id (shell arrays String-coerce object elements).
+			if p.isAnyListElem(litElem) {
+				// LIST-element slice (`[]tok{...}`, `[]any{...}`): elements
+				// ride a LIST id (shell arrays String-coerce objects).
 				p.anyLists[targets[i]] = true
 				p.anyElem[targets[i]] = litElem
 				pushes := []map[string]any{assignStmt(targets[i],
@@ -5110,6 +5252,31 @@ func (p *parser) parseAssignStmt() []map[string]any {
 	}
 	if p.atIdent("map") {
 		me := p.parsePrimary() // the structlit expr (parsePrimary's map case)
+		// INDEXED any-list element write (`out[i] = map[string]any{...}`
+		// — toAnySlice's indexed fill): the maplit lowers to a
+		// jsonObject word (a plain JS object, serialization-safe) and
+		// listSet grows/sets the slot. The assocSet paths below would
+		// strand the target text ("out[0]") as a map NAME.
+		if me.kind == "maplit" && len(targets) == 1 && p.idxBase != "" {
+			if ln := p.anyListVar(p.idxBase); ln != "" {
+				var idxW map[string]any
+				if p.idxKey != nil {
+					idxW = p.exprToWord(p.idxKey)
+				} else if _, err := strconv.Atoi(p.idxLit); err == nil {
+					idxW = strExpr(p.idxLit)
+				}
+				if idxW != nil {
+					return []map[string]any{{
+						"type": "Expr",
+						"expr": map[string]any{
+							"type": "Call", "func": "listSet",
+							"args":   []any{getVarExpr(ln), idxW, p.exprToWord(me)},
+							"purity": "PureCpu",
+						},
+					}}
+				}
+			}
+		}
 		allLit := true
 		for _, f := range me.args {
 			if f.kind != "str" && f.kind != "num" && f.kind != "rawstr" &&
@@ -5579,7 +5746,7 @@ func (p *parser) parseAssignStmt() []map[string]any {
 		if sig, okSig := p.fnSig[calleeName]; okSig && p.isStructType(sig[1]) {
 			for _, tg := range targets {
 				if tg != "_" {
-					p.varStruct[p.resolveVar(tg)] = sig[1]
+					p.varStruct[p.resolveVar(tg)] = strings.TrimPrefix(sig[1], "*")
 				}
 			}
 		}
@@ -5683,7 +5850,7 @@ func (p *parser) parseAssignStmt() []map[string]any {
 					p.registerVar(tg, "Bool")
 				case p.isStructType(rt):
 					p.registerVar(tg, "Str")
-					p.varStruct[p.resolveVar(tg)] = rt
+					p.varStruct[p.resolveVar(tg)] = strings.TrimPrefix(rt, "*")
 				default:
 					p.registerVar(tg, "Str")
 				}
@@ -5932,10 +6099,18 @@ func (p *parser) parseAssignStmt() []map[string]any {
 		vName, okName := targets[0], targets[1]
 		// a MAP assertion binds the value as a NAMED ASSOC array (the
 		// A1's map model): x["k"] reads lower to assocGet after the
-		// comma-ok `v, ok := x.(map[string]any)` form
+		// comma-ok `v, ok := x.(map[string]any)` form. The asserted
+		// value (a list element, a jsonObject word) materializes via
+		// the runtime toAssoc — a bare passthrough would strand a
+		// plain object no assocGet can read.
 		if k == "map" {
 			p.maps[vName] = true
 			p.registerVar(vName, "Map")
+			w = map[string]any{
+				"type": "Call", "func": "toAssocInto",
+				"args":   []any{strExpr(vName), w},
+				"purity": "PureCpu",
+			}
 		} else {
 			p.registerVar(vName, "Str")
 		}
@@ -5971,7 +6146,11 @@ func (p *parser) parseAssignStmt() []map[string]any {
 	if len(targets) == 1 && rhs.kind == "assert" && goTypeKind(rhs.typeName) == "map" {
 		p.maps[targets[0]] = true
 		p.registerVar(targets[0], "Map")
-		return []map[string]any{assignStmt(targets[0], p.exprToWord(rhs))}
+		return []map[string]any{assignStmt(targets[0], map[string]any{
+			"type": "Call", "func": "toAssocInto",
+			"args":   []any{strExpr(targets[0]), p.exprToWord(rhs)},
+			"purity": "PureCpu",
+		})}
 	}
 
 	// comma-ok MAP read: v, ok := m[k] — v gets the element, ok gets
@@ -6138,13 +6317,18 @@ func (p *parser) parseAssignStmt() []map[string]any {
 	if rhs.kind == "call" {
 		if tn := p.callTargetName(rhs.callee); tn != "" {
 			if sig, ok := p.fnSig[tn]; ok && p.isStructType(sig[1]) {
-				p.varStruct[p.resolveVar(targets[0])] = sig[1]
+				p.varStruct[p.resolveVar(targets[0])] = strings.TrimPrefix(sig[1], "*")
 			}
 			// a user func returning a SLICE ([]T): the target is an
 			// Array-typed store var, so ranging/slicing it lowers through
 			// the proven param("slice", …) shapes (`args := p.parseArgs()`
-			// then `range args[1:]` — go-sh.go's own parseAppendIntoList)
-			if sig, ok := p.fnSig[tn]; ok && strings.HasPrefix(sig[1], "[]") {
+			// then `range args[1:]` — go-sh.go's own parseAppendIntoList).
+			// LIST-element slices route to list storage first (see the
+			// callFirstListElem contract — shell arrays flatten objects).
+			if le := p.callFirstListElem(tn, p.fnRetIdents[tn]); le != "" {
+				p.anyLists[targets[0]] = true
+				p.anyElem[targets[0]] = le
+			} else if sig, ok := p.fnSig[tn]; ok && strings.HasPrefix(sig[1], "[]") {
 				p.registerVar(targets[0], "Array")
 			}
 			// a func returning a MAP (`map[string]any` — the golib's own
@@ -6205,11 +6389,16 @@ func (p *parser) parseAssignStmt() []map[string]any {
 		p.registerAssignType(targets[0], rhs, w)
 		// a SLICE-returning call (`args := p.parseArgs()` — the golib's
 		// own parseAppendIntoList) binds an Array store so `range
-		// args[1:]` lowers through param("slice", …). The call word is
-		// Str-typed; the retSlice signature overrides it.
+		// args[1:]` lowers through param("slice", …). LIST-element
+		// slices (`[]tok`, `[]any`, `[]map[string]any`) bind a list id
+		// instead (shell arrays String-coerce object elements). The
+		// call word is Str-typed; the signature overrides it.
 		if rhs.kind == "call" {
 			cn := p.callTargetName(rhs.callee)
-			if sig, ok := p.fnSig[cn]; ok && strings.HasPrefix(sig[1], "[]") {
+			if le := p.callFirstListElem(cn, p.fnRetIdents[cn]); le != "" {
+				p.anyLists[targets[0]] = true
+				p.anyElem[targets[0]] = le
+			} else if sig, ok := p.fnSig[cn]; ok && strings.HasPrefix(sig[1], "[]") {
 				p.registerVar(targets[0], "Array")
 			} else if strings.HasPrefix(p.prescanRet[cn], "[]") {
 				p.registerVar(targets[0], "Array")
@@ -7303,6 +7492,49 @@ func (p *parser) parseFor() []map[string]any {
 				}},
 				"body": b4,
 			}}
+		}
+		if rv.kind == "var" {
+			if ln := p.anyListVar(rv.name); ln != "" {
+				// ANY-LIST var index+value range (`for i, s := range
+				// stmts` — toAnyStmts over a list id): C-style over
+				// listLen; the value binds listGet (RAW — objects
+				// survive for member reads). The container reads
+				// through paramName so positional params resolve.
+				p.registerVar(idxName, "Int")
+				p.registerVar(valName, "Str")
+				if et := p.anyElem[ln]; et != "" && p.isStructType(et) {
+					p.varStruct[p.resolveVar(valName)] = et
+				}
+				lw := getVarExpr(p.paramName(rv.name))
+				b5 := []map[string]any{assignStmt(valName, map[string]any{
+					"type": "Call", "func": "listGet",
+					"args":   []any{lw, getVarExpr(idxName)},
+					"purity": "PureCpu",
+				})}
+				b5 = append(b5, p.parseBlockStmts()...)
+				return []map[string]any{{
+					"type": "ForInit",
+					"init": []map[string]any{arithAssignStmt(idxName, 0)},
+					"cond": map[string]any{
+						"type": "BinOp", "op": "Lt",
+						"lhs": map[string]any{"type": "Arith", "ast": arithVar(idxName)},
+						"rhs": map[string]any{
+							"type": "Call", "func": "listLen",
+							"args":   []any{lw},
+							"purity": "PureCpu",
+						},
+					},
+					"step": []map[string]any{{
+						"type":    "Assign",
+						"targets": []any{map[string]any{"var": idxName, "sigil": nil, "indices": []any{}}},
+						"expr": map[string]any{
+							"type": "Arith",
+							"ast":  map[string]any{"type": "IncDec", "var": idxName, "delta": 1, "prefix": false},
+						},
+					}},
+					"body": b5,
+				}}
+			}
 		}
 		if rv.kind != "var" {
 			p.failf("range over a non-var (v2)")
@@ -8591,7 +8823,7 @@ func (p *parser) noteCallResultType(target, callee string, args []*expr) {
 	_ = args
 	if p.isStructType(ret) {
 		rn := p.resolveVar(target)
-		p.varStruct[rn] = ret
+		p.varStruct[rn] = strings.TrimPrefix(ret, "*")
 	}
 }
 
