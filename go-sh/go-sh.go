@@ -204,11 +204,16 @@ func lex(src string) ([]token, error) {
 					break
 				}
 			}
-			if matched {
-				break
+			// NO `break` here: this default sits inside a switch, and
+			// the ESTree backend lowers switches to if-chains where a
+			// bare break would exit the enclosing WHILE (lex stopped
+			// after the first multi-char op self-hosted). The for-break
+			// above is safe (forLoopSync scopes it). Fall through to
+			// punct only when nothing matched.
+			if !matched {
+				toks = append(toks, token{kind: tPunct, text: string(c), line: line})
+				i++
 			}
-			toks = append(toks, token{kind: tPunct, text: string(c), line: line})
-			i++
 		}
 	}
 	toks = append(toks, token{kind: tEOF, line: line})
