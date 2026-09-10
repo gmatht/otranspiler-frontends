@@ -5588,7 +5588,8 @@ func (p *parser) parseAssignStmt() []map[string]any {
 		// param("slice", …) shapes (`args := p.parseArgs()` then
 		// `range args[1:]` — go-sh.go's own parseAppendIntoList)
 		sig, hasSig := p.fnSig[calleeName]
-		retSlice := hasSig && strings.HasPrefix(sig[1], "[]")
+		retSlice := (hasSig && strings.HasPrefix(sig[1], "[]")) ||
+			strings.HasPrefix(p.prescanRet[calleeName], "[]")
 		// a func returning a MAP (`map[string]any` — the golib's own
 		// word builders: exprToWord, strExpr, …): the targets bind as
 		// NAMED ASSOC arrays so x["key"] reads lower to assocGet. The
@@ -6202,6 +6203,18 @@ func (p *parser) parseAssignStmt() []map[string]any {
 		// char compares) see it — the shared registerAssignType path
 		// below is skipped by this early return.
 		p.registerAssignType(targets[0], rhs, w)
+		// a SLICE-returning call (`args := p.parseArgs()` — the golib's
+		// own parseAppendIntoList) binds an Array store so `range
+		// args[1:]` lowers through param("slice", …). The call word is
+		// Str-typed; the retSlice signature overrides it.
+		if rhs.kind == "call" {
+			cn := p.callTargetName(rhs.callee)
+			if sig, ok := p.fnSig[cn]; ok && strings.HasPrefix(sig[1], "[]") {
+				p.registerVar(targets[0], "Array")
+			} else if strings.HasPrefix(p.prescanRet[cn], "[]") {
+				p.registerVar(targets[0], "Array")
+			}
+		}
 		// bool literals register as Bool so bare-var conditions lower to
 		// `"$x" = "true"` (the comma-ok idiom's gate)
 		if ww, ok := w["value"].(string); ok && (ww == "true" || ww == "false") {
@@ -11547,6 +11560,14 @@ func (p *parser) prescanFuncNames() {
 				retRaw += p.toks[k].text
 				if p.toks[k].kind == tIdent {
 					base := p.toks[k].text
+					// a POINTER element (`[]*expr`) keeps its `*` so
+					// callFirstListElem returns "" (pointer elements ride
+					// shell arrays as arena-id strings, never the list-id
+					// path) — without it `[]*expr` is misread as a
+					// struct-slice of `expr`.
+					if k > 0 && p.toks[k-1].kind == tPunct && p.toks[k-1].text == "*" {
+						base = "*" + base
+					}
 					// record provisional per-position ret types (resolved
 					// against structs at use time) — forward-referenced
 					// `(T, bool)`/`*T` returns arm comma-ok Bool and the
