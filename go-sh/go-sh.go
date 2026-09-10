@@ -8284,12 +8284,13 @@ func (p *parser) parseFor() []map[string]any {
 		p.expect(tPunct, ";")
 		p.skipNL()
 		post := []map[string]any{}
+		postDelta := 1
 		if cond == nil {
 			cond = &expr{kind: "cond", text: "true"}
 		}
 		if !p.atPunct("{") {
 			postName := p.expect(tIdent, "").text
-			postDelta := 1
+			postDelta = 1
 			postOp := "+"
 			if p.acceptPunct("--") {
 				postDelta = -1
@@ -8337,6 +8338,31 @@ func (p *parser) parseFor() []map[string]any {
 						}}
 					}
 				}
+			}
+		}
+		// GENERAL C-style for (non-numeric bounds like `i < len(raw)`,
+		// any cmp op, numeric init): ForInit with a condToJSON cond.
+		// The While+appended-post fallback drops post on `continue`
+		// (self-host decodeGoStr looped forever on 'h'); ForInit's
+		// step runs on continue (core semantics, t-pinned).
+		if cond != nil && initName == postName &&
+			cond.kind == "binop" && cond.BOpKind == "cmp" &&
+			cond.lhs.kind == "var" && cond.lhs.name == initName {
+			if start, err := strconv.Atoi(rhs.text); err == nil && rhs.kind == "num" {
+				return []map[string]any{{
+					"type": "ForInit",
+					"init": []any{arithAssignStmt(initName, start)},
+					"cond": p.condToJSON(cond),
+					"step": []any{map[string]any{
+						"type":    "Assign",
+						"targets": []any{map[string]any{"var": postName, "sigil": nil, "indices": []any{}}},
+						"expr": map[string]any{
+							"type": "Arith",
+							"ast":  map[string]any{"type": "IncDec", "var": postName, "delta": postDelta, "prefix": false},
+						},
+					}},
+					"body": body,
+				}}
 			}
 		}
 		body = append(body, post...)
