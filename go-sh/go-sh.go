@@ -495,10 +495,6 @@ type parser struct {
 	idxKey      *expr                 // computed index expr (nil when the key is a literal)
 	idxLit      string                // literal index text ("" when computed)
 	maps        map[string]bool    // m := map[K]V{...} — assoc-array name
-	nodeTemps   map[string]bool    // compile-time node temps (`return
-	// map[string]any{...}` in builders — strExpr/assignStmt/...):
-	// freezeStmts resolves exactly these at the stmt-list boundary
-	// (other assoc names are runtime refs and must stay names)
 	bufs        map[string]string  // b := bytes.Buffer — accumulated contents
 	runtimeBufs map[string]bool    // buffers with runtime-dependent contents (WriteByte of a runtime byte)
 	cmds        map[string][]*expr // cmd := exec.Command(...) -> args
@@ -643,6 +639,15 @@ func (p *parser) acceptPunct(s string) bool {
 var exprBoundary = map[string]bool{
 	",": true, ")": true, "}": true, "]": true, ";": true, ":": true, "{": true,
 }
+
+// nodeTemps marks compile-time node temps (`return map[string]any{...}`
+// in builders — strExpr/assignStmt/...): freezeStmts resolves exactly
+// these (by name) into plain objects at the stmt-list boundary; other
+// assoc names are runtime refs and must stay names. A GLOBAL (not
+// parser state) so plain-func bodies (no $1 parser) can mark too; the
+// mark is an emitted assocSet (codegen-time Go writes would stay
+// native-only). Materializes on first mark — no declaration emits.
+var nodeTemps = map[string]bool{}
 
 func (p *parser) parseExpr() *expr {
 	e := p.parseOr()
@@ -2839,10 +2844,19 @@ func (p *parser) parseStmt() []map[string]any {
 				tmpM := "__tmp_m" + strconv.Itoa(p.tmpN)
 				p.tmpN++
 				p.maps[tmpM] = true
-				// compile-time node temp: freezeStmts resolves exactly
-				// these (by name) into plain objects at the stmt-list
-				// boundary — other assoc names are runtime refs.
-				p.nodeTemps[tmpM] = true
+				// MARK the temp as a compile-time node (an EMITTED
+				// assocSet — a codegen-time Go write would stay
+				// native-only and never reach the self-hosted
+				// store). Runs in any body (methods + plain funcs)
+				// since the set is global.
+				preEcho = append(preEcho, map[string]any{
+					"type": "Expr",
+					"expr": map[string]any{
+						"type": "Call", "func": "assocSet",
+						"args":   []any{strExpr("nodeTemps"), strExpr(tmpM), strExpr("true")},
+						"purity": "Emulable",
+					},
+				})
 				p.registerVar(tmpM, "Map")
 				for i, k := range e.keys {
 					kw := strExpr(strings.Trim(strings.TrimSpace(k.text), "\""))
@@ -9090,17 +9104,14 @@ func (p *parser) returnAppendList(e *expr) (stmts []map[string]any, tmp string, 
 	// compile-time node temps (temp-assoc names) alongside live ids —
 	// freezeStmts resolves exactly the marked node temps into plain
 	// objects (null-restoring sigil/params), passing everything else
-	// (obj#/list# refs, words, runtime names) through. In plain-func
-	// bodies $1 is not the parser — objGet yields "" and the helper
-	// returns the input unchanged.
+	// (obj#/list# refs, words, runtime names) through. The temps set is
+	// global, so this works in plain-func bodies too.
 	frozen := "__ret_f" + strconv.Itoa(p.tmpN)
 	p.tmpN++
 	stmts = append(stmts, assignStmt(frozen,
 		map[string]any{"type": "Call", "func": "freezeStmts",
 			"args": []any{getVarExpr(tmp),
-				map[string]any{"type": "Call", "func": "objGet",
-					"args":   []any{getVarExpr("1"), strExpr("nodeTemps")},
-					"purity": "PureCpu"},
+				strExpr("nodeTemps"),
 				strExpr("sigil,params")},
 			"purity": "PureCpu"}))
 	return stmts, frozen, true
@@ -12157,7 +12168,6 @@ func Shir(src string) ([]byte, error) {
 		anyLists:    map[string]bool{},
 		anyElem:     map[string]string{},
 		maps:        map[string]bool{},
-		nodeTemps:   map[string]bool{},
 		bufs:        map[string]string{},
 		cmds:        map[string][]*expr{},
 		stdinRdr:    map[string]bool{},
