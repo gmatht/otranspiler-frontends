@@ -1125,7 +1125,9 @@ func (p *parser) parsePrimary() *expr {
 			p.expect(tPunct, ")")
 			if arg.kind == "var" && (p.varTypes[arg.name] == "Array" ||
 				p.varTypes[p.resolveVar(arg.name)] == "ListRef" ||
-				p.anyListVar(arg.name) != "") {
+				p.anyListVar(arg.name) != "" ||
+				// SLICE params hold list ids (listLen, not string len)
+				p.paramSlice[arg.name] || p.paramSlice[p.resolveVar(arg.name)]) {
 				return &expr{kind: "arrlen", target: arg}
 			}
 			if arg.kind == "member" {
