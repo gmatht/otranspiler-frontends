@@ -2761,7 +2761,19 @@ func (p *parser) parseStmt() []map[string]any {
 		// as an expression ("unexpected token c after expression")
 		if p.atPunct(";") || p.atPunct("}") || p.tok().kind == tNL || p.tok().kind == tEOF {
 			p.skipNL()
-			return []map[string]any{execStmt("echo", []map[string]any{strExpr("")}, "Emulable")}
+			// BARE return (always void — the subset has no named
+				// results): STOP the sub with no value echo. (An echo
+				// "" here leaked into enclosing captures, and the
+				// missing stop fell through — self-host
+				// skipReturnType ran skipType past `func f() {`.)
+			return []map[string]any{map[string]any{
+				"type": "Expr",
+				"expr": map[string]any{
+					"type": "Call", "func": "return",
+					"args":   []any{},
+					"purity": "Spawn",
+				},
+			}}
 		}
 		p.skipNL()
 		// `return w1[, w2…]` — the A1 lowers return to echo (a shell sub
