@@ -9414,6 +9414,12 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 		if n, ok := p.paramNumber(name); ok {
 			return getVarExpr(strconv.Itoa(n))
 		}
+		// MAP vars (named assocs — `call := map...` locals, user maps)
+		// hold the assoc NAME, not a vars-store string: read the name
+		// itself (freeze/assocGet resolve it; getVar sees only "").
+		if p.maps[e.name] || p.maps[name] {
+			return strExpr(name)
+		}
 		return getVarExpr(name)
 	case "member":
 		// STRUCT FIELD ACCESS: a dotted name whose base is a
@@ -11646,6 +11652,11 @@ func (p *parser) condWordAny(e *expr) map[string]any {
 		name := p.resolveVar(e.name)
 		if n, ok := p.paramNumber(name); ok {
 			return getVarExpr(strconv.Itoa(n))
+		}
+		// MAP vars hold assoc names (truthy when present) — same
+		// store correction as exprToWord.
+		if p.maps[e.name] || p.maps[name] {
+			return strExpr(name)
 		}
 		return getVarExpr(name)
 	case "str", "rawstr":
