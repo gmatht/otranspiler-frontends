@@ -2346,9 +2346,15 @@ func (p *parser) isExternalAlias(base string) bool {
 }
 
 func (p *parser) parseTopLevel() []map[string]any {
-	var out []map[string]any
-	var funcStmts []map[string]any
-	var declStmts []map[string]any
+	var __ptlOut []map[string]any
+	var __ptlFunc []map[string]any
+	var __ptlDecl []map[string]any
+	// STMT-LIST accumulators (reserved __ptl prefix — no user collision):
+	// mark any-list so `return append(...)` routes through returnAppendList
+	// (list ids + freeze) instead of legacy scalar capture (strands).
+	p.anyLists["__ptlOut"] = true
+	p.anyLists["__ptlFunc"] = true
+	p.anyLists["__ptlDecl"] = true
 	for {
 		p.skipNL()
 		t := p.tok()
@@ -2362,7 +2368,7 @@ func (p *parser) parseTopLevel() []map[string]any {
 			// registers subs at their Function statement, so a call
 			// before registration is "command not found"), then the
 			// entry statements (main's body).
-			return append(append(declStmts, funcStmts...), out...)
+			return append(append(__ptlDecl, __ptlFunc...), __ptlOut...)
 		}
 		switch {
 		case p.atPunct("{") || p.atPunct("}"):
@@ -2401,7 +2407,7 @@ func (p *parser) parseTopLevel() []map[string]any {
 			// this is unambiguous. (Nested bodies route through
 			// parseStmt's own `func` case.)
 			if p.funcLitAhead() {
-				out = append(out, p.parseIIFEStmt()...)
+				__ptlOut = append(__ptlOut, p.parseIIFEStmt()...)
 				// `continue` (not `break`): this is a switch case inside
 				// the top-level for loop — `break` would break the
 				// LOOP (the frontend lowers it as an A1 Break), but Go's
@@ -2541,7 +2547,7 @@ func (p *parser) parseTopLevel() []map[string]any {
 			p.fnParams, p.fnParamOrd, p.fnLocals, p.inFunc = saveParams, saveOrd, saveLocals, saveIn
 			p.varTypes = saveVarTypes
 			p.fnNames[nm] = true
-			funcStmts = append(funcStmts, map[string]any{"type": "Function", "name": nm, "params": params, "body": body})
+			__ptlFunc = append(__ptlFunc, map[string]any{"type": "Function", "name": nm, "params": params, "body": body})
 		case p.atIdent("type"):
 			// [see parseTypeDecl for the erasure contract]
 			p.parseTypeDecl()
@@ -2551,15 +2557,15 @@ func (p *parser) parseTopLevel() []map[string]any {
 			// parseStmt and died on `tEOF tokKind = iota` → "unexpected
 			// token tokKind after expression"). Each name lowers to an
 			// Assign of its evaluated value — see parseConstDecl. These
-			// go to declStmts (emitted FIRST — the core's lift folds a
+			// go to __ptlDecl (emitted FIRST — the core's lift folds a
 			// pure decl into the module binding's init).
-			declStmts = append(declStmts, p.parseConstDecl()...)
+			__ptlDecl = append(__ptlDecl, p.parseConstDecl()...)
 		case p.atIdent("var"):
 			// top-level var decls — same decl-first ordering (the
 			// golib's `var debugNoRecover string` etc.)
-			declStmts = append(declStmts, p.parseVarDecl()...)
+			__ptlDecl = append(__ptlDecl, p.parseVarDecl()...)
 		default:
-			out = append(out, p.parseStmt()...)
+			__ptlOut = append(__ptlOut, p.parseStmt()...)
 		}
 	}
 }
