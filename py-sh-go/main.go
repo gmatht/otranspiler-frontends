@@ -2348,11 +2348,16 @@ func (l *lowerer) arithIRDom(e Expr, dom string, zeroCmp bool) (map[string]any, 
 		if p, ok := l.curParams[t.Name]; ok {
 			pos = p
 		}
-		// A bigint-domain read of a "big"-typed var: the var is typed Int64
-		// in VarTypes, so the core's arith_var_read reads it exactly as
-		// BigInt(raw) (no asIntN wrap — Int64 vars are exact in estree) and
-		// writes it natively (no wrap). A plain Var read is correct: a
-		// 2**100 value survives (t91_set_sum_fallback).
+		if dom == "big" {
+			// a bigint-domain read: coerce to exact BigInt. Cast(Int64, …)
+			// is the frontend's "read exactly as BigInt" marker — the core
+			// renders a bigint-homed var arg as BigInt(raw || 0) with NO
+			// asIntN(64, …) wrap (t91_set_sum_fallback: the loop var x can
+			// hold 2**100, which must not wrap mod 2^64). A var whose
+			// binding may hold a Number/string must coerce up too: BigInt(x)
+			// is exact for any integral value within ±2^63.
+			return arithExpr(arithCast("Int64", arithVar(pos))), nil
+		}
 		return arithExpr(arithVar(pos)), nil
 	case *CallE:
 		if len(t.Path) == 1 && (t.Path[0] == "max" || t.Path[0] == "min" || t.Path[0] == "sum") && len(t.Args) == 1 {
@@ -4226,11 +4231,15 @@ func (l *lowerer) assignOne(target, op string, val Expr) ([]map[string]any, erro
 				l.setType(target, "int")
 				delete(l.ranges, target)
 			}
-			// The accumulator is bigint-typed (Int64 in VarTypes): the core
-			// reads it exactly as BigInt on read and writes it natively (no
-			// wrap), so `total + BigInt(x)` stays in the BigInt domain and a
-			// 2**100 value survives (t91_set_sum_fallback).
 			ast := arithBin("+", arithVar(target), rhsAst)
+			if dom == "big" {
+				// the accumulator is bigint-typed: read it exactly as BigInt
+				// too (Cast(Int64, …) is the frontend's exact-BigInt marker;
+				// the core renders a bigint-homed var arg as BigInt(raw || 0)
+				// with no asIntN wrap). Without this, `total` reads as a
+				// Number and `total + BigInt(x)` mixes types (t91).
+				ast = arithBin("+", arithCast("Int64", arithVar(target)), rhsAst)
+			}
 			return []map[string]any{assignStmt(target, arithExpr(ast))}, nil
 		}
 		// string += → concat
@@ -4523,21 +4532,15 @@ func buildProgram(stmts []Stmt) (*shiremit.Program, error) {
 	if err != nil {
 		return nil, err
 	}
-	// A2 var_types: every assigned variable, sorted by name. "int" vars
-	// (proven within ±2^53) stay "Int" — the widthless kind the estree
-	// backend homes as an exact-precision Number binding. "big" vars
-	// (unbounded Python ints) are typed {"kind":"Int64"}: in estree an
-	// Int64 var reads exactly as BigInt(raw) and writes natively (no
-	// asIntN wrap), so a 2**100 value survives (t91_set_sum_fallback).
-	// (The C-only backend would wrap Int64 mod 2^64 — but py-sh-go
-	// targets estree, where Int64 vars are exact.)
-	byName := map[string]any{}
+	// A2 var_types: every assigned variable, sorted by name ("big" vars
+	// stay "Int" — the widthless kind the estree backend homes as an
+	// exact-precision binding; the C-only Int64 object kind would wrap
+	// assignments mod 2^64, breaking unbounded Python ints)
+	byName := map[string]string{}
 	for name, ty := range l.types {
-		t := any("Str")
-		if ty == "int" {
+		t := "Str"
+		if ty == "int" || ty == "big" {
 			t = "Int"
-		} else if ty == "big" {
-			t = map[string]any{"kind": "Int64"}
 		}
 		byName[name] = t
 	}
