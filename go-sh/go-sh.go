@@ -3689,7 +3689,24 @@ func (p *parser) parseDottedStmt() []map[string]any {
 		for _, a := range args {
 			words = append(words, p.argToWord(a))
 		}
-		return []map[string]any{execStmt(method, words, "Spawn")}
+		stmt := execStmt(method, words, "Spawn")
+		if p.methodReturnsValue(method) {
+			// BARE call to a value-returning method (Go discards
+			// the value): swallow the callee's stdout echo (its
+			// return channel) in a capture, else it leaks into an
+			// enclosing capture (self-host: `p.expect(tIdent,
+			// "var")` echoed the var token into declStmts,
+			// corrupting the Program stmts).
+			stmt = map[string]any{
+				"type": "Expr",
+				"expr": map[string]any{
+					"type": "Call", "func": "capture",
+					"args":   []any{map[string]any{"type": "Arrow", "body": []any{stmt}}},
+					"purity": "Spawn",
+				},
+			}
+		}
+		return []map[string]any{stmt}
 	}
 	// struct field WRITE forms: `p.f = v` / `p.f++` / `p.f += n` /
 	// `l.toks = append(l.toks, ...)` — the OBJECT STORE model: one
