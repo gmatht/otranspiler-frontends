@@ -3672,7 +3672,11 @@ func (p *parser) parseDottedStmt() []map[string]any {
 			// DYNAMIC writes (WriteByte(c)): the buffer is an OBJECT
 			// whose buf field concatenates at runtime (Interpolate =
 			// native template literal; WriteByte of a byte value prints
-			// the character — Go string(byte) equivalence for ASCII)
+			// the character — Go string(byte) equivalence for ASCII).
+			// WriteByte takes a byte BY CONSTRUCTION, so chr() the
+			// word unconditionally (byteAt yields codes; appending the
+			// code built "104104…" for "hi" self-hosted). WriteString
+			// appends text (no chr).
 			p.bufDyn[first] = true
 			idw := getVarExpr(p.resolveVar(first))
 			cur := map[string]any{
@@ -3680,9 +3684,17 @@ func (p *parser) parseDottedStmt() []map[string]any {
 				"args":   []any{idw, strExpr("buf")},
 				"purity": "PureCpu",
 			}
+			av := p.exprToWord(a)
+			if method == "WriteByte" {
+				av = map[string]any{
+					"type": "Call", "func": "chr",
+					"args":   []any{av},
+					"purity": "PureCpu",
+				}
+			}
 			cat := interpParts([]any{
 				map[string]any{"kind": "expr", "expr": cur},
-				map[string]any{"kind": "expr", "expr": p.exprToWord(a)},
+				map[string]any{"kind": "expr", "expr": av},
 			})
 			return []map[string]any{{
 				"type": "Expr",
