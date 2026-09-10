@@ -5923,6 +5923,27 @@ func (p *parser) parseAssignStmt() []map[string]any {
 		}
 		return rdOut
 	}
+	// recover() in an assign (`r := recover()` — run's err capture):
+	// the caught value rides the defer's as-binding (getVar reads
+	// the Error object; Sprintf %v renders it). The generic
+	// call path would exec a missing "recover" sub and bind "".
+	// (Before the callTargetName gate — recover is a builtin, never a
+	// user sub.)
+	if rhs.kind == "call" && rhs.callee == "recover" && !p.atPunct(",") {
+		if p.deferRecover == "" {
+			p.failf("recover() outside a defer func (v2)")
+		}
+		p.deferUsedRcv = true
+		var ro []map[string]any
+		for _, tg := range targets {
+			if tg == "_" {
+				continue
+			}
+			p.registerVar(tg, "Str")
+			ro = append(ro, assignStmt(tg, getVarExpr(p.deferRecover)))
+		}
+		return ro
+	}
 	if rhs.kind == "call" && p.callTargetName(rhs.callee) != "" && !p.atPunct(",") {
 		// METHOD calls (`x := l.cur()`): the receiver rides as $1; the
 		// sub name is the last dotted segment
