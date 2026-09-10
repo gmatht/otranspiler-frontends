@@ -2782,7 +2782,7 @@ func (p *parser) parseStmt() []map[string]any {
 		// PREDICATE returns (`return c == '_' || ...`, `return true`) —
 		// a bool-returning sub signals via EXIT STATUS (sh2.return 0/1):
 		// callers in condition position exec the sub and branch on $?
-		if len(rexprs) == 1 && p.inFunc && p.isPredicateExpr(rexprs[0]) {
+		if len(rexprs) == 1 && p.inFunc && (p.isPredicateExpr(rexprs[0]) || p.isBoolLitReturn(rexprs[0])) {
 			// STATUS-ONLY predicate return: the sub signals via exit
 			// status (Return 0/1). Value-position callers wrap the exec
 			// with a $?→"true"/"false" echo (userCallWord), so nested
@@ -7292,6 +7292,15 @@ func (p *parser) boolTreeStmts(e *expr, flag string) []map[string]any {
 		})
 		return out
 	}
+	// BARE bool literals (`return true` / `return false` in a bool
+	// function): constant flags — condToJSON would read `$true` (an
+	// unset var, always false).
+	if e.kind == "var" && (e.name == "true" || e.name == "false") {
+		if e.name == "true" {
+			return []map[string]any{setTrue}
+		}
+		return []map[string]any{setFalse}
+	}
 	cond := p.condToJSON(e)
 	return []map[string]any{{
 		"type":   "If",
@@ -10257,6 +10266,28 @@ func (p *parser) exprToWord(e *expr) map[string]any {
 	}
 	p.failf("unsupported expression %q (v2 subset)", e.kind)
 	return nil
+}
+
+// isBoolLitReturn: `return true` / `return false` in a
+// bool-declared function — a STATUS-protocol predicate return like a
+// comparison (`acceptPunct`'s direct-boolean callers read $?; the
+// echo-only lowering left them always-true, hanging parseVarSpec's
+// names loop in self-host). Gated on the declared return type so
+// `return true` in an any/interface function keeps value semantics.
+func (p *parser) isBoolLitReturn(e *expr) bool {
+	if e.kind != "var" || (e.name != "true" && e.name != "false") {
+		return false
+	}
+	if p.curFn == "" {
+		return false
+	}
+	if sig, ok := p.fnSig[p.curFn]; ok && len(sig) > 1 {
+		return sig[1] == "bool"
+	}
+	if r, ok := p.prescanRet[p.curFn]; ok {
+		return r == "bool"
+	}
+	return false
 }
 
 // isPredicateExpr: a comparison / logical-over-comparisons expression
