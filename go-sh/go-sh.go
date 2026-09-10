@@ -703,7 +703,11 @@ func (p *parser) parseCmp() *expr {
 	if t := p.tok(); (t.kind == tOp || t.kind == tPunct) &&
 		(t.text == "==" || t.text == "!=" || t.text == "<" || t.text == "<=" || t.text == ">" || t.text == ">=") {
 		p.pos++
-		l = &expr{kind: "binop", BOp: t.text, BOpKind: "cmp", lhs: l, rhs: p.parseAdd()}
+		// BIND the operator text NOW — `t` is a global temp that
+		// nested tok() calls clobber before rhs finishes (self-host
+		// `i == 2` read BOp "{" from the post-rhs probe).
+		cmpOp := t.text
+		l = &expr{kind: "binop", BOp: cmpOp, BOpKind: "cmp", lhs: l, rhs: p.parseAdd()}
 	}
 	return l
 }
