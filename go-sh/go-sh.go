@@ -11114,14 +11114,43 @@ func (p *parser) switchPattern(e *expr) string {
 
 // hasMemberCall — does the expr contain a member-on-call (`p.tok().kind`)?
 func (p *parser) hasMemberCall(e *expr) bool {
+	// ITERATIVE (no recursion): recursive bool calls echo for the value
+	// protocol, clobbering exit status so direct-if callers always saw
+	// true self-hosted (every comparison took the member-hoist branch).
+	// Explicit stack with pure ops only (no echoing calls) keeps status
+	// clean; nil links are skipped explicitly (nil != "" compares).
 	if e == nil {
 		return false
 	}
-	if e.kind == "member" && e.memberTarget != nil {
-		return true
+	// Worklist of pending subtrees (append-only; nil links are never
+	// pushed so no nil-deref can occur below).
+	var stack []*expr
+	if e != nil {
+		stack = append(stack, e)
 	}
-	return p.hasMemberCall(e.lhs) || p.hasMemberCall(e.rhs) || p.hasMemberCall(e.target) ||
-		p.hasMemberCall(e.idx1e) || p.hasMemberCall(e.idx2e)
+	for len(stack) > 0 {
+		n := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if n.kind == "member" && n.memberTarget != nil {
+			return true
+		}
+		if n.lhs != nil {
+			stack = append(stack, n.lhs)
+		}
+		if n.rhs != nil {
+			stack = append(stack, n.rhs)
+		}
+		if n.target != nil {
+			stack = append(stack, n.target)
+		}
+		if n.idx1e != nil {
+			stack = append(stack, n.idx1e)
+		}
+		if n.idx2e != nil {
+			stack = append(stack, n.idx2e)
+		}
+	}
+	return false
 }
 
 // hoistMemberCalls — rewrite member-on-call exprs to temp-var jsonGet
