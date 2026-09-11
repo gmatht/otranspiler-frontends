@@ -11509,6 +11509,27 @@ func (p *parser) condToJSON(c *expr) map[string]any {
 	// spec.zig` format-spec match: the slice word evaluates to the
 	// sliced text. Placed BEFORE the And/Or arms so compound guards
 	// with a sliced leaf lower natively too (condSideJSON routes here).
+	// SIMPLE ==/!= FIRST (plain vars/literals, e.g. `if x == "a"`):
+	// fully inline BinOp with no helper calls and no ok-flags. Placed
+	// BEFORE the strict-BinOp below because its `ok1 && ok2` check
+	// passes spuriously in JS (refusal echoes "false", which is
+		// truthy/non-empty), building degenerate BinOps with empty
+		// operands that poison output. simpleCmpWord nil-checks are
+		// immune (nil maps, not bool strings).
+	if c.kind == "binop" && (c.BOp == "==" || c.BOp == "!=") {
+		if lwS := p.simpleCmpWord(c.lhs); lwS != nil {
+			if rwS := p.simpleCmpWord(c.rhs); rwS != nil {
+				op := "Eq"
+				if c.BOp == "!=" {
+					op = "Ne"
+				}
+				return map[string]any{
+					"type": "BinOp", "op": op,
+					"lhs": lwS, "rhs": rwS,
+				}
+			}
+		}
+	}
 	if c.kind == "binop" && (c.BOp == "==" || c.BOp == "!=") {
 		lw, ok1 := p.condOperandA1Word(c.lhs)
 		rw, ok2 := p.condOperandA1Word(c.rhs)
@@ -11667,6 +11688,7 @@ func (p *parser) condToJSON(c *expr) map[string]any {
 		lw, lok := p.condOperandA1Word(c.lhs)
 		rw, rok := p.condOperandA1Word(c.rhs)
 		op := map[string]string{"==": "Eq", "!=": "Ne"}[c.BOp]
+		// (SIMPLE ==/!= handled FIRST, above the strict-BinOp block.)
 		if op != "" && (lok || rok) {
 			// at least one operand is an OBJECT/strlen/index read: the
 			// whole comparison lowers as a native BinOp (plain operands
@@ -12105,6 +12127,33 @@ func (p *parser) stringsHelperWord(e *expr) map[string]any {
 // OBJECT reads (struct members, list/map fields, user-fn captures);
 // plain vars/literals report ok=false so the shell test-string shapes
 // keep handling them.
+// simpleCmpWord: an ==/!= operand as an inline word map (or nil when
+// not a plain var/literal). FULLY inline — no helper calls, no ok
+// flags (both lose values in JS: fnCall-status discard, bool-string
+// truthiness). Callers nil-check the result (nil maps survive the
+// channel; bools do not). Covers var (getVar), str/rawstr/num (Str).
+func (p *parser) simpleCmpWord(operand *expr) map[string]any {
+	// NO nil guard: Go `operand == nil` transpiles to `"" == ""`
+	// (always true), so the function would always return nil. Callers
+	// only pass non-nil binop operands; the `!= nil` checks on the
+	// CAPTURED results (strings) lower correctly to `!= ""`.
+	switch operand.kind {
+	case "var":
+		if operand.name == "nil" {
+			return map[string]any{"type": "Str", "value": "", "style": "DoubleQuoted"}
+		}
+		rn := p.resolveVar(operand.name)
+		return map[string]any{
+			"type": "Call", "func": "getVar",
+			"args":   []any{map[string]any{"type": "Str", "value": rn, "style": "DoubleQuoted"}},
+			"purity": "Emulable",
+		}
+	case "str", "rawstr", "num":
+		return map[string]any{"type": "Str", "value": operand.text, "style": "DoubleQuoted"}
+	}
+	return nil
+}
+
 func (p *parser) condOperandA1Word(e *expr) (map[string]any, bool) {
 	w, ok := p.condOperandA1WordInner(e)
 	return w, ok
