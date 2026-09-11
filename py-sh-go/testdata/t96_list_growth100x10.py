@@ -4,4 +4,5 @@ for i in range(100):
 print(len(xs))
 print(sum(xs))
 print(xs[0])
+print(xs[99])
 print(xs[100])
