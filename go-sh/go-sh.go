@@ -3042,7 +3042,19 @@ func (p *parser) parseStmt() []map[string]any {
 			}
 			words = []map[string]any{{"type": "Interpolate", "parts": parts}}
 		}
-		out := append(preEcho, execStmt("echo", words, "Emulable"))
+		// INLINE echo-node literal (NOT via the execStmt helper): a
+		// helper call here transpiles to fnCall+status and DISCARDS
+		// the returned map (the self-host echo-loss — `return 42`
+		// lost its echo). An inline map literal materializes via
+		// objNew/mapSet (like the return-stop below) and survives.
+		out := append(preEcho, map[string]any{
+			"type": "Expr",
+			"expr": map[string]any{
+				"type": "Call", "func": "exec",
+				"args":   []any{strExpr("echo"), map[string]any{"type": "Array", "elements": words}},
+				"purity": "Emulable",
+			},
+		})
 		if p.inFunc {
 			// EARLY return inside a conditional: the echo writes the
 			// value channel (the sub-stdout convention), the bare
@@ -7536,7 +7548,17 @@ func (p *parser) parseIf() []map[string]any {
 		}}
 		return append(pre, append(stmts, guarded...)...)
 	}
-	return append(pre, p.condToJSONIf(cond, then, elseBody)...)
+	// INLINE If-node literal (NOT via the condToJSONIf helper): a helper
+	// call in spread position transpiles to exec+status and DISCARDS
+	// the returned slice (every `if` lowered to zero stmts). An inline
+	// literal materializes via objNew/mapSet and survives.
+	return append(pre, map[string]any{
+		"type":   "If",
+		"cond":   p.condToJSON(cond),
+		"then":   then,
+		"elsifs": []any{},
+		"else":   elseBody,
+	})
 }
 
 // condToJSONIf: plain If with an already-lowered cond
