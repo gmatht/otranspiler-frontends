@@ -2746,6 +2746,43 @@ func st(s string) map[string]any {
 	return map[string]any{"type": "Str", "value": s, "style": "DoubleQuoted"}
 }
 
+// numNode builds an IrExpr::Int node ({"type":"Int","value":N}).
+func numNode(n int64) map[string]any {
+	return map[string]any{"type": "Int", "value": n}
+}
+
+// parsePyInt parses a Python integer literal (underscores, 0x/0o/0b
+// prefixes, decimal) into an int64 for typed call args. ok=false when
+// unparseable or out of int64 range — the caller keeps the string form
+// (status quo), so huge literals never truncate and odd spellings
+// never misread (a leading-zero decimal is a Python SyntaxError, so
+// refuse it rather than guess octal).
+func parsePyInt(text string) (int64, bool) {
+	t := strings.ReplaceAll(text, "_", "")
+	if t == "" {
+		return 0, false
+	}
+	base := 10
+	digits := t
+	if strings.HasPrefix(t, "0x") || strings.HasPrefix(t, "0X") {
+		base, digits = 16, t[2:]
+	} else if strings.HasPrefix(t, "0o") || strings.HasPrefix(t, "0O") {
+		base, digits = 8, t[2:]
+	} else if strings.HasPrefix(t, "0b") || strings.HasPrefix(t, "0B") {
+		base, digits = 2, t[2:]
+	} else if len(t) > 1 && strings.HasPrefix(t, "0") {
+		return 0, false
+	}
+	if digits == "" {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(digits, base, 64)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
 // syncBuiltins mirrors shir.rs SYNC_BUILTINS (ask A3 purity for exec).
 var syncBuiltins = map[string]bool{
 	".": true, ":": true, "basename": true, "break": true, "cat": true,
@@ -3320,8 +3357,10 @@ func (l *lowerer) callIR(t *CallE, isStmt bool) (map[string]any, error) {
 		return nil, fmt.Errorf("sorted: expected a list variable")
 	default:
 		if len(t.Path) == 1 && l.fns[t.Path[0]] {
-			// call to a script-defined function
-			ws, err := l.argListIR(t.Args)
+			// call to a script-defined function: int-literal args
+			// stay numeric (typed); everything else lowers exactly
+			// as before (dynamic values stay stringly).
+			ws, err := l.argListIRTyped(t.Args)
 			if err != nil {
 				return nil, err
 			}
@@ -3364,6 +3403,29 @@ func (l *lowerer) procArgs(args []Expr) (string, []any, error) {
 func (l *lowerer) argListIR(args []Expr) ([]any, error) {
 	out := []any{}
 	for _, a := range args {
+		ir, err := l.argIR(a)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ir)
+	}
+	return out, nil
+}
+
+// argListIRTyped lowers call args like argListIR, except integer
+// literals that fit int64 stay numeric ({"type":"Int"}) instead of
+// degrading to shell words. Used ONLY for script-defined function
+// calls: external boundaries (exec argv, echo words, print) stay
+// stringly — syscalls and word splitting genuinely take strings.
+func (l *lowerer) argListIRTyped(args []Expr) ([]any, error) {
+	out := []any{}
+	for _, a := range args {
+		if lit, ok := a.(*LitInt); ok {
+			if n, ok := parsePyInt(lit.Text); ok {
+				out = append(out, numNode(n))
+				continue
+			}
+		}
 		ir, err := l.argIR(a)
 		if err != nil {
 			return nil, err
