@@ -16,10 +16,10 @@ native behavior (`go run`). The gates:
 
 | gate | green |
 |---|---|
-| corpus Go→JS (`fail-go`) | **98/98** |
+| corpus Go→JS (`fail-go`) | **109/109** |
 | corpus Go→Rust (`fail-go --rust`) | 41/88 (rust backend `sh2.*` stubs: assoc arrays, argv, etc. — backend gap, per-target) |
 | Go idiom ladder (47 templates, mined from the app + seeded) | 42/47 (4 contract boundaries + 1 documented nondeterministic) |
-| app integration (the CLI, `fail-go --app`) | **RED — self-parse** (2026-08-25 audit): the package-mode concat (main.go + go-sh.go + emit.go) must PARSE before the CLI's behavior can be compared, and the golib's own lexer blocked it. Landed: rune literals as comparison operands in `condWordAny` (`c == '\t'` — condOperandQ's code-vs-code convention; the lexer switch now lowers, the self-parse advanced line 115 → 898). Current blocker: **plain/field compound assign** — `p.pos += 3`, `n++`/`n--` (308 sites in the golib); only map/list-element `+=` is lowered today. The table's earlier "green" predates the golib's v2-pipeline growth; keep the gate red until the concat parses end-to-end |
+| app integration (the CLI, `fail-go --app`) | **GREEN** (2026-09-09): `fail-go --app frontends/go-sh/cmd/go-sh/main.go` passes — oracle and JS both print the usage path and exit 2 with no args. The last blocker was the EXTERNAL-UNIT call `out, err := golib.Shir(src)` (main.go:68): `golib` is an import alias for another compilation unit, so neither the defined-sub nor the PACKAGE-MODE clause applied. Landed: import alias→path recording (`parseImportSpec`/`importAlias`; `_`/`.` bind nothing) + `isExternalAlias` (dot in the first path segment = non-stdlib) admitted in `callTargetName`, the assign-path word builder, and the word-position call path — the call lowers to the bare sub name with the multi-return positional distribution (DOCUMENTED APPROXIMATION: resolves only when the callee's unit is linked in; executed absent-sub calls fail at runtime, but the app's no-args path exits before it). Probe `t99_external_unit.go` pins it. The golib's OWN full translation (11k lines, maps/structs/methods) stays the (a)/(d) contract boundary — the `--app` gate covers the CLI unit only |
 | cpp CLI integration (`fail-go --app frontends/cpp-sh-go/cmd/cpp-sh-go/main.go`) | **green** — the cpp frontend's CLI transpiles Go→JS and reproduces its no-args behavior |
 
 ### New idioms landed (this pass — the app gate)

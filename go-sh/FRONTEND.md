@@ -492,3 +492,24 @@ function values (`f := func(){…}` as var + fnValue dispatch); compound
 field assigns on cross-function vars; bare call conditions in remaining
 shapes; range over member-of-index; map key must be literal (computed
 assoc keys landed but some shapes remain).
+
+## External-unit calls via import aliases (2026-09-09)
+
+`import` clauses are now PARSED (alias → path in `importAlias`), not
+skipped. A call `alias.F(args)` where the alias imports a NON-stdlib
+package (dot in the first path segment — `github.com/…`, not
+`fmt`/`os`/`strings`) targets a function in ANOTHER compilation unit
+whose body is not in this input (the CLI's `out, err := golib.Shir(src)`,
+cmd/go-sh/main.go:68). `isExternalAlias` admits it in `callTargetName`,
+the assign-path word builder, and the word-position call path: the call
+lowers to the bare sub name with the existing multi-return positional
+distribution (first non-_ target binds, error slots dropped like Atoi's).
+DOCUMENTED APPROXIMATION: the sub resolves only when the callee's unit is
+linked in (PACKAGE MODE concat); an executed call to an absent sub fails
+at runtime — but the app's no-args path exits before it, so the gate
+verifies parse + valid A1 + dead code. Probe: `t99_external_unit.go`
+(oracle and JS both print `alive`, exit 2). Deliberately NOT extended to
+stdlib: unknown `strings.`/`os.`/`fmt.` members keep refusing (they need
+dedicated lowerings; a bare-name guess would invent semantics) — the
+`templates/go/qualified_call.go` (`strings.Cut`, no import decl in the
+snippet) refusal is preserved. `_`/` .` imports bind no qualifier.

@@ -1601,6 +1601,54 @@ func (p *parser) structMemberWord(name string) (map[string]any, bool) {
 	return w, true
 }
 
+// resolveStructVals normalizes the two structlit shapes for the OBJECT
+// STORE consumers (newstructStmts, objNewCall): the (structType,
+// fieldVals) shape passes through untouched; the (name, args,
+// fieldNames) shape the postfix `{` handler builds for known types is
+// positioned against the registered layout (package qualifier stripped
+// exactly like the handler strips it). Unresolvable (unknown type,
+// overlong positional) → ("", nil): the historical empty allocation,
+// never a guess. Pure read — the node is never mutated, so the
+// name-shape consumers (interpLit) see identical input.
+func (p *parser) resolveStructVals(e *expr) (string, []*expr) {
+	if e.structType != "" {
+		return e.structType, e.fieldVals
+	}
+	typeName := e.name
+	if _, ok := p.structs[typeName]; !ok {
+		if dot := strings.LastIndex(typeName, "."); dot >= 0 {
+			typeName = typeName[dot+1:]
+		}
+	}
+	layout, ok := p.structs[typeName]
+	if !ok {
+		return "", nil
+	}
+	if len(e.fieldNames) == 0 {
+		// positional: source order IS layout order (Go requires it);
+		// overlong is malformed — leave unresolved (historical empty).
+		if len(e.args) > len(layout) {
+			return "", nil
+		}
+		vals := make([]*expr, len(layout))
+		copy(vals, e.args)
+		return typeName, vals
+	}
+	vals := make([]*expr, len(layout))
+	for i, n := range e.fieldNames {
+		if i >= len(e.args) {
+			break
+		}
+		for j, f := range layout {
+			if f == n {
+				vals[j] = e.args[i]
+				break
+			}
+		}
+	}
+	return typeName, vals
+}
+
 // newstructStmts lowers `target = &T{...}` (or a temp for expression
 // uses): ONE objNew call — the OBJECT STORE model. Nested &T{...}
 // field values pre-lower into temps (statement boundary), then the
@@ -1613,11 +1661,12 @@ func (p *parser) newstructStmts(target string, e *expr) []map[string]any {
 	if e.kind == "addr" && e.lhs != nil {
 		e = e.lhs
 	}
-	layout := p.structs[e.structType]
+	stype, fvals := p.resolveStructVals(e)
+	layout := p.structs[stype]
 	prelude := []map[string]any{}
 	fieldNames := []any{}
 	fieldVals := []any{}
-	for i, fv := range e.fieldVals {
+	for i, fv := range fvals {
 		if i >= len(layout) {
 			break
 		}
@@ -1646,7 +1695,7 @@ func (p *parser) newstructStmts(target string, e *expr) []map[string]any {
 		fieldVals = append(fieldVals, p.exprToWord(fv))
 	}
 	out := prelude
-	out = append(out, assignStmt(target, p.objNewCallNamed(e.structType, fieldNames, fieldVals)))
+	out = append(out, assignStmt(target, p.objNewCallNamed(stype, fieldNames, fieldVals)))
 	return out
 }
 
@@ -1682,8 +1731,9 @@ func (p *parser) objNewCall(e *expr) map[string]any {
 		}
 		return p.objNewCallNamed("map", names, vals)
 	}
-	layout := p.structs[e.structType]
-	for i, fv := range e.fieldVals {
+	stype2, fvals2 := p.resolveStructVals(e)
+	layout := p.structs[stype2]
+	for i, fv := range fvals2 {
 		if i >= len(layout) {
 			break
 		}
@@ -1709,7 +1759,7 @@ func (p *parser) objNewCall(e *expr) map[string]any {
 		}
 		vals = append(vals, p.exprToWord(fv))
 	}
-	return p.objNewCallNamed(e.structType, names, vals)
+	return p.objNewCallNamed(stype2, names, vals)
 }
 
 func wordsToAny(ws []map[string]any) []any {
