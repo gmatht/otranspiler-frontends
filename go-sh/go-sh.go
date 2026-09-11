@@ -5438,7 +5438,13 @@ func (p *parser) parseAssignStmt() []map[string]any {
 				p.failf("array literal with more targets than values (v2)")
 			}
 			litElem := p.peekSliceElem()
+			// Save/restore the loop index: parseArrayLiteral uses a
+			// shared `i` temp internally (transpiled store has no
+			// function scoping), clobbering ours — targets[i] below
+			// would read the wrong index (m7 read targets[1]).
+			saveI := i
 			elems, typ := p.parseArrayLiteral()
+			i = saveI
 			p.arrays[targets[i]] = arrayInfo{elems: elems, typ: typ}
 			p.registerVar(targets[i], "Array")
 			// rebinding clears stale list marks (see parseVarDecl).
@@ -5463,12 +5469,22 @@ func (p *parser) parseAssignStmt() []map[string]any {
 				}
 				out = append(out, pushes...)
 			} else {
-				out = append(out, assignStmt(targets[i],
-					map[string]any{
+				// INLINE Assign literal (NOT via assignStmt helper): the
+				// helper call transpiles to fnCall (String-flattening
+				// the node arg to "[object Object]" AND discarding
+				// the returned map). Inline literals materialize via
+				// objNew/mapSet and survive.
+				out = append(out, map[string]any{
+					"type": "Assign",
+					"targets": []any{map[string]any{
+						"var": targets[i], "sigil": nil, "indices": []any{},
+					}},
+					"expr": map[string]any{
 						"type": "Call", "func": "setArray",
 						"args":   []any{strExpr(targets[i]), map[string]any{"type": "Array", "elements": elems}},
 						"purity": "Emulable",
-					}))
+					},
+				})
 			}
 			if !p.acceptPunct(",") {
 				break
