@@ -2864,14 +2864,21 @@ func (p *parser) parseStmt() []map[string]any {
 				// "" here leaked into enclosing captures, and the
 				// missing stop fell through — self-host
 				// skipReturnType ran skipType past `func f() {`.)
-			return []map[string]any{map[string]any{
+			// Return a VAR holding the node (NOT an inline literal):
+			// `return []map{…}` transpiles to echo-jsonObject (plain
+			// object → "[object Object]"), while a var echoes its
+			// list id (resolved structurally). The empty literal is a
+			// real list via objNew("list").
+			out := []map[string]any{}
+			out = append(out, map[string]any{
 				"type": "Expr",
 				"expr": map[string]any{
 					"type": "Call", "func": "return",
 					"args":   []any{},
 					"purity": "Spawn",
 				},
-			}}
+			})
+			return out
 		}
 		p.skipNL()
 		// `return w1[, w2…]` — the A1 lowers return to echo (a shell sub
@@ -3042,12 +3049,13 @@ func (p *parser) parseStmt() []map[string]any {
 			}
 			words = []map[string]any{{"type": "Interpolate", "parts": parts}}
 		}
-		// INLINE echo-node literal (NOT via the execStmt helper): a
-		// helper call here transpiles to fnCall+status and DISCARDS
-		// the returned map (the self-host echo-loss — `return 42`
-		// lost its echo). An inline map literal materializes via
-		// objNew/mapSet (like the return-stop below) and survives.
-		out := append(preEcho, map[string]any{
+		// Alias-then-append (NOT out := append(preEcho, …)): the
+		// transpiler lowers :=-append with the ASSIGNEE as base
+		// (out = push(out, X), dropping preEcho's contents) instead
+		// of the appended slice. Aliasing shares the list id, then
+		// plain appends push correctly (preEcho is dead after).
+		out := preEcho
+		out = append(out, map[string]any{
 			"type": "Expr",
 			"expr": map[string]any{
 				"type": "Call", "func": "exec",
@@ -6794,9 +6802,25 @@ func (p *parser) parseAssignStmt() []map[string]any {
 		// own `c := src[i]` byte read in lex. Emit a plain store assign
 		// instead (the runtime's local builtin is a plain store write
 		// anyway — the A1 has no scoped locals).
-		if lv := localVal(w); lv != "" {
-			return []map[string]any{execStmt("local",
-				[]map[string]any{strExpr(targets[0] + "=" + lv)}, "Emulable")}
+		// Literal detection reads the RHS EXPR (not the built word):
+		// word maps ride as store ids in JS, so direct w["type"]
+		// access sees an id string (localVal always missed → every
+		// `x := lit` lowered Assign instead of local-exec). Expr
+		// kind/text lower via objGet and survive.
+		// INLINE echo-node literal (NOT via execStmt helper — same
+		// fnCall-status discard as the return echo); returned as a
+		// VAR (echo-ID) so the node resolves structurally.
+		if lv, ok := p.assignLiteral(rhs); ok {
+			out := []map[string]any{}
+			out = append(out, map[string]any{
+				"type": "Expr",
+				"expr": map[string]any{
+					"type": "Call", "func": "exec",
+					"args":   []any{strExpr("local"), map[string]any{"type": "Array", "elements": []any{strExpr(targets[0] + "=" + lv)}}},
+					"purity": "Emulable",
+				},
+			})
+			return out
 		}
 		return []map[string]any{assignStmt(targets[0], w)}
 	}
@@ -6859,18 +6883,23 @@ func (p *parser) isAddStrOperand(e *expr) bool {
 }
 
 // localVal renders the value text for `local name=val`.
-func localVal(w map[string]any) string {
-	switch v := w["type"].(string); v {
-	case "Interpolate":
-		if parts, ok := w["parts"].([]any); ok && len(parts) == 1 {
-			if pt, ok := parts[0].(map[string]any); ok && pt["kind"] == "lit" {
-				return pt["text"].(string)
-			}
-		}
-	case "Str":
-		return w["value"].(string)
+// assignLiteral: the literal text when an assign RHS is a plain literal
+// (str/num/rawstr) — for `local name=val` emission, which needs the
+// TEXT (not a word map). Reads expr kind/text (objGet-safe in JS).
+func (p *parser) assignLiteral(rhs *expr) (string, bool) {
+	if rhs == nil {
+		return "", false
 	}
-	return ""
+	switch rhs.kind {
+	case "str", "rawstr", "num":
+		// empty text takes the assign path (matches localVal's
+		// lv != "" gate — `x := ""` is Assign, not local-exec).
+		if rhs.text == "" {
+			return "", false
+		}
+		return rhs.text, true
+	}
+	return "", false
 }
 
 // parseMapLiteral: `map[K]V{ k: v, ... }` → one assocSet per pair (the
