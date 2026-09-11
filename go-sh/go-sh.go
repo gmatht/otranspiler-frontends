@@ -5259,10 +5259,8 @@ func (p *parser) parseAssignStmt() []map[string]any {
 		if len(targets) != 1 {
 			p.failf("%s needs one target", op)
 		}
-		delta := 1
 		arithOp := "+"
 		if op == "--" {
-			delta = -1
 			arithOp = "-"
 		}
 		if memberBase != "" {
@@ -5299,7 +5297,7 @@ func (p *parser) parseAssignStmt() []map[string]any {
 		}
 		p.registerVar(targets[0], "Int")
 		return []map[string]any{assignStmt(targets[0],
-			arithWrap(arithBin(arithVar(targets[0]), arithOp, arithNum(delta))))}
+			arithWrap(arithBin(arithVar(targets[0]), arithOp, arithNum(1))))}
 	}
 	op := ""
 	switch {
@@ -6816,9 +6814,36 @@ func (p *parser) registerAssignType(name string, rhs *expr, w map[string]any) {
 			}
 		}
 		p.registerVar(name, p.wordType(w))
+	} else if rhs.kind == "mul" || rhs.kind == "neg" {
+		// Go arithmetic with no string overload (`*`, unary `-`)
+		p.registerVar(name, "Int")
+	} else if rhs.kind == "add" {
+		// `+` is int addition when a side is provably numeric and no
+		// side is provably a string (member/int arithmetic like
+		// `i := p.pos+1` must be Int — Str mistyping drove
+		// lexicographic loop comparisons). String concats and
+		// unprovable shapes keep the word-type fallback.
+		if (rhs.lhs != nil && p.isIntCmpOperand(rhs.lhs) || rhs.rhs != nil && p.isIntCmpOperand(rhs.rhs)) &&
+			!(rhs.lhs != nil && p.isAddStrOperand(rhs.lhs)) && !(rhs.rhs != nil && p.isAddStrOperand(rhs.rhs)) {
+			p.registerVar(name, "Int")
+		} else {
+			p.registerVar(name, p.wordType(w))
+		}
 	} else {
 		p.registerVar(name, p.wordType(w))
 	}
+}
+
+// isAddStrOperand: whether an addition operand is provably a Go string
+// (string concat detection for `:=` typing — chars/bytes stay numeric).
+func (p *parser) isAddStrOperand(e *expr) bool {
+	switch e.kind {
+	case "str", "rawstr":
+		return true
+	case "var":
+		return p.varTypes[p.resolveVar(e.name)] == "Str"
+	}
+	return false
 }
 
 // localVal renders the value text for `local name=val`.
@@ -8368,10 +8393,8 @@ func (p *parser) parseFor() []map[string]any {
 		if !p.atPunct("{") {
 			postName := p.expect(tIdent, "").text
 			postOp := "+"
-			delta := 1
 			if p.acceptPunct("--") {
 				postOp = "-"
-				delta = -1
 			} else if p.acceptPunct("+=") {
 				p.skipNL()
 				rhs := p.parseExpr()
@@ -8386,7 +8409,7 @@ func (p *parser) parseFor() []map[string]any {
 				p.expect(tPunct, "++")
 			}
 			post = []map[string]any{assignStmt(postName,
-				arithWrap(arithBin(arithVar(postName), postOp, arithNum(delta))))}
+				arithWrap(arithBin(arithVar(postName), postOp, arithNum(1))))}
 			body := p.parseBlockStmts()
 			return []map[string]any{{"type": "ForInit",
 				"init": []map[string]any{}, "cond": p.condToJSON(cond), "step": post, "body": body}}
@@ -11706,6 +11729,66 @@ func (p *parser) condTestText(e *expr) string {
 
 // condTestString renders a comparison as the core's [ ] argument string
 // (the `"$X"="1"` / `1 -lt 2` / ` -z "$X"` shapes).
+// isIntCmpOperand: whether a comparison operand is provably a Go int
+// (numbers, lengths, Int/Byte vars).
+func (p *parser) isIntCmpOperand(e *expr) bool {
+	switch e.kind {
+	case "num", "arrlen", "strlen":
+		return true
+	case "var":
+		if e.name == "nil" {
+			return false
+		}
+		t := p.varTypes[p.resolveVar(e.name)]
+		return t == "Int" || t == "Byte"
+	}
+	return false
+}
+
+// isStrCmpOperand: whether a comparison operand is provably a Go
+// string/char (or nil) — such comparisons stay lexicographic `<`.
+func (p *parser) isStrCmpOperand(e *expr) bool {
+	switch e.kind {
+	case "str", "rawstr", "char":
+		return true
+	case "var":
+		if e.name == "nil" {
+			return true
+		}
+		return p.varTypes[p.resolveVar(e.name)] == "Str"
+	}
+	return false
+}
+
+// isNumericCmp: Go's < <= > >= on integers compare numerically. The app
+// is valid Go, so a comparison with a provably-int side and no
+// provably-string/char side is int/int (loop counters like `i` are often
+// untyped — `i := p.pos+1` infers nothing — but valid Go forces them int
+// when the other side is a length). Such pairs take the -lt family;
+// anything string/char-flavored keeps lexicographic `<` (the dogfood
+// lexer's char tests mis-lower under -lt).
+func (p *parser) isNumericCmp(l, r *expr) bool {
+	if p.isStrCmpOperand(l) || p.isStrCmpOperand(r) {
+		return false
+	}
+	return p.isIntCmpOperand(l) || p.isIntCmpOperand(r)
+}
+
+// isLenCmp: a comparison anchored on a length (`X < len(p.toks)`). The
+// app is valid Go, so X is an int no matter how the frontend mistyped
+// it (loop counters from member reads / var copies often land Str via
+// the word-type fallback). Numeric operator unless the other side is a
+// string/char literal (conservative keep of `<` for literal shapes).
+func (p *parser) isLenCmp(l, r *expr) bool {
+	if l.kind == "arrlen" || l.kind == "strlen" {
+		return r.kind != "str" && r.kind != "rawstr" && r.kind != "char"
+	}
+	if r.kind == "arrlen" || r.kind == "strlen" {
+		return l.kind != "str" && l.kind != "rawstr" && l.kind != "char"
+	}
+	return false
+}
+
 func (p *parser) condTestString(c *expr) string {
 	if c.kind == "call" {
 		// recover() inside a defer — the caught value
@@ -11779,16 +11862,29 @@ func (p *parser) condTestString(c *expr) string {
 		}
 		return ls + "!=" + rs
 	case "<":
-		// STRING comparison (`[ "$a" < "$b" ]` — the runtime's test
-		// evaluates < > lexicographically, matching Go's byte semantics
-		// for single ASCII chars; `-lt` is numeric-only and intCmp on a
-		// non-numeric operand mis-lowered the dogfood lexer's char tests).
+		// Go's < on integers is NUMERIC, but the test-string `<` is
+		// lexicographic (right for chars/strings — the dogfood lexer's
+		// char tests mis-lower under -lt — wrong for `i < len(p.toks)`
+		// once indices/lengths reach two digits). Provably-int pairs
+		// take the -lt family; anything char/string keeps `<`.
+		if p.isLenCmp(l, r) || p.isNumericCmp(l, r) {
+			return p.condOperandArg(l) + " -lt " + p.condOperandArg(r)
+		}
 		return p.condOperandArg(l) + " < " + p.condOperandArg(r)
 	case "<=":
+		if p.isLenCmp(l, r) || p.isNumericCmp(l, r) {
+			return p.condOperandArg(l) + " -le " + p.condOperandArg(r)
+		}
 		return "! " + p.condOperandArg(l) + " > " + p.condOperandArg(r)
 	case ">":
+		if p.isLenCmp(l, r) || p.isNumericCmp(l, r) {
+			return p.condOperandArg(l) + " -gt " + p.condOperandArg(r)
+		}
 		return p.condOperandArg(l) + " > " + p.condOperandArg(r)
 	case ">=":
+		if p.isLenCmp(l, r) || p.isNumericCmp(l, r) {
+			return p.condOperandArg(l) + " -ge " + p.condOperandArg(r)
+		}
 		return "! " + p.condOperandArg(l) + " < " + p.condOperandArg(r)
 	}
 	p.failf("unsupported comparison %q (v2)", c.BOp)
@@ -12381,11 +12477,38 @@ func (p *parser) condOperandArg(e *expr) string {
 	case "arrlen":
 		// len(arr) in a numeric comparison — the quoted length word
 		// (e.g. `"${#arr[@]}" -gt 1`; a bare ${#arr[@]} would need the
-		// word-splitting the quoted form avoids).
+		// word-splitting the quoted form avoids). A MEMBER list field
+		// (`len(p.toks)`) is not a store var, so the `${#p.toks[@]}`
+		// spelling can't resolve (every lookahead bound-check misfired);
+		// use the objFieldLen cmdsub word instead (byteAt-style).
+		if e.target != nil && e.target.kind == "member" {
+			if parts := strings.Split(e.target.name, "."); len(parts) == 2 {
+				if _, tag := p.structFieldWord(e.target.name); tag == "list" {
+					ref := p.resolveVar(parts[0])
+					if n, ok := p.paramNumber(ref); ok {
+						ref = strconv.Itoa(n)
+					}
+					return `"$(sh2.objFieldLen(` + ref + `, ` + parts[1] + `))"`
+				}
+			}
+		}
 		return `"${#` + p.paramName(e.target.name) + `[@]}"`
 	case "strlen":
 		// len(s) in a numeric comparison — the quoted length word
-		// (`"${#s}" -gt 1`; the same shape as condOperandQ).
+		// (`"${#s}" -gt 1`; the same shape as condOperandQ). A MEMBER
+		// string field (`len(p.src)`) takes the same objFieldLen word
+		// (the helper returns the string length for plain values).
+		if e.target != nil && e.target.kind == "member" {
+			if parts := strings.Split(e.target.name, "."); len(parts) == 2 {
+				if w, _ := p.structFieldWord(e.target.name); w != nil {
+					ref := p.resolveVar(parts[0])
+					if n, ok := p.paramNumber(ref); ok {
+						ref = strconv.Itoa(n)
+					}
+					return `"$(sh2.objFieldLen(` + ref + `, ` + parts[1] + `))"`
+				}
+			}
+		}
 		return `"${#` + p.paramName(e.target.name) + `}"`
 	case "index":
 		// src[i] in a numeric comparison — the sh2.byteAt cmdsub word
