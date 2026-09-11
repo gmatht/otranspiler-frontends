@@ -2315,6 +2315,25 @@ func bigLitAst(text string) (map[string]any, error) {
 	return cur, nil
 }
 
+// tempFor — a fresh, readable IR temp name for a hoisted call operand
+// (`min(xs)` -> `_min_xs`; `len(names)` -> `_len_names`). A per-base
+// sequence disambiguates only on collision with an existing temp.
+func (l *lowerer) tempFor(fn, name string) string {
+	base := fmt.Sprintf("_%s_%s", fn, name)
+	if !l.usedHoist[base] {
+		l.usedHoist[base] = true
+		return base
+	}
+	for {
+		l.hoistSeq[base]++
+		t := fmt.Sprintf("%s_%d", base, l.hoistSeq[base])
+		if !l.usedHoist[t] {
+			l.usedHoist[t] = true
+			return t
+		}
+	}
+}
+
 // arithIRDom — the domain-aware arith lowering. dom == "big" wraps
 // literals as exact BigInt leaves and composes Python's floor division /
 // modulo (sign-of-divisor semantics JS lacks) out of + - * % over the
@@ -2360,14 +2379,15 @@ func (l *lowerer) arithIRDom(e Expr, dom string, zeroCmp bool) (map[string]any, 
 		}
 		return arithExpr(arithVar(pos)), nil
 	case *CallE:
-		if len(t.Path) == 1 && (t.Path[0] == "max" || t.Path[0] == "min" || t.Path[0] == "sum") && len(t.Args) == 1 {
+		if len(t.Path) == 1 && (t.Path[0] == "max" || t.Path[0] == "min" || t.Path[0] == "sum" || t.Path[0] == "len") && len(t.Args) == 1 {
 			if n, ok := t.Args[0].(*NameE); ok {
-				return call(t.Path[0], []any{st(n.Name)}), nil
-			}
-		}
-		if len(t.Path) == 1 && t.Path[0] == "len" && len(t.Args) == 1 {
-			if n, ok := t.Args[0].(*NameE); ok {
-				return call("arrayLen", []any{st(n.Name)}), nil
+				// a reduction is a VALUE, not an arith leaf — the Arith AST
+				// has no call node and every arithIRDom caller extracts
+				// ["ast"]. Callers that can emit statements must hoist the
+				// call into a temp FIRST (see assignOne's += path); a bare
+				// return call(…) here would nil-panic every consumer, so
+				// fail loudly and let the caller hoist.
+				return nil, fmt.Errorf("reduction call %s(%s) cannot be an arith leaf — hoist it into a temp first", t.Path[0], n.Name)
 			}
 		}
 		if len(t.Path) == 1 && t.Path[0] == "int" && len(t.Args) == 1 {
@@ -4368,6 +4388,28 @@ func (l *lowerer) assignOne(target, op string, val Expr) ([]map[string]any, erro
 			dom = "big"
 		}
 		if dom == "int" || dom == "big" {
+			// a call RHS (min/max/sum/len of a name) is a VALUE, not an
+			// arith leaf (the Arith AST has no call node): hoist it into
+			// a fresh temp first, then compose the accumulator on the
+			// temp (`sum_min += min(xs)` → `_min_xs = min(xs); sum_min
+			// += _min_xs`). The reduction is pure, so the extra statement
+			// is exact. Without this, arithIRDom returns a bare Call node
+			// with no "ast" and the accumulator composition below
+			// nil-panics (t97).
+			pre := []map[string]any{}
+			if c, ok := val.(*CallE); ok && len(c.Path) == 1 && len(c.Args) == 1 {
+				if n, isName := c.Args[0].(*NameE); isName &&
+					(c.Path[0] == "max" || c.Path[0] == "min" || c.Path[0] == "sum" || c.Path[0] == "len") {
+					name := n.Name
+					if p, ok := l.curParams[name]; ok {
+						name = p
+					}
+					t := l.tempFor(c.Path[0], name)
+					l.setType(t, dom)
+					pre = []map[string]any{assignStmt(t, call(c.Path[0], []any{st(name)}))}
+					val = &NameE{Name: t}
+				}
+			}
 			rhs, err := l.arithIRDom(val, dom, false)
 			if err != nil {
 				return nil, err
@@ -4393,7 +4435,7 @@ func (l *lowerer) assignOne(target, op string, val Expr) ([]map[string]any, erro
 				// Number and `total + BigInt(x)` mixes types (t91).
 				ast = arithBin("+", arithCast("Int64", arithVar(target)), rhsAst)
 			}
-			return []map[string]any{assignStmt(target, arithExpr(ast))}, nil
+			return append(pre, assignStmt(target, arithExpr(ast))), nil
 		}
 		// string += → concat
 		rhs, err := l.argIR(val)
