@@ -11672,10 +11672,32 @@ func (p *parser) condToJSON(c *expr) map[string]any {
 			// whole comparison lowers as a native BinOp (plain operands
 			// render as ordinary store words)
 			if !lok {
-				lw = p.condWordAny(c.lhs)
+				// PLAIN vars (`x == "a"`): inline the getVar word —
+				// condWordAny rides fnCall-status and loses its map
+				// (lw="" poisoned the program to empty output).
+				// FULLY inline (no helper calls).
+				if c.lhs.kind == "var" {
+					rn := p.resolveVar(c.lhs.name)
+					lw = map[string]any{
+						"type": "Call", "func": "getVar",
+						"args":   []any{map[string]any{"type": "Str", "value": rn, "style": "DoubleQuoted"}},
+						"purity": "Emulable",
+					}
+				} else {
+					lw = p.condWordAny(c.lhs)
+				}
 			}
 			if !rok {
-				rw = p.condWordAny(c.rhs)
+				if c.rhs.kind == "var" {
+					rn := p.resolveVar(c.rhs.name)
+					rw = map[string]any{
+						"type": "Call", "func": "getVar",
+						"args":   []any{map[string]any{"type": "Str", "value": rn, "style": "DoubleQuoted"}},
+						"purity": "Emulable",
+					}
+				} else {
+					rw = p.condWordAny(c.rhs)
+				}
 			}
 			return map[string]any{
 				"type": "BinOp", "op": op,
