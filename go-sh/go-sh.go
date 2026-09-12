@@ -7681,6 +7681,27 @@ func (p *parser) parseIf() []map[string]any {
 	// call in spread position transpiles to exec+status and DISCARDS
 	// the returned slice (every `if` lowered to zero stmts). An inline
 	// literal materializes via objNew/mapSet and survives.
+	// ==/!= via test-string + inline testCall (NOT condToJSON):
+	// condToJSON loses BinOp maps (Go-return, no echo → empty cond
+	// poisons output). condTestString rides exec+echo (text survives);
+	// inline testCall map materializes. Shape differs from oracle
+	// BinOp (test Call vs Eq) but present+valid vs empty. Owner
+	// text→object/BinOp-echo will restore exact shape.
+	// NARROW (plain var/str/num operands only): complex operands
+	// (calls/members) need condToJSON (condTestString failfs on them).
+	if cond.kind == "binop" && (cond.BOp == "==" || cond.BOp == "!=") && p.isSimpleEqOperand(cond.lhs) && p.isSimpleEqOperand(cond.rhs) {
+		return append(pre, map[string]any{
+			"type": "If",
+			"cond": map[string]any{
+				"type": "Call", "func": "test",
+				"args":   []any{map[string]any{"type": "Str", "value": p.condTestString(cond), "style": "DoubleQuoted"}},
+				"purity": "Emulable",
+			},
+			"then":   then,
+			"elsifs": []any{},
+			"else":   elseBody,
+		})
+	}
 	return append(pre, map[string]any{
 		"type":   "If",
 		"cond":   p.condToJSON(cond),
@@ -7688,6 +7709,19 @@ func (p *parser) parseIf() []map[string]any {
 		"elsifs": []any{},
 		"else":   elseBody,
 	})
+}
+
+// isSimpleEqOperand: plain var/str/num (or nil-var) for ==/!= test-
+// string bypass (kind check only, no helpers — objGet-safe).
+func (p *parser) isSimpleEqOperand(e *expr) bool {
+	if e == nil {
+		return false
+	}
+	switch e.kind {
+	case "var", "str", "rawstr", "num":
+		return true
+	}
+	return false
 }
 
 // condToJSONIf: plain If with an already-lowered cond
