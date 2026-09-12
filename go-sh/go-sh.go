@@ -1887,7 +1887,14 @@ func (p *parser) isAnyListElem(elem string) bool {
 	if elem == "any" || elem == "map" || strings.HasPrefix(elem, "map[") {
 		return true
 	}
-	return p.isStructType(elem)
+	// INLINE struct check (NOT p.isStructType call): a helper-call
+	// return forces echo-convention on the whole function (all paths
+	// echo, leaking true/false into captures — same class as the
+	// isStructType bool-var echo). Literals + inline lookup stay pure.
+	if _, ok := p.structs[strings.TrimPrefix(elem, "*")]; ok {
+		return true
+	}
+	return false
 }
 
 // peekSliceElem: the element type of a `[]T` / `[N]T` slice literal or
