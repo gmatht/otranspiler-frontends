@@ -7681,6 +7681,24 @@ func (p *parser) parseIf() []map[string]any {
 	// call in spread position transpiles to exec+status and DISCARDS
 	// the returned slice (every `if` lowered to zero stmts). An inline
 	// literal materializes via objNew/mapSet and survives.
+	// BARE var conds (`if true`, `if ok`) via test-string + inline
+	// testCall (NOT condToJSON): same loss as BinOp (empty cond poisons).
+	// Valid Go forces bool here, so test-string is always correct
+	// (oracle uses test Calls for these too).
+	if cond.kind == "var" {
+		return append(pre, map[string]any{
+			"type": "If",
+			"cond": map[string]any{
+				"type": "Call", "func": "test",
+				"args":   []any{map[string]any{"type": "Str", "value": p.condTestString(cond), "style": "DoubleQuoted"}},
+				"purity": "Emulable",
+			},
+			"then":   then,
+			"elsifs": []any{},
+			"else":   elseBody,
+		})
+	}
+	// ==/!= via test-string + inline testCall (NOT condToJSON):
 	// ==/!= via test-string + inline testCall (NOT condToJSON):
 	// condToJSON loses BinOp maps (Go-return, no echo → empty cond
 	// poisons output). condTestString rides exec+echo (text survives);
