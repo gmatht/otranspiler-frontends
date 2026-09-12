@@ -6080,12 +6080,63 @@ func (p *parser) parseAssignStmt() []map[string]any {
 		tmpMr := "__mr_" + strconv.Itoa(p.tmpN)
 		p.tmpN++
 		p.registerVar(tmpMr, "Str")
-		capMr := map[string]any{
-			"type": "Call", "func": "capture",
-			"args":   []any{map[string]any{"type": "Arrow", "body": []any{execStmtTA(calleeName, words, "Spawn", rhs.typeArgs)}}},
-			"purity": "Spawn",
+		// FULLY inline, branched on typeArgs (NO map temps): standalone
+		// map vars are DCE-dropped (execNode/execExpr came out ""),
+		// while maps nested in append/return materialize. Duplicate
+		// the out construction per branch (verbose but sound).
+		// calleeName/words are string/slice values (not maps) and
+		// survive as references.
+		var out []map[string]any
+		if len(rhs.typeArgs) > 0 {
+			ta := make([]any, len(rhs.typeArgs))
+			for i, s := range rhs.typeArgs {
+				ta[i] = s
+			}
+			out = []map[string]any{map[string]any{
+				"type": "Assign",
+				"targets": []any{map[string]any{
+					"var": tmpMr, "sigil": nil, "indices": []any{},
+				}},
+				"expr": map[string]any{
+					"type": "Call", "func": "capture",
+					"args": []any{map[string]any{
+						"type": "Arrow",
+						"body": []any{map[string]any{
+							"type": "Expr",
+							"expr": map[string]any{
+								"type": "Call", "func": "exec",
+								"args":     []any{map[string]any{"type": "Str", "value": calleeName, "style": "DoubleQuoted"}, map[string]any{"type": "Array", "elements": words}},
+								"purity":   "Spawn",
+								"typeArgs": ta,
+							},
+						}},
+					}},
+					"purity": "Spawn",
+				},
+			}}
+		} else {
+			out = []map[string]any{map[string]any{
+				"type": "Assign",
+				"targets": []any{map[string]any{
+					"var": tmpMr, "sigil": nil, "indices": []any{},
+				}},
+				"expr": map[string]any{
+					"type": "Call", "func": "capture",
+					"args": []any{map[string]any{
+						"type": "Arrow",
+						"body": []any{map[string]any{
+							"type": "Expr",
+							"expr": map[string]any{
+								"type": "Call", "func": "exec",
+								"args":   []any{map[string]any{"type": "Str", "value": calleeName, "style": "DoubleQuoted"}, map[string]any{"type": "Array", "elements": words}},
+								"purity": "Spawn",
+							},
+						}},
+					}},
+					"purity": "Spawn",
+				},
+			}}
 		}
-		out := []map[string]any{assignStmt(tmpMr, capMr)}
 		// a STRUCT-returning callee arms the dotted-field-write path
 		// (`sp.inSub = true` on a newParser() result)
 		if sig, okSig := p.fnSig[calleeName]; okSig && p.isStructType(sig[1]) {
@@ -6205,17 +6256,37 @@ func (p *parser) parseAssignStmt() []map[string]any {
 					p.registerVar(tg, "Str")
 				}
 			}
-			splitCall := map[string]any{
-				"type": "Call", "func": "strSplit",
-				"args":   []any{getVarExpr(tmpMr), strExpr("\036")},
-				"purity": "PureCpu",
-			}
-			out = append(out, assignStmt(tg,
-				map[string]any{
+			// INLINE Assign+listGet+splitCall (NOT via assignStmt helper
+			// or splitCall var): standalone map vars become plain
+			// objects ("[object Object]" on embed) and helper calls
+			// discard maps. Nested inline literals materialize via
+			// objNew/mapSet. getVar/strExpr/Int also inlined (helpers
+			// lose).
+			out = append(out, map[string]any{
+				"type": "Assign",
+				"targets": []any{map[string]any{
+					"var": tg, "sigil": nil, "indices": []any{},
+				}},
+				"expr": map[string]any{
 					"type": "Call", "func": "listGet",
-					"args":   []any{splitCall, map[string]any{"type": "Int", "value": i}},
+					"args": []any{
+						map[string]any{
+							"type": "Call", "func": "strSplit",
+							"args": []any{
+								map[string]any{
+									"type": "Call", "func": "getVar",
+									"args":   []any{map[string]any{"type": "Str", "value": tmpMr, "style": "DoubleQuoted"}},
+									"purity": "Emulable",
+								},
+								map[string]any{"type": "Str", "value": "\036", "style": "DoubleQuoted"},
+							},
+							"purity": "PureCpu",
+						},
+						map[string]any{"type": "Int", "value": i},
+					},
 					"purity": "PureCpu",
-				}))
+					},
+				})
 		}
 		if len(targets) > 1 {
 			return out
