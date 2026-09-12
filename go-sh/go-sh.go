@@ -1836,8 +1836,14 @@ func (p *parser) isStructType(name string) bool {
 	// POINTER returns (`*expr` — parseUnary/parseExpr/parsePrimary):
 	// the pointee is the struct type (the golib's own `e :=
 	// p.parseUnary()` then `e.isAddrOf = true` field write).
-	_, ok := p.structs[strings.TrimPrefix(name, "*")]
-	return ok
+	// Literal returns (NOT `_, ok := ...; return ok`): a bool VAR
+	// return transpiles to echo+return (the "false" leaks into
+	// enclosing captures/stdout — m8's invalid JSON), while literal
+	// and expression returns stay pure (atIdent precedent).
+	if _, ok := p.structs[strings.TrimPrefix(name, "*")]; ok {
+		return true
+	}
+	return false
 }
 
 // anyListVar: the resolved name when a var holds an objStore LIST id
