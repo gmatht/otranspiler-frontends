@@ -358,46 +358,75 @@ The three rows are deliberately different so the report is not a
 cherry-pick: the transpiler wins most on numeric hot loops, least on
 already-optimized big-int work.
 
-## `bench_cython.sh` — the Cython yardstick
+## `bench_cython.sh` — the Cython yardstick (pure + typed)
 
-Cython is the obvious comparison: it also compiles the *same Python
-source* to C. Four columns — CPython, Cython **pure** (`cython --embed
--3 app.py`, no annotations), Cython **typed** (a hand-written `.pyx`
-with C types — the ceiling), and py-sh-go's automatic C:
+Cython also compiles Python source to C, so it is the direct comparison.
+Four columns, three shapes, both compiled `-O2`:
+
+- **CPython** — `python3 app.py`
+- **Cython (pure)** — `cython --embed -3 app.py`, no annotations
+- **Cython (typed)** — a hand-written `.pyx` with C types (the ceiling):
+  a `malloc`'d `long long` array for compute, the same growable
+  `char**`+`strdup` list maintenance as `app.py` for I/O, and a
+  hand-written **GMP FFI** for bigint (Cython has no native big-int)
+- **py-sh-go C** — automatic, from the unmodified `.py`
+
+### Startup floor first (it reframes the rest)
+
+```
+startup floor (empty program)
+  CPython               0.039    1.0x
+  Cython (embedded)     0.049    0.8x
+  py-sh-go C            0.001   60.0x
+```
+
+`cython --embed` links and initialises **libpython**, so it pays the
+same ~40–60 ms startup as CPython; the py-sh-go binary starts in ~1 ms.
+A Cython-typed win therefore has to be earned inside the program.
+
+### Per shape (best of 5)
 
 ```
 sum_squares (2000000)
-  CPython             0.432      86.6      1.0x
-  Cython (pure)       0.594      87.6      0.7x
-  Cython (typed)      0.049      26.1      8.8x
-  py-sh-go C          0.018      17.3     24.3x
+  CPython               0.370   86.6MB    1.0x
+  Cython (pure)         0.494   87.4MB    0.7x
+  Cython (typed)        0.056   26.1MB    6.6x
+  py-sh-go C            0.010   17.0MB   37.6x
+
+app.py (io/1000000 lines, storing both lists)
+  CPython               0.465   94.3MB    1.0x
+  Cython (pure)         0.890   95.1MB    0.5x
+  Cython (typed)        0.214   64.8MB    2.2x
+  py-sh-go C            0.172   55.1MB    2.7x
 
 bignum_mul (100k x*=3 from 2**100)
-  CPython             0.643      10.2      1.0x
-  Cython (pure)       1.258      11.0      0.5x
-  Cython (typed)          -         - n/a (no C bigint)
-  py-sh-go C (GMP)    0.272       1.9      2.4x
-
-app.py (io/1000000 lines)
-  CPython             0.747      94.3      1.0x
-  Cython (pure)       1.489      95.2      0.5x
-  py-sh-go C          0.204      54.5      3.7x
+  CPython               0.453   10.1MB    1.0x
+  Cython (pure)         0.554   10.9MB    0.8x
+  Cython (typed)        0.187   11.2MB    2.4x
+  py-sh-go C (GMP)      0.187    2.0MB    2.4x
 ```
 
-The result that matters: **Cython-pure is ~2x *slower* than CPython**
-on all three shapes. Compiling to C does not help when the values are
-still boxed `PyLong`s and every operation still goes through the
-C-API — Cython is a *typed* compiler, and its win only appears after a
-human rewrites the hot code with `cdef` types (the typed column), which
-is also why it cannot speed up bigint at all (no C big-int). py-sh-go
-infers those types automatically from the unmodified source, so it
-beats CPython on every shape and beats hand-typed Cython by ~2.7x on
-the compute loop.
+### Reading it
 
-The `N=2000000` compute size is chosen so the hand-typed `long long`
-Cython sum is exact; py-sh-go's `__int128` aggregate is exact at any
-size (see the 10M row above). Cython also pays a ~30 ms embedded
-interpreter start that py-sh-go's binaries do not (~2 ms).
+- **Cython-pure is slower than CPython** on every shape. Compiling to
+  C does not help while values stay boxed `PyLong`s and every operation
+  still crosses the C-API. Cython is a *typed* compiler.
+- **Cython-typed only wins after a human rewrites the hot code** with
+  `cdef` types — and for bigint it wins only by hand-binding GMP
+  (`cdef extern from "gmp.h"`), which is no longer "Cython".
+- **Subtract the startup floor and the loops are comparable**: typed
+  Cython's compute loop is ~7 ms vs py-sh-go's ~9 ms at 2M — so most of
+  py-sh-go's 37.6x is CPython's boxing, and its edge over typed Cython
+  is the 60x cheaper start plus inferred types with no annotations.
+- **Bigint is an exact tie on time** (both call GMP) — but py-sh-go
+  uses **5.6x less RSS** (2.0 vs 11.2 MB) because it does not link
+  libpython.
+- I/O: py-sh-go's automatic C beats typed Cython (0.172 vs 0.214) with
+  less memory, despite the typed `.pyx` doing identical list upkeep.
+
+Caveat: best-of-N on a shared, sometimes-busy machine; absolute times
+move by ~2x run to run, ratios are stable. The typed `.pyx` files are
+in `bench/cython/` so the comparison is reproducible and reviewable.
 
 ## `check_cpython_parity.sh`
 
