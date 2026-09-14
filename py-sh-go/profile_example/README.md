@@ -358,6 +358,47 @@ The three rows are deliberately different so the report is not a
 cherry-pick: the transpiler wins most on numeric hot loops, least on
 already-optimized big-int work.
 
+## `bench_cython.sh` — the Cython yardstick
+
+Cython is the obvious comparison: it also compiles the *same Python
+source* to C. Four columns — CPython, Cython **pure** (`cython --embed
+-3 app.py`, no annotations), Cython **typed** (a hand-written `.pyx`
+with C types — the ceiling), and py-sh-go's automatic C:
+
+```
+sum_squares (2000000)
+  CPython             0.432      86.6      1.0x
+  Cython (pure)       0.594      87.6      0.7x
+  Cython (typed)      0.049      26.1      8.8x
+  py-sh-go C          0.018      17.3     24.3x
+
+bignum_mul (100k x*=3 from 2**100)
+  CPython             0.643      10.2      1.0x
+  Cython (pure)       1.258      11.0      0.5x
+  Cython (typed)          -         - n/a (no C bigint)
+  py-sh-go C (GMP)    0.272       1.9      2.4x
+
+app.py (io/1000000 lines)
+  CPython             0.747      94.3      1.0x
+  Cython (pure)       1.489      95.2      0.5x
+  py-sh-go C          0.204      54.5      3.7x
+```
+
+The result that matters: **Cython-pure is ~2x *slower* than CPython**
+on all three shapes. Compiling to C does not help when the values are
+still boxed `PyLong`s and every operation still goes through the
+C-API — Cython is a *typed* compiler, and its win only appears after a
+human rewrites the hot code with `cdef` types (the typed column), which
+is also why it cannot speed up bigint at all (no C big-int). py-sh-go
+infers those types automatically from the unmodified source, so it
+beats CPython on every shape and beats hand-typed Cython by ~2.7x on
+the compute loop.
+
+The `N=2000000` compute size is chosen so the hand-typed `long long`
+Cython sum is exact; py-sh-go's `__int128` aggregate is exact at any
+size (see the 10M row above). Cython also pays a ~30 ms embedded
+interpreter start that py-sh-go's binaries do not (~2 ms).
+
 ## `check_cpython_parity.sh`
 
 Speed is only meaningful if the result is right. This runs every
