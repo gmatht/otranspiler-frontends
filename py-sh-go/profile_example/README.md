@@ -316,3 +316,89 @@ Scope note: this specialises **scalar Int variables** (loop counters and
 accumulators). Int-homed array element widths use the same buckets in
 the design (`docs/DUAL_LOOPS.MD` §4.1) but need a per-store *widen*
 guard; dynamic-bound lists in py-sh-go are string-homed and unaffected.
+
+---
+
+# Part 3 — effectiveness: CPython vs the transpiled C
+
+Parts 1–2 exercise the profiler. This part measures the *transpiler*:
+same Python source, same workload, CPython vs native C
+(`py-sh-go → A1 shIR → otranspilerl --target c`, `-O2`).
+
+## `bench_vs_cpython.sh`
+
+Correctness is checked first (a differing run is reported, never timed),
+then best-of-`REPS` wall time and peak RSS (`/usr/bin/time`), across
+three shapes:
+
+```
+app / shape        impl      time(s)   rss(MB)    speedup
+sum_squares (compute) python3     2.425     392.8
+                   C           0.075      77.8
+                                                    32.3x
+bignum_mul (bigint) python3     0.617      10.2
+                   C           0.248       2.0
+                                                     2.5x
+app.py (io/1000000) python3     0.837      94.3
+                   C           0.250      55.5
+                                                     3.3x
+```
+
+- **compute** (`bench/sum_squares.py`, 10M `i*i`): **~32x faster, 5x
+  less RSS**. The C uses a native `long long` vector and a maintained
+  `__int128` sum; CPython boxes 10M `PyLong`s and dispatches the
+  bytecode loop.
+- **bigint** (`bench/bignum_mul.py`, 100k `x *= 3` from `2**100`): **~2.5x
+  faster, 5x less RSS**. GMP vs CPython's own big-int — the honest case
+  where the win is real but modest, not 30x.
+- **I/O** (`app.py`, 1M-line classify): **~3.3x faster, 1.7x less RSS**.
+  Line reading + substring search, no interpreter.
+
+The three rows are deliberately different so the report is not a
+cherry-pick: the transpiler wins most on numeric hot loops, least on
+already-optimized big-int work.
+
+## `check_cpython_parity.sh`
+
+Speed is only meaningful if the result is right. This runs every
+`frontends/py-sh-go/testdata/*.py` through Python → A1 → C, compiles,
+executes, and diffs stdout against CPython:
+
+```
+total 95   match 94   mismatch 1  (t91_set_sum_fallback)   emit fail 0  cc fail 0
+```
+
+Known C-backend gaps are listed in `KNOWN_GAPS` so a new mismatch is
+loud; the test fails if one appears. (The frontend itself passes 95/95
+through the ESTree backend; `t91` is a C-accumulator gap.)
+
+## What the benchmark caught
+
+The first run of `bench_vs_cpython.sh` at 10M elements **failed parity**:
+CPython printed `333333283333335000000`, C printed `1291890006563070912`.
+The native int-array sum was accumulated in `long long` and wrapped past
+9.2e18 — a real miscompile, not a benchmark artifact. It is fixed:
+the maintained aggregate and the on-demand scan now accumulate in
+`__int128` (exact for any memory-sized i64 array: `M·2^64 < 2^127`) and
+print through `_sh_i128_str`. That is the point of a differential
+benchmark — the 32x number above only counts because the output now
+matches.
+
+## What to try next (not built here)
+
+- **Cross-target parity**: the same A1 already has C/Go/Rust/Zig/Java/
+  Perl/Python/JS backends. A table of "one Python app → N languages,
+  same stdout, time each" would show the universal-shIR value.
+- **Profile-guided vs default C**: a single table contrasting the
+  default build, `SH2_PROFILE_IN` pre-sizing, and
+  `SH2_ASSUME_OBSERVED_WIDTHS` tiers (i128 vs GMP is already ~15x in
+  `bench_i128_gmp.c`).
+- **Coverage, not just pass/fail**: extend `check_cpython_parity.sh` to
+  report which Python constructs are refused vs miscompiled, and to
+  run the stdin-using tests with inputs.
+- **GPU offload**: the workspace's bash-O4 autoshaderization already
+  turns compute loops into CUDA; running a Python-derived loop on the
+  GPU is the natural next headline (the RTX 2070 work is in-tree).
+- **Startup/memory for embedding**: no interpreter, ~2 MB RSS vs ~10 MB
+  for CPython, no import preamble — measure `main()` time for a
+  short-lived process.

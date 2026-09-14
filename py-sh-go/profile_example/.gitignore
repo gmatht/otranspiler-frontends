@@ -1,2 +1,3 @@
-# generated demo artifacts
 out/
+# scratch files a corpus test may create in CWD
+f
