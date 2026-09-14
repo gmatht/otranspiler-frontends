@@ -182,64 +182,98 @@ The default (no-profile) build types both `x` and `i` as `long long`,
 which is **wrong past N=63** (`2**130` truncates). The profile is what
 makes it exact.
 
+## Why the profiler needed fixing first
+
+The first version of this demo could not see the middle tier at all: the
+*instrumented* build was the default one (`long long x`), so `x`
+**wrapped** at 2^63 before the probe ran, and every large workload
+reported the same saturated bucket (`8`). A profile that cannot
+distinguish "fits 64 bits" from "fits 128" from "needs arbitrary
+precision" cannot choose between i64, `__int128` and GMP.
+
+The fix is a **non-wrapping instrumented build**:
+`SH2_PROFILE_WIDE=1` homes the detected *growers* (`x = x * 2`, never a
+loop condition variable — see `profile_wide_vars`) in GMP for the
+measurement pass only, and emits `_sh_prof_val_mpz`, which reports the
+true bit length. The buckets are then honest:
+
+| bucket | means | release tier |
+|---|---|---|
+| 1..8 | fits u8..u64 | narrow C int (`uint*_t`), guarded store |
+| 9..16 | needs 65..128 bits | **`__int128`** (fast middle tier) |
+| 17 | beyond 128 bits (saturated) | GMP `mpz_t` (exact, slow) |
+
+## Why the middle tier is worth finding
+
+Both tiers are exact past 64 bits; the difference is speed. The same
+doubling loop in `__int128` vs GMP (this is `bench_i128_gmp.c`, and the
+demo runs it):
+
+```
+doubling x 120 times, 1000000 reps
+  __int128 :   0.085 s  ( 0.71 ns/op)
+  mpz (GMP):   1.302 s  (10.85 ns/op)
+  speedup  :   15.2x
+```
+
+So the payoff of the wide probe is: when the observed magnitude needs
+128 bits but not more, the release build picks `__int128` and runs
+~10-15x faster than GMP — and only falls back to GMP when the profile
+shows bucket 17.
+
 ## The three profiles
 
-`run_width_demo.sh` generates three workloads (`seq 10`, `seq 130`,
-`seq 70000`), takes a profile on each, and re-renders with
+`run_width_demo.sh` generates three workloads (`seq 10`, `seq 100`,
+`seq 70000`), takes a **wide** profile on each
+(`SH2_PROFILE=1 SH2_PROFILE_WIDE=1`), and re-renders with
 `SH2_ASSUME_OBSERVED_WIDTHS=1 SH2_PROFILE_IN=<profile>`:
 
 ```
 profile      lines x-bucket i-bucket  C types                            guided C          correct?
 a               10        2        1  uint16_t i uint32_t x              3dc05042fbc69566  yes
-b              130        8        1  mpz_t x uint16_t i                 c8e1c9a206a6be62  yes
-c            70000        8        3  mpz_t x uint32_t i                 30cdf0b6809eadaf  yes
+b              100       13        1  __int128 x uint16_t i              7de5ef294b48cc49  yes
+c            70000       17        3  mpz_t x uint32_t i                 30cdf0b6809eadaf  yes
 merged       a+b+c        -        -  mpz_t x uint32_t i                 30cdf0b6809eadaf  yes
 
-guard: profile a (x<=65535) run on b.lines (x=2**130) -> exit 127
+guard: profile a (x<=65535) run on b.lines (x=2**100) -> exit 127
   sh2-profile: x exceeded the observed range [0, 65535] (SH2_ASSUME_OBSERVED_WIDTHS); rebuild with a matching profile or drop the flag
 ```
 
-Reading it:
-
-- **profile a** — a small workload. The `x` bucket (2 bytes) seeds
-  `x ∈ [0, 65535]` and `i ∈ [0, 255]`; the existing width machinery then
-  homes `x` in `uint32_t` (the `x*2` expression widens one tier) and `i`
-  in `uint16_t`. **Explicit u32 support** — and no GMP in the file at
-  all.
-- **profile b** — a large workload. `x = 2**130` pushed the i64
-  profiled build to the 8-byte bucket, so `x` is homed in **GMP**
-  (exact for any magnitude — the "i128 or similar" wide tier). The loop
-  counter stays narrow (`uint16_t i`).
-- **profile c** — a workload whose counter is itself large (`i` needs 3
-  bytes). The build now contains **both** `uint32_t i` and `mpz_t x`:
-  the narrow loop tier *and* the wide accumulator tier.
-- **merged** — `harness/profile-merge.py` unions all three profiles
-  (max bucket per var), so the merged build is correct on every
-  workload.
-- **guard** — profile `a` assumed `x ≤ 65535`. Run on the `b` workload
-  it stops with a diagnostic (exit 127) instead of silently wrapping:
-  the store guard is the soundness of the assertive tier
-  (`docs/DUAL_LOOPS.MD` §4.1: "point at the `else` branch"). The
-  default, profile-less build remains available and unchanged.
+- **profile a** — small workload (`x = 2**10`, bucket 2). The bucket
+  seeds `x ∈ [0,65535]`, the `x*2` expression widens one tier, and `x`
+  becomes `uint32_t` (counter `uint16_t`). **u32** — no GMP, no
+  `__int128`.
+- **profile b** — `x = 2**100` (bucket 13, needs 101 bits). The wide
+  probe sees it, so the release build homes `x` in **`__int128`** —
+  exact to 128 bits and ~15x faster than GMP.
+- **profile c** — `x = 2**70000` (bucket 17, beyond 128). Only now is
+  `x` homed in **GMP**, and the large counter is `uint32_t` — the file
+  contains **both** the narrow loop tier and the arbitrary-precision
+  accumulator tier.
+- **merged** — `harness/profile-merge.py` unions the buckets (max per
+  var), so the merged build is correct on every workload.
+- **guard** — profile `a` assumed `x ≤ 65535`; on the `b` workload it
+  stops with a diagnostic (exit 127) instead of wrapping. The
+  profile-less build stays available and unchanged.
 
 ## Where the width wiring lives
 
-- `sh2perl/src/c_profile.rs` — `_sh_prof_val` buckets to 16 bytes (so
-  ≥64-bit magnitudes are representable); `ProfileIn.mag_buckets` parses
-  the `mags` sites; `bucket_hi` maps a bucket to its inclusive bound;
-  `assume_observed_widths()` reads the flag.
-- `sh2perl/src/c_backend.rs` — before `effective_widths`, a bucket ≤ 7
-  seeds the var's range to `[0, bucket_hi]` (narrow tiers) and records
-  `profile_bounds`; after `analyze_bigint_vars`, a bucket ≥ 8 adds the
-  var to `bigint_vars` (GMP); `profile_store` / `profile_incdec` emit
-  the `__int128`-checked, reader-visible guard at every store. A
-  source-hash mismatch **refuses** the render (`exit 2`), per §4.2.
-- `sh2perl/tests/profile_e2e.rs::assume_observed_width_guard` pins the
-  guard and the narrowing.
+- `sh2perl/src/c_profile.rs` — `_sh_prof_val` buckets to 17 (16 = 128
+  bits, 17 = the saturated "beyond" marker); the wide
+  `_sh_prof_val_mpz` reports `mpz_sizeinbase(x,2)`; `ProfileIn.mag_buckets`
+  parses the `mags` sites; `bucket_hi`; `assume_observed_widths()`.
+- `sh2perl/src/c_backend.rs` — `profile_wide_vars` detects growers for
+  the instrumented build; before `effective_widths` a bucket 1..8 seeds
+  `[0, bucket_hi]` (guarded narrow tier) and 9..16 joins `i128_vars`;
+  after `analyze_bigint_vars` a bucket ≥ 17 joins `bigint_vars`;
+  `i128_vars` declare `__int128` and print through `_sh_i128_str`;
+  `profile_store` / `profile_incdec` emit the `__int128`-checked guard.
+  A source-hash mismatch **refuses** the render (`exit 2`, §4.2).
+- `sh2perl/tests/profile_e2e.rs` — `assume_observed_width_guard` (narrow
+  tier + guard) and `assume_observed_width_i128_tier` (bucket 13 →
+  `__int128`, not GMP).
 
-Scope note: this slice specialises **scalar Int variables** (loop
-counters and accumulators). The `int_array_widths` consumer (int-homed
-array element widths) uses the same observed buckets in the design
-(`docs/DUAL_LOOPS.MD` §4.1) but needs a per-store widen guard for
-arrays, so it is deliberately not narrowed here; dynamic-bound lists in
-py-sh-go are string-homed and unaffected either way.
+Scope note: this specialises **scalar Int variables** (loop counters and
+accumulators). Int-homed array element widths use the same buckets in
+the design (`docs/DUAL_LOOPS.MD` §4.1) but need a per-store *widen*
+guard; dynamic-bound lists in py-sh-go are string-homed and unaffected.

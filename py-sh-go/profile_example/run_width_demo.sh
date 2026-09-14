@@ -6,20 +6,23 @@
 # (value magnitude buckets) under SH2_ASSUME_OBSERVED_WIDTHS, the
 # assertive tier of docs/DUAL_LOOPS.MD §4:
 #
-#   bucket 1..7 -> seed the range to the observed bound, so the C
-#                  backend homes the variable at u8/u16/u32/u64; every
-#                  store carries a runtime range guard (assertive mode).
-#   bucket >= 8 -> the profiled (i64) build hit the 8-byte edge, so the
-#                  variable is homed in GMP (exact for any magnitude —
-#                  the "i128 or similar" wide tier). No guard needed.
+# The profiling build MUST use a non-wrapping probe (SH2_PROFILE_WIDE=1):
+# the default i64 instrumentation build wraps the accumulator first, so
+# its probe only ever sees the bucket-8 edge and cannot distinguish
+# "needs 64 bits" from "needs 128". With the wide (GMP) probe the
+# buckets are honest:
+#
+#   1..=8  -> seed [0, bucket_hi] -> u8..u64, guarded store (§4.1)
+#   9..=16 -> 65..128 bits           -> __int128  (fast middle tier)
+#   >=17   -> beyond 128 bits        -> GMP mpz   (exact, slow)
 #
 # The application is app_grow.py (read N lines, double x N times), so
 # the workload shape decides the tiers:
 #
 #   profile a (10 lines)     x=2**10    -> uint32_t x, uint16_t i
-#   profile b (130 lines)    x=2**130   -> mpz_t x (wide), uint16_t i
-#   profile c (70000 lines)  x=2**70000 -> mpz_t x (wide), uint32_t i
-#   merged a+b+c                        -> mpz_t x, uint32_t i  (both)
+#   profile b (100 lines)    x=2**100   -> __int128 x, uint16_t i
+#   profile c (70000 lines)  x=2**70000 -> mpz_t x, uint32_t i   (both)
+#   merged a+b+c                         -> mpz_t x, uint32_t i   (union)
 #
 # Usage: ./run_width_demo.sh
 set -uo pipefail
@@ -49,7 +52,7 @@ A1="$OUT/app_grow.shir.json"
 
 # ── workloads (deterministic; sized to move the buckets) ────────────
 seq 10    > "$OUT/a.lines"
-seq 130   > "$OUT/b.lines"
+seq 100   > "$OUT/b.lines"
 seq 70000 > "$OUT/c.lines"
 
 render() { # render <c-out> [env...]
@@ -58,14 +61,14 @@ render() { # render <c-out> [env...]
 }
 compile() { $CC -O1 -o "$2" "$1" -lgmp 2>"$2.gcc.log" || { cat "$2.gcc.log" >&2; die "cc failed on $1"; }; }
 sha() { sha256sum "$1" | cut -c1-16; }
-types() { grep -oE '(mpz_t|uint(8|16|32|64)_t|long long|unsigned long long) (x|i)\b' "$1" | sort -u | paste -sd' ' -; }
+types() { grep -oE '(mpz_t|__int128|uint(8|16|32|64)_t|long long|unsigned long long) (x|i)\b' "$1" | sort -u | paste -sd' ' -; }
 
 # ── baseline: the default (no-profile) render ───────────────────────
 BASE_C="$OUT/baseline.c"; BASE_BIN="$OUT/baseline"
 render "$BASE_C"; compile "$BASE_C" "$BASE_BIN"
 BASE_TYPES="$(types "$BASE_C")"
 echo "app_grow.py -> default C types: ${BASE_TYPES:-?}"
-echo "  (x is i64 by default: N=130 overflows, which is why the profile matters)"
+echo "  (x is i64 by default: N=100 overflows, which is why the profile matters)"
 echo
 
 printf '%-10s %7s %8s %8s  %-34s %-17s %s\n' \
@@ -80,8 +83,8 @@ for tag in a b c; do
   pc="$OUT/$tag.profiled.c"; pbin="$OUT/$tag.profiled"
   gc="$OUT/$tag.guided.c";  gbin="$OUT/$tag.guided"
 
-  # 1. take the profile
-  render "$pc" SH2_PROFILE=1 SH2_PROFILE_OUT="$prof"
+  # 1. take the profile — WIDE probe, so x does not wrap first
+  render "$pc" SH2_PROFILE=1 SH2_PROFILE_WIDE=1 SH2_PROFILE_OUT="$prof"
   compile "$pc" "$pbin"
   "$pbin" < "$wl" > "$OUT/$tag.profiled.out" || die "profiled run $tag"
   PROFILES+=("$prof")
@@ -123,10 +126,20 @@ render "$ga_c" -u SH2_PROFILE SH2_ASSUME_OBSERVED_WIDTHS=1 SH2_PROFILE_IN="$OUT/
 compile "$ga_c" "$ga_bin"
 "$ga_bin" < "$OUT/b.lines" > "$OUT/guard.out" 2> "$OUT/guard.err"
 rc=$?
-echo "guard: profile a (x<=65535) run on b.lines (x=2**130) -> exit $rc"
+echo "guard: profile a (x<=65535) run on b.lines (x=2**100) -> exit $rc"
 sed 's/^/  /' "$OUT/guard.err"
 [ "$rc" -eq 127 ] || die "expected the assertive width guard to fire (exit 127)"
 echo
+
+# ── why the middle tier matters: __int128 vs GMP (informational) ─────
+BENCH="$SCRIPT_DIR/bench_i128_gmp.c"
+if [ -f "$BENCH" ] && command -v "$CC" >/dev/null; then
+  if $CC -O2 -o "$OUT/bench_i128_gmp" "$BENCH" -lgmp 2>/dev/null; then
+    echo "--- __int128 vs GMP for the same exact 128-bit work ---"
+    "$OUT/bench_i128_gmp" | sed 's/^/  /'
+    echo
+  fi
+fi
 
 echo "artifacts under $OUT"
 echo "  <tag>.profile.json  a/b/c measurements   <tag>.guided.c  the C each produced"
