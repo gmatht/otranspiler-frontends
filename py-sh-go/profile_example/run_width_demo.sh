@@ -61,7 +61,7 @@ render() { # render <c-out> [env...]
 }
 compile() { $CC -O1 -o "$2" "$1" -lgmp 2>"$2.gcc.log" || { cat "$2.gcc.log" >&2; die "cc failed on $1"; }; }
 sha() { sha256sum "$1" | cut -c1-16; }
-types() { grep -oE '(mpz_t|__int128|uint(8|16|32|64)_t|long long|unsigned long long) (x|i)\b' "$1" | sort -u | paste -sd' ' -; }
+types() { grep -oE '(mpz_t|__int128|uint(8|16|32|64)_t|long long|unsigned long long) (x_f|x|i)\b' "$1" | sort -u | paste -sd' ' -; }
 
 # ── baseline: the default (no-profile) render ───────────────────────
 BASE_C="$OUT/baseline.c"; BASE_BIN="$OUT/baseline"

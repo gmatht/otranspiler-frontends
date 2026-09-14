@@ -232,8 +232,8 @@ shows bucket 17.
 profile      lines x-bucket i-bucket  C types                            guided C          correct?
 a               10        2        1  uint16_t i uint32_t x              3dc05042fbc69566  yes
 b              100       13        1  __int128 x uint16_t i              7de5ef294b48cc49  yes
-c            70000       17        3  mpz_t x uint32_t i                 30cdf0b6809eadaf  yes
-merged       a+b+c        -        -  mpz_t x uint32_t i                 30cdf0b6809eadaf  yes
+c            70000       17        3  __int128 x_f mpz_t x uint32_t i    e9e1b0e5914a830c  yes
+merged       a+b+c        -        -  __int128 x_f mpz_t x uint32_t i    e9e1b0e5914a830c  yes
 
 guard: profile a (x<=65535) run on b.lines (x=2**100) -> exit 127
   sh2-profile: x exceeded the observed range [0, 65535] (SH2_ASSUME_OBSERVED_WIDTHS); rebuild with a matching profile or drop the flag
@@ -246,15 +246,53 @@ guard: profile a (x<=65535) run on b.lines (x=2**100) -> exit 127
 - **profile b** — `x = 2**100` (bucket 13, needs 101 bits). The wide
   probe sees it, so the release build homes `x` in **`__int128`** —
   exact to 128 bits and ~15x faster than GMP.
-- **profile c** — `x = 2**70000` (bucket 17, beyond 128). Only now is
-  `x` homed in **GMP**, and the large counter is `uint32_t` — the file
-  contains **both** the narrow loop tier and the arbitrary-precision
-  accumulator tier.
+- **profile c** — `x = 2**70000` (bucket 17, beyond 128). The **max
+  bucket is 17**, so the profile cannot promise 128 bits. The grower
+  gets a **tiered** variable: `__int128 x_f` fast path + `mpz_t x`
+  spill, switched at runtime by `x_big`. The large counter is
+  `uint32_t`.
 - **merged** — `harness/profile-merge.py` unions the buckets (max per
-  var), so the merged build is correct on every workload.
+  var): `x` is 17, `i` is 3. So merged is *identical to c* — and, unlike
+  before, it **still contains `__int128 x_f`**: the tiered form is what
+  keeps the fast 128-bit path when the merged maximum is beyond 128.
 - **guard** — profile `a` assumed `x ≤ 65535`; on the `b` workload it
   stops with a diagnostic (exit 127) instead of wrapping. The
   profile-less build stays available and unchanged.
+
+### Why merged keeps `__int128` (the tiered grower)
+
+A per-var max of 17 forces GMP for *correctness* (some observation
+needed more than 128 bits), but it does not mean every value is huge.
+The grower therefore compiles to two tiers with a runtime switch
+(`out/width/merged.guided.c`):
+
+```c
+mpz_t x;
+__int128 x_f = 0;
+int x_big = 0;
+...
+if (!x_big) {
+    __int128 _tr6;
+    if (__builtin_mul_overflow(x_f, (__int128)(2LL), &_tr6)) {
+        _sh_i128_str(&_v7, x_f);
+        mpz_set_str(x, _v7.p, 10);     /* lift the fast value ... */
+        mpz_mul(x, x, _bigint_2);      /* ... then continue exactly   */
+        x_big = 1;
+    } else {
+        x_f = _tr6;                    /* the common case: ~15x faster */
+    }
+} else {
+    mpz_mul(x, x, _bigint_2);
+}
+...
+if (x_big) _sh_mpz_str(&_v9, x); else _sh_i128_str(&_v9, x_f);
+```
+
+So the merged binary is exact on the 2\*\*70000 workload **and** uses
+`__int128` (not GMP) until the value actually crosses 2^128. The
+`__builtin_mul_overflow` check means the spill is correct for *any*
+input, not just the profiled ones — this is DUAL_LOOPS §4.1's "route to
+the next tier up to GMP".
 
 ## Where the width wiring lives
 
@@ -270,8 +308,9 @@ guard: profile a (x<=65535) run on b.lines (x=2**100) -> exit 127
   `profile_store` / `profile_incdec` emit the `__int128`-checked guard.
   A source-hash mismatch **refuses** the render (`exit 2`, §4.2).
 - `sh2perl/tests/profile_e2e.rs` — `assume_observed_width_guard` (narrow
-  tier + guard) and `assume_observed_width_i128_tier` (bucket 13 →
-  `__int128`, not GMP).
+  tier + guard), `assume_observed_width_i128_tier` (bucket 13 →
+  `__int128`, not GMP), and `assume_observed_width_tiered_grower`
+  (bucket 17 grower → `__int128 x_f` + `mpz_t x` spill + select-print).
 
 Scope note: this specialises **scalar Int variables** (loop counters and
 accumulators). Int-homed array element widths use the same buckets in
