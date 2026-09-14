@@ -1782,6 +1782,13 @@ type lowerer struct {
 	types     map[string]string   // var → int|big|float|str|list|dict
 	params    map[string][]string // function name → params (for scoping)
 	curParams map[string]string   // active function: param → positional string
+	// exactHi is the largest magnitude an integer expression may be
+	// PROVEN within and still lower to the native "int" domain.
+	// Default 2^53 (the JS Number bound); `--exact-i64` raises it to
+	// 2^63-1 for C-only callers, where signed i64 arithmetic is exact
+	// and the `Cast(Int64)` bigint marker (which would home the var in
+	// GMP) is unnecessary. Proven-huge stays "big" either way.
+	exactHi *big.Int
 	// pending Popen pipe chains (the `a | b` idiom): tail var → ordered
 	// stages (each stage is one exec statement). Flushed as an A1
 	// `Pipeline` statement at the first non-chain statement / end of
@@ -1813,6 +1820,9 @@ type lowerer struct {
 }
 
 var two53 = func() *big.Int { return big.NewInt(9007199254740992) }() // 2^53
+
+// 2^63-1: the C-exact integer ceiling (`--exact-i64`).
+var two63m1 = func() *big.Int { return big.NewInt(9223372036854775807) }()
 
 // foldInt constant-folds an integer expression with exact big.Int
 // arithmetic (literals, + - * // % ** over foldable operands). ok=false
@@ -2223,13 +2233,13 @@ func (l *lowerer) intDom(e Expr) string {
 		}
 		if t.Op == "**" {
 			// pow: unprovable growth — only a proven-small fold stays Number
-			if lo, hi, ok := l.rangeOf(e); ok && hi.Cmp(two53) <= 0 && lo.Cmp(new(big.Int).Neg(two53)) >= 0 {
+			if lo, hi, ok := l.rangeOf(e); ok && hi.Cmp(l.exactHi) <= 0 && lo.Cmp(new(big.Int).Neg(l.exactHi)) >= 0 {
 				return "int"
 			}
 			return "big"
 		}
 		if lo, hi, ok := l.rangeOf(e); ok {
-			if hi.Cmp(two53) <= 0 && lo.Cmp(new(big.Int).Neg(two53)) >= 0 {
+			if hi.Cmp(l.exactHi) <= 0 && lo.Cmp(new(big.Int).Neg(l.exactHi)) >= 0 {
 				return "int"
 			}
 			return "big"
@@ -2242,9 +2252,19 @@ func (l *lowerer) intDom(e Expr) string {
 			}
 			return "int" // float-path int() results are double-derived
 		}
+	case *SubscriptE:
+		// An array element read carries the list's recorded element
+		// domain (noteElemAdd). Without this, `s + a[i]` fell to the
+		// "big" default, homing the accumulator in GMP even when every
+		// element was a proven-i64 integer (squares-map: 27 s vs 2 s).
+		if n, ok := t.Obj.(*NameE); ok {
+			if dom, ok := l.setElemDom[n.Name]; ok {
+				return dom
+			}
+		}
 	}
 	if lo, hi, ok := l.rangeOf(e); ok {
-		if hi.Cmp(two53) <= 0 && lo.Cmp(new(big.Int).Neg(two53)) >= 0 {
+		if hi.Cmp(l.exactHi) <= 0 && lo.Cmp(new(big.Int).Neg(l.exactHi)) >= 0 {
 			return "int"
 		}
 		return "big"
@@ -2433,6 +2453,30 @@ func (l *lowerer) arithIRDom(e Expr, dom string, zeroCmp bool) (map[string]any, 
 		}
 		return arithExpr(arithBin(op, lhsAst, rhsAst)), nil
 	case *SubscriptE:
+		// Arith-context array element read: `a[i] % K` etc. must lower to
+		// the A1 arith `Index` node ({type:Index,var,key}) — NOT the
+		// expression-level `subscriptIR` result (which has no "ast" and
+		// nil-panics the enclosing BinOpE, see the hash/squares-map
+		// idioms).
+		if name, ok := t.Obj.(*NameE); ok && t.Index != nil {
+			key, err := l.arithIRDom(t.Index, dom, false)
+			if err != nil {
+				return nil, err
+			}
+			keyAst, ok := key["ast"].(map[string]any)
+			if !ok {
+				return nil, fmt.Errorf("unsupported arithmetic index")
+			}
+			return arithExpr(map[string]any{
+				"type": "Index",
+				"var":  name.Name,
+				"key":  keyAst,
+			}), nil
+		}
+		// Other subscript idioms (os.environ["K"], split/rsplit[0], …)
+		// resolve to an EXPRESSION node (e.g. getVar) — return it unchanged
+		// (the `int(os.environ["N"])` form; arithIRDom callers that need
+		// an "ast" leaf handle only genuine arith subscripts).
 		return l.subscriptIR(t)
 	}
 	return nil, fmt.Errorf("unsupported arithmetic")
@@ -4093,7 +4137,7 @@ func (l *lowerer) stmtIR(s Stmt) ([]map[string]any, error) {
 				continue
 			}
 			dom := "big"
-			if iv[1].Cmp(two53) <= 0 && iv[0].Cmp(new(big.Int).Neg(two53)) >= 0 {
+			if iv[1].Cmp(l.exactHi) <= 0 && iv[0].Cmp(new(big.Int).Neg(l.exactHi)) >= 0 {
 				dom = "int"
 			}
 			l.ranges[prm] = iv
@@ -4785,7 +4829,14 @@ func (l *lowerer) withIR(t *WithS) ([]map[string]any, error) {
 // ─────────────────────────────────────────────────────────────────────
 
 func buildProgram(stmts []Stmt) (*shiremit.Program, error) {
+	return buildProgramExact(stmts, two53)
+}
+
+// buildProgramExact is buildProgram with an explicit exact-integer
+// ceiling (see lowerer.exactHi).
+func buildProgramExact(stmts []Stmt, exactHi *big.Int) (*shiremit.Program, error) {
 	l := &lowerer{
+		exactHi: exactHi,
 		fns:     map[string]bool{},
 		types:   map[string]string{},
 		params:  map[string][]string{},
@@ -4839,6 +4890,21 @@ func buildProgram(stmts []Stmt) (*shiremit.Program, error) {
 // ─────────────────────────────────────────────────────────────────────
 
 func Shir(src string) ([]byte, error) {
+	return shir(src, two53)
+}
+
+// ShirExact is Shir with the exact-integer ceiling selected: exact64
+// raises it to 2^63-1 (C-only callers — `python-O4`). Nothing in the
+// default path changes.
+func ShirExact(src string, exact64 bool) ([]byte, error) {
+	hi := two53
+	if exact64 {
+		hi = two63m1
+	}
+	return shir(src, hi)
+}
+
+func shir(src string, exactHi *big.Int) ([]byte, error) {
 	// Strip shebang.
 	if i := strings.IndexByte(src, '\n'); i > 0 && strings.HasPrefix(src, "#!") {
 		src = src[i+1:]
@@ -4847,7 +4913,7 @@ func Shir(src string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse: %w", err)
 	}
-	prog, err := buildProgram(stmts)
+	prog, err := buildProgramExact(stmts, exactHi)
 	if err != nil {
 		return nil, fmt.Errorf("lower: %w", err)
 	}

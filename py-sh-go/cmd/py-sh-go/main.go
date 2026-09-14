@@ -13,16 +13,25 @@ import (
 func main() {
 	args := os.Args[1:]
 	raw := false
+	exact64 := false
 	filtered := []string{}
 	for _, a := range args {
-		if a == "--raw" {
+		switch a {
+		case "--raw":
 			raw = true
-		} else {
+		case "--exact-i64":
+			// C-only callers (python-O4): prove integer ranges against
+			// the exact signed-i64 ceiling (2^63-1) instead of the JS
+			// Number bound (2^53), so a value proven to fit i64 stays
+			// native instead of being homed in GMP. A default-off flag:
+			// the ESTree/JS path needs the 2^53 bound.
+			exact64 = true
+		default:
 			filtered = append(filtered, a)
 		}
 	}
 	if len(filtered) != 2 || filtered[0] != "--shir" {
-		fmt.Fprintln(os.Stderr, "usage: py-sh-go --shir <file.py> [--raw]")
+		fmt.Fprintln(os.Stderr, "usage: py-sh-go --shir <file.py> [--raw] [--exact-i64]")
 		os.Exit(2)
 	}
 	inp := filtered[1]
@@ -32,7 +41,7 @@ func main() {
 			src = string(b)
 		}
 	}
-	out, err := pylib.Shir(src)
+	out, err := pylib.ShirExact(src, exact64)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "py-sh-go: "+err.Error())
 		os.Exit(2)
