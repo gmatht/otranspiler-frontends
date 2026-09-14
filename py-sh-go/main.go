@@ -1789,6 +1789,11 @@ type lowerer struct {
 	// and the `Cast(Int64)` bigint marker (which would home the var in
 	// GMP) is unnecessary. Proven-huge stays "big" either way.
 	exactHi *big.Int
+	// loopDepth counts enclosing loop bodies during lowering. The range
+	// proof is straight-line, so a variable assigned inside a loop is
+	// loop-carried and its pre-loop range is stale; an unbounded-growth
+	// accumulator must therefore not be narrowed on it (`growsUnbounded`).
+	loopDepth int
 	// pending Popen pipe chains (the `a | b` idiom): tail var → ordered
 	// stages (each stage is one exec statement). Flushed as an A1
 	// `Pipeline` statement at the first non-chain statement / end of
@@ -2112,6 +2117,13 @@ func (l *lowerer) rangeOf(e Expr) (*big.Int, *big.Int, bool) {
 		aLo, aHi, ok1 := l.rangeOf(t.Lhs)
 		bLo, bHi, ok2 := l.rangeOf(t.Rhs)
 		if !ok1 || !ok2 {
+			// Python modulo with a proven-positive divisor bounds the
+			// RESULT from the divisor alone (x % m ∈ [0, m-1] for any x),
+			// so a loop-carried dividend does not hide the bound. This is
+			// what keeps a mod-bounded accumulator provable (sumred).
+			if t.Op == "%" && ok2 && bLo.Sign() > 0 {
+				return big.NewInt(0), new(big.Int).Sub(bHi, big.NewInt(1)), true
+			}
 			// int()/sqrt bounds are provable from ONE side's interval
 			if t.Op == "**" {
 				if fl, ok := t.Rhs.(*LitFloat); ok && fl.Text == "0.5" {
@@ -3682,7 +3694,7 @@ func (l *lowerer) rangeWhile(t *ForS, c *CallE) ([]map[string]any, error) {
 		}
 		step = []map[string]any{assignStmt(t.Var, arithExpr(arithBin("+", arithVar(t.Var), one)))}
 	}
-	body, err := l.stmtsIR(t.Body)
+	body, err := l.loopBodyIR(t.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -4010,6 +4022,80 @@ func (l *lowerer) flushPipes() []map[string]any {
 	return out
 }
 
+// loopBodyIR lowers a loop body with loopDepth raised, so assignments
+// inside it are known to be loop-carried.
+func (l *lowerer) loopBodyIR(body []Stmt) ([]map[string]any, error) {
+	l.loopDepth++
+	irs, err := l.stmtsIR(body)
+	l.loopDepth--
+	return irs, err
+}
+
+// exprContainsName reports whether expression `e` reads variable `v`.
+func exprContainsName(e Expr, v string) bool {
+	found := false
+	var walk func(Expr)
+	walk = func(e Expr) {
+		switch t := e.(type) {
+		case *NameE:
+			if t.Name == v {
+				found = true
+			}
+		case *BinOpE:
+			walk(t.Lhs)
+			walk(t.Rhs)
+		case *NotE:
+			walk(t.Arg)
+		case *CallE:
+			for _, a := range t.Args {
+				walk(a)
+			}
+		}
+	}
+	walk(e)
+	return found
+}
+
+// growsUnbounded reports whether `val` grows `v` without a bound while
+// the assignment sits inside a loop: a self-referential multiply / pow /
+// shift anywhere, or `v` appearing more than once in an additive chain
+// (`v = v + v`). A top-level modulo bounds the result and is not growth.
+// This is the guard for release blocker B1: the straight-line range
+// proof cannot bound a loop-carried accumulator, so a stale pre-loop
+// range must not narrow `v = v * i` to i64 (factorial(30) wrapped).
+func growsUnbounded(v string, val Expr) bool {
+	if b, ok := val.(*BinOpE); ok && b.Op == "%" {
+		return false // x % m is bounded by m
+	}
+	count := 0
+	growth := false
+	var walk func(Expr)
+	walk = func(e Expr) {
+		switch t := e.(type) {
+		case *NameE:
+			if t.Name == v {
+				count++
+			}
+		case *BinOpE:
+			if t.Op == "*" || t.Op == "**" || t.Op == "<<" {
+				if exprContainsName(t.Lhs, v) || exprContainsName(t.Rhs, v) {
+					growth = true
+				}
+			}
+			walk(t.Lhs)
+			walk(t.Rhs)
+		case *NotE:
+			walk(t.Arg)
+		case *CallE:
+			for _, a := range t.Args {
+				walk(a)
+			}
+		}
+	}
+	walk(val)
+	return growth || count > 1
+}
+
 func (l *lowerer) stmtsIR(stmts []Stmt) ([]map[string]any, error) {
 	var out []map[string]any
 	for _, s := range stmts {
@@ -4049,7 +4135,7 @@ func (l *lowerer) stmtIR(s Stmt) ([]map[string]any, error) {
 		if err != nil {
 			return nil, err
 		}
-		body, err := l.stmtsIR(t.Body)
+		body, err := l.loopBodyIR(t.Body)
 		if err != nil {
 			return nil, err
 		}
@@ -4061,7 +4147,7 @@ func (l *lowerer) stmtIR(s Stmt) ([]map[string]any, error) {
 		if at, ok := t.Iter.(*AttrE); ok {
 			if path, ok2 := dottedPath(at); ok2 && strings.Join(path, ".") == "sys.stdin" {
 				l.setType(t.Var, "str")
-				body, err := l.stmtsIR(t.Body)
+				body, err := l.loopBodyIR(t.Body)
 				if err != nil {
 					return nil, err
 				}
@@ -4108,7 +4194,7 @@ func (l *lowerer) stmtIR(s Stmt) ([]map[string]any, error) {
 		} else {
 			l.setType(t.Var, "str")
 		}
-		body, err := l.stmtsIR(t.Body)
+		body, err := l.loopBodyIR(t.Body)
 		if err != nil {
 			return nil, err
 		}
@@ -4158,7 +4244,7 @@ func (l *lowerer) stmtIR(s Stmt) ([]map[string]any, error) {
 				pre = append(pre, assignStmt(prm, arithExpr(arithCast("Int64", arithVar(pos)))))
 			}
 		}
-		body, err := l.stmtsIR(t.Body)
+		body, err := l.loopBodyIR(t.Body)
 		l.curParams = saved
 		if err != nil {
 			return nil, err
@@ -4506,6 +4592,10 @@ func (l *lowerer) assignOne(target, op string, val Expr) ([]map[string]any, erro
 		if dom != "big" && l.typeOf(&NameE{Name: target}) == "big" {
 			dom = "big"
 		}
+		// B1 guard: `v += v` doubles an unbounded accumulator.
+		if l.loopDepth > 0 && exprContainsName(val, target) {
+			dom = "big"
+		}
 		if dom == "int" || dom == "big" {
 			// a call RHS (min/max/sum/len of a name) is a VALUE, not an
 			// arith leaf (the Arith AST has no call node): hoist it into
@@ -4622,9 +4712,16 @@ func (l *lowerer) assignSimple(target string, val Expr) ([]map[string]any, error
 	}
 	// numeric arithmetic (int or bigint domain)
 	if ty := l.typeOf(val); ty == "int" || ty == "big" {
-		ir, err := l.arithIRDom(val, ty, false)
+		// B1 guard: a loop-carried accumulator growing without a bound
+		// has no sound straight-line range, so it must be exact (bigint)
+		// rather than narrowed to i64 on a stale pre-loop range.
+		dom := ty
+		if l.loopDepth > 0 && growsUnbounded(target, val) {
+			dom = "big"
+		}
+		ir, err := l.arithIRDom(val, dom, false)
 		if err == nil {
-			l.setType(target, ty)
+			l.setType(target, dom)
 			if lo, hi, ok := l.rangeOf(val); ok {
 				l.ranges[target] = [2]*big.Int{lo, hi}
 			} else {
