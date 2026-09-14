@@ -1,35 +1,39 @@
 #!/usr/bin/env bash
-# bench_vs_cpython.sh — the direct effectiveness measure: run the SAME
-# Python source and the SAME workload under CPython and as transpiled
-# native C, and compare wall time + peak RSS.
+# bench_vs_cpython.sh — CPython vs the transpiled C on the same source.
 #
 #   python3 app.py        vs        ./app  (py-sh-go -> A1 -> C, -O2)
 #
-# Three shapes, because the win is not uniform:
-#   compute  (sum_squares.py)  native i64 vector + maintained aggregate
-#   bigint   (bignum_mul.py)   GMP vs CPython's own big-int
-#   I/O      (app.py)          line read + substring classify
+# Workload sizes are CALIBRATED so the CPython baseline lands in
+# [0.8*TARGET_SECS, 1.25*TARGET_SECS] — set TARGET_SECS to anything in
+# the documented 1..100s band (default 5). Every implementation then
+# runs the same source. Correctness is checked before timing.
 #
-# Correctness is checked first: a run whose stdout differs from CPython
-# is reported, never timed.
+# Shapes: sum_squares (native vector), rolling_hash (scalar recurrence,
+# memory-light), app.py (line I/O + substring), bignum_mul (GMP bigint).
 #
 # Usage: ./bench_vs_cpython.sh
-# Env:   REPS=3  CC=cc  CFLAGS=-O2  IO_LINES=1000000
+# Env: TARGET_SECS=5 REPS=3 CC=cc CFLAGS=-O2
+#      LIST_CAP=10000000 IO_CAP=20000000 (memory guards)
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 export OTRANSPILER_ROOT="$ROOT"
+# shellcheck source=bench_lib.sh
+. "$SCRIPT_DIR/bench_lib.sh"
 
 PYG="$ROOT/frontends/py-sh-go/py-sh-go"
 CLI="$ROOT/otranspilerl/target/debug/otranspilerl-cli"
-APP_IO="$SCRIPT_DIR/app.py"
 BENCH="$SCRIPT_DIR/bench"
+export BENCH
 OUT="${OUT:-$SCRIPT_DIR/out/bench}"
 REPS="${REPS:-3}"
+TARGET_SECS="${TARGET_SECS:-5}"
 CC="${CC:-cc}"
 CFLAGS="${CFLAGS:--O2}"
-IO_LINES="${IO_LINES:-1000000}"
+LIST_CAP="${LIST_CAP:-10000000}"   # sum_squares: 10M boxed ints is already ~1GB
+IO_CAP="${IO_CAP:-20000000}"
+bench_clamp_target
 
 die() { echo "bench_vs_cpython: $*" >&2; exit 1; }
 [ -x "$PYG" ] || die "missing $PYG (cd frontends/py-sh-go && make build)"
@@ -38,85 +42,81 @@ command -v python3 >/dev/null || die "python3 needed"
 command -v /usr/bin/time >/dev/null || die "/usr/bin/time needed (GNU time)"
 mkdir -p "$OUT"
 
-# 1M-line mixed log for the I/O shape (deterministic).
-IO_LOG="$OUT/io.log"
-if [ ! -f "$IO_LOG" ] || [ "$(wc -l < "$IO_LOG")" != "$IO_LINES" ]; then
-  python3 - "$IO_LINES" > "$IO_LOG" <<'PY'
-import sys
-n = int(sys.argv[1])
-for i in range(1, n + 1):
-    sys.stdout.write(f"ERROR worker {i} failed\n" if i % 10 == 0 else f"request line {i} served\n")
-PY
-fi
-
-build() { # build <src.py> <tag> -> echoes the binary path
-  local src="$1" tag="$2"
+pyg_c() { # <src.py> <tag> -> binary path
+  local src="$1" tag="$2" i
   "$PYG" --shir "$src" --raw > "$OUT/$tag.shir.json" || die "emit $src"
-  "$CLI" - --target c < "$OUT/$tag.shir.json" > "$OUT/$tag.c" 2>/dev/null || die "render $tag"
+  # the shared otranspilerl-cli can be relinked by concurrent workers
+  # mid-run; retry rather than fail a whole benchmark on a transient
+  for i in 1 2 3 4; do
+    if "$CLI" - --target c < "$OUT/$tag.shir.json" > "$OUT/$tag.c" 2>"$OUT/$tag.render.log"; then break; fi
+    sleep 2
+  done
+  [ -s "$OUT/$tag.c" ] || { tail -3 "$OUT/$tag.render.log" >&2; die "render $tag"; }
   $CC $CFLAGS -o "$OUT/$tag" "$OUT/$tag.c" -lgmp 2>"$OUT/$tag.cc.log" || die "cc $tag"
   echo "$OUT/$tag"
 }
 
-# high-resolution wall time for one run (μs; process startup included —
-# the C compute binary is fast enough that `%e`'s 10ms resolution is
-# useless). stdin comes from the workload file; stdout is discarded.
-wall() { # wall <workload> <cmd...> -> seconds
-  local wl="$1"; shift
-  python3 - "$wl" "$@" <<'PY'
-import subprocess, sys, time
-wl = sys.argv[1]; cmd = sys.argv[2:]
-with open(wl, 'rb') as f:
-    t0 = time.perf_counter()
-    subprocess.run(cmd, stdin=f, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    print(f"{time.perf_counter() - t0:.6f}")
-PY
-}
+# gen snippets (used by bench_calibrate; $BENCH_N in scope)
+GEN_SUM='sed "s/range([0-9]*)/range($BENCH_N)/" "$BENCH/sum_squares.py"'
+GEN_ROLL='sed "s/range([0-9]*)/range($BENCH_N)/" "$BENCH/rolling_hash.py"'
+GEN_BIG='sed "s/i < [0-9]*/i < $BENCH_N/" "$BENCH/bignum_mul.py"'
+make_app() { BENCH_N="$2" bash -c "$1" > "$3"; }
 
-# best-of-REPS wall seconds and max RSS (kB) for a command on a workload
-measure() { # measure <workload> <cmd...> -> "secs rss_kb"
-  local wl="$1"; shift
-  local best="" t tf rssmax=0
-  for _ in $(seq "$REPS"); do
-    t="$(wall "$wl" "$@")"
-    awk -v a="$t" -v b="$best" 'BEGIN{exit !(b=="" || a<b)}' && best="$t"
-  done
-  tf="$(mktemp)"
-  /usr/bin/time -f "%M" "$@" < "$wl" > /dev/null 2>"$tf" || true
-  rssmax="$(tail -1 "$tf" | tr -dc '0-9')"; rm -f "$tf"
-  echo "$best ${rssmax:-0}"
-}
+printf 'python3: %s   cc: %s   reps: %s   target: %ss\n' \
+  "$(python3 --version 2>&1)" "$($CC --version | head -1)" "$REPS" "$TARGET_SECS"
+printf 'calibrating workloads (CPython baseline ~%ss each)...\n' "$TARGET_SECS"
 
-row() { # row <app> <impl> <secs> <rss_kb>
-  printf '%-18s %-8s %8.3f %9.1f\n' "$1" "$2" "$3" "$(awk -v k="$4" 'BEGIN{printf "%.1f", k/1024}')"
-}
+N_SUM="$(bench_calibrate 2000000 "$LIST_CAP" "$GEN_SUM")"
+N_ROLL="$(bench_calibrate 2000000 400000000 "$GEN_ROLL")"
+N_BIG="$(bench_calibrate 100000 20000000 "$GEN_BIG")"
 
-printf 'python3: %s\n' "$(python3 --version 2>&1)"
-printf 'cc: %s   reps: %s\n\n' "$($CC --version | head -1)" "$REPS"
+# I/O needs a file generator, so it calibrates against a log we write.
+N_IO="$(bench_calibrate_io 1000000 "$IO_CAP" "$SCRIPT_DIR/app.py")"
+
+printf 'sizes: sum_squares=%s  rolling_hash=%s  bignum_mul=%s  io=%s lines\n\n' \
+  "$N_SUM" "$N_ROLL" "$N_BIG" "$N_IO"
+
 printf '%-18s %-8s %8s %9s %10s\n' "app / shape" "impl" "time(s)" "rss(MB)" "speedup"
 printf '%-18s %-8s %8s %9s %10s\n' "------------------" "--------" "--------" "---------" "----------"
 
-# ── compute + bigint shapes (no input) ──────────────────────────────
-for spec in "sum_squares:compute" "bignum_mul:bigint"; do
-  name="${spec%%:*}"; shape="${spec##*:}"
-  bin="$(build "$BENCH/$name.py" "$name")"
-  pyout="$(python3 "$BENCH/$name.py")"; cout="$("$bin")"
-  [ "$pyout" = "$cout" ] || { echo "PARITY FAIL $name: py=[$pyout] c=[$cout]"; continue; }
-  read -r pts prss < <(measure /dev/null python3 "$BENCH/$name.py")
-  read -r cts crss < <(measure /dev/null "$bin")
-  row "$name ($shape)" "python3" "$pts" "$prss"
-  row "" "C" "$cts" "$crss"
-  printf '%-18s %-8s %8s %9s %10s\n' "" "" "" "" "$(awk -v p="$pts" -v c="$cts" 'BEGIN{printf "%.1fx", p/c}')"
-done
+# ── rolling_hash: scalar recurrence ─────────────────────────────────
+make_app "$GEN_ROLL" "$N_ROLL" "$OUT/rolling_hash.py"
+BIN_ROLL="$(pyg_c "$OUT/rolling_hash.py" pyg_roll)"
+pyout="$(python3 "$OUT/rolling_hash.py")"; cout="$("$BIN_ROLL")"
+[ "$pyout" = "$cout" ] || die "parity rolling_hash: py=[$pyout] c=[$cout]"
+printf '\nrolling_hash (%s)\n' "$N_ROLL"
+base="$(bench_wall /dev/null python3 "$OUT/rolling_hash.py")"
+bench_row "CPython"  "$base" "$(bench_rss /dev/null python3 "$OUT/rolling_hash.py")" "$base"
+bench_row "C"        "$(bench_wall /dev/null "$BIN_ROLL")" "$(bench_rss /dev/null "$BIN_ROLL")" "$base"
 
-# ── I/O shape ───────────────────────────────────────────────────────
-bin="$(build "$APP_IO" "app_io")"
-pyout="$(python3 "$APP_IO" < "$IO_LOG")"; cout="$("$bin" < "$IO_LOG")"
-[ "$pyout" = "$cout" ] || echo "PARITY FAIL app.py: py=[$pyout] c=[$cout]"
-read -r pts prss < <(measure "$IO_LOG" python3 "$APP_IO")
-read -r cts crss < <(measure "$IO_LOG" "$bin")
-row "app.py (io/$IO_LINES)" "python3" "$pts" "$prss"
-row "" "C" "$cts" "$crss"
-printf '%-18s %-8s %8s %9s %10s\n' "" "" "" "" "$(awk -v p="$pts" -v c="$cts" 'BEGIN{printf "%.1fx", p/c}')"
+# ── sum_squares: native vector + aggregate ──────────────────────────
+make_app "$GEN_SUM" "$N_SUM" "$OUT/sum_squares.py"
+BIN_SUM="$(pyg_c "$OUT/sum_squares.py" pyg_sum)"
+pyout="$(python3 "$OUT/sum_squares.py")"; cout="$("$BIN_SUM")"
+[ "$pyout" = "$cout" ] || die "parity sum_squares: py=[$pyout] c=[$cout]"
+printf '\nsum_squares (%s)\n' "$N_SUM"
+base="$(bench_wall /dev/null python3 "$OUT/sum_squares.py")"
+bench_row "CPython"  "$base" "$(bench_rss /dev/null python3 "$OUT/sum_squares.py")" "$base"
+bench_row "C"        "$(bench_wall /dev/null "$BIN_SUM")" "$(bench_rss /dev/null "$BIN_SUM")" "$base"
+
+# ── bignum_mul: GMP vs CPython big-int ──────────────────────────────
+make_app "$GEN_BIG" "$N_BIG" "$OUT/bignum_mul.py"
+BIN_BIG="$(pyg_c "$OUT/bignum_mul.py" pyg_big)"
+pyout="$(python3 "$OUT/bignum_mul.py")"; cout="$("$BIN_BIG")"
+[ "$pyout" = "$cout" ] || die "parity bignum_mul: py=[$pyout] c=[$cout]"
+printf '\nbignum_mul (%s x*=3 from 2**100)\n' "$N_BIG"
+base="$(bench_wall /dev/null python3 "$OUT/bignum_mul.py")"
+bench_row "CPython"      "$base" "$(bench_rss /dev/null python3 "$OUT/bignum_mul.py")" "$base"
+bench_row "C (GMP)"      "$(bench_wall /dev/null "$BIN_BIG")" "$(bench_rss /dev/null "$BIN_BIG")" "$base"
+
+# ── app.py: line I/O, storing both lists ────────────────────────────
+BIN_IO="$(pyg_c "$SCRIPT_DIR/app.py" pyg_io)"
+pyout="$(python3 "$SCRIPT_DIR/app.py" < "$OUT/io.log")"; cout="$("$BIN_IO" < "$OUT/io.log")"
+[ "$pyout" = "$cout" ] || die "parity app.py: py=[$pyout] c=[$cout]"
+printf '\napp.py (io/%s lines)\n' "$N_IO"
+base="$(bench_wall "$OUT/io.log" python3 "$SCRIPT_DIR/app.py")"
+bench_row "CPython"  "$base" "$(bench_rss "$OUT/io.log" python3 "$SCRIPT_DIR/app.py")" "$base"
+bench_row "C"        "$(bench_wall "$OUT/io.log" "$BIN_IO")" "$(bench_rss "$OUT/io.log" "$BIN_IO")" "$base"
+
 echo
-
 echo "artifacts under $OUT (the .c is exactly what ran)"

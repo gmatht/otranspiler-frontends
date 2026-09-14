@@ -319,156 +319,38 @@ guard; dynamic-bound lists in py-sh-go are string-homed and unaffected.
 
 ---
 
-# Part 3 — effectiveness: CPython vs the transpiled C
+# Part 3 — effectiveness: CPython and Cython vs the transpiled C
 
-Parts 1–2 exercise the profiler. This part measures the *transpiler*:
-same Python source, same workload, CPython vs native C
-(`py-sh-go → A1 shIR → otranspilerl --target c`, `-O2`).
+Parts 1–2 exercise the profiler. Part 3 measures the *transpiler* on the
+same source and workload. The full write-up — method, calibrated
+durations, results, manual reproduction, and the issues the benchmark
+found — lives in **`docs/PY_BENCH.md`**.
 
-## `bench_vs_cpython.sh`
+Three scripts:
 
-Correctness is checked first (a differing run is reported, never timed),
-then best-of-`REPS` wall time and peak RSS (`/usr/bin/time`), across
-three shapes:
+| script | what it does |
+|---|---|
+| `check_cpython_parity.sh` | every `testdata/*.py` through Python→A1→C vs CPython (94/95; the one gap is listed) |
+| `bench_vs_cpython.sh` | CPython vs C, four shapes, durations calibrated to `TARGET_SECS` (1–100 s) |
+| `bench_cython.sh` | adds Cython pure + hand-typed columns, plus the linked-libpython startup floor |
 
-```
-app / shape        impl      time(s)   rss(MB)    speedup
-sum_squares (compute) python3     2.425     392.8
-                   C           0.075      77.8
-                                                    32.3x
-bignum_mul (bigint) python3     0.617      10.2
-                   C           0.248       2.0
-                                                     2.5x
-app.py (io/1000000) python3     0.837      94.3
-                   C           0.250      55.5
-                                                     3.3x
-```
+Headline (one capture; see the doc for the method and caveats):
 
-- **compute** (`bench/sum_squares.py`, 10M `i*i`): **~32x faster, 5x
-  less RSS**. The C uses a native `long long` vector and a maintained
-  `__int128` sum; CPython boxes 10M `PyLong`s and dispatches the
-  bytecode loop.
-- **bigint** (`bench/bignum_mul.py`, 100k `x *= 3` from `2**100`): **~2.5x
-  faster, 5x less RSS**. GMP vs CPython's own big-int — the honest case
-  where the win is real but modest, not 30x.
-- **I/O** (`app.py`, 1M-line classify): **~3.3x faster, 1.7x less RSS**.
-  Line reading + substring search, no interpreter.
+- **compute** (`rolling_hash`, scalar recurrence): ~33× faster than
+  CPython, 6× less RSS.
+- **vector + exact wide sum** (`sum_squares`): ~31–45×; the C homes a
+  native i64 vector and an exact `__int128` aggregate that hand-typed
+  Cython cannot express (no `__int128`), hence its `n/a` column.
+- **bigint** (`bignum_mul`): ~2× vs CPython — the honest small win, and
+  ~5× less RSS.
+- **I/O** (`app.py`): ~2.3×, 1.6× less RSS.
+- **Cython-pure is slower than CPython on every shape** (0.7–1.0×);
+  typed Cython wins only after hand-writing `cdef` types (and GMP FFI
+  for bigint), and even then **pays the full ~57 ms libpython startup**
+  that py-sh-go's ~1 ms binary does not.
 
-The three rows are deliberately different so the report is not a
-cherry-pick: the transpiler wins most on numeric hot loops, least on
-already-optimized big-int work.
-
-## `bench_cython.sh` — the Cython yardstick (pure + typed)
-
-Cython also compiles Python source to C, so it is the direct comparison.
-Four columns, three shapes, both compiled `-O2`:
-
-- **CPython** — `python3 app.py`
-- **Cython (pure)** — `cython --embed -3 app.py`, no annotations
-- **Cython (typed)** — a hand-written `.pyx` with C types (the ceiling):
-  a `malloc`'d `long long` array for compute, the same growable
-  `char**`+`strdup` list maintenance as `app.py` for I/O, and a
-  hand-written **GMP FFI** for bigint (Cython has no native big-int)
-- **py-sh-go C** — automatic, from the unmodified `.py`
-
-### Startup floor first (it reframes the rest)
-
-```
-startup floor (empty program)
-  CPython               0.039    1.0x
-  Cython (embedded)     0.049    0.8x
-  py-sh-go C            0.001   60.0x
-```
-
-`cython --embed` links and initialises **libpython**, so it pays the
-same ~40–60 ms startup as CPython; the py-sh-go binary starts in ~1 ms.
-A Cython-typed win therefore has to be earned inside the program.
-
-### Per shape (best of 5)
-
-```
-sum_squares (2000000)
-  CPython               0.370   86.6MB    1.0x
-  Cython (pure)         0.494   87.4MB    0.7x
-  Cython (typed)        0.056   26.1MB    6.6x
-  py-sh-go C            0.010   17.0MB   37.6x
-
-app.py (io/1000000 lines, storing both lists)
-  CPython               0.465   94.3MB    1.0x
-  Cython (pure)         0.890   95.1MB    0.5x
-  Cython (typed)        0.214   64.8MB    2.2x
-  py-sh-go C            0.172   55.1MB    2.7x
-
-bignum_mul (100k x*=3 from 2**100)
-  CPython               0.453   10.1MB    1.0x
-  Cython (pure)         0.554   10.9MB    0.8x
-  Cython (typed)        0.187   11.2MB    2.4x
-  py-sh-go C (GMP)      0.187    2.0MB    2.4x
-```
-
-### Reading it
-
-- **Cython-pure is slower than CPython** on every shape. Compiling to
-  C does not help while values stay boxed `PyLong`s and every operation
-  still crosses the C-API. Cython is a *typed* compiler.
-- **Cython-typed only wins after a human rewrites the hot code** with
-  `cdef` types — and for bigint it wins only by hand-binding GMP
-  (`cdef extern from "gmp.h"`), which is no longer "Cython".
-- **Subtract the startup floor and the loops are comparable**: typed
-  Cython's compute loop is ~7 ms vs py-sh-go's ~9 ms at 2M — so most of
-  py-sh-go's 37.6x is CPython's boxing, and its edge over typed Cython
-  is the 60x cheaper start plus inferred types with no annotations.
-- **Bigint is an exact tie on time** (both call GMP) — but py-sh-go
-  uses **5.6x less RSS** (2.0 vs 11.2 MB) because it does not link
-  libpython.
-- I/O: py-sh-go's automatic C beats typed Cython (0.172 vs 0.214) with
-  less memory, despite the typed `.pyx` doing identical list upkeep.
-
-Caveat: best-of-N on a shared, sometimes-busy machine; absolute times
-move by ~2x run to run, ratios are stable. The typed `.pyx` files are
-in `bench/cython/` so the comparison is reproducible and reviewable.
-
-## `check_cpython_parity.sh`
-
-Speed is only meaningful if the result is right. This runs every
-`frontends/py-sh-go/testdata/*.py` through Python → A1 → C, compiles,
-executes, and diffs stdout against CPython:
-
-```
-total 95   match 94   mismatch 1  (t91_set_sum_fallback)   emit fail 0  cc fail 0
-```
-
-Known C-backend gaps are listed in `KNOWN_GAPS` so a new mismatch is
-loud; the test fails if one appears. (The frontend itself passes 95/95
-through the ESTree backend; `t91` is a C-accumulator gap.)
-
-## What the benchmark caught
-
-The first run of `bench_vs_cpython.sh` at 10M elements **failed parity**:
-CPython printed `333333283333335000000`, C printed `1291890006563070912`.
-The native int-array sum was accumulated in `long long` and wrapped past
-9.2e18 — a real miscompile, not a benchmark artifact. It is fixed:
-the maintained aggregate and the on-demand scan now accumulate in
-`__int128` (exact for any memory-sized i64 array: `M·2^64 < 2^127`) and
-print through `_sh_i128_str`. That is the point of a differential
-benchmark — the 32x number above only counts because the output now
-matches.
-
-## What to try next (not built here)
-
-- **Cross-target parity**: the same A1 already has C/Go/Rust/Zig/Java/
-  Perl/Python/JS backends. A table of "one Python app → N languages,
-  same stdout, time each" would show the universal-shIR value.
-- **Profile-guided vs default C**: a single table contrasting the
-  default build, `SH2_PROFILE_IN` pre-sizing, and
-  `SH2_ASSUME_OBSERVED_WIDTHS` tiers (i128 vs GMP is already ~15x in
-  `bench_i128_gmp.c`).
-- **Coverage, not just pass/fail**: extend `check_cpython_parity.sh` to
-  report which Python constructs are refused vs miscompiled, and to
-  run the stdin-using tests with inputs.
-- **GPU offload**: the workspace's bash-O4 autoshaderization already
-  turns compute loops into CUDA; running a Python-derived loop on the
-  GPU is the natural next headline (the RTX 2070 work is in-tree).
-- **Startup/memory for embedding**: no interpreter, ~2 MB RSS vs ~10 MB
-  for CPython, no import preamble — measure `main()` time for a
-  short-lived process.
+The benchmark also found and drove fixes for real defects — see
+`docs/PY_BENCH.md` §8 (a wrapped `long long` array sum, now `__int128`;
+a saturated profile bucket, now a wide probe + `__int128` tier) — plus
+two open findings (bigint `mpz_mul_ui`, and computed int lists falling
+back to a string vec).
