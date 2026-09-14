@@ -1,0 +1,8 @@
+ERROR this is a deliberately very long error line padded out to be much longer than the rest of the corpus
+a
+ERROR another very long error line that keeps going and going and going well past eighty columns for good measure
+b
+c
+ERROR third long error line, padded so the workload mixes long error lines with short ok lines
+d
+e
