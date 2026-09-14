@@ -152,3 +152,94 @@ firewall). See `docs/PROFILING.md` for the design; Phase 2 (this demo)
 is the exact-cap pre-sizing. Phase 1 metrics (`growth_events`,
 per-call arg-type bitmaps, reduction execution bits) and Phase 3
 (assertive mode with widen guards) are future work.
+
+---
+
+# Part 2 — profile-selected integer widths (u32 / wide)
+
+`app.py` / `run_profile_demo.sh` exercise the *allocation* half of the
+profile (array lengths → pre-sized vecs). `app_grow.py` /
+`run_width_demo.sh` exercise the *type* half: the `mags` sites (value
+magnitude buckets) select the C integer tier, the assertive
+`SH2_ASSUME_OBSERVED_WIDTHS` of `docs/DUAL_LOOPS.MD` §4.
+
+## The one application
+
+`app_grow.py` reads N lines and doubles `x` N times, so the workload
+shape decides the magnitudes:
+
+```python
+n = len(lines)
+x = 1
+i = 0
+while i < n:
+    x = x * 2
+    i = i + 1
+print(x)
+```
+
+The default (no-profile) build types both `x` and `i` as `long long`,
+which is **wrong past N=63** (`2**130` truncates). The profile is what
+makes it exact.
+
+## The three profiles
+
+`run_width_demo.sh` generates three workloads (`seq 10`, `seq 130`,
+`seq 70000`), takes a profile on each, and re-renders with
+`SH2_ASSUME_OBSERVED_WIDTHS=1 SH2_PROFILE_IN=<profile>`:
+
+```
+profile      lines x-bucket i-bucket  C types                            guided C          correct?
+a               10        2        1  uint16_t i uint32_t x              3dc05042fbc69566  yes
+b              130        8        1  mpz_t x uint16_t i                 c8e1c9a206a6be62  yes
+c            70000        8        3  mpz_t x uint32_t i                 30cdf0b6809eadaf  yes
+merged       a+b+c        -        -  mpz_t x uint32_t i                 30cdf0b6809eadaf  yes
+
+guard: profile a (x<=65535) run on b.lines (x=2**130) -> exit 127
+  sh2-profile: x exceeded the observed range [0, 65535] (SH2_ASSUME_OBSERVED_WIDTHS); rebuild with a matching profile or drop the flag
+```
+
+Reading it:
+
+- **profile a** — a small workload. The `x` bucket (2 bytes) seeds
+  `x ∈ [0, 65535]` and `i ∈ [0, 255]`; the existing width machinery then
+  homes `x` in `uint32_t` (the `x*2` expression widens one tier) and `i`
+  in `uint16_t`. **Explicit u32 support** — and no GMP in the file at
+  all.
+- **profile b** — a large workload. `x = 2**130` pushed the i64
+  profiled build to the 8-byte bucket, so `x` is homed in **GMP**
+  (exact for any magnitude — the "i128 or similar" wide tier). The loop
+  counter stays narrow (`uint16_t i`).
+- **profile c** — a workload whose counter is itself large (`i` needs 3
+  bytes). The build now contains **both** `uint32_t i` and `mpz_t x`:
+  the narrow loop tier *and* the wide accumulator tier.
+- **merged** — `harness/profile-merge.py` unions all three profiles
+  (max bucket per var), so the merged build is correct on every
+  workload.
+- **guard** — profile `a` assumed `x ≤ 65535`. Run on the `b` workload
+  it stops with a diagnostic (exit 127) instead of silently wrapping:
+  the store guard is the soundness of the assertive tier
+  (`docs/DUAL_LOOPS.MD` §4.1: "point at the `else` branch"). The
+  default, profile-less build remains available and unchanged.
+
+## Where the width wiring lives
+
+- `sh2perl/src/c_profile.rs` — `_sh_prof_val` buckets to 16 bytes (so
+  ≥64-bit magnitudes are representable); `ProfileIn.mag_buckets` parses
+  the `mags` sites; `bucket_hi` maps a bucket to its inclusive bound;
+  `assume_observed_widths()` reads the flag.
+- `sh2perl/src/c_backend.rs` — before `effective_widths`, a bucket ≤ 7
+  seeds the var's range to `[0, bucket_hi]` (narrow tiers) and records
+  `profile_bounds`; after `analyze_bigint_vars`, a bucket ≥ 8 adds the
+  var to `bigint_vars` (GMP); `profile_store` / `profile_incdec` emit
+  the `__int128`-checked, reader-visible guard at every store. A
+  source-hash mismatch **refuses** the render (`exit 2`), per §4.2.
+- `sh2perl/tests/profile_e2e.rs::assume_observed_width_guard` pins the
+  guard and the narrowing.
+
+Scope note: this slice specialises **scalar Int variables** (loop
+counters and accumulators). The `int_array_widths` consumer (int-homed
+array element widths) uses the same observed buckets in the design
+(`docs/DUAL_LOOPS.MD` §4.1) but needs a per-store widen guard for
+arrays, so it is deliberately not narrowed here; dynamic-bound lists in
+py-sh-go are string-homed and unaffected either way.
