@@ -1794,6 +1794,22 @@ type lowerer struct {
 	// loop-carried and its pre-loop range is stale; an unbounded-growth
 	// accumulator must therefore not be narrowed on it (`growsUnbounded`).
 	loopDepth int
+	// loopTrips is the innermost-last trip-count stack for the enclosing
+	// loop bodies (nil = unprovable). `loopCarriedExceedsExact` multiplies
+	// it by the per-iteration magnitude to decide whether a loop-carried
+	// accumulator can leave the exact int domain (the additive sibling of
+	// the `growsUnbounded` multiplicative guard).
+	loopTrips []*big.Int
+	// loopBounded names the vars an enclosing loop's condition bounds
+	// (a counted-loop counter). Such a var cannot leave the exact domain
+	// even when the trip count is dynamic (its exit value is within one
+	// step of a provably exact bound), so the additive guard skips it.
+	loopBounded [][]string
+	// loopAssigned records the vars an enclosing loop body assigns. A
+	// loop-carried operand makes the `trips * max|rhs|` bound unsound (its
+	// stale range under-estimates the value it reaches in the loop), so an
+	// accumulator reading one is forced to the exact domain.
+	loopAssigned []map[string]bool
 	// pending Popen pipe chains (the `a | b` idiom): tail var → ordered
 	// stages (each stage is one exec statement). Flushed as an A1
 	// `Pipeline` statement at the first non-chain statement / end of
@@ -3694,7 +3710,7 @@ func (l *lowerer) rangeWhile(t *ForS, c *CallE) ([]map[string]any, error) {
 		}
 		step = []map[string]any{assignStmt(t.Var, arithExpr(arithBin("+", arithVar(t.Var), one)))}
 	}
-	body, err := l.loopBodyIR(t.Body)
+	body, err := l.loopBodyIRTrips(t.Body, l.rangeTrips(loE, hiE), []string{t.Var})
 	if err != nil {
 		return nil, err
 	}
@@ -4031,6 +4047,260 @@ func (l *lowerer) loopBodyIR(body []Stmt) ([]map[string]any, error) {
 	return irs, err
 }
 
+// loopBodyIRTrips lowers a loop body with its trip count and
+// condition-bounded vars on the stack.
+func (l *lowerer) loopBodyIRTrips(body []Stmt, trips *big.Int, bounded []string) ([]map[string]any, error) {
+	l.loopTrips = append(l.loopTrips, trips)
+	l.loopBounded = append(l.loopBounded, bounded)
+	l.loopAssigned = append(l.loopAssigned, assignsIn(body))
+	irs, err := l.loopBodyIR(body)
+	l.loopAssigned = l.loopAssigned[:len(l.loopAssigned)-1]
+	l.loopBounded = l.loopBounded[:len(l.loopBounded)-1]
+	l.loopTrips = l.loopTrips[:len(l.loopTrips)-1]
+	return irs, err
+}
+
+// assignsIn collects every target a statement list assigns, recursively
+// (nested loops included — an operand growing in an inner loop is still
+// loop-carried for the outer accumulator).
+func assignsIn(stmts []Stmt) map[string]bool {
+	out := map[string]bool{}
+	var walkStmts func([]Stmt)
+	var walkStmt func(Stmt)
+	walkStmt = func(st Stmt) {
+		switch t := st.(type) {
+		case *AssignS:
+			for _, tg := range t.Targets {
+				out[tg] = true
+			}
+		case *IfS:
+			walkStmts(t.Then)
+			for _, e := range t.Elifs {
+				walkStmts(e.Body)
+			}
+			walkStmts(t.Else)
+		case *WhileS:
+			walkStmts(t.Body)
+		case *ForS:
+			walkStmts(t.Body)
+		case *TryS:
+			walkStmts(t.Body)
+			for _, e := range t.Except {
+				walkStmts(e.Body)
+			}
+			walkStmts(t.ElseBody)
+			walkStmts(t.Finally)
+		}
+	}
+	walkStmts = func(ss []Stmt) {
+		for _, st := range ss {
+			walkStmt(st)
+		}
+	}
+	walkStmts(stmts)
+	return out
+}
+
+// loopAssignedNames is the union of every enclosing loop body's assigned
+// target names.
+func (l *lowerer) loopAssignedNames() []string {
+	seen := map[string]bool{}
+	for _, m := range l.loopAssigned {
+		for k := range m {
+			seen[k] = true
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for k := range seen {
+		out = append(out, k)
+	}
+	return out
+}
+
+// isLoopCarriedOperand: the var is assigned by an enclosing loop body and
+// not a counted-loop counter — its stale range cannot bound a per-trip
+// operand.
+func (l *lowerer) isLoopCarriedOperand(name string) bool {
+	if l.isLoopBounded(name) {
+		return false
+	}
+	for _, m := range l.loopAssigned {
+		if m[name] {
+			return true
+		}
+	}
+	return false
+}
+
+// isLoopBounded reports whether an enclosing loop's condition bounds the
+// var (a counted-loop counter, bounded by a provably exact limit).
+func (l *lowerer) isLoopBounded(name string) bool {
+	for _, b := range l.loopBounded {
+		for _, v := range b {
+			if v == name {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// whileCountedBounded: `while i <cmp> B:` whose LAST body statement
+// increments `i` by a positive literal is a counted loop. Returns `i`
+// when its exit value (bounded by B + step - 1) is provably inside the
+// exact ceiling — then the additive guard must not force it bigint.
+func (l *lowerer) whileCountedBounded(t *WhileS) string {
+	cmp, ok := t.Cond.(*CompareE)
+	if !ok {
+		return ""
+	}
+	switch cmp.Op {
+	case "<", "<=", "!=", "==":
+	default:
+		return ""
+	}
+	var nm string
+	var bound Expr
+	if n, ok := cmp.Lhs.(*NameE); ok {
+		nm, bound = n.Name, cmp.Rhs
+	} else if n, ok := cmp.Rhs.(*NameE); ok {
+		nm, bound = n.Name, cmp.Lhs
+	} else {
+		return ""
+	}
+	hi := (*big.Int)(nil)
+	if lit, ok := bound.(*LitInt); ok {
+		hi, _ = new(big.Int).SetString(lit.Text, 10)
+	}
+	if hi == nil {
+		if _, h, ok := l.rangeOf(bound); ok {
+			hi = new(big.Int).Set(h)
+		}
+	}
+	if hi == nil {
+		return ""
+	}
+	if len(t.Body) == 0 {
+		return ""
+	}
+	a, ok := t.Body[len(t.Body)-1].(*AssignS)
+	if !ok || len(a.Targets) != 1 || a.Targets[0] != nm {
+		return ""
+	}
+	k := (*big.Int)(nil)
+	switch a.Op {
+	case "+=":
+		if lit, ok := a.Expr.(*LitInt); ok {
+			k, _ = new(big.Int).SetString(lit.Text, 10)
+		}
+	case "=":
+		if b, ok := a.Expr.(*BinOpE); ok && b.Op == "+" {
+			if n2, ok := b.Lhs.(*NameE); ok && n2.Name == nm {
+				if lit, ok := b.Rhs.(*LitInt); ok {
+					k, _ = new(big.Int).SetString(lit.Text, 10)
+				}
+			}
+		}
+	}
+	if k == nil || k.Sign() <= 0 {
+		return ""
+	}
+	if new(big.Int).Add(hi, k).Cmp(l.exactHi) > 0 {
+		return ""
+	}
+	return nm
+}
+
+// rangeTrips is the maximum trip count of a `range(lo, hi)` when both
+// bounds are provable, else nil.
+func (l *lowerer) rangeTrips(loE, hiE Expr) *big.Int {
+	lo, _, ok1 := l.rangeOf(loE)
+	_, hiHi, ok2 := l.rangeOf(hiE)
+	if !ok1 || !ok2 {
+		return nil
+	}
+	t := new(big.Int).Sub(hiHi, lo)
+	if t.Sign() < 0 {
+		return nil
+	}
+	return t
+}
+
+// iterTrips dispatches a for-loop iterator to its trip count.
+func (l *lowerer) iterTrips(t *ForS) *big.Int {
+	c, ok := t.Iter.(*CallE)
+	if !ok || len(c.Path) != 1 || c.Path[0] != "range" || len(c.Args) < 1 || len(c.Args) > 2 {
+		return nil
+	}
+	if len(c.Args) == 1 {
+		return l.rangeTrips(&LitInt{Text: "0"}, c.Args[0])
+	}
+	return l.rangeTrips(c.Args[0], c.Args[1])
+}
+
+// tripsProduct is the product of every enclosing loop's trip count, or
+// nil when any enclosing trip count is unprovable.
+func (l *lowerer) tripsProduct() *big.Int {
+	p := big.NewInt(1)
+	for _, t := range l.loopTrips {
+		if t == nil {
+			return nil
+		}
+		p.Mul(p, t)
+	}
+	return p
+}
+
+// maxAbsRange is the largest magnitude in an expression's proven interval,
+// or nil when the interval is unproven.
+func (l *lowerer) maxAbsRange(e Expr) *big.Int {
+	lo, hi, ok := l.rangeOf(e)
+	if !ok {
+		return nil
+	}
+	a := new(big.Int).Abs(lo)
+	b := new(big.Int).Abs(hi)
+	if a.Cmp(b) > 0 {
+		return a
+	}
+	return b
+}
+
+// loopCarriedExceedsExact: an additive loop-carried accumulator whose
+// value can leave the exact int domain after every enclosing loop's
+// trips. Conservative: an unproven trip count or interval forces the
+// exact (bigint) domain. Multiplicative growth is `growsUnbounded`'s job.
+func (l *lowerer) loopCarriedExceedsExact(target string, val Expr) bool {
+	if !exprContainsName(val, target) {
+		return false
+	}
+	// A counted-loop counter is bounded by its exit condition.
+	if l.isLoopBounded(target) {
+		return false
+	}
+	// A loop-carried OPERAND (its own stale range) makes `trips * max|rhs|`
+	// unsound: the operand reaches far more than its pre-loop range.
+	for _, x := range l.loopAssignedNames() {
+		if x != target && exprContainsName(val, x) && l.isLoopCarriedOperand(x) {
+			return true
+		}
+	}
+	// A top-level modulo bounds the result (`s = (s + e) % m`).
+	if b, ok := val.(*BinOpE); ok && b.Op == "%" {
+		return false
+	}
+	m := l.maxAbsRange(val)
+	if m == nil {
+		return true
+	}
+	trips := l.tripsProduct()
+	if trips == nil {
+		return true
+	}
+	bound := new(big.Int).Mul(trips, m)
+	return bound.Cmp(l.exactHi) > 0
+}
+
 // exprContainsName reports whether expression `e` reads variable `v`.
 func exprContainsName(e Expr, v string) bool {
 	found := false
@@ -4135,7 +4405,11 @@ func (l *lowerer) stmtIR(s Stmt) ([]map[string]any, error) {
 		if err != nil {
 			return nil, err
 		}
-		body, err := l.loopBodyIR(t.Body)
+		bounded := []string(nil)
+		if b := l.whileCountedBounded(t); b != "" {
+			bounded = []string{b}
+		}
+		body, err := l.loopBodyIRTrips(t.Body, nil, bounded)
 		if err != nil {
 			return nil, err
 		}
@@ -4147,7 +4421,7 @@ func (l *lowerer) stmtIR(s Stmt) ([]map[string]any, error) {
 		if at, ok := t.Iter.(*AttrE); ok {
 			if path, ok2 := dottedPath(at); ok2 && strings.Join(path, ".") == "sys.stdin" {
 				l.setType(t.Var, "str")
-				body, err := l.loopBodyIR(t.Body)
+				body, err := l.loopBodyIRTrips(t.Body, nil, nil)
 				if err != nil {
 					return nil, err
 				}
@@ -4194,7 +4468,7 @@ func (l *lowerer) stmtIR(s Stmt) ([]map[string]any, error) {
 		} else {
 			l.setType(t.Var, "str")
 		}
-		body, err := l.loopBodyIR(t.Body)
+		body, err := l.loopBodyIRTrips(t.Body, l.iterTrips(t), []string{t.Var})
 		if err != nil {
 			return nil, err
 		}
@@ -4717,6 +4991,10 @@ func (l *lowerer) assignSimple(target string, val Expr) ([]map[string]any, error
 		// rather than narrowed to i64 on a stale pre-loop range.
 		dom := ty
 		if l.loopDepth > 0 && growsUnbounded(target, val) {
+			dom = "big"
+		} else if l.loopDepth > 0 && l.loopCarriedExceedsExact(target, val) {
+			// additive growth whose bound over the enclosing trips leaves
+			// the exact int domain (the multiplicative case above)
 			dom = "big"
 		}
 		ir, err := l.arithIRDom(val, dom, false)

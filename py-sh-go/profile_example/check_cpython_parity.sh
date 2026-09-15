@@ -22,7 +22,10 @@ TMO="${TMO:-20}"
 VERBOSE="${1:-}"
 
 # Known C-backend (not frontend) gaps. Each entry: reason.
-KNOWN_GAPS="t91_set_sum_fallback"   # bigint element in a set: C sum accumulator not exact
+# EMPTY: t91_set_sum_fallback (bigint element in a set) was fixed — the
+# string loop var is now string-homed and its accumulator's mpz slot is
+# authoritative (`_big`), so the C sum is exact again.
+KNOWN_GAPS=""
 
 die() { echo "check_cpython_parity: $*" >&2; exit 1; }
 [ -x "$PYG" ] || die "missing $PYG"
