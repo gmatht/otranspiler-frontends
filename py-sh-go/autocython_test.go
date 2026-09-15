@@ -356,3 +356,30 @@ func TestAnnotateFunctionGlobalNotShadowed(t *testing.T) {
 		}
 	}
 }
+
+func TestAnnotateStringNotNumeric(t *testing.T) {
+	// an operator INSIDE a string literal must not look like arithmetic
+	for _, src := range []string{
+		"s = \"a/b\"\n",
+		"s = 'x+y'\n",
+		"s = (\"a/b\" \"c\")\n",
+		"d = \"mappings/VENDORS/MICSFT/MAC/LATIN2.TXT\"\n",
+	} {
+		if out := annotate(t, src); len(out.Typed) != 0 {
+			t.Errorf("%q must not be typed: %v", src, out.Typed)
+		}
+	}
+}
+
+func TestAnnotateFutureImportOrder(t *testing.T) {
+	out, _ := AnnotateCython("from __future__ import annotations\nx = 0\n", DefaultOptions())
+	if !strings.Contains(out.Source, "from __future__ import annotations\nimport cython") {
+		t.Fatalf("import cython must follow the future import:\n%s", out.Source)
+	}
+	// the module docstring stays the first statement
+	out2, _ := AnnotateCython("\"\"\"d\"\"\"\nfrom __future__ import annotations\nx = 0\n", DefaultOptions())
+	lines := strings.Split(out2.Source, "\n")
+	if len(lines) < 2 || lines[1] != `"""d"""` {
+		t.Fatalf("docstring must stay first:\n%s", out2.Source)
+	}
+}

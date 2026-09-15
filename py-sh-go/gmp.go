@@ -198,7 +198,7 @@ func intDomainFixpoint(tree antlr.Tree) map[string]bool {
 // lattice: a value can be an int without a proved bound).
 func intDomain(s string, dom map[string]bool) bool {
 	s = stripOuterParens(strings.TrimSpace(s))
-	if s == "" {
+	if s == "" || strings.ContainsAny(s, `"'`) {
 		return false
 	}
 	if l, r, ok := splitTopTwo(s, "**"); ok {

@@ -188,16 +188,26 @@ func AnnotateCython(src string, opts Options) (*CythonOutput, error) {
 	sort.Strings(names)
 	sort.Strings(refused)
 
+	moduleDecl := declLines(sortedKeys(moduleInts), sortedKeys(moduleFloats), opts.Mode, moduleWidths)
+	anyDecl := len(moduleInts)+len(moduleFloats)+len(funcInts)+len(funcFloats) > 0
+	// Everything the pass adds is spliced AFTER the module docstring and any
+	// `from __future__` imports: `import cython`, `cimport`, `cdef` and
+	// `cython.declare` are all statements, and a future import must come
+	// first (Cython rejects `from __future__` after any other statement).
+	preamble := ""
+	if containerDecls != "" {
+		preamble += i64PushHelper
+	}
+	if opts.Mode == ModePy && anyDecl {
+		preamble += "import cython\n"
+	}
+	preamble += moduleDecl
+	preamble += containerDecls
+	if strings.TrimSpace(preamble) != "" {
+		body = insertAfterFuture(body, strings.TrimRight(preamble, "\n"))
+	}
 	var b strings.Builder
 	b.WriteString("# cython: language_level=3\n")
-	if containerDecls != "" {
-		b.WriteString(i64PushHelper)
-	}
-	if opts.Mode == ModePy {
-		b.WriteString("import cython\n")
-	}
-	b.WriteString(declLines(sortedKeys(moduleInts), sortedKeys(moduleFloats), opts.Mode, moduleWidths))
-	b.WriteString(containerDecls)
 	b.WriteString(body)
 	evidence := make([]IntEvidence, 0, len(moduleWidths)+len(funcWidths))
 	for n, ev := range moduleWidths {
@@ -260,6 +270,56 @@ func declLines(ints, floats []string, mode Mode, widths map[string]IntEvidence) 
 		parts[i] = d.name + "=" + d.ctype
 	}
 	return "cython.declare(" + strings.Join(parts, ", ") + ")\n"
+}
+
+// insertAfterFuture splices `insert` into src after the module docstring and
+// any `from __future__ import ...` lines (a real `import` cannot precede a
+// future import, and a docstring must stay the first statement).
+func insertAfterFuture(src, insert string) string {
+	lines := strings.Split(src, "\n")
+	i := 0
+	skipTrivia := func() {
+		for i < len(lines) {
+			t := strings.TrimSpace(lines[i])
+			if t == "" || strings.HasPrefix(t, "#") {
+				i++
+			} else {
+				return
+			}
+		}
+	}
+	skipTrivia()
+	if i < len(lines) {
+		t := strings.TrimSpace(lines[i])
+		if strings.HasPrefix(t, "\"\"\"") || strings.HasPrefix(t, "'''") {
+			q := t[:3]
+			if strings.Count(t, q) >= 2 {
+				i++
+			} else {
+				i++
+				for i < len(lines) {
+					if strings.Contains(lines[i], q) {
+						i++
+						break
+					}
+					i++
+				}
+			}
+		}
+	}
+	for {
+		skipTrivia()
+		if i < len(lines) && strings.HasPrefix(strings.TrimSpace(lines[i]), "from __future__ import") {
+			i++
+			continue
+		}
+		break
+	}
+	out := make([]string, 0, len(lines)+2)
+	out = append(out, lines[:i]...)
+	out = append(out, insert)
+	out = append(out, lines[i:]...)
+	return strings.Join(out, "\n")
 }
 
 func indentLines(s, indent string) string {

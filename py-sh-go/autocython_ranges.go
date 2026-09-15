@@ -550,7 +550,9 @@ func floatDomainFixpoint(tree antlr.Tree) map[string]bool {
 // doubles match Python (given the default cdivision=False).
 func floatDomain(s string, dom map[string]bool) bool {
 	s = stripOuterParens(strings.TrimSpace(s))
-	if s == "" {
+	if s == "" || strings.ContainsAny(s, `"'`) {
+		// a string literal is not a float, and an operator INSIDE it (e.g.
+		// the `/` in `'\x2f'`) must not be read as arithmetic.
 		return false
 	}
 	if isFloatLit(s) || dom[s] {
