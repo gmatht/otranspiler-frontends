@@ -95,6 +95,12 @@ one_shape() {
   fi
 
   # the hand-written typed goldens have shape-specific names
+  # scalar .pyx mode (cdef) for comparison with the default pure-Python mode
+  ./py2cy --pyx "$py" > "$OUT/$name.pyx.pyx"
+  if b="$(compile_cy "$OUT/$name.pyx.pyx" "${name}_pyx")" && check "$b" "$py"; then
+    row "py2cy --pyx" "$(timeit "$b")" "$base"
+  fi
+
   local gold="" glibs=""
   case "$name" in
     bignum_mul)   gold="$CYX/bignum_typed.pyx"; glibs="-lgmp" ;;

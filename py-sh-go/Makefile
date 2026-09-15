@@ -43,7 +43,8 @@ py2cy:
 
 py2cy-test: py2cy
 	$(GO) test -run TestAnnotate .
-	bash coverage/py2cy-parity.sh
+	MODE=py bash coverage/py2cy-parity.sh
+	MODE=pyx bash coverage/py2cy-parity.sh
 
 # Bigint transform: .pyx with cdef mpz_t + GMP calls (docs/AUTO_CYTHON.md
 # Stage 1b). Needs cython + gmp.h; declines fall back to the exact

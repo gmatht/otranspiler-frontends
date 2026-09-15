@@ -51,14 +51,27 @@ const (
 // Options configures the annotation pass.
 type Options struct {
 	Level Level
-	// GMP is reserved for the bigint transform (a .pyx-only rewrite to
-	// cdef extern from "gmp.h"; docs/AUTO_CYTHON.md Stage 1b). Not yet
-	// implemented: with it off (the default) bigints stay exact Python ints.
+	Mode  Mode
+	// GMP is the bigint transform (a .pyx-only rewrite to
+	// cdef extern from "gmp.h"; docs/AUTO_CYTHON.md Stage 1b).
 	GMP bool
 }
 
-// DefaultOptions is the full interval analysis, GMP off.
-func DefaultOptions() Options { return Options{Level: OptFull} }
+// Mode is the output surface.
+type Mode int
+
+const (
+	// ModePy is pure-Python mode: a .py that is valid CPython AND Cython,
+	// with `cython.declare(...)` declarations (the default).
+	ModePy Mode = iota
+	// ModePyx is traditional Cython: a .pyx with `cdef` declarations. Not
+	// runnable under CPython, but the native form (and what the hand-written
+	// goldens use).
+	ModePyx
+)
+
+// DefaultOptions is the full interval analysis, pure-Python mode, GMP off.
+func DefaultOptions() Options { return Options{Level: OptFull, Mode: ModePy} }
 
 // CythonOutput is the result of the annotation pass.
 type CythonOutput struct {
@@ -97,7 +110,7 @@ func AnnotateCython(src string, opts Options) (*CythonOutput, error) {
 	default:
 		moduleTyped, moduleAssigned = proveNames(tree, opts.Level)
 		var fnNames []string
-		ins, fnNames = collectFuncDecls(tree, strings.Split(src, "\n"), opts.Level)
+		ins, fnNames = collectFuncDecls(tree, strings.Split(src, "\n"), opts.Level, opts.Mode)
 		for _, n := range fnNames {
 			funcTyped[n] = true
 		}
@@ -134,15 +147,21 @@ func AnnotateCython(src string, opts Options) (*CythonOutput, error) {
 		body = applyInsertions(src, ins)
 	}
 	var b strings.Builder
-	b.WriteString("# cython: language_level=3\nimport cython\n")
+	b.WriteString("# cython: language_level=3\n")
+	if opts.Mode == ModePy {
+		b.WriteString("import cython\n")
+	}
 	if len(moduleTyped) > 0 {
-		b.WriteString(declLine(sortedKeys(moduleTyped)))
+		b.WriteString(declLine(sortedKeys(moduleTyped), opts.Mode))
 	}
 	b.WriteString(body)
 	return &CythonOutput{Source: b.String(), Typed: names, Refused: refused}, nil
 }
 
-func declLine(names []string) string {
+func declLine(names []string, mode Mode) string {
+	if mode == ModePyx {
+		return "cdef long long " + strings.Join(names, ", ") + "\n"
+	}
 	decls := make([]string, len(names))
 	for i, n := range names {
 		decls[i] = n + "=cython.longlong"
@@ -175,7 +194,7 @@ type insertion struct {
 // `cython.declare(...)` lines to insert at the top of each body (after a
 // docstring). Parameters are never declared: a parameter can be any Python
 // object, so forcing a C type would change behaviour for non-int callers.
-func collectFuncDecls(tree antlr.Tree, lines []string, level Level) ([]insertion, []string) {
+func collectFuncDecls(tree antlr.Tree, lines []string, level Level, mode Mode) ([]insertion, []string) {
 	var ins []insertion
 	typed := map[string]bool{}
 	walkTree(tree, func(n antlr.Tree) {
@@ -224,7 +243,7 @@ func collectFuncDecls(tree antlr.Tree, lines []string, level Level) ([]insertion
 			line = len(lines)
 		}
 		indent := leadingWS(lines[line-1])
-		ins = append(ins, insertion{line: line, text: indent + strings.TrimRight(declLine(names), "\n")})
+		ins = append(ins, insertion{line: line, text: indent + strings.TrimRight(declLine(names, mode), "\n")})
 	})
 	return ins, sortedKeys(typed)
 }

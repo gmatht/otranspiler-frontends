@@ -26,7 +26,9 @@ func usage() {
 
   --no-opts           passthrough: no declarations (Stage 0)
   --simple-opts-only  only i64 literals and literal-bounded counters
-  --gmp               (reserved) rewrite bigints to GMP; not implemented yet`)
+  --py                pure-Python mode (default; .py valid under CPython)
+  --pyx               Cython .pyx with cdef declarations
+  --gmp               rewrite bigints to GMP (implies --pyx)`)
 }
 
 func main() {
@@ -43,8 +45,13 @@ func main() {
 			opts.Level = pylib.OptSimple
 		case "--annotate=full":
 			opts.Level = pylib.OptFull
+		case "--py", "--pure-python", "--mode=py", "--output=py":
+			opts.Mode = pylib.ModePy
+		case "--pyx", "--mode=pyx", "--output=pyx":
+			opts.Mode = pylib.ModePyx
 		case "--gmp":
 			opts.GMP = true
+			opts.Mode = pylib.ModePyx // GMP is .pyx-only
 		default:
 			if strings.HasPrefix(a, "--") {
 				fmt.Fprintln(os.Stderr, "py2cy: unknown flag "+a)

@@ -182,3 +182,30 @@ func TestAnnotateFunctionDocstring(t *testing.T) {
 		t.Fatalf("declaration must follow the docstring:\n%s", out.Source)
 	}
 }
+
+func TestAnnotatePyxMode(t *testing.T) {
+	opts := Options{Level: OptFull, Mode: ModePyx}
+	out, err := AnnotateCython("h = 0\nfor i in range(10):\n    h = (h + i) % 7\nprint(h)\n", opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.Source, "cdef long long h, i") {
+		t.Fatalf("expected cdef declaration:\n%s", out.Source)
+	}
+	if strings.Contains(out.Source, "import cython") {
+		t.Fatalf("pyx mode must not import cython:\n%s", out.Source)
+	}
+	// function-local cdef
+	fn, err := AnnotateCython("def f():\n    h = 0\n    return h\n", opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(fn.Source, "    cdef long long h") {
+		t.Fatalf("expected function-local cdef:\n%s", fn.Source)
+	}
+	// pure-Python mode is unchanged
+	py, _ := AnnotateCython("h = 0\n", DefaultOptions())
+	if !strings.Contains(py.Source, "cython.declare(h=cython.longlong)") {
+		t.Fatalf("py mode changed:\n%s", py.Source)
+	}
+}

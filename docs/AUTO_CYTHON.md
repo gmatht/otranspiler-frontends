@@ -566,6 +566,12 @@ pinned by `spec_collect_rejects_baked_array_index_in_bare_arith`.
   is `.pyx`-only and needs `-lgmp`; it declines back to the exact
   pure-Python output whenever it cannot rewrite a construct exactly. Off
   (the default), bigints stay exact Python ints (~1× CPython, no faster);
+- **output mode** (`--py` default, `--pyx`): `--py` is pure-Python mode
+  (a `.py` valid under both CPython and Cython, `cython.declare`); `--pyx`
+  emits traditional Cython (`cdef long long a, b` at module and function
+  scope, no `import cython`). `--gmp` implies `--pyx`. `--pyx` is faster
+  where scalars dominate (`rolling_hash` 0.081 vs 0.107 s) and is the form
+  the hand-written goldens use;
 - **function scope**: each `def`'s locals are proved with the same analysis,
   and a `cython.declare(...)` line is inserted at the top of the body (after
   a docstring). Parameters are never declared (a parameter may be any object
@@ -617,32 +623,36 @@ One capture (`REPS=4`, `gcc -O2`, Cython 3.0.8):
 
 | shape | impl | time(s) | vs CPython |
 |---|---|---|---|
-| `rolling_hash` (range 2e6) | CPython | 0.741 | 1.00× |
-| | Cython (pure) | 0.904 | 0.82× |
-| | **py2cy (default)** | **0.119** | **6.25×** |
-| | hand-typed `.pyx` | 0.073 | 10.17× |
-| `sum_squares` (range 2e6) | CPython | 0.595 | 1.00× |
-| | Cython (pure) | 0.780 | 0.76× |
-| | **py2cy (default)** | **0.421** | **1.41×** |
-| `bignum_mul` (while 1e5) | CPython | 0.748 | 1.00× |
-| | Cython (pure) | 0.769 | 0.97× |
-| | **py2cy --gmp** | **0.241** | **3.10×** |
-| | hand-typed `.pyx` | 0.222 | 3.36× |
+| `rolling_hash` (range 2e6) | CPython | 0.492 | 1.00× |
+| | Cython (pure) | 0.587 | 0.84× |
+| | py2cy (default, `--py`) | 0.107 | 4.60× |
+| | **py2cy --pyx** | **0.081** | **6.10×** |
+| | hand-typed `.pyx` | 0.051 | 9.59× |
+| `sum_squares` (range 2e6) | CPython | 0.455 | 1.00× |
+| | Cython (pure) | 0.475 | 0.96× |
+| | **py2cy (default)** | **0.290** | **1.57×** |
+| | py2cy --pyx | 0.296 | 1.53× |
+| `bignum_mul` (while 1e5) | CPython | 0.493 | 1.00× |
+| | Cython (pure) | 0.518 | 0.95× |
+| | **py2cy --gmp** | **0.165** | **2.99×** |
+| | py2cy --pyx (no GMP) | 0.480 | 1.03× |
+| | hand-typed `.pyx` | 0.159 | 3.09× |
 
 Reading it:
 
-- **Typing is the whole win.** Pure Cython is ≤ CPython on every shape
-  (0.76–0.97×); the same source plus py2cy's declarations is 1.4–6.3×.
-- **The hand-typed `.pyx` still edges py2cy** on `rolling_hash` (0.073 vs
-  0.119): the golden wraps the loop in a function and uses function-local
-  `cdef long long`, while py2cy emits module-level `cython.declare`, which
-  is a little slower. On bigint they are within noise (0.222 vs 0.241).
+- **Typing is the whole win.** Pure Cython is ≤~CPython on every shape
+  (0.84–0.96×); the same source plus py2cy's declarations is 1.5–6.1×.
+- **`--pyx` (cdef) beats `--py` (cython.declare)** where scalars dominate:
+  0.081 vs 0.107 s on `rolling_hash`; the hand-typed golden still leads
+  (0.051 s) because it hand-writes the tightest loop. On `sum_squares` the
+  two modes tie (the list is untyped either way).
+- **`--gmp` vs `--pyx` on bigint** (0.165 vs 0.480 s ≈ 3× vs 1×) shows
+  precisely what the GMP transform buys: without it the bigint is a Python
+  `int` and the annotation is a no-op for the hot variable.
 - **Partial typing shows up honestly.** `sum_squares` proves only the
-  counter `i`: `xs` stays a Python list (pure-Python mode has no typed
-  `list[int]`) and the exact sum needs `__int128`, which Cython cannot
-  express — hence 1.41×, not 30×.
-- **GMP pays on bigint** (3.10×, near the hand-written golden), at the cost
-  of `.pyx`-only output and `-lgmp`.
+  counter `i`: `xs` stays a Python list (no typed `list[int]` in pure-Python
+  mode) and the exact sum needs `__int128`, which Cython cannot express —
+  hence ~1.5×, not 30×.
 - All of these **link libpython** (`cython --embed`): short programs carry a
   ~57 ms startup the `py-sh-go → C` path (~1 ms) does not.
 

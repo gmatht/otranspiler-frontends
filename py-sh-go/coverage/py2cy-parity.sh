@@ -9,6 +9,11 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 GO="${GO:-go}"
 "$GO" build -o py2cy ./cmd/py2cy || exit 1
+MODE="${MODE:-py}"
+FLAGS=""
+EXT="py"
+if [ "$MODE" = pyx ]; then FLAGS="--pyx"; EXT="pyx"; fi
+
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
@@ -16,10 +21,10 @@ ok=0
 fail=0
 for f in ${1:-testdata/t0*.py testdata/t1*.py}; do
   bn="$(basename "$f")"
-  if ! ./py2cy "$f" > "$tmp/$bn.py" 2>"$tmp/$bn.err"; then
+  if ! ./py2cy $FLAGS "$f" > "$tmp/$bn.$EXT" 2>"$tmp/$bn.err"; then
     echo "FAIL $bn (annotate)"; fail=$((fail+1)); continue
   fi
-  if ! cython --embed -3 "$tmp/$bn.py" -o "$tmp/$bn.c" 2>"$tmp/$bn.cy"; then
+  if ! cython --embed -3 "$tmp/$bn.$EXT" -o "$tmp/$bn.c" 2>"$tmp/$bn.cy"; then
     echo "FAIL $bn (cython)"; fail=$((fail+1)); continue
   fi
   if ! cc -O2 -o "$tmp/$bn" "$tmp/$bn.c" \
@@ -34,5 +39,5 @@ for f in ${1:-testdata/t0*.py testdata/t1*.py}; do
     echo "FAIL $bn (parity: [$got] vs [$want])"; fail=$((fail+1))
   fi
 done
-echo "py2cy parity: $ok ok, $fail fail"
+echo "py2cy[$MODE] parity: $ok ok, $fail fail"
 [ "$fail" -eq 0 ]
