@@ -5,3 +5,22 @@ py-sh-go/py-sh-go
 posix-sh-go/posix-sh-go
 perl-sh-go/perl-sh-go
 loop-*.log
+
+# Moved here from the workspace root .gitignore at the split: those rules
+# applied to this tree when it lived at sh2loop/frontends/, and a parent
+# repo cannot ignore a submodule's contents, so they belong HERE.
+*/[a-z-]*-go
+c-sh-go/c-sh-go
+zsh-sh-go/zsh-sh-go
+fish-sh-go/fish-sh-go
+bat-sh-go/refs/
+coverage/ts-node-gap/ts-node-gap
+coverage/ts-node-gap/obj/
+coverage/ts-node-gap/libgrammars.a
+coverage/refused-refresh-stamp-*.txt
+coverage/refused-refresh-cursor-*.txt
+**/target/
+**/target-*/
+*/*.wasm
+*/grammars/*/src/parser.c
+py-sh-go/f
