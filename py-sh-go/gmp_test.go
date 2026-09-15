@@ -60,6 +60,7 @@ func TestGMPDeclines(t *testing.T) {
 		"x = 2 ** 100\nif x > 0:\n    pass\n",// bigint in a condition
 		"for x in xs:\n    pass\n",           // non-range iteration
 		"x = 2 ** 100\ndef f():\n    return x\n", // function scope (out of subset)
+		"include = 100000\nx = 2 ** 100\nprint(x)\nprint(include)\n", // Cython-reserved name: .pyx unparseable
 	} {
 		if _, ok, err := AnnotateGMP(src); err != nil || ok {
 			t.Errorf("%q: expected decline, got ok=%v err=%v", src, ok, err)

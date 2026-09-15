@@ -9,8 +9,13 @@
 //   - arithmetic is interval arithmetic in i64, and ANY overflow yields ⊤;
 //   - `a % m` with m provably > 0 is [0, m-1] (Python floor-mod);
 //   - a `for x in range(<int literals>)` counter is bounded by the endpoints;
-//   - a loop body is iterated to a fixed point with union-widening (monotone
-//     transfer), capped — if it has not stabilised it is widened to ⊤;
+//   - a `for x in <proved list>` loop runs exactly len steps with x bound to
+//     the element interval (the trip count is the array length), so an
+//     accumulator converges instead of widening to ⊤; anything that may
+//     mutate or alias the list drops the fact (REFUSE > GUESS);
+//   - any other loop body is iterated to a fixed point with union-widening
+//     (monotone transfer), capped — if it has not stabilised it is widened
+//     to ⊤;
 //   - a `while` body runs an unknown number of times, so every variable it
 //     assigns becomes ⊤;
 //   - `if`/`elif`/`else` joins the branch states (⊤ if either is ⊤).
@@ -85,16 +90,287 @@ func (e env) joinFrom(o env) {
 	}
 }
 
+// ── bounded `for x in <list>` iteration ───────────────────────────────────
+//
+// A `for` over an unknown iterable runs an unknown number of times, so the
+// fixed-point path widens loop-carried values to ⊤ (an accumulator never
+// stabilises under union-widening: [0,0], [1,9], [2,18], … never repeats).
+// But a loop over a PROVED list runs exactly len steps — the trip count is
+// the array length — so the body is run exactly len times in the abstract
+// domain, rebinding the target each trip like the concrete loop. That is
+// sound (it mirrors the concrete trip count) and precise: with
+// `arr = [3,1,4,1,5,9,2,6]` the accumulator `total = total + v` yields
+// [8,72], not ⊤.
+//
+// A list fact is sound only while the object is provably unshared and
+// unmutated, so the analysis refuses (drops the fact) on anything that may
+// share or mutate it — REFUSE > GUESS, as everywhere else here:
+//
+//   - fact creation only from a single-target `NAME = [e1, …, en]` display
+//     whose every element has a proved i64 interval (flow-sensitive, so
+//     `[k, k+1]` with k proved works); a multi-target `x = y = […]` shares
+//     one object and earns no fact; an alias `b = arr` drops arr's fact;
+//   - any `NAME.` / `NAME[` use kills the fact (`xs.append(..)` and
+//     `xs[i] = ..`, but also reads like `xs[3]` — conservative, still sound);
+//   - passing the list to anything but a whitelisted pure builtin
+//     (`len`, `print`, `sum`, …) kills it — the callee may mutate the alias;
+//   - `del` naming it kills it; reassigning it replaces the fact;
+//   - a name touched as `NAME.` / `NAME[` / `global NAME` inside a nested
+//     function/class/lambda never earns one (a closure can mutate the shared
+//     object and the flow pass does not cross scope boundaries);
+//   - the bounded loop itself bails to the fixed-point path when the body
+//     may mutate the iterable or rebind it, when the target IS the iterable
+//     (`for arr in arr`), or when len exceeds maxBoundedIter.
+//
+// Int and list facts are mutually exclusive per name (every assignment clears
+// both first), and a rebound loop target clears its list fact: after
+// `for arr in [3,4]` arr is a scalar, not a list.
+
+// listFact is the proved value of a Python list: its exact length and the
+// joined interval of its elements (elem.ok=false only for the empty list,
+// whose loop body never runs).
+type listFact struct {
+	length int
+	elem   iv
+}
+
+// maxBoundedIter caps exact unrolling of `for x in <known list>`. Beyond it
+// the loop falls back to the fixed-point path (loop-carried values go ⊤).
+// Nesting multiplies the cost, but realistic list displays are small.
+const maxBoundedIter = 256
+
+var reAttrSub = regexp.MustCompile(`([A-Za-z_][A-Za-z0-9_]*)\s*(\.|\[)`)
+
+// pureBuiltinCalls are calls that provably do not mutate their arguments, so
+// passing a tracked list to them keeps the fact.
+var pureBuiltinCalls = map[string]bool{
+	"len": true, "sum": true, "min": true, "max": true, "sorted": true,
+	"list": true, "tuple": true, "range": true, "print": true, "abs": true,
+	"repr": true, "str": true, "int": true, "float": true, "bool": true,
+	"enumerate": true, "reversed": true, "any": true, "all": true,
+	"isinstance": true, "hash": true, "chr": true, "ord": true,
+	"hex": true, "oct": true, "bin": true,
+}
+
+var reCallHead = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)\(`)
+
+// treeText renders a subtree's source text ("" when it is not a parse tree).
+func treeText(n antlr.Tree) string {
+	if pt, ok := n.(antlr.ParseTree); ok {
+		return pt.GetText()
+	}
+	return ""
+}
+
+// cloneLists copies the list facts (branch scopes must not leak into each other).
+func cloneLists(lists map[string]listFact) map[string]listFact {
+	m := make(map[string]listFact, len(lists))
+	for k, v := range lists {
+		m[k] = v
+	}
+	return m
+}
+
+// splitTopCommas splits s on every top-level comma (bracket depth 0). It is
+// quote-agnostic: a comma inside a string literal yields pieces that still
+// contain quote characters, which the int analyses reject — the error is
+// always toward refusal, never toward a false proof.
+func splitTopCommas(s string) []string {
+	var out []string
+	depth := 0
+	start := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			depth--
+		case ',':
+			if depth == 0 {
+				out = append(out, s[start:i])
+				start = i + 1
+			}
+		}
+	}
+	return append(out, s[start:])
+}
+
+// evalListLiteral proves a list DISPLAY `[e1, …, en]` (not a comprehension or
+// starred form): every element must have a proved i64 interval. It returns
+// the exact length and the joined element interval.
+func evalListLiteral(text string, e env) (listFact, bool) {
+	s := strings.TrimSpace(text)
+	if len(s) < 2 || s[0] != '[' || s[len(s)-1] != ']' {
+		return listFact{}, false
+	}
+	inner := strings.TrimSpace(s[1 : len(s)-1])
+	if inner == "" {
+		return listFact{length: 0}, true
+	}
+	if strings.ContainsAny(inner, "[]") {
+		// a nested display, slice, or comprehension — none modelled
+		return listFact{}, false
+	}
+	parts := splitTopCommas(inner)
+	elem := iv{}
+	for i, p := range parts {
+		v := evalText(p, e)
+		if !v.ok {
+			return listFact{}, false
+		}
+		if i == 0 {
+			elem = v
+		} else {
+			elem = join(elem, v)
+		}
+	}
+	return listFact{length: len(parts), elem: elem}, true
+}
+
+// iterListFact resolves a `for` iterable to a proved list: a list display,
+// or a name holding a proved list fact.
+func iterListFact(iter string, e env, lists map[string]listFact) (listFact, bool) {
+	if f, ok := evalListLiteral(iter, e); ok {
+		return f, true
+	}
+	if f, ok := lists[strings.TrimSpace(iter)]; ok {
+		return f, true
+	}
+	return listFact{}, false
+}
+
+// closedOverNames collects the names that must never hold a list fact in this
+// scope: any name used as `NAME.` / `NAME[` or declared `global NAME` inside
+// a nested function/class/lambda scope.
+func closedOverNames(root antlr.Tree) map[string]bool {
+	out := map[string]bool{}
+	var walk func(n antlr.Tree, nested bool)
+	walk = func(n antlr.Tree, nested bool) {
+		switch t := n.(type) {
+		case gen.IFuncdefContext, gen.IClassdefContext, gen.ILambdefContext:
+			nested = true
+		case gen.IGlobal_stmtContext:
+			if nested {
+				for _, nm := range t.AllName() {
+					out[nm.GetText()] = true
+				}
+			}
+		case gen.IAtom_exprContext:
+			if nested {
+				for _, m := range reAttrSub.FindAllStringSubmatch(t.GetText(), -1) {
+					out[m[1]] = true
+				}
+			}
+		}
+		for i := 0; i < n.GetChildCount(); i++ {
+			walk(n.GetChild(i), nested)
+		}
+	}
+	walk(root, false)
+	return out
+}
+
+// killListUses deletes the list facts of every tracked name used as `NAME.`
+// or `NAME[` in text (a method call or subscript use may mutate the object;
+// reads match too — conservative, still sound).
+// or `NAME[` in text (a method call or subscript use may mutate the object;
+// reads match too — conservative, still sound).
+func killListUses(text string, lists map[string]listFact) {
+	if len(lists) == 0 {
+		return
+	}
+	for _, m := range reAttrSub.FindAllStringSubmatch(text, -1) {
+		delete(lists, m[1])
+	}
+}
+
+// killListCallArgs deletes tracked lists passed to a possibly-mutating call:
+// anything but a whitelisted pure builtin applied to a bare name. The name
+// match is a substring over-approximation (`f(xs)` also kills a tracked `x`)
+// — always toward refusal.
+func killListCallArgs(atomNoSpace string, lists map[string]listFact) {
+	if len(lists) == 0 {
+		return
+	}
+	open := strings.Index(atomNoSpace, "(")
+	if open < 0 {
+		return
+	}
+	if m := reCallHead.FindStringSubmatch(atomNoSpace); m != nil && pureBuiltinCalls[m[1]] {
+		return
+	}
+	args := atomNoSpace[open:]
+	for nm := range lists {
+		if strings.Contains(args, nm) {
+			delete(lists, nm)
+		}
+	}
+}
+
+// killListMutations drops every list fact the subtree may invalidate: any
+// `NAME.` / `NAME[` use and any possibly-mutating call argument anywhere
+// under it (statements, iterables, and conditions alike). It is idempotent,
+// so overlapping scans are harmless.
+func killListMutations(n antlr.Tree, lists map[string]listFact) {
+	if len(lists) == 0 {
+		return
+	}
+	walkTree(n, func(t antlr.Tree) {
+		if atom, ok := t.(gen.IAtom_exprContext); ok {
+			text := strings.ReplaceAll(atom.GetText(), " ", "")
+			killListUses(text, lists)
+			killListCallArgs(text, lists)
+		}
+	})
+}
+
+// bodyMutatesName reports whether a loop body may mutate or rebind the named
+// list (textual over-approximation — toward refusal). "" never matches.
+func bodyMutatesName(body antlr.Tree, name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, m := range reAttrSub.FindAllStringSubmatch(treeText(body), -1) {
+		if m[1] == name {
+			return true
+		}
+	}
+	mutated := false
+	walkTree(body, func(t antlr.Tree) {
+		if es, ok := t.(gen.IExpr_stmtContext); ok {
+			text := es.GetText()
+			if es.Augassign() != nil || es.Annassign() != nil {
+				if strings.Contains(text, name) {
+					mutated = true
+				}
+				return
+			}
+			for _, tl := range es.AllTestlist_star_expr() {
+				if strings.TrimSpace(tl.GetText()) == name {
+					mutated = true
+				}
+			}
+		}
+		if fs, ok := t.(gen.IFor_stmtContext); ok {
+			if forTargetName(fs) == name {
+				mutated = true
+			}
+		}
+	})
+	return mutated
+}
+
 // proveRanges walks a parsed module and returns the proved intervals plus the
 // set of everything assigned (so the caller can report the refusals).
 func proveRanges(tree antlr.Tree) (env, map[string]bool) {
 	e := env{}
+	lists := map[string]listFact{}
 	assigned := map[string]bool{}
-	runNode(tree, e, assigned, 0)
+	runNode(tree, e, lists, closedOverNames(tree), assigned, 0)
 	return e, assigned
 }
 
-func runNode(n antlr.Tree, e env, assigned map[string]bool, depth int) {
+func runNode(n antlr.Tree, e env, lists map[string]listFact, taint map[string]bool, assigned map[string]bool, depth int) {
 	if depth > 24 {
 		return
 	}
@@ -102,35 +378,57 @@ func runNode(n antlr.Tree, e env, assigned map[string]bool, depth int) {
 	case gen.IFuncdefContext, gen.IClassdefContext, gen.ILambdefContext:
 		// own scope: do not prove module-level ranges through them
 		return
+	case gen.IDel_stmtContext:
+		// `del xs[i]` mutates the list; `del xs` unbinds the name
+		for _, id := range reIdentAll.FindAllString(ctx.GetText(), -1) {
+			if isSimpleName(id) {
+				assigned[id] = true
+				delete(e, id)
+				delete(lists, id)
+			}
+		}
+		return
 	case gen.ITry_stmtContext, gen.IMatch_stmtContext, gen.IAsync_stmtContext:
 		// conditional / unknown-iteration bodies: widen everything they assign
-		markUnknownSubtree(ctx, e, assigned)
+		markUnknownSubtree(ctx, e, lists, assigned)
 		return
 	case gen.IFor_stmtContext:
-		runFor(ctx, e, assigned, depth)
+		runFor(ctx, e, lists, taint, assigned, depth)
 		return
 	case gen.IWhile_stmtContext:
-		runWhile(ctx, e, assigned, depth)
+		runWhile(ctx, e, lists, taint, assigned, depth)
 		return
 	case gen.IIf_stmtContext:
-		runIf(ctx, e, assigned, depth)
+		runIf(ctx, e, lists, taint, assigned, depth)
 		return
 	case gen.IExpr_stmtContext:
-		runExprStmt(ctx, e, assigned)
+		runExprStmt(ctx, e, lists, taint, assigned)
 		return
+	case gen.IAtom_exprContext:
+		// a call may mutate a list passed to it (`f(xs)`); a `NAME.` /
+		// `NAME[` use may mutate directly (`xs.append(1)`). Pure builtins
+		// (`len`, `print`, `sum`, …) only read.
+		text := strings.ReplaceAll(ctx.GetText(), " ", "")
+		killListUses(text, lists)
+		killListCallArgs(text, lists)
 	}
 	for i := 0; i < n.GetChildCount(); i++ {
-		runNode(n.GetChild(i), e, assigned, depth)
+		runNode(n.GetChild(i), e, lists, taint, assigned, depth)
 	}
 }
 
-func runExprStmt(ctx gen.IExpr_stmtContext, e env, assigned map[string]bool) {
+func runExprStmt(ctx gen.IExpr_stmtContext, e env, lists map[string]listFact, taint map[string]bool, assigned map[string]bool) {
 	mark := func(nm string) {
 		if isSimpleName(nm) {
 			assigned[nm] = true
 			delete(e, nm)
+			delete(lists, nm)
 		}
 	}
+	// a `NAME.` / `NAME[` use in this statement may mutate a tracked list
+	// (`xs.append(..)`, `xs[i] = ..`), as may any call argument (`f(xs)`);
+	// reads match too — toward refusal.
+	killListMutations(ctx, lists)
 	if ctx.Annassign() != nil {
 		// annotated assignment is not a proof
 		for _, t := range ctx.AllTestlist_star_expr() {
@@ -149,6 +447,7 @@ func runExprStmt(ctx gen.IExpr_stmtContext, e env, assigned map[string]bool) {
 				out = applyAug(op, lhs, r)
 			}
 			e.set(nm, out)
+			delete(lists, nm)
 			return
 		}
 		for _, t := range ctx.AllTestlist_star_expr() {
@@ -164,11 +463,23 @@ func runExprStmt(ctx gen.IExpr_stmtContext, e env, assigned map[string]bool) {
 		return
 	}
 	// `x = y = <expr>`: every target gets the same proved interval
-	rhs := evalText(ts[len(ts)-1].GetText(), e)
+	rhsText := ts[len(ts)-1].GetText()
+	rhs := evalText(rhsText, e)
+	// `b = arr` shares the object: either name may mutate through the other,
+	// so the fact is dropped (aliases are never propagated).
+	if nm := strings.TrimSpace(rhsText); isSimpleName(nm) {
+		delete(lists, nm)
+	}
+	// a single-target `NAME = [e1, …, en]` display with proved elements earns
+	// a list fact; a multi-target `x = y = […]` shares one object and earns none
+	fact, haveFact := evalListLiteral(rhsText, e)
 	for _, t := range ts[:len(ts)-1] {
 		mark(strings.TrimSpace(t.GetText()))
 		if nm := strings.TrimSpace(t.GetText()); isSimpleName(nm) {
 			e.set(nm, rhs)
+			if haveFact && len(ts) == 2 && !taint[nm] {
+				lists[nm] = fact
+			}
 		}
 	}
 }
@@ -213,11 +524,12 @@ func forTargetName(ctx gen.IFor_stmtContext) string {
 
 // markUnknownSubtree widens every simple-name target assigned anywhere in a
 // conditional / unknown-iteration subtree (try, match, async for/with).
-func markUnknownSubtree(n antlr.Tree, e env, assigned map[string]bool) {
+func markUnknownSubtree(n antlr.Tree, e env, lists map[string]listFact, assigned map[string]bool) {
 	mark := func(nm string) {
 		if isSimpleName(nm) {
 			assigned[nm] = true
 			delete(e, nm)
+			delete(lists, nm)
 		}
 	}
 	walkTree(n, func(t antlr.Tree) {
@@ -230,6 +542,9 @@ func markUnknownSubtree(n antlr.Tree, e env, assigned map[string]bool) {
 			mark(forTargetName(c))
 		}
 	})
+	// the subtree may mutate a tracked list without assigning it
+	// (`xs.append(..)` in a try body, `f(xs)` in a match scrutinee)
+	killListMutations(n, lists)
 }
 
 func rangeCounterIV(ctx gen.IFor_stmtContext) (iv, bool) {
@@ -270,23 +585,62 @@ func rangeCounterIV(ctx gen.IFor_stmtContext) (iv, bool) {
 	return known(a, b), true
 }
 
-func runFor(ctx gen.IFor_stmtContext, e env, assigned map[string]bool, depth int) {
-	if name := forTargetName(ctx); name != "" {
+func runFor(ctx gen.IFor_stmtContext, e env, lists map[string]listFact, taint map[string]bool, assigned map[string]bool, depth int) {
+	name := forTargetName(ctx)
+	blocks := ctx.AllBlock()
+	if len(blocks) == 0 {
+		if name != "" {
+			assigned[name] = true
+			delete(e, name)
+			delete(lists, name)
+		}
+		return
+	}
+	iter := ""
+	if tl := ctx.Testlist(); tl != nil {
+		iter = tl.GetText()
+		// the iterable is evaluated before the loop and may mutate a
+		// tracked list through an alias (`for v in foo(arr)`)
+		killListMutations(tl, lists)
+	}
+	if name != "" {
+		// bounded iteration: the trip count is the array length. The body
+		// runs exactly len times with the target rebound to the element
+		// interval each trip — sound and precise for accumulators, where
+		// the fixed-point path below would widen to ⊤.
+		if fact, ok := iterListFact(iter, e, lists); ok &&
+			(fact.length == 0 || fact.elem.ok) &&
+			fact.length <= maxBoundedIter {
+			itName := strings.TrimSpace(iter)
+			if !isSimpleName(itName) {
+				itName = ""
+			}
+			if itName != name && !bodyMutatesName(blocks[0], itName) {
+				assigned[name] = true
+				delete(lists, name)
+				for k := 0; k < fact.length; k++ {
+					e.set(name, fact.elem)
+					runNode(blocks[0], e, lists, taint, assigned, depth+1)
+				}
+				// len == 0 runs the body never: the target keeps its entry value
+				if len(blocks) > 1 {
+					runNode(blocks[1], e, lists, taint, assigned, depth+1)
+				}
+				return
+			}
+		}
 		assigned[name] = true
+		delete(lists, name)
 		if c, ok := rangeCounterIV(ctx); ok {
 			e.set(name, c)
 		} else {
 			delete(e, name)
 		}
 	}
-	blocks := ctx.AllBlock()
-	if len(blocks) == 0 {
-		return
-	}
 	body := blocks[0]
 	for i := 0; i < 6; i++ {
 		before := e.clone()
-		runNode(body, e, assigned, depth+1)
+		runNode(body, e, lists, taint, assigned, depth+1)
 		if envStable(e, before) {
 			break
 		}
@@ -295,14 +649,19 @@ func runFor(ctx gen.IFor_stmtContext, e env, assigned map[string]bool, depth int
 		}
 	}
 	if len(blocks) > 1 {
-		runNode(blocks[1], e, assigned, depth+1)
+		runNode(blocks[1], e, lists, taint, assigned, depth+1)
 	}
 }
 
-func runWhile(ctx gen.IWhile_stmtContext, e env, assigned map[string]bool, depth int) {
+func runWhile(ctx gen.IWhile_stmtContext, e env, lists map[string]listFact, taint map[string]bool, assigned map[string]bool, depth int) {
 	blocks := ctx.AllBlock()
 	if len(blocks) == 0 {
 		return
+	}
+	// the condition is evaluated before the body and may mutate a tracked
+	// list through an alias (`while foo(arr):`)
+	if ne := ctx.Namedexpr_test(); ne != nil {
+		killListMutations(ne, lists)
 	}
 	body := blocks[0]
 	if name, bound, ok := whileCounterBound(ctx, e); ok {
@@ -310,9 +669,10 @@ func runWhile(ctx gen.IWhile_stmtContext, e env, assigned map[string]bool, depth
 		// keep it proved across the body's fixed point.
 		assigned[name] = true
 		e.set(name, bound)
+		delete(lists, name)
 		for i := 0; i < 6; i++ {
 			before := e.clone()
-			runNode(body, e, assigned, depth+1)
+			runNode(body, e, lists, taint, assigned, depth+1)
 			e.set(name, bound)
 			if envStable(e, before) {
 				break
@@ -326,16 +686,20 @@ func runWhile(ctx gen.IWhile_stmtContext, e env, assigned map[string]bool, depth
 		// unknown trip count: run once, then widen everything the body assigns.
 		bodyAssigned := map[string]bool{}
 		be := e.clone()
-		runNode(body, be, bodyAssigned, depth+1)
+		beLists := cloneLists(lists)
+		runNode(body, be, beLists, taint, bodyAssigned, depth+1)
 		for k := range bodyAssigned {
 			assigned[k] = true
 			delete(e, k)
+			delete(lists, k)
 		}
+		// the body may also mutate a tracked list without assigning it
+		killListUses(strings.ReplaceAll(treeText(body), " ", ""), lists)
 	}
 	// the loop condition may contain a walrus (`while (n := f()):`); its
 	// target is left ⊤ (never proved), which is sound.
 	if len(blocks) > 1 {
-		runNode(blocks[1], e, assigned, depth+1)
+		runNode(blocks[1], e, lists, taint, assigned, depth+1)
 	}
 }
 
@@ -462,19 +826,36 @@ func counterUpdate(body antlr.Tree, name string) (int64, bool) {
 	return delta, found && okAll
 }
 
-func runIf(ctx gen.IIf_stmtContext, e env, assigned map[string]bool, depth int) {
+func runIf(ctx gen.IIf_stmtContext, e env, lists map[string]listFact, taint map[string]bool, assigned map[string]bool, depth int) {
 	blocks := ctx.AllBlock()
 	if len(blocks) == 0 {
 		return
 	}
+	// every condition is evaluated and may mutate through an alias
+	for _, ne := range ctx.AllNamedexpr_test() {
+		killListMutations(ne, lists)
+	}
 	merged := e.clone()
+	var mergedLists map[string]listFact
 	for i, b := range blocks {
 		be := e.clone()
-		runNode(b, be, assigned, depth+1)
+		beLists := cloneLists(lists)
+		runNode(b, be, beLists, taint, assigned, depth+1)
 		if i == 0 {
 			merged = be
+			mergedLists = beLists
 		} else {
 			merged.joinFrom(be)
+		// a list fact survives the join only when every branch agrees
+		// on the length; the elements join.
+		for k, v := range mergedLists {
+			o, ok := beLists[k]
+			if !ok || o.length != v.length {
+				delete(mergedLists, k)
+			} else {
+				mergedLists[k] = listFact{length: v.length, elem: join(v.elem, o.elem)}
+			}
+		}
 		}
 	}
 	for k := range e {
@@ -482,6 +863,12 @@ func runIf(ctx gen.IIf_stmtContext, e env, assigned map[string]bool, depth int) 
 	}
 	for k, v := range merged {
 		e[k] = v
+	}
+	for k := range lists {
+		delete(lists, k)
+	}
+	for k, v := range mergedLists {
+		lists[k] = v
 	}
 }
 
@@ -516,13 +903,13 @@ func isFloatLit(s string) bool {
 
 // floatDomainFixpoint classifies each name as a Python float: EVERY
 // assignment must be float-domain (so `x = 1; x = 1.5` is neither).
-func floatDomainFixpoint(tree antlr.Tree) map[string]bool {
+func floatDomainFixpoint(tree antlr.Tree, isInt func(string) bool) map[string]bool {
 	assigns := collectAssigns(tree)
 	dom := map[string]bool{}
 	for changed := true; changed; {
 		changed = false
 		for _, a := range assigns {
-			if floatDomain(a.rhs, dom) {
+			if floatDomain(a.rhs, dom, isInt) {
 				for _, t := range a.targets {
 					if !dom[t] {
 						dom[t] = true
@@ -537,7 +924,7 @@ func floatDomainFixpoint(tree antlr.Tree) map[string]bool {
 		all[k] = true
 	}
 	for _, a := range assigns {
-		if !floatDomain(a.rhs, dom) {
+		if !floatDomain(a.rhs, dom, isInt) {
 			for _, t := range a.targets {
 				delete(all, t)
 			}
@@ -548,7 +935,7 @@ func floatDomainFixpoint(tree antlr.Tree) map[string]bool {
 
 // floatDomain: Python floats are IEEE doubles, so `+ - * / % // **` on C
 // doubles match Python (given the default cdivision=False).
-func floatDomain(s string, dom map[string]bool) bool {
+func floatDomain(s string, dom map[string]bool, isInt func(string) bool) bool {
 	s = stripOuterParens(strings.TrimSpace(s))
 	if s == "" || strings.ContainsAny(s, `"'`) {
 		// a string literal is not a float, and an operator INSIDE it (e.g.
@@ -561,25 +948,29 @@ func floatDomain(s string, dom map[string]bool) bool {
 	if strings.HasPrefix(s, "float(") && strings.HasSuffix(s, ")") {
 		return true
 	}
-	// `+ - * % // **` yield a float iff EITHER operand is a float (int op
-	// int stays int); a single `/` is true division and always a float.
+	// An operator yields a float only when BOTH operands are scalar numbers
+	// (proved float or proved int) and — except for `/` — at least one of
+	// them is a float. `T / 2` over an unknown T is tensor division, not a
+	// float: typing it `double` made Cython reject indexing on real code.
+	num := func(t string) bool { return floatDomain(t, dom, isInt) || isInt(t) }
+	flt := func(t string) bool { return floatDomain(t, dom, isInt) }
 	if l, r, ok := splitTopTwo(s, "**"); ok {
-		return floatDomain(l, dom) || floatDomain(r, dom)
+		return num(l) && num(r) && (flt(l) || flt(r))
 	}
 	if l, r, ok := splitTopTwo(s, "//"); ok {
-		return floatDomain(l, dom) || floatDomain(r, dom)
+		return num(l) && num(r) && (flt(l) || flt(r))
 	}
-	if _, _, _, ok := splitTop(s, "/"); ok {
-		return true
+	if l, _, r, ok := splitTop(s, "/"); ok {
+		return num(l) && num(r)
 	}
 	if l, _, r, ok := splitTop(s, "+-"); ok {
-		return floatDomain(l, dom) || floatDomain(r, dom)
+		return num(l) && num(r) && (flt(l) || flt(r))
 	}
 	if l, _, r, ok := splitTop(s, "*%"); ok {
-		return floatDomain(l, dom) || floatDomain(r, dom)
+		return num(l) && num(r) && (flt(l) || flt(r))
 	}
 	if strings.HasPrefix(s, "-") {
-		return floatDomain(s[1:], dom)
+		return floatDomain(s[1:], dom, isInt)
 	}
 	return false
 }

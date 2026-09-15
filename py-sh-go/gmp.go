@@ -65,6 +65,13 @@ func AnnotateGMP(src string) (*GMPOutput, bool, error) {
 	if len(errs) > 0 {
 		return nil, false, gmpErr(errs[0])
 	}
+	// The transform targets `.pyx` exclusively, so a Cython-reserved
+	// identifier anywhere in the file declines (a `cdef` for it would not
+	// parse, and verbatim statements like `from x import include` would not
+	// either). The caller falls back to the exact pure-Python output.
+	if len(pyxBlockingNames(tree)) > 0 {
+		return nil, false, nil
+	}
 	big, longs := classifyBigints(tree)
 	if len(big) == 0 {
 		return nil, false, nil
@@ -153,6 +160,12 @@ func collectAssigns(tree antlr.Tree) []assignT {
 // would be wrong — `x = 1; x = 1.5` is not an int.
 func intDomainFixpoint(tree antlr.Tree) map[string]bool {
 	assigns := collectAssigns(tree)
+	taint := closedOverNames(tree)
+	// intDomainFixpoint has no flow sensitivity, so a name used as `NAME.` /
+	// `NAME[` anywhere may have been mutated after its list assignment and
+	// never earns an int-list fact (the flow pass kills such facts precisely,
+	// in order; this is the conservative analogue).
+	attrUsed := attrUsedNames(tree)
 	seed := map[string]bool{}
 	walkTree(tree, func(n antlr.Tree) {
 		if ctx, ok := n.(gen.IFor_stmtContext); ok {
@@ -167,9 +180,35 @@ func intDomainFixpoint(tree antlr.Tree) map[string]bool {
 	for k := range seed {
 		dom[k] = true
 	}
+	// intLists mirrors the flow pass's list facts without flow sensitivity:
+	// a single-target `NAME = [<int-domain elems>]` earns one; any other
+	// assignment to the name, or an alias `b = arr`, kills it permanently
+	// (deadLists keeps the fixpoint from oscillating).
+	intLists := map[string]bool{}
+	deadLists := map[string]bool{}
 	for changed := true; changed; {
 		changed = false
 		for _, a := range assigns {
+			if len(a.targets) == 1 && isIntListRHS(a.rhs, dom) {
+				if t := a.targets[0]; !taint[t] && !attrUsed[t] && !deadLists[t] && !intLists[t] {
+					intLists[t] = true
+					changed = true
+				}
+			} else {
+				for _, t := range a.targets {
+					if !deadLists[t] {
+						deadLists[t] = true
+						changed = true
+					}
+					delete(intLists, t)
+				}
+				// `b = arr` shares the object: the alias kills the fact
+				if nm := strings.TrimSpace(a.rhs); isSimpleName(nm) && !deadLists[nm] {
+					deadLists[nm] = true
+					delete(intLists, nm)
+					changed = true
+				}
+			}
 			if intDomain(a.rhs, dom) {
 				for _, t := range a.targets {
 					if !dom[t] {
@@ -179,6 +218,24 @@ func intDomainFixpoint(tree antlr.Tree) map[string]bool {
 				}
 			}
 		}
+		// `for v in <int list>`: the target takes int elements. (The trip
+		// count is bounded separately by the flow pass; here only the domain
+		// matters.) A rebound target is no longer a list.
+		walkTree(tree, func(n antlr.Tree) {
+			ctx, ok := n.(gen.IFor_stmtContext)
+			if !ok {
+				return
+			}
+			nm := forTargetName(ctx)
+			if nm == "" || dom[nm] || ctx.Testlist() == nil {
+				return
+			}
+			if isIntListExpr(ctx.Testlist().GetText(), dom, intLists) {
+				dom[nm] = true
+				delete(intLists, nm)
+				changed = true
+			}
+		})
 	}
 	all := map[string]bool{}
 	for k := range dom {
@@ -234,6 +291,56 @@ func intDomain(s string, dom map[string]bool) bool {
 		}
 	}
 	return false
+}
+
+// attrUsedNames collects names used as `NAME.` / `NAME[` anywhere under tree.
+func attrUsedNames(tree antlr.Tree) map[string]bool {
+	out := map[string]bool{}
+	walkTree(tree, func(n antlr.Tree) {
+		switch t := n.(type) {
+		case gen.IAtom_exprContext:
+			for _, m := range reAttrSub.FindAllStringSubmatch(t.GetText(), -1) {
+				out[m[1]] = true
+			}
+		case gen.IExpr_stmtContext:
+			for _, m := range reAttrSub.FindAllStringSubmatch(t.GetText(), -1) {
+				out[m[1]] = true
+			}
+		}
+	})
+	return out
+}
+
+// isIntListRHS reports whether rhs is an int-domain list DISPLAY. Aliases
+// (`b = arr`) return false: without flow sensitivity an alias cannot prove
+// the object was not mutated through the other name.
+func isIntListRHS(rhs string, dom map[string]bool) bool {
+	s := strings.TrimSpace(rhs)
+	if len(s) < 2 || s[0] != '[' || s[len(s)-1] != ']' {
+		return false
+	}
+	inner := strings.TrimSpace(s[1 : len(s)-1])
+	if inner == "" {
+		return true
+	}
+	if strings.ContainsAny(inner, "[]") {
+		return false
+	}
+	for _, p := range splitTopCommas(inner) {
+		if !intDomain(p, dom) {
+			return false
+		}
+	}
+	return true
+}
+
+// isIntListExpr reports whether a `for` iterable is an int-domain list: a
+// display, or a name holding an int-list fact.
+func isIntListExpr(iter string, dom map[string]bool, intLists map[string]bool) bool {
+	if isIntListRHS(iter, dom) {
+		return true
+	}
+	return intLists[strings.TrimSpace(iter)]
 }
 
 // ── rendering ────────────────────────────────────────────────────────────

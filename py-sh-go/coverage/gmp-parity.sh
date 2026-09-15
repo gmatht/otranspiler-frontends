@@ -62,6 +62,10 @@ x = x % 1000000007
 print(x)'
 run fallback_unrewritable 'x = 2 ** 100
 print(x + x)'
+run reserved_decline 'include = 100000
+x = 2 ** 100
+print(x)
+print(include)'
 
 echo "gmp parity: $ok ok, $fail fail"
 [ "$fail" -eq 0 ]

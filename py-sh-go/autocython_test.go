@@ -194,6 +194,103 @@ func TestAnnotateScalarCoverage(t *testing.T) {
 	}
 }
 
+// TestAnnotateBoundedListLoop pins the array-length trip-count rule: a `for`
+// over a proved list runs exactly len steps with the target bound to the
+// element interval, so an accumulator converges instead of widening to ⊤.
+func TestAnnotateBoundedListLoop(t *testing.T) {
+	src := "arr = [3, 1, 4, 1, 5, 9, 2, 6]\ntotal = 0\nfor v in arr:\n    total = total + v\nprint(total)\n"
+	out := annotate(t, src)
+	if !typed(out, "total") || !typed(out, "v") {
+		t.Fatalf("expected total and v typed; got %v (refused %v)", out.Typed, out.Refused)
+	}
+	if typed(out, "arr") {
+		t.Fatalf("arr is a Python list, not a scalar: %v", out.Typed)
+	}
+	if !strings.Contains(out.Source, "cython.declare(total=cython.int, v=cython.int)") {
+		t.Fatalf("declaration missing or wrong width:\n%s", out.Source)
+	}
+	ev, ok := out.EvidenceFor("total")
+	if !ok || ev.Lo != 8 || ev.Hi != 72 {
+		t.Fatalf("total range: got %+v", ev)
+	}
+	if ev.Width != WidthI32 {
+		t.Fatalf("total must earn int, got %v", ev.Width)
+	}
+	if evv, ok := out.EvidenceFor("v"); !ok || evv.Lo != 1 || evv.Hi != 9 {
+		t.Fatalf("v range: got %+v", evv)
+	}
+	// simple level does not run the interval analysis: still refused there
+	if simple, _ := AnnotateCython(src, Options{Level: OptSimple}); typed(simple, "total") || typed(simple, "v") {
+		t.Fatalf("simple must refuse the accumulator: %v", simple.Typed)
+	}
+}
+
+func TestAnnotateBoundedListShapes(t *testing.T) {
+	// a literal iterable needs no name at all
+	if out := annotate(t, "total = 0\nfor v in [3, 1, 4]:\n    total = total + v\nprint(total)\n"); !typed(out, "total") {
+		t.Fatalf("literal iterable: total refused: %v", out.Refused)
+	} else if ev, _ := out.EvidenceFor("total"); ev.Lo != 3 || ev.Hi != 12 {
+		t.Fatalf("literal iterable: total range got [%d,%d], want [3,12]", ev.Lo, ev.Hi)
+	}
+	// an empty list runs the body never, so the target stays ⊤ (unbound) and
+	// poisons the accumulator's only arithmetic use back to ⊤: refused, honestly
+	if out := annotate(t, "total = 0\nfor v in []:\n    total = total + v\nprint(total)\n"); typed(out, "total") || typed(out, "v") {
+		t.Fatalf("empty list: typed=%v refused=%v", out.Typed, out.Refused)
+	}
+	// nested bounded loops multiply trips exactly
+	if out := annotate(t, "total = 0\nfor a in [1, 2]:\n    for b in [3, 4]:\n        total = total + a * b\nprint(total)\n"); !typed(out, "total") {
+		t.Fatalf("nested: total refused: %v", out.Refused)
+	} else if ev, _ := out.EvidenceFor("total"); ev.Lo != 12 || ev.Hi != 32 {
+		t.Fatalf("nested: total range got [%d,%d], want [12,32]", ev.Lo, ev.Hi)
+	}
+	// an unknown-length iterable still widens to ⊤
+	if out := annotate(t, "total = 0\nfor v in xs:\n    total = total + v\nprint(total)\n"); typed(out, "total") || typed(out, "v") {
+		t.Fatalf("unknown iterable must be refused: %v", out.Typed)
+	}
+	// i64 overflow in the accumulation is ⊤, not a wrap
+	if out := annotate(t, "total = 0\nfor v in [9223372036854775807, 9223372036854775807]:\n    total = total + v\nprint(total)\n"); typed(out, "total") {
+		t.Fatalf("overflowing accumulator must be refused: %v", out.Typed)
+	}
+	// over the unroll cap the loop falls back to the fixed point (refused, not slow)
+	big := "total = 0\nfor v in [" + strings.Repeat("7,", 299) + "7]:\n    total = total + v\nprint(total)\n"
+	if out := annotate(t, big); typed(out, "total") {
+		t.Fatalf("over-cap loop must be refused: %v", out.Typed)
+	}
+}
+
+func TestAnnotateBoundedListRefusals(t *testing.T) {
+	// anything that may share or mutate the list drops the fact, and the
+	// accumulator goes back to ⊤
+	for _, src := range []string{
+		// method call in the body
+		"arr = [1, 2]\ntotal = 0\nfor v in arr:\n    arr.append(v)\n    total = total + v\nprint(total)\n",
+		// subscript store in the body
+		"arr = [1, 2]\ntotal = 0\nfor v in arr:\n    arr[0] = v\n    total = total + v\nprint(total)\n",
+		// rebinding the iterable in the body
+		"arr = [1, 2]\ntotal = 0\nfor v in arr:\n    arr = [9]\n    total = total + v\nprint(total)\n",
+		// the target IS the iterable
+		"arr = [1, 2]\nfor arr in arr:\n    pass\n",
+		// passed to an unknown callee before the loop
+		"arr = [1, 2]\nfoo(arr)\ntotal = 0\nfor v in arr:\n    total = total + v\nprint(total)\n",
+		// aliased, then mutated through the alias
+		"arr = [1, 2]\nb = arr\nb.append(3)\ntotal = 0\nfor v in arr:\n    total = total + v\nprint(total)\n",
+		// shared from birth by a multi-target assignment
+		"x = y = [1, 2]\ntotal = 0\nfor v in x:\n    total = total + v\nprint(total)\n",
+		// mutated through a closure the flow pass does not cross
+		"arr = [1, 2]\ndef f():\n    arr.append(3)\ntotal = 0\nfor v in arr:\n    total = total + v\nprint(total)\n",
+		// a non-int element is no list at all
+		"arr = [1, \"s\"]\ntotal = 0\nfor v in arr:\n    total = total + v\nprint(total)\n",
+	} {
+		if out := annotate(t, src); typed(out, "total") || typed(out, "v") {
+			t.Errorf("%q: must be refused; typed=%v", src, out.Typed)
+		}
+	}
+	// reads through pure builtins keep the fact
+	if out := annotate(t, "arr = [3, 1, 4]\nprint(len(arr))\ntotal = 0\nfor v in arr:\n    total = total + v\nprint(total)\n"); !typed(out, "total") {
+		t.Fatalf("pure-builtin reads must keep the fact: refused=%v", out.Refused)
+	}
+}
+
 func TestAnnotateRejectsSyntaxError(t *testing.T) {
 	if _, err := AnnotateCython("def f(:\n    pass\n", DefaultOptions()); err == nil {
 		t.Fatal("expected a syntax error")
@@ -381,5 +478,68 @@ func TestAnnotateFutureImportOrder(t *testing.T) {
 	lines := strings.Split(out2.Source, "\n")
 	if len(lines) < 2 || lines[1] != `"""d"""` {
 		t.Fatalf("docstring must stay first:\n%s", out2.Source)
+	}
+}
+
+func TestFloatRequiresNumericOperands(t *testing.T) {
+	// An operator over an unknown operand is not a float: `T / 2` may be
+	// tensor division, and `2.0 * T` may be anything.
+	for _, src := range []string{
+		"u = a / b\n",
+		"x = 2.0 * a\n",
+		"m = min(t1, t2)\n",
+	} {
+		if out := annotate(t, src); len(out.Typed) != 0 {
+			t.Errorf("%q: expected no declarations, got %v", src, out.Typed)
+		}
+	}
+	// Controls: int/int division and float*int stay double.
+	if out := annotate(t, "a = 7\nx = a / 2\n"); !typed(out, "x") {
+		t.Errorf("int/int division must stay double; typed=%v", out.Typed)
+	}
+	if out := annotate(t, "a = 1.5\nx = 2.0 * a\n"); !typed(out, "x") {
+		t.Errorf("float*int must stay double; typed=%v", out.Typed)
+	}
+}
+
+func TestPyxDeclinesReservedIdentifiers(t *testing.T) {
+	pyx := Options{Level: OptFull, Mode: ModePyx}
+	for name, src := range map[string]string{
+		"from-import": "from x import include\ny = 2\nprint(y)\n",
+		"attribute":   "print(x.include)\n",
+		"fstring":     `v = 1
+print(f"{v} {include}")
+`,
+		"cdef-name":   "include = 5\nprint(include)\n",
+	} {
+		out, err := AnnotateCython(src, pyx)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if !out.Declined {
+			t.Errorf("%s: expected Declined=true", name)
+		}
+		if strings.Contains(out.Source, "cdef ") {
+			t.Errorf("%s: fallback must not contain cdef:\n%s", name, out.Source)
+		}
+		// no declarations here, so no `import cython` either: the fallback
+		// is the source verbatim (plus header), which is exactly what a
+		// declined file must be.
+	}
+	// An innocent f-string with no reserved word still emits `.pyx`.
+	out2, err := AnnotateCython("v = 1\nprint(f\"{v}\")\n", pyx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out2.Declined {
+		t.Errorf("innocent f-string must not decline")
+	}
+	// ModePy is unaffected by the rule.
+	out, err := AnnotateCython("from x import include\ny = 2\nprint(y)\n", DefaultOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Declined {
+		t.Errorf("ModePy must never decline")
 	}
 }

@@ -55,6 +55,9 @@ type Options struct {
 	// GMP is the bigint transform (a .pyx-only rewrite to
 	// cdef extern from "gmp.h"; docs/AUTO_CYTHON.md Stage 1b).
 	GMP bool
+	// I128 is the __int128 middle tier (a .pyx-only rewrite to
+	// cdef int128/uint128 with the vendored py2cy_int128.h helpers).
+	I128 bool
 }
 
 // Mode is the output surface.
@@ -70,6 +73,196 @@ const (
 	ModePyx
 )
 
+// pyReservedCython are identifiers that are legal Python names but reserved
+// words in Cython `.pyx` files — verified by compiling: `from x import
+// include`, `x.include`, `obj.nogil`, `def include`, `from a import DEF`
+// all fail as `.pyx` while the identical `.py` compiles under Cython.
+// The failure hits every identifier position (even after a dot), so the
+// rule is necessarily blanket: emitting such a file as `.pyx` is
+// unparseable, and ModePyx declines it in favour of pure-Python mode.
+var pyReservedCython = map[string]bool{
+	"include": true, "cimport": true, "cdef": true, "cpdef": true,
+	"ctypedef": true, "DEF": true, "IF": true, "ELIF": true, "ELSE": true,
+	"sizeof": true, "NULL": true, "nogil": true, "gil": true,
+	"api": true, "inline": true, "struct": true, "union": true,
+	"enum": true, "fused": true, "cppclass": true, "namespace": true,
+	"property": true, "readonly": true, "const": true, "volatile": true,
+	"packed": true, "extern": true, "typeof": true,
+}
+
+// pyxBlockingNames returns the Cython-reserved identifiers a source uses.
+// Both `name`-rule nodes and bare NAME terminals are checked: decorators
+// and dotted import paths (`@include`, `from a.include import x`) never
+// produce an INameContext, and per-position reasoning is unsound anyway
+// since the words fail even after a dot.
+//
+// F-strings lex as a single opaque STRING token, so `{...}` expression
+// parts are invisible to the tree walk — a reserved word there (e.g.
+// `f"{include}"`) breaks `.pyx` too, and those spans are scanned
+// textually. Identifiers inside nested string literals within an
+// expression may false-positive; that only declines, never miscompiles.
+func pyxBlockingNames(tree antlr.Tree) map[string]bool {
+	bad := map[string]bool{}
+	walkTree(tree, func(n antlr.Tree) {
+		if ctx, ok := n.(gen.INameContext); ok {
+			if pyReservedCython[ctx.GetText()] {
+			bad[ctx.GetText()] = true
+			}
+			return
+		}
+		if tn, ok := n.(antlr.TerminalNode); ok {
+			t := tn.GetText()
+			if pyReservedCython[t] {
+				bad[t] = true
+				return
+			}
+			if isFStringTok(t) {
+				for _, span := range fstringExprs(t) {
+					for _, id := range rePyIdent.FindAllString(span, -1) {
+						if pyReservedCython[id] {
+							bad[id] = true
+						}
+					}
+				}
+			}
+		}
+	})
+	return bad
+}
+
+var rePyIdent = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]*`)
+
+// isFStringTok reports whether a STRING token's text is an f-string (any
+// case/prefix combination) containing at least one replacement field.
+func isFStringTok(t string) bool {
+	i := 0
+	for i < len(t) && strings.IndexByte("rRbBuUfF", t[i]) >= 0 {
+		i++
+	}
+	if i == 0 || i >= len(t) || (t[i] != '\'' && t[i] != '"') {
+		return false
+	}
+	hasF := false
+	for _, c := range t[:i] {
+		if c == 'f' || c == 'F' {
+			hasF = true
+		}
+	}
+	return hasF && strings.Contains(t[i:], "{")
+}
+
+// fstringExprs returns the top-level `{...}` expression spans of an
+// f-string token's text, honouring nesting, quotes, escapes and the
+// `{{`/`}}` literal-brace pairs.
+func fstringExprs(tok string) []string {
+	i := 0
+	for i < len(tok) && strings.IndexByte("rRbBuUfF", tok[i]) >= 0 {
+		i++
+	}
+	if i >= len(tok) {
+		return nil
+	}
+	q := tok[i]
+	qlen := 1
+	if i+2 < len(tok) && tok[i+1] == q && tok[i+2] == q {
+		qlen = 3
+	}
+	if len(tok) < i+2*qlen {
+		return nil
+	}
+	body := tok[i+qlen : len(tok)-qlen]
+	var spans []string
+	for j := 0; j < len(body); {
+		c := body[j]
+		if c == '{' {
+			if j+1 < len(body) && body[j+1] == '{' {
+				j += 2
+				continue
+			}
+			k, ok := scanFStringExpr(body, j)
+			if !ok {
+				return spans
+			}
+			spans = append(spans, body[j+1:k])
+			j = k + 1
+			continue
+		}
+		if c == '\'' || c == '"' {
+			j = skipQuoted(body, j)
+			continue
+		}
+		if c == '\\' {
+			j += 2
+			continue
+		}
+		j++
+	}
+	return spans
+}
+
+// scanFStringExpr returns the index of the `}` closing the `{` at
+// body[start], honouring nesting, quotes, escapes and `{{`/`}}` pairs.
+func scanFStringExpr(body string, start int) (int, bool) {
+	depth := 0
+	for j := start; j < len(body); {
+		c := body[j]
+		switch {
+		case c == '{':
+			if j+1 < len(body) && body[j+1] == '{' {
+				j += 2
+				continue
+			}
+			depth++
+			j++
+		case c == '}':
+			if j+1 < len(body) && body[j+1] == '}' {
+				j += 2
+				continue
+			}
+			depth--
+			if depth == 0 {
+				return j, true
+			}
+			j++
+		case c == '\'' || c == '"':
+			j = skipQuoted(body, j)
+		case c == '\\':
+			j += 2
+		default:
+			j++
+		}
+	}
+	return 0, false
+}
+
+// skipQuoted skips a single- or triple-quoted section starting at s[j].
+func skipQuoted(s string, j int) int {
+	q := s[j]
+	n := 1
+	if j+2 < len(s) && s[j+1] == q && s[j+2] == q {
+		n = 3
+	}
+	j += n
+	for j < len(s) {
+		if s[j] == '\\' {
+			j += 2
+			continue
+		}
+		if s[j] == q {
+			if n == 3 {
+				if j+2 < len(s) && s[j+1] == q && s[j+2] == q {
+					return j + 3
+				}
+				j++
+				continue
+			}
+			return j + 1
+		}
+		j++
+	}
+	return len(s)
+}
+
 // DefaultOptions is the full interval analysis, pure-Python mode, GMP off.
 func DefaultOptions() Options { return Options{Level: OptFull, Mode: ModePy} }
 
@@ -78,6 +271,10 @@ type CythonOutput struct {
 	Source  string   // pure-Python-mode Cython (also valid CPython)
 	Typed   []string // names emitted as C ints (any width)
 	Refused []string // names left as Python objects (informational)
+	// Declined is set when a `.pyx` emission was requested but refused: the
+	// Source then holds the exact pure-Python output instead, which the
+	// caller emits as-is (it compiles under either extension).
+	Declined bool
 	// Evidence separates the proved VALUE range from the required C STORAGE
 	// width (autocython_width.go): the same proof is honest for both the
 	// annotation and the "why" column of the evidence table.
@@ -113,6 +310,20 @@ func AnnotateCython(src string, opts Options) (*CythonOutput, error) {
 	tree, errs := ParsePython(src)
 	if len(errs) > 0 {
 		return nil, fmt.Errorf("python2cython: %s", errs[0])
+	}
+	if opts.Mode == ModePyx {
+		if bad := pyxBlockingNames(tree); len(bad) > 0 {
+			// Fine Python, unparseable `.pyx`: decline and yield the exact
+			// pure-Python output (which compiles under either extension).
+			py := opts
+			py.Mode = ModePy
+			out, err := AnnotateCython(src, py)
+			if err != nil {
+				return nil, err
+			}
+			out.Declined = true
+			return out, nil
+		}
 	}
 
 	moduleInts, moduleFloats := map[string]bool{}, map[string]bool{}
@@ -354,7 +565,23 @@ func proveAll(tree antlr.Tree, level Level) proof {
 			ints[n] = true
 		}
 	}
-	floats := floatDomainFixpoint(tree)
+	// isInt answers whether a leaf expression denotes a Python int: an i64
+	// literal, a proved interval, or an int-domain name. It never recurses
+	// into floatDomain, so the numericity check cannot loop.
+	isInt := func(t string) bool {
+		t = stripOuterParens(strings.TrimSpace(t))
+		if reIntLit.MatchString(t) && intLiteralFits64(t) {
+			return true
+		}
+		if v, ok := e[t]; ok && v.ok {
+			return true
+		}
+		if iv := evalText(t, e); iv.ok {
+			return true
+		}
+		return allInt[t]
+	}
+	floats := floatDomainFixpoint(tree, isInt)
 	for n := range ints {
 		delete(floats, n)
 	}

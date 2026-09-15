@@ -21,10 +21,16 @@ ok=0
 fail=0
 for f in ${1:-testdata/t0*.py testdata/t1*.py}; do
   bn="$(basename "$f")"
-  if ! ./py2cy $FLAGS "$f" > "$tmp/$bn.$EXT" 2>"$tmp/$bn.err"; then
+  oext="$EXT"
+  if ! ./py2cy $FLAGS "$f" > "$tmp/$bn.$oext" 2>"$tmp/$bn.err"; then
     echo "FAIL $bn (annotate)"; fail=$((fail+1)); continue
   fi
-  if ! cython --embed -3 "$tmp/$bn.$EXT" -o "$tmp/$bn.c" 2>"$tmp/$bn.cy"; then
+  if [ "$oext" = pyx ] && grep -q "declined" "$tmp/$bn.err" 2>/dev/null; then
+    # declined .pyx falls back to pure-Python content: compile as .py
+    cp "$tmp/$bn.pyx" "$tmp/$bn.py"
+    oext=py
+  fi
+  if ! cython --embed -3 "$tmp/$bn.$oext" -o "$tmp/$bn.c" 2>"$tmp/$bn.cy"; then
     echo "FAIL $bn (cython)"; fail=$((fail+1)); continue
   fi
   if ! cc -O2 -o "$tmp/$bn" "$tmp/$bn.c" \

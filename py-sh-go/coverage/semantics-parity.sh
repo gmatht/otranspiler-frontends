@@ -67,6 +67,10 @@ run float_neg 'a = -5.0
 b = 3.0
 print(a % b, a // b, a / b)'
 
+run div_unknown 'def f(a, b):
+    return a / b
+print(f(7.0, 2))'
+
 run identity_is 'a = 1000
 b = a + 0
 print(a is b, a == b)'

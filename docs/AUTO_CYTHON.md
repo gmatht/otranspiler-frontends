@@ -230,6 +230,8 @@ existing analogue in the C backend, which is why this is *bounded* work:
 | **exceptions across C frames** | Cython propagates them | free, but `finally`/`except` over C-typed locals needs care in the planner |
 | **`exec`/`eval`/metaclasses/monkey-patching** | mostly supported; `inspect`/frames differ | pass through as Python; never annotate through them |
 | **startup** | `--embed` ≈ 57 ms libpython | document it; prefer extension-module mode where the caller already has a Python |
+| **operators over unknown operands** | only typed when both sides prove numeric | tensor division (`T / 2`) stays Python, never `double` |
+| **Cython-reserved identifiers** | `--pyx` declines the file to pure-Python mode | `include`/`cdef`/`DEF`/f-string spans fail as `.pyx` in every position |
 
 The governing rule is unchanged: **an annotation is a proof, not a guess.**
 Every declaration is emitted only when the core has *proved* it; anything
@@ -574,8 +576,10 @@ pinned by `spec_collect_rejects_baked_array_index_in_bare_arith`.
   the hand-written goldens use;
 - **scalar types**: `int` -> `cython.longlong`/`cdef long long`, and
   `float` -> `cython.double`/`cdef double` (Python floats are IEEE doubles;
-  `/` is true division and always float; `+ - * % // **` yield a float when
-  either operand is). A name assigned both an int and a float is neither.
+  an operator yields a float only when both operands prove numeric — proved
+  float or proved int — and, except for `/`, at least one is a float, so
+  `T / 2` over an unknown `T` (tensor division, not a float) stays Python).
+  A name assigned both an int and a float is neither.
   `--pyx` groups declarations by C type;
 - **typed int lists** (`.pyx` only): `xs = []; xs.append(<i64 expr>)` with
   `len(xs)`/`xs[i]` is rewritten to a growable `long long *xs`
@@ -596,6 +600,14 @@ pinned by `spec_collect_rejects_baked_array_index_in_bare_arith`.
   a docstring). Parameters are never declared (a parameter may be any object
   at the call site). Function-local declarations beat module-level ones
   (`rolling_hash` in a function: 0.09 s vs 0.14 s);
+- **`--pyx` declines reserved identifiers**: `include`, `cdef`, `DEF`,
+  `sizeof`, `nogil`, ... are legal Python names but reserved words in
+  Cython `.pyx` files — they fail in every identifier position, even after
+  a dot, and inside f-string `{...}` spans (which lex as one opaque token,
+  so `pyxBlockingNames` scans those spans textually). A file using one
+  declines to the exact pure-Python output instead of an unparseable `.pyx`
+  (the CLI says so on stderr); `TestPyxDeclinesReservedIdentifiers` and
+  `coverage/gmp-parity.sh`'s `reserved_decline` pin this;
 - the lexer synthesises CPython's end-of-input NEWLINE, so a file whose last
   line has no trailing newline (or ends in whitespace) parses;
 - **soundness is a sound i64 interval analysis** (`autocython_ranges.go`):
@@ -603,7 +615,12 @@ pinned by `spec_collect_rejects_baked_array_index_in_bare_arith`.
   arithmetic with **any overflow → ⊤**; `a % m` with `m > 0` and a provably
   **non-negative** `a` is `[0, m-1]` (Python floor-mod equals C truncation
   only there); a `for x in range(<int literals>)` counter is bounded by the
-  endpoints; a `for` body is iterated to a fixed point with union-widening
+  endpoints; a `for x in <proved list>` loop runs exactly len steps with x
+  bound to the element interval (the trip count is the array length), so an
+  accumulator like `total = total + v` converges instead of widening to ⊤ —
+  anything that may share or mutate the list (`xs.append`, `xs[i] = ..`, an
+  alias, a non-pure call argument, a closure over it) drops the fact; any
+  other `for` body is iterated to a fixed point with union-widening
   (capped → ⊤); a `while` body and `try`/`match`/`async` subtrees widen
   everything they assign to ⊤; `if`/`elif`/`else` join the branch states.
   Everything not proved stays a Python object. Pinned refusals: t101's
