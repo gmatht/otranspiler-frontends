@@ -53,10 +53,6 @@ func main() {
 			file = a
 		}
 	}
-	if opts.GMP {
-		fmt.Fprintln(os.Stderr, "py2cy: --gmp (bigint transform) is not implemented yet")
-		os.Exit(2)
-	}
 	if file == "" {
 		usage()
 		os.Exit(2)
@@ -65,6 +61,18 @@ func main() {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "py2cy: "+err.Error())
 		os.Exit(2)
+	}
+	if opts.GMP {
+		// bigint transform: .pyx with cdef mpz_t + GMP calls. Decline (no
+		// rewritable bigint) falls back to the exact pure-Python output.
+		if gmp, ok, err := pylib.AnnotateGMP(string(src)); err != nil {
+			fmt.Fprintln(os.Stderr, "py2cy: "+err.Error())
+			os.Exit(2)
+		} else if ok {
+			os.Stdout.WriteString(gmp.Source)
+			return
+		}
+		fmt.Fprintln(os.Stderr, "py2cy: --gmp: no rewritable bigint; falling back to pure-Python annotation")
 	}
 	out, err := pylib.AnnotateCython(string(src), opts)
 	if err != nil {

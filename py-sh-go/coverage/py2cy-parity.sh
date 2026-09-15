@@ -8,9 +8,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 GO="${GO:-go}"
-if [ ! -x ./py2cy ]; then
-  "$GO" build -o py2cy ./cmd/py2cy || exit 1
-fi
+"$GO" build -o py2cy ./cmd/py2cy || exit 1
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 

@@ -20,7 +20,7 @@ ANTLR4 ?= antlr4
 CLI ?= $(abspath ../../../otranspilerl/target/debug/otranspilerl-cli)
 GO ?= /snap/go/current/bin/go
 
-.PHONY: all gen build test parse-test py2cy py2cy-test worker clean
+.PHONY: all gen build test parse-test py2cy py2cy-test gmp-test worker clean
 
 all: build
 
@@ -44,6 +44,13 @@ py2cy:
 py2cy-test: py2cy
 	$(GO) test -run TestAnnotate .
 	bash coverage/py2cy-parity.sh
+
+# Bigint transform: .pyx with cdef mpz_t + GMP calls (docs/AUTO_CYTHON.md
+# Stage 1b). Needs cython + gmp.h; declines fall back to the exact
+# pure-Python output.
+gmp-test: py2cy
+	$(GO) test -run TestGMP .
+	bash coverage/gmp-parity.sh
 
 # Build the CLI (a thin wrapper over the pylib library at the module root).
 build:
