@@ -19,6 +19,7 @@ import (
 	"math/big"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/antlr4-go/antlr/v4"
@@ -779,4 +780,737 @@ func hullMerge(dm magEnv, name string, m bigIV) {
 		return
 	}
 	dm[name] = m
+}
+
+// i128Block is the __int128 FFI declaration block: fake 64-bit ctypedefs
+// so Cython generates C, plus the real helpers from py2cy_int128.h (which
+// must sit beside the .pyx at C-compile time; the parity harness copies
+// it into the temp build dir).
+//
+// SOUNDNESS (read carefully — the fake typedef is load-bearing): Cython
+// believes int128/uint128 are 64-bit and would truncate in any conversion
+// IT inserts (print/auto-boxing, Python-int operands). The renderer below
+// therefore guarantees, per construct, that NO Cython-inserted conversion
+// ever touches a wide value: big literals enter only via parse helpers,
+// printing exits only via to_py helpers, and every other operand is a
+// small literal or a real C integer. Anything else declines.
+const i128Block = `from libc.stdio cimport printf
+cdef extern from "py2cy_int128.h":
+    ctypedef unsigned long long int128
+    ctypedef unsigned long long uint128
+    int128 py2cy_i128_from_str(const char*)
+    uint128 py2cy_u128_from_str(const char*)
+    object py2cy_i128_to_py(int128)
+    object py2cy_u128_to_py(uint128)`
+
+// I128Output is a `.pyx`-mode result for the middle tier.
+// AnnotateI128 parses src and, if every integer variable is provably i64
+// (longs) or magnitude-proved to 65..128 bits (i128/u128) AND every
+// statement is in the exact subset, returns the `.pyx`. ok=false means
+// "decline" (fall back to the exact pure-Python output).
+func AnnotateI128(src string) (*I128Output, bool, error) {
+	tree, errs := ParsePython(src)
+	if len(errs) > 0 {
+		return nil, false, gmpErr(errs[0])
+	}
+	i128, u128, longs, mag := classifyI128Full(tree)
+	if len(i128) == 0 && len(u128) == 0 {
+		return nil, false, nil
+	}
+	r := &i128R{i128: i128, u128: u128, longs: longs, ok: true, temps: map[string]string{}}
+	r.render(tree)
+	if !r.ok {
+		return nil, false, nil
+	}
+	var b strings.Builder
+	b.WriteString("# cython: language_level=3\n")
+	b.WriteString(i128Block)
+	b.WriteByte('\n')
+	for _, n := range r.sortedLongs() {
+		b.WriteString("cdef long long " + n + "\n")
+	}
+	for _, n := range r.sortedI128() {
+		b.WriteString("cdef int128 " + n + "\n")
+	}
+	for _, n := range r.sortedU128() {
+		b.WriteString("cdef uint128 " + n + "\n")
+	}
+	for _, t := range r.sortedTemps() {
+		info := r.tempInfo[t]
+		if info.signed {
+			b.WriteString("cdef int128 " + t + "\n")
+		} else {
+			b.WriteString("cdef uint128 " + t + "\n")
+		}
+		b.WriteString(t + " = " + parseCall(info.signed, info.lit) + "\n")
+	}
+	for _, line := range r.out {
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	return &I128Output{Source: b.String(), I128: r.sortedI128(), U128: r.sortedU128(),
+		Longs: r.sortedLongs(), Mag: mag}, true, nil
+}
+
+func parseCall(signed bool, lit string) string {
+	if signed {
+		return `py2cy_i128_from_str("` + lit + `")`
+	}
+	return `py2cy_u128_from_str("` + lit + `")`
+}
+
+// classifyI128Full classifies i128/u128 (magnitude proof) plus longs
+// (existing int64 proof, same as the GMP classifier's longs half).
+func classifyI128Full(tree antlr.Tree) (i128, u128, longs map[string]bool, mag []MagEvidence) {
+	i128, u128, _, mag = classifyI128(tree)
+	longs = map[string]bool{}
+	proved, assigned := proveRanges(tree)
+	_ = assigned
+	for n, v := range proved {
+		if v.ok {
+			longs[n] = true
+		}
+	}
+	// Single owner: a name is never both long and wide (mag tier refused
+	// i64-fit names already; belt-and-suspenders here).
+	for n := range i128 {
+		delete(longs, n)
+	}
+	for n := range u128 {
+		delete(longs, n)
+	}
+	return i128, u128, longs, mag
+}
+
+type i128R struct {
+	i128, u128, longs map[string]bool
+	out               []string
+	ok                bool
+	lastIndent        int
+	temps             map[string]string // big literal text -> temp name
+	tempInfo          map[string]struct {
+		signed bool
+		lit    string
+	}
+	tempN int
+	// typedSoFar tracks declared names whose proving assignment has
+	// executed (renderer dominance: reads before that decline, so a C
+	// var is never read where Python would raise NameError).
+	typedSoFar map[string]bool
+}
+
+func (r *i128R) sortedI128() []string { return sortedKeys(r.i128) }
+func (r *i128R) sortedU128() []string { return sortedKeys(r.u128) }
+func (r *i128R) sortedLongs() []string {
+	out := []string{}
+	for _, n := range sortedKeys(r.longs) {
+		if !r.i128[n] && !r.u128[n] {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+func (r *i128R) sortedTemps() []string {
+	out := make([]string, 0, len(r.temps))
+	seen := map[string]bool{}
+	for _, t := range r.temps {
+		if !seen[t] {
+			seen[t] = true
+			out = append(out, t)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (r *i128R) isWide(n string) bool   { return r.i128[n] || r.u128[n] }
+func (r *i128R) signedOf(n string) bool { return r.i128[n] }
+
+// tempFor registers a big-int literal temper (module-top, deduped).
+// signed selects the parse helper; callers guarantee fit (proven).
+func (r *i128R) tempFor(lit string, signed bool) string {
+	if t, ok := r.temps[lit]; ok {
+		return t
+	}
+	r.tempN++
+	t := "__py2cy_c" + strconv.Itoa(r.tempN)
+	if r.tempInfo == nil {
+		r.tempInfo = map[string]struct {
+			signed bool
+			lit    string
+		}{}
+	}
+	r.temps[lit] = t
+	r.tempInfo[t] = struct {
+		signed bool
+		lit    string
+	}{signed, lit}
+	return t
+}
+
+func (r *i128R) emit(indent int, s string) {
+	r.out = append(r.out, strings.Repeat("    ", indent)+s)
+}
+
+func (r *i128R) render(tree antlr.Tree) {
+	fi, ok := tree.(gen.IFile_inputContext)
+	if !ok {
+		r.ok = false
+		return
+	}
+	if r.typedSoFar == nil {
+		r.typedSoFar = map[string]bool{}
+	}
+	r.stmts(fi.AllStmt(), 0)
+}
+
+func (r *i128R) stmts(list []gen.IStmtContext, indent int) {
+	for _, s := range list {
+		if ss := s.Simple_stmts(); ss != nil {
+			for _, sm := range ss.AllSimple_stmt() {
+				r.simple(sm, indent)
+			}
+		} else if cs := s.Compound_stmt(); cs != nil {
+			r.compound(cs, indent)
+		} else {
+			r.ok = false
+		}
+		if !r.ok {
+			return
+		}
+	}
+}
+
+func (r *i128R) simple(sm gen.ISimple_stmtContext, indent int) {
+	if e := sm.Expr_stmt(); e != nil {
+		r.exprStmt(e, indent)
+		return
+	}
+	if sm.Pass_stmt() != nil {
+		r.emit(indent, "pass")
+		return
+	}
+	r.ok = false
+}
+
+func (r *i128R) exprStmt(e gen.IExpr_stmtContext, indent int) {
+	text := e.GetText()
+	if strings.HasPrefix(text, "print(") && strings.HasSuffix(text, ")") {
+		r.lastIndent = indent
+		r.print(text[len("print(") : len(text)-1])
+		return
+	}
+	ts := e.AllTestlist_star_expr()
+	if e.Annassign() != nil || len(ts) != 2 {
+		r.ok = false
+		return
+	}
+	lhs := strings.TrimSpace(ts[0].GetText())
+	if !isSimpleName(lhs) {
+		r.ok = false
+		return
+	}
+	rhs := ts[1].GetText()
+	// Augmented assigns (`+=` etc.) on wide targets with
+	// small-literal or wide RHS (transparent C compound ops).
+	if e.Augassign() != nil {
+		op := augOp(text, lhs)
+		if op == "" || !r.isWide(lhs) {
+			r.ok = false
+			return
+		}
+		r.augAssign(lhs, rhs, op, indent)
+		return
+	}
+	if r.isWide(lhs) {
+		r.wideAssign(lhs, rhs, indent)
+		return
+	}
+	if r.longs[lhs] {
+		r.emit(indent, lhs+" = "+rhs)
+		r.typedSoFar[lhs] = true
+		return
+	}
+	// Unclassified target with a wide/small-int RHS still needs a home:
+	// plain Python names keep the statement verbatim (object semantics),
+	// but a wide value flowing into one is a narrowing we don't model.
+	if r.mentionsWide(rhs) {
+		r.ok = false
+		return
+	}
+	r.emit(indent, lhs+" = "+rhs)
+}
+
+// augOp extracts the compound operator for `v <op>= rhs` text.
+
+// print renders print(...) for the exact subset: empty, string literals,
+// single i128/u128 vars (via to_py helpers — never Cython's fake-64-bit
+// conversion), single longs vars (%lld). Anything else declines.
+func (r *i128R) print(arg string) {
+	arg = strings.TrimSpace(arg)
+	switch {
+	case arg == "":
+		r.emit(r.lastIndent, `printf("\n")`)
+	case isStringLit(arg):
+		r.emit(r.lastIndent, `printf("`+cStrEscape(unquote(arg))+`\n")`)
+	case isSimpleName(arg) && r.i128[arg]:
+		r.emit(r.lastIndent, `print(py2cy_i128_to_py(`+arg+`))`)
+	case isSimpleName(arg) && r.u128[arg]:
+		r.emit(r.lastIndent, `print(py2cy_u128_to_py(`+arg+`))`)
+	case isSimpleName(arg) && r.longs[arg]:
+		r.emit(r.lastIndent, `printf("%lld\n", `+arg+`)`)
+	default:
+		r.ok = false
+	}
+}
+
+// isStringLit reports a single- or double-quoted string literal (no
+// prefixes handled — the subset only produces plain quotes).
+func isStringLit(s string) bool {
+	return len(s) >= 2 && ((s[0] == '"' && s[len(s)-1] == '"') || (s[0] == '\'' && s[len(s)-1] == '\'')) && !strings.ContainsAny(s[1:len(s)-1], "\"'")
+}
+
+func unquote(s string) string { return s[1 : len(s)-1] }
+
+// cStrEscape escapes a Python string value for a C "%s" literal.
+func cStrEscape(s string) string {
+	s = strings.ReplaceAll(s, "\\", "\\\\")
+	s = strings.ReplaceAll(s, "\"", "\\\"")
+	s = strings.ReplaceAll(s, "\n", "\\n")
+	s = strings.ReplaceAll(s, "\r", "\\r")
+	s = strings.ReplaceAll(s, "%", "%%")
+	return s
+}
+
+// wideAssign rewrites `target = <rhs>` for i128/u128 targets. Every RHS
+// shape is exact: big literals via parse temps, small literals direct,
+// same-sign copies direct, cross-sign copies only with proven containment,
+// arithmetic via transparent C ops with operand discipline (below).
+func (r *i128R) wideAssign(target, rhs string, indent int) {
+	signed := r.i128[target]
+	s := strings.ReplaceAll(strings.TrimSpace(rhs), " ", "")
+	// Big literal (any size): temp (declared + parsed once at top).
+	if reBigLit.MatchString(s) {
+		r.emit(indent, target+" = "+r.tempFor(s, signed))
+		return
+	}
+	// Bare name: same-sign copy direct; cross-sign only with containment
+	// (source range inside target range — else silent C wrap).
+	if isSimpleName(s) {
+		if (r.i128[s] && signed) || (r.u128[s] && !signed) {
+			r.emit(indent, target+" = "+s)
+			return
+		}
+		if r.isWide(s) {
+			r.ok = false
+			return
+		}
+		// Small/unknown names: only exact if the name is a proven long
+		// (real i64, converts exactly) — otherwise decline.
+		if r.longs[s] {
+			r.emit(indent, target+" = "+s)
+			return
+		}
+		r.ok = false
+		return
+	}
+	// Small literal: direct C constant (exact, never a conversion).
+	if isSmallInt(s) {
+		r.emit(indent, target+" = "+s)
+		return
+	}
+	// Unary minus/plus on a provable operand.
+	if strings.HasPrefix(s, "-") || strings.HasPrefix(s, "+") {
+		inner := s[1:]
+		if r.isWide(inner) || isSmallInt(inner) || reBigLit.MatchString(inner) {
+			if strings.HasPrefix(s, "-") && !signed {
+				// Negating into unsigned wraps mod 2^128 in C but is
+				// exact-negative in Python: decline (fail-closed).
+				// (The classifier only proves nonneg targets anyway, so
+				// this arm is nearly unreachable — kept for safety.)
+				r.ok = false
+				return
+			}
+			r.emit(indent, target+" = "+s)
+			return
+		}
+		r.ok = false
+		return
+	}
+	// Binary arithmetic: operands each small-lit, temp-eligible big-lit,
+	// or same-sign wide; % // need nonneg dividend + positive divisor
+	// (C-vs-Python sign semantics differ otherwise).
+	for _, op := range []string{"+", "-", "*", "%", "//"} {
+		l, rr, ok := splitTopTwo(s, op)
+		if !ok {
+			continue
+		}
+		if !r.arithOperand(l, signed) || !r.arithOperand(rr, signed) {
+			r.ok = false
+			return
+		}
+		if (op == "%" || op == "//") && !r.nonnegSmallDivisor(target, l, rr) {
+			r.ok = false
+			return
+		}
+		r.emit(indent, target+" = "+l+op+rr)
+		return
+	}
+	// a ** b with literal operands: const-eval exactly, then parse temp.
+	if l, rr, ok := splitTopTwo(s, "**"); ok {
+		if lv, ok1 := bigLit(l); ok1 {
+			if rv, ok2 := bigLit(rr); ok2 {
+				if rv.Sign() >= 0 && rv.IsInt64() && rv.Int64() <= 100000 {
+					v := new(big.Int).Exp(lv, rv, nil)
+					if v.BitLen() <= maxPowBits {
+						r.emit(indent, target+" = "+r.tempFor(v.String(), signed))
+						return
+					}
+				}
+			}
+		}
+		r.ok = false
+		return
+	}
+	r.ok = false
+}
+
+// arithOperand reports whether text is emittable as a C operand of an
+// i128 arithmetic op: small literals (C constants), same-sign wide vars
+// (real C values), or big literals (rewritten to temps by the caller —
+// / here only *recognized*; the caller substitutes the temp).
+func (r *i128R) arithOperand(s string, signed bool) bool {
+	s = strings.TrimSpace(s)
+	if isSmallInt(s) {
+		return true
+	}
+	if reBigLit.MatchString(s) {
+		return true
+	}
+	if isSimpleName(s) {
+		if signed {
+			return r.i128[s]
+		}
+		return r.u128[s]
+	}
+	return false
+}
+
+// nonnegSmallDivisor gates % and //: dividend must be provably nonneg
+// (else C trunc-toward-zero differs from Python floor) and divisor a
+// positive small literal (else div-by-zero or sign오는).
+func (r *i128R) nonnegSmallDivisor(target, l, rr string) bool {
+	_ = target
+	if !isSmallInt(rr) {
+		return false
+	}
+	d, ok := bigLit(rr)
+	if !ok || d.Sign() <= 0 {
+		return false
+	}
+	// Dividend nonneg: nonneg small literal, or u128 var.
+	if isSmallInt(l) {
+		if v, ok := bigLit(l); ok && v.Sign() >= 0 {
+			return true
+		}
+		return false
+	}
+	if isSimpleName(l) {
+		return r.u128[l]
+	}
+	return false
+}
+
+// augOp extracts the compound operator for `v <op>= rhs` text.
+func augOp(text, lhs string) string {
+	rest := strings.TrimSpace(strings.TrimPrefix(text, lhs))
+	for _, op := range []string{"**=", "<<=", ">>=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^="} {
+		if strings.HasPrefix(rest, op) {
+			return op
+		}
+	}
+	return ""
+}
+
+// augAssign handles `v <op>= rhs` with v wide: transparent C compound ops
+// need no conversion, but the RHS must be small-literal or wide (a big
+// literal or foreign value would convert through the fake type).
+// //= and %= are declined (floor/modulo need the nonneg+positive proof
+// the classifier does not track per-statement).
+func (r *i128R) augAssign(lhs, rhs, op string, indent int) {
+	if op == "//=" || op == "%=" {
+		r.ok = false
+		return
+	}
+	s := strings.ReplaceAll(rhs, " ", "")
+	if r.isWide(s) || isSmallInt(s) {
+		r.emit(indent, lhs+" "+op+" "+s)
+		return
+	}
+	r.ok = false
+}
+
+// isSmallInt reports a decimal int literal fitting C long long (exact C
+// constant — never a conversion). The whole text incl. sign is parsed
+// (magnitude-only parsing wrongly rejects -2**63, whose magnitude
+// overflows but value fits).
+func isSmallInt(s string) bool {
+	s = strings.TrimSpace(s)
+	body := s
+	if strings.HasPrefix(body, "+") || strings.HasPrefix(body, "-") {
+		body = body[1:]
+	}
+	if body == "" {
+		return false
+	}
+	for _, c := range []byte(body) {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	_, err := strconv.ParseInt(s, 10, 64)
+	return err == nil
+}
+
+// mentionsWide reports whether text names an i128/u128 variable outside
+// string literals (f-strings veto everything: their braces hold code the
+// stripper cannot see — fail-closed). Conservative over-approximation
+// (attributes/keywords can false-positive) — always used in the decline
+// direction.
+func (r *i128R) mentionsWide(s string) bool {
+	if strings.Contains(s, `f"`) || strings.Contains(s, `f'`) {
+		return true
+	}
+	stripped := stripStrings(s)
+	for _, id := range reIdentAll.FindAllString(stripped, -1) {
+		if r.isWide(id) {
+			return true
+		}
+	}
+	return false
+}
+
+// stripStrings blanks single/double/triple-quoted regions (escapes
+// honored) so identifier scans skip string contents.
+func stripStrings(s string) string {
+	var b strings.Builder
+	i := 0
+	for i < len(s) {
+		c := s[i]
+		if c == '"' || c == '\'' {
+			q := c
+			n := 1
+			if i+2 < len(s) && s[i+1] == q && s[i+2] == q {
+				n = 3
+			}
+			j := i + n
+			for j < len(s) {
+				if s[j] == '\\' {
+					j += 2
+					continue
+				}
+				if s[j] == q {
+					if n == 1 {
+						j++
+						break
+					}
+					if j+2 < len(s) && s[j+1] == q && s[j+2] == q {
+						j += 3
+						break
+					}
+				}
+				j++
+			}
+			for k := i; k < j && k < len(s); k++ {
+				b.WriteByte(' ')
+			}
+			i = j
+			continue
+		}
+		b.WriteByte(c)
+		i++
+	}
+	return b.String()
+}
+
+func (r *i128R) block(b gen.IBlockContext, indent int) {
+	if b == nil {
+		r.ok = false
+		return
+	}
+	if len(b.AllStmt()) == 0 {
+		r.emit(indent, "pass")
+		return
+	}
+	r.stmts(b.AllStmt(), indent)
+}
+
+// compound renders while/if for the exact subset. Conditions may mention
+// i128 vars freely (C comparisons are exact) but no other non-small,
+// non-long names (those would convert through the fake type); big
+// literals become temps. Anything else declines.
+func (r *i128R) compound(cs gen.ICompound_stmtContext, indent int) {
+	switch {
+	case cs.While_stmt() != nil:
+		w := cs.While_stmt()
+		cond := w.Namedexpr_test().GetText()
+		if !r.condOk(cond) {
+			r.ok = false
+			return
+		}
+		r.emit(indent, "while "+r.condRewrite(cond)+":")
+		r.block(w.Block(0), indent+1)
+	case cs.If_stmt() != nil:
+		ifs := cs.If_stmt()
+		blocks := ifs.AllBlock()
+		tests := ifs.AllNamedexpr_test()
+		if len(blocks) == 0 {
+			r.ok = false
+			return
+		}
+		for i, b := range blocks {
+			var cond string
+			isElse := i == len(blocks)-1 && ifs.ELSE() != nil && i >= len(tests)
+			if i == 0 {
+				if len(tests) < 1 || !r.condOk(tests[0].GetText()) {
+					r.ok = false
+					return
+				}
+				cond = r.condRewrite(tests[0].GetText())
+				r.emit(indent, "if "+cond+":")
+			} else if isElse {
+				r.emit(indent, "else:")
+			} else {
+				if i >= len(tests) || !r.condOk(tests[i].GetText()) {
+					r.ok = false
+					return
+				}
+				cond = r.condRewrite(tests[i].GetText())
+				_ = cond
+				r.emit(indent, "elif "+r.condRewrite(tests[i].GetText())+":")
+			}
+			r.block(b, indent+1)
+		}
+	default:
+		r.ok = false
+	}
+}
+
+// condOk reports whether a condition mentions only i128/u128/long
+// names, small literals, and big literals (rewritten to temps by
+// condRewrite), plus keywords. Calls (any `name(` shape — grouping
+// parens are bare and fine), f-strings (code inside braces defeats the
+// string skip below), and anything else decline (fail-closed: an
+// unmodelled conversion could truncate through the fake type).
+func (r *i128R) condOk(cond string) bool {
+	if strings.Contains(cond, `f"`) || strings.Contains(cond, `f'`) {
+		return false
+	}
+	if reCallParen.FindString(cond) != "" {
+		return false
+	}
+	clean := stripStrings(cond)
+	for _, id := range reIdentAll.FindAllString(clean, -1) {
+		if r.isWide(id) || r.longs[id] {
+			continue
+		}
+		if isSmallInt(id) || reBigLit.MatchString(id) {
+			continue
+		}
+		if isPyKeyword(id) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// reCallParen finds call-shaped parens (identifier/]/) directly followed
+// by `(`); bare grouping parens do not match.
+var reCallParen = regexp.MustCompile(`[A-Za-z_0-9\]\)]\s*\(`)
+
+// condRewrite replaces big-int literals OUTSIDE strings with temp refs
+// (registering signed parse temps — callers guarantee fit, see below).
+// Big literals here must fit SIGNED i128 (decline otherwise): the temp
+// is signed, and an over-wide literal would overflow its parse loop
+// (fail-closed; a beyond-signed bound against any var is a constant
+// fold the renderer does not attempt).
+func (r *i128R) condRewrite(cond string) string {
+	var b strings.Builder
+	i := 0
+	for i < len(cond) {
+		c := cond[i]
+		if c == '"' || c == '\'' {
+			q := c
+			n := 1
+			if i+2 < len(cond) && cond[i+1] == q && cond[i+2] == q {
+				n = 3
+			}
+			j := i + n
+			for j < len(cond) {
+				if cond[j] == '\\' {
+					j += 2
+					continue
+				}
+				if cond[j] == q {
+					if n == 1 {
+						j++
+						break
+					}
+					if j+2 < len(cond) && cond[j+1] == q && cond[j+2] == q {
+						j += 3
+						break
+					}
+				}
+				j++
+			}
+			b.WriteString(cond[i:j])
+			i = j
+			continue
+		}
+		if c >= '0' && c <= '9' {
+			j := i
+			for j < len(cond) && cond[j] >= '0' && cond[j] <= '9' {
+				j++
+			}
+			lit := cond[i:j]
+			if len(lit) >= 20 {
+				v, ok := bigLit(lit)
+				if !ok || !fitsSigned128Str(v) {
+					r.ok = false
+					return cond
+				}
+				b.WriteString(r.tempFor(lit, true))
+				i = j
+				continue
+			}
+		}
+		b.WriteByte(c)
+		i++
+	}
+	return b.String()
+}
+
+// fitsSigned128Str reports whether a non-negative big value fits signed
+// __int128 (callers only temp non-negative literals here; negatives
+// arrive as unary minus on temps, handled by the assign rules).
+func fitsSigned128Str(v *big.Int) bool {
+	if v.Sign() < 0 {
+		return false
+	}
+	return v.BitLen() <= 127
+}
+
+// reBigLit matches plain decimal int literals of any size (for operand
+// classification; temping decisions live in condRewrite/assign paths).
+var reBigLit = regexp.MustCompile(`^[0-9]+$`)
+
+// isPyKeyword reports Python keywords (never variable reads).
+func isPyKeyword(s string) bool {
+	switch s {
+	case "and", "or", "not", "in", "is", "if", "else", "elif", "while",
+		"for", "True", "False", "None", "pass", "return", "def", "lambda":
+		return true
+	}
+	return false
 }
