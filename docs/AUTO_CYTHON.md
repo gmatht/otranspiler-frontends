@@ -566,6 +566,13 @@ pinned by `spec_collect_rejects_baked_array_index_in_bare_arith`.
   is `.pyx`-only and needs `-lgmp`; it declines back to the exact
   pure-Python output whenever it cannot rewrite a construct exactly. Off
   (the default), bigints stay exact Python ints (~1× CPython, no faster);
+- **function scope**: each `def`'s locals are proved with the same analysis,
+  and a `cython.declare(...)` line is inserted at the top of the body (after
+  a docstring). Parameters are never declared (a parameter may be any object
+  at the call site). Function-local declarations beat module-level ones
+  (`rolling_hash` in a function: 0.09 s vs 0.14 s);
+- the lexer synthesises CPython's end-of-input NEWLINE, so a file whose last
+  line has no trailing newline (or ends in whitespace) parses;
 - **soundness is a sound i64 interval analysis** (`autocython_ranges.go`):
   a scalar's abstract value is an interval or ⊤; arithmetic is interval
   arithmetic with **any overflow → ⊤**; `a % m` with `m > 0` and a provably

@@ -154,3 +154,31 @@ func TestAnnotateRejectsSyntaxError(t *testing.T) {
 		t.Fatal("expected a syntax error")
 	}
 }
+
+func TestAnnotateFunctionScope(t *testing.T) {
+	src := "def f():\n    h = 0\n    for i in range(10):\n        h = (h + i) % 7\n    return h\n"
+	out := annotate(t, src)
+	if !typed(out, "h") || !typed(out, "i") {
+		t.Fatalf("expected h and i typed; got %v (refused %v)", out.Typed, out.Refused)
+	}
+	if !strings.Contains(out.Source, "    cython.declare(h=cython.longlong, i=cython.longlong)") {
+		t.Fatalf("function declaration missing:\n%s", out.Source)
+	}
+}
+
+func TestAnnotateFunctionParamsNotTyped(t *testing.T) {
+	// a parameter can be any object at the call site, so it is never declared
+	out := annotate(t, "def f(x):\n    x = 0\n    return x\n")
+	if typed(out, "x") {
+		t.Fatalf("parameter x must not be declared: %v", out.Typed)
+	}
+}
+
+func TestAnnotateFunctionDocstring(t *testing.T) {
+	out := annotate(t, "def f():\n    \"\"\"d\"\"\"\n    n = 5\n    return n\n")
+	i := strings.Index(out.Source, `"""d"""`)
+	j := strings.Index(out.Source, "cython.declare(n=")
+	if i < 0 || j < 0 || j < i {
+		t.Fatalf("declaration must follow the docstring:\n%s", out.Source)
+	}
+}

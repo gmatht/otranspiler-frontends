@@ -88,20 +88,34 @@ func AnnotateCython(src string, opts Options) (*CythonOutput, error) {
 		return nil, fmt.Errorf("python2cython: %s", errs[0])
 	}
 
-	var typed, assigned map[string]bool
+	moduleTyped, moduleAssigned := map[string]bool{}, map[string]bool{}
+	funcTyped := map[string]bool{}
+	var ins []insertion
 	switch opts.Level {
 	case OptNone:
-		typed, assigned = map[string]bool{}, map[string]bool{}
-	case OptSimple:
-		typed, assigned = proveSimple(tree)
+		// passthrough: no declarations at all
 	default:
-		env, as := proveRanges(tree)
-		typed, assigned = map[string]bool{}, as
-		for n, v := range env {
-			if v.ok {
-				typed[n] = true
-			}
+		moduleTyped, moduleAssigned = proveNames(tree, opts.Level)
+		var fnNames []string
+		ins, fnNames = collectFuncDecls(tree, strings.Split(src, "\n"), opts.Level)
+		for _, n := range fnNames {
+			funcTyped[n] = true
 		}
+	}
+
+	typed := map[string]bool{}
+	for n := range moduleTyped {
+		typed[n] = true
+	}
+	for n := range funcTyped {
+		typed[n] = true
+	}
+	assigned := map[string]bool{}
+	for n := range moduleAssigned {
+		assigned[n] = true
+	}
+	for n := range funcTyped {
+		assigned[n] = true
 	}
 
 	var names, refused []string
@@ -115,18 +129,140 @@ func AnnotateCython(src string, opts Options) (*CythonOutput, error) {
 	sort.Strings(names)
 	sort.Strings(refused)
 
+	body := src
+	if len(ins) > 0 {
+		body = applyInsertions(src, ins)
+	}
 	var b strings.Builder
 	b.WriteString("# cython: language_level=3\nimport cython\n")
-	if len(names) > 0 {
-		decls := make([]string, len(names))
-		for i, n := range names {
-			decls[i] = n + "=cython.longlong"
-		}
-		b.WriteString("cython.declare(" + strings.Join(decls, ", ") + ")")
-		b.WriteByte('\n')
+	if len(moduleTyped) > 0 {
+		b.WriteString(declLine(sortedKeys(moduleTyped)))
 	}
-	b.WriteString(src)
+	b.WriteString(body)
 	return &CythonOutput{Source: b.String(), Typed: names, Refused: refused}, nil
+}
+
+func declLine(names []string) string {
+	decls := make([]string, len(names))
+	for i, n := range names {
+		decls[i] = n + "=cython.longlong"
+	}
+	return "cython.declare(" + strings.Join(decls, ", ") + ")\n"
+}
+
+// proveNames runs the chosen analysis and returns the proved + assigned names.
+func proveNames(tree antlr.Tree, level Level) (map[string]bool, map[string]bool) {
+	if level == OptSimple {
+		return proveSimple(tree)
+	}
+	env, assigned := proveRanges(tree)
+	typed := map[string]bool{}
+	for n, v := range env {
+		if v.ok {
+			typed[n] = true
+		}
+	}
+	return typed, assigned
+}
+
+// insertion places text before a 1-based source line.
+type insertion struct {
+	line int
+	text string
+}
+
+// collectFuncDecls proves each function's LOCAL ranges and returns the
+// `cython.declare(...)` lines to insert at the top of each body (after a
+// docstring). Parameters are never declared: a parameter can be any Python
+// object, so forcing a C type would change behaviour for non-int callers.
+func collectFuncDecls(tree antlr.Tree, lines []string, level Level) ([]insertion, []string) {
+	var ins []insertion
+	typed := map[string]bool{}
+	walkTree(tree, func(n antlr.Tree) {
+		fn, ok := n.(gen.IFuncdefContext)
+		if !ok {
+			return
+		}
+		body := fn.Block()
+		if body == nil {
+			return
+		}
+		localTyped, assigned := proveNames(body, level)
+		params := map[string]bool{}
+		if p := fn.Parameters(); p != nil {
+			for _, id := range reIdentAll.FindAllString(p.GetText(), -1) {
+				params[id] = true
+			}
+		}
+		var names []string
+		for nm := range localTyped {
+			if assigned[nm] && !params[nm] {
+				names = append(names, nm)
+				typed[nm] = true
+			}
+		}
+		if len(names) == 0 {
+			return
+		}
+		sort.Strings(names)
+		stmts := body.AllStmt()
+		if len(stmts) == 0 {
+			return
+		}
+		line := stmts[0].GetStart().GetLine()
+		if isDocstring(stmts[0]) {
+			if len(stmts) > 1 {
+				line = stmts[1].GetStart().GetLine()
+			} else {
+				line = stmts[0].GetStop().GetLine() + 1
+			}
+		}
+		if line < 1 {
+			line = 1
+		}
+		if line > len(lines) {
+			line = len(lines)
+		}
+		indent := leadingWS(lines[line-1])
+		ins = append(ins, insertion{line: line, text: indent + strings.TrimRight(declLine(names), "\n")})
+	})
+	return ins, sortedKeys(typed)
+}
+
+func isDocstring(s gen.IStmtContext) bool {
+	text := strings.TrimSpace(s.GetText())
+	return strings.HasPrefix(text, `"`) || strings.HasPrefix(text, `'`)
+}
+
+func leadingWS(s string) string {
+	for i := 0; i < len(s); i++ {
+		if s[i] != ' ' && s[i] != '\t' {
+			return s[:i]
+		}
+	}
+	return s
+}
+
+// applyInsertions inserts each text before its 1-based line, bottom-up so the
+// line numbers stay valid.
+func applyInsertions(src string, ins []insertion) string {
+	lines := strings.Split(src, "\n")
+	sort.Slice(ins, func(i, j int) bool { return ins[i].line > ins[j].line })
+	for _, in := range ins {
+		idx := in.line - 1
+		if idx < 0 {
+			idx = 0
+		}
+		if idx > len(lines) {
+			idx = len(lines)
+		}
+		nl := make([]string, 0, len(lines)+1)
+		nl = append(nl, lines[:idx]...)
+		nl = append(nl, in.text)
+		nl = append(nl, lines[idx:]...)
+		lines = nl
+	}
+	return strings.Join(lines, "\n")
 }
 
 // proveSimple is the OptSimple lattice: a scalar is typed iff every

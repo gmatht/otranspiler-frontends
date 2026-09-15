@@ -8,10 +8,11 @@ import (
 
 type Python3LexerBase struct {
 	*antlr.BaseLexer
-	tokens    []antlr.Token
-	indents   []int
-	Opened    int
-	lastToken antlr.Token
+	tokens     []antlr.Token
+	indents    []int
+	Opened     int
+	lastToken  antlr.Token
+	eofStarted bool
 }
 
 // Emit queues the automatically emitted token (the Go runtime returns one
@@ -55,18 +56,16 @@ func (l *Python3LexerBase) CreateDedent() antlr.Token {
 
 func (l *Python3LexerBase) NextToken() antlr.Token {
 	for len(l.tokens) == 0 {
-		// End of input with open indents: synthesise the trailing NEWLINE and
-		// one DEDENT per open indent before EOF (CPython's tokenizer does).
-		if l.GetInputStream().LA(1) == antlr.TokenEOF && len(l.indents) != 0 {
-			l.EmitToken(l.MakeCommonToken(Python3ParserNEWLINE, "\n"))
-			for len(l.indents) != 0 {
-				l.EmitToken(l.CreateDedent())
-				l.indents = l.indents[:len(l.indents)-1]
-			}
-			l.EmitToken(l.MakeCommonToken(antlr.TokenEOF, "<EOF>"))
+		t := l.BaseLexer.NextToken()
+		if t.GetTokenType() == antlr.TokenEOF {
+			// CPython's tokenizer synthesises a NEWLINE at end of input when
+			// the last statement was not newline-terminated (a file may end
+			// without `\n`, or with trailing whitespace), then one DEDENT per
+			// open indent, then EOF. Without this, `x = 1` (no trailing
+			// newline) fails with "expecting NEWLINE".
+			l.emitEOF()
 			continue
 		}
-		t := l.BaseLexer.NextToken()
 		// Emit()/EmitToken() already queue the token; only the runtime's own
 		// EOF path bypasses them, so queue t when it did not land.
 		if len(l.tokens) == 0 || l.tokens[len(l.tokens)-1] != t {
@@ -79,6 +78,29 @@ func (l *Python3LexerBase) NextToken() antlr.Token {
 		l.lastToken = x
 	}
 	return x
+}
+
+// emitEOF queues the end-of-input sequence (NEWLINE? DEDENT* EOF).
+func (l *Python3LexerBase) emitEOF() {
+	if !l.eofStarted {
+		if l.lastToken != nil && !isStmtTerminator(l.lastToken.GetTokenType()) {
+			l.EmitToken(l.MakeCommonToken(Python3ParserNEWLINE, "\n"))
+		}
+		for len(l.indents) != 0 {
+			l.EmitToken(l.CreateDedent())
+			l.indents = l.indents[:len(l.indents)-1]
+		}
+		l.eofStarted = true
+	}
+	l.EmitToken(l.MakeCommonToken(antlr.TokenEOF, "<EOF>"))
+}
+
+func isStmtTerminator(tt int) bool {
+	switch tt {
+	case Python3ParserNEWLINE, Python3ParserINDENT, Python3ParserDEDENT:
+		return true
+	}
+	return false
 }
 
 func (l *Python3LexerBase) GetIndentationCount(spaces string) int {
@@ -141,6 +163,7 @@ func (l *Python3LexerBase) Reset() {
 	l.tokens = make([]antlr.Token, 0)
 	l.indents = make([]int, 0)
 	l.Opened = 0
+	l.eofStarted = false
 	//l.lastToken = null
 	l.BaseLexer.Reset()
 }
