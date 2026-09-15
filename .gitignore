@@ -2,6 +2,8 @@ __pycache__/
 *.pyc
 go-sh/go-sh
 py-sh-go/py-sh-go
+# py2cy is built by `make py2cy` (cmd/py2cy) like every other frontend binary
+py-sh-go/py2cy
 posix-sh-go/posix-sh-go
 perl-sh-go/perl-sh-go
 loop-*.log
