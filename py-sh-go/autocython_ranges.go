@@ -494,6 +494,16 @@ func widenChanged(e, before env) {
 // operand is a Python object the whole expression is evaluated by Python
 // (exact), and a variable's proved interval is a property of its VALUE, so
 // remaining declarations stay sound.
+var reIdCall = regexp.MustCompile(`\bid\s*\(`)
+
+func banNames(text string, typed, bad map[string]bool) {
+	for _, id := range reIdentAll.FindAllString(text, -1) {
+		if typed[id] {
+			bad[id] = true
+		}
+	}
+}
+
 func unsafeTypedNames(n antlr.Tree, e env, typed map[string]bool) map[string]bool {
 	bad := map[string]bool{}
 	var walk func(antlr.Tree, bool)
@@ -501,13 +511,28 @@ func unsafeTypedNames(n antlr.Tree, e env, typed map[string]bool) map[string]boo
 		if _, isFn := t.(gen.IFuncdefContext); isFn && !root {
 			return // own scope: its own env types it
 		}
-		if ctx, ok := t.(gen.IExprContext); ok {
+		switch ctx := t.(type) {
+		case gen.IExprContext:
 			text := ctx.GetText()
 			if strings.ContainsAny(text, "+-*&|^<>") && !evalText(text, e).ok {
-				for _, id := range reIdentAll.FindAllString(text, -1) {
-					if typed[id] {
-						bad[id] = true
+				banNames(text, typed, bad)
+			}
+		case gen.IComparisonContext:
+			// `a is b` / `a is not b`: identity, which a C value cannot have
+			// (Cython would compare values). Refuse the operands.
+			for _, op := range ctx.AllComp_op() {
+				if op.IS() != nil {
+					for _, ex := range ctx.AllExpr() {
+						banNames(ex.GetText(), typed, bad)
 					}
+					break
+				}
+			}
+		case gen.IAtom_exprContext:
+			// `id(x)` boxes a C value into a fresh object on every call.
+			if reIdCall.MatchString(ctx.GetText()) {
+				for k := range typed {
+					bad[k] = true
 				}
 			}
 		}

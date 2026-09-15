@@ -575,7 +575,8 @@ pinned by `spec_collect_rejects_baked_array_index_in_bare_arith`.
 - **usage safety**: a typed variable forces its whole expression into C, so
   any typed name in an expression that is not provably i64-safe (wrap-prone
   `+ - *`, shifts, bitwise) is refused as well — `x = 2**63-1; y = x + 1`
-  leaves *both* exact. `/`, `//`, `%` stay safe because the emitted header
+  leaves *both* exact. A value used with `is`/`is not` or `id()` is never
+  typed (a C value has no Python identity). `/`, `//`, `%` stay safe because the emitted header
   does **not** set `cdivision=True` (Cython's default gives Python
   semantics); `coverage/semantics-parity.sh` pins all of this;
 - **function scope**: each `def`'s locals are proved with the same analysis,

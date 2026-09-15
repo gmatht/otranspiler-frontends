@@ -228,3 +228,14 @@ func TestAnnotateOverflowOperandNotTyped(t *testing.T) {
 		t.Fatalf("safe arithmetic must stay typed: %v", out.Typed)
 	}
 }
+
+func TestAnnotateIdentityNotTyped(t *testing.T) {
+	// `a is b`: a C value has no Python identity, so both operands are refused
+	if out := annotate(t, "a = 1000\nb = a + 0\nprint(a is b)\n"); typed(out, "a") || typed(out, "b") {
+		t.Fatalf("is-operands must not be typed: %v", out.Typed)
+	}
+	// `id(x)` boxes a fresh object each call
+	if out := annotate(t, "a = 5\nprint(id(a))\n"); typed(out, "a") {
+		t.Fatalf("id() must disable typing: %v", out.Typed)
+	}
+}

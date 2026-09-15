@@ -56,6 +56,10 @@ print(c)'
 run aug_overflow 'x = 9223372036854775800
 x += 100
 print(x)'
+run identity_is 'a = 1000
+b = a + 0
+print(a is b, a == b)'
+
 run func_neg 'def f(a, b):
     c = a % b
     return c
