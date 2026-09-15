@@ -482,6 +482,43 @@ func widenChanged(e, before env) {
 	}
 }
 
+// unsafeTypedNames scans the arithmetic expressions of ONE scope and returns
+// the typed names that must NOT be declared: a typed variable makes its
+// whole expression evaluate in C, so every such expression must be provably
+// i64-safe. `a + b`, `a * b`, shifts and bitwise ops can wrap (C has no
+// Python big-int fixup); `/`, `//`, `%` are safe because the emitted header
+// leaves `cdivision` at its default (False), where Cython applies Python
+// semantics.
+//
+// De-typing every typed name in an unsafe expression is sufficient: once one
+// operand is a Python object the whole expression is evaluated by Python
+// (exact), and a variable's proved interval is a property of its VALUE, so
+// remaining declarations stay sound.
+func unsafeTypedNames(n antlr.Tree, e env, typed map[string]bool) map[string]bool {
+	bad := map[string]bool{}
+	var walk func(antlr.Tree, bool)
+	walk = func(t antlr.Tree, root bool) {
+		if _, isFn := t.(gen.IFuncdefContext); isFn && !root {
+			return // own scope: its own env types it
+		}
+		if ctx, ok := t.(gen.IExprContext); ok {
+			text := ctx.GetText()
+			if strings.ContainsAny(text, "+-*&|^<>") && !evalText(text, e).ok {
+				for _, id := range reIdentAll.FindAllString(text, -1) {
+					if typed[id] {
+						bad[id] = true
+					}
+				}
+			}
+		}
+		for i := 0; i < t.GetChildCount(); i++ {
+			walk(t.GetChild(i), false)
+		}
+	}
+	walk(n, true)
+	return bad
+}
+
 // ── expression interval evaluation (textual: the subset is small) ────────
 
 func evalText(text string, e env) iv { return evalTextDepth(text, e, 0) }
@@ -629,6 +666,23 @@ func splitTop(s, ops string) (string, string, string, bool) {
 		}
 	}
 	return "", "", "", false
+}
+
+// splitTopTwo splits at a top-level two-character operator (`**`, `//`).
+func splitTopTwo(s, op string) (string, string, bool) {
+	depth := 0
+	for i := len(s) - len(op); i >= 0; i-- {
+		switch s[i] {
+		case ')', ']', '}':
+			depth++
+		case '(', '[', '{':
+			depth--
+		}
+		if depth == 0 && s[i:i+len(op)] == op {
+			return s[:i], s[i+len(op):], true
+		}
+	}
+	return "", "", false
 }
 
 func applyBin(op string, a, b iv) iv {

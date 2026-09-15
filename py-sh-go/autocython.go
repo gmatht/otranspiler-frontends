@@ -108,7 +108,13 @@ func AnnotateCython(src string, opts Options) (*CythonOutput, error) {
 	case OptNone:
 		// passthrough: no declarations at all
 	default:
-		moduleTyped, moduleAssigned = proveNames(tree, opts.Level)
+		var moduleEnv env
+		moduleTyped, moduleAssigned, moduleEnv = proveNames(tree, opts.Level)
+		if fi, ok := tree.(gen.IFile_inputContext); ok {
+			for n := range unsafeTypedNames(fi, moduleEnv, moduleTyped) {
+				delete(moduleTyped, n)
+			}
+		}
 		var fnNames []string
 		ins, fnNames = collectFuncDecls(tree, strings.Split(src, "\n"), opts.Level, opts.Mode)
 		for _, n := range fnNames {
@@ -169,19 +175,22 @@ func declLine(names []string, mode Mode) string {
 	return "cython.declare(" + strings.Join(decls, ", ") + ")\n"
 }
 
-// proveNames runs the chosen analysis and returns the proved + assigned names.
-func proveNames(tree antlr.Tree, level Level) (map[string]bool, map[string]bool) {
+// proveNames runs the chosen analysis and returns the proved + assigned names
+// plus the interval env (used by the usage-safety scan).
+func proveNames(tree antlr.Tree, level Level) (map[string]bool, map[string]bool, env) {
 	if level == OptSimple {
-		return proveSimple(tree)
+		e, _ := proveRanges(tree)
+		typed, assigned := proveSimple(tree)
+		return typed, assigned, e
 	}
-	env, assigned := proveRanges(tree)
+	e, assigned := proveRanges(tree)
 	typed := map[string]bool{}
-	for n, v := range env {
+	for n, v := range e {
 		if v.ok {
 			typed[n] = true
 		}
 	}
-	return typed, assigned
+	return typed, assigned, e
 }
 
 // insertion places text before a 1-based source line.
@@ -206,7 +215,10 @@ func collectFuncDecls(tree antlr.Tree, lines []string, level Level, mode Mode) (
 		if body == nil {
 			return
 		}
-		localTyped, assigned := proveNames(body, level)
+		localTyped, assigned, e := proveNames(body, level)
+		for n := range unsafeTypedNames(body, e, localTyped) {
+			delete(localTyped, n)
+		}
 		params := map[string]bool{}
 		if p := fn.Parameters(); p != nil {
 			for _, id := range reIdentAll.FindAllString(p.GetText(), -1) {

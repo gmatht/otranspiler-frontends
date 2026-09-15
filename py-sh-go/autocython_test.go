@@ -209,3 +209,22 @@ func TestAnnotatePyxMode(t *testing.T) {
 		t.Fatalf("py mode changed:\n%s", py.Source)
 	}
 }
+
+func TestAnnotateOverflowOperandNotTyped(t *testing.T) {
+	// typing x would make `x + 1` a C wrap: the OPERAND must be refused even
+	// though only the RESULT (y) is unprovable.
+	if out := annotate(t, "x = 9223372036854775807\ny = x + 1\nprint(y)\n"); typed(out, "x") {
+		t.Fatalf("x must not be typed (x+1 overflows i64): %v", out.Typed)
+	}
+	// shifts / bitwise have C semantics that differ from Python for big ints
+	if out := annotate(t, "a = 1\nb = 100\nc = a << b\nprint(c)\n"); typed(out, "a") || typed(out, "b") {
+		t.Fatalf("shift operands must not be typed: %v", out.Typed)
+	}
+	if out := annotate(t, "a = 1\nb = 2\nc = a & b\nprint(c)\n"); typed(out, "a") {
+		t.Fatalf("bitwise operand must not be typed: %v", out.Typed)
+	}
+	// but a provably-safe arithmetic expression keeps its operands typed
+	if out := annotate(t, "h = 0\nfor i in range(10):\n    h = (h * 31 + i) % 7\nprint(h)\n"); !typed(out, "h") || !typed(out, "i") {
+		t.Fatalf("safe arithmetic must stay typed: %v", out.Typed)
+	}
+}
