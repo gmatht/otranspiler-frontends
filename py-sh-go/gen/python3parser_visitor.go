@@ -271,6 +271,9 @@ type Python3ParserVisitor interface {
 	// Visit a parse tree produced by Python3Parser#test.
 	VisitTest(ctx *TestContext) interface{}
 
+	// Visit a parse tree produced by Python3Parser#namedexpr_test.
+	VisitNamedexpr_test(ctx *Namedexpr_testContext) interface{}
+
 	// Visit a parse tree produced by Python3Parser#test_nocond.
 	VisitTest_nocond(ctx *Test_nocondContext) interface{}
 

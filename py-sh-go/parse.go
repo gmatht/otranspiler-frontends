@@ -29,8 +29,9 @@ func (e *errCollector) SyntaxError(_ antlr.Recognizer, _ interface{}, line, colu
 // ParsePython parses src with the full ANTLR Python3 grammar and returns
 // the file_input tree plus any syntax-error messages (empty = accepted).
 //
-// Known upstream-grammar gap: the walrus operator (`(n := f())`) is not in
-// the grammars-v4 Python3 grammar and is reported as a syntax error.
+// The grammar carries CPython's `namedexpr_test`, so the walrus operator
+// (`(n := f())`, `if n := f():`, `print(x := 1)`, `[y := f(x) for x in it]`)
+// parses too — see corpus/walrus.py.
 func ParsePython(src string) (antlr.ParseTree, []string) {
 	ec := &errCollector{DefaultErrorListener: antlr.NewDefaultErrorListener()}
 

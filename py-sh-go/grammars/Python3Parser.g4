@@ -281,11 +281,11 @@ async_stmt
     ;
 
 if_stmt
-    : 'if' test ':' block ('elif' test ':' block)* ('else' ':' block)?
+    : 'if' namedexpr_test ':' block ('elif' namedexpr_test ':' block)* ('else' ':' block)?
     ;
 
 while_stmt
-    : 'while' test ':' block ('else' ':' block)?
+    : 'while' namedexpr_test ':' block ('else' ':' block)?
     ;
 
 for_stmt
@@ -510,6 +510,15 @@ test
     | lambdef
     ;
 
+// CPython's `namedexpr_test: test [':=' test]` — the walrus operator. It
+// is only allowed unparenthesised in the positions CPython allows it (an
+// `if`/`while` condition, a comprehension element, an argument, a
+// parenthesised testlist_comp); elsewhere `(x := y)` reaches it through
+// `atom` -> `testlist_comp`.
+namedexpr_test
+    : test (COLONEQUAL test)?
+    ;
+
 test_nocond
     : or_test
     | lambdef_nocond
@@ -604,7 +613,7 @@ name
     ;
 
 testlist_comp
-    : (test | star_expr) (comp_for | (',' (test | star_expr))* ','?)
+    : (namedexpr_test | star_expr) (comp_for | (',' (namedexpr_test | star_expr))* ','?)
     ;
 
 trailer
@@ -637,7 +646,7 @@ testlist
 dictorsetmaker
     : (
         ((test ':' test | '**' expr) (comp_for | (',' (test ':' test | '**' expr))* ','?))
-        | ((test | star_expr) (comp_for | (',' (test | star_expr))* ','?))
+        | ((namedexpr_test | star_expr) (comp_for | (',' (namedexpr_test | star_expr))* ','?))
     )
     ;
 
@@ -659,7 +668,7 @@ arglist
 // multiple (test comp_for) arguments are blocked; keyword unpackings
 // that precede iterable unpackings are blocked; etc.
 argument
-    : (test comp_for? | test '=' test | '**' test | '*' test)
+    : (namedexpr_test comp_for? | test '=' test | '**' test | '*' test)
     ;
 
 comp_iter

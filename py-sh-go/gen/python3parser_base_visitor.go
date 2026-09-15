@@ -359,6 +359,10 @@ func (v *BasePython3ParserVisitor) VisitTest(ctx *TestContext) interface{} {
 	return v.VisitChildren(ctx)
 }
 
+func (v *BasePython3ParserVisitor) VisitNamedexpr_test(ctx *Namedexpr_testContext) interface{} {
+	return v.VisitChildren(ctx)
+}
+
 func (v *BasePython3ParserVisitor) VisitTest_nocond(ctx *Test_nocondContext) interface{} {
 	return v.VisitChildren(ctx)
 }

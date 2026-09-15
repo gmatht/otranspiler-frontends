@@ -271,6 +271,9 @@ type Python3ParserListener interface {
 	// EnterTest is called when entering the test production.
 	EnterTest(c *TestContext)
 
+	// EnterNamedexpr_test is called when entering the namedexpr_test production.
+	EnterNamedexpr_test(c *Namedexpr_testContext)
+
 	// EnterTest_nocond is called when entering the test_nocond production.
 	EnterTest_nocond(c *Test_nocondContext)
 
@@ -627,6 +630,9 @@ type Python3ParserListener interface {
 
 	// ExitTest is called when exiting the test production.
 	ExitTest(c *TestContext)
+
+	// ExitNamedexpr_test is called when exiting the namedexpr_test production.
+	ExitNamedexpr_test(c *Namedexpr_testContext)
 
 	// ExitTest_nocond is called when exiting the test_nocond production.
 	ExitTest_nocond(c *Test_nocondContext)

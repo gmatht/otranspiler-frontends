@@ -548,6 +548,12 @@ func (s *BasePython3ParserListener) EnterTest(ctx *TestContext) {}
 // ExitTest is called when production test is exited.
 func (s *BasePython3ParserListener) ExitTest(ctx *TestContext) {}
 
+// EnterNamedexpr_test is called when production namedexpr_test is entered.
+func (s *BasePython3ParserListener) EnterNamedexpr_test(ctx *Namedexpr_testContext) {}
+
+// ExitNamedexpr_test is called when production namedexpr_test is exited.
+func (s *BasePython3ParserListener) ExitNamedexpr_test(ctx *Namedexpr_testContext) {}
+
 // EnterTest_nocond is called when production test_nocond is entered.
 func (s *BasePython3ParserListener) EnterTest_nocond(ctx *Test_nocondContext) {}
 

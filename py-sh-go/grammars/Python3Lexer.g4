@@ -136,6 +136,7 @@ STAR               : '*';
 OPEN_PAREN         : '(' {this.openBrace();};
 CLOSE_PAREN        : ')' {this.closeBrace();};
 COMMA              : ',';
+COLONEQUAL         : ':=';
 COLON              : ':';
 SEMI_COLON         : ';';
 POWER              : '**';
