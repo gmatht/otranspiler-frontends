@@ -53,6 +53,20 @@ func TestAnnotateTypedShapes(t *testing.T) {
 	}
 }
 
+func TestAnnotateWhileCounter(t *testing.T) {
+	for _, tc := range []struct{ src, name string }{
+		{"i = 0\nwhile i < 5:\n    i = i + 1\nprint(i)\n", "i"},
+		{"i = 0\nwhile i < 5:\n    i += 2\nprint(i)\n", "i"},
+		{"i = 10\nwhile i > 0:\n    i = i - 1\nprint(i)\n", "i"},
+		{"i = 0\nwhile i <= 5:\n    i = i + 1\nprint(i)\n", "i"},
+	} {
+		out := annotate(t, tc.src)
+		if !typed(out, tc.name) {
+			t.Errorf("%q: expected %s typed; got %v (refused %v)", tc.src, tc.name, out.Typed, out.Refused)
+		}
+	}
+}
+
 func TestAnnotateRefusedShapes(t *testing.T) {
 	for _, tc := range []struct{ src, refuse string }{
 		{"x = 1.5\n", "x"},
@@ -71,6 +85,11 @@ func TestAnnotateRefusedShapes(t *testing.T) {
 		{"x = -5\ny = x // 3\n", "y"},
 		{"x = 0\ntry:\n    x = 5\nexcept:\n    pass\n", "x"},
 		{"x = 0\nmatch v:\n    case 1:\n        x = 1\n", "x"},
+		{"i = 0\nwhile i < n:\n    i = i + 1\n", "i"},
+		{"i = 0\nwhile i < 5:\n    i = i * 2\n", "i"},
+		{"i = 0\nwhile i < 5:\n    i = i + j\n", "i"},
+		{"i = 0\nwhile i < 5:\n    i = i - 1\n", "i"},          // wrong direction
+		{"i = 0\nwhile i < 5:\n    i = i + 1\n    i = 0\n", "i"}, // two updates
 		// t101: a growing while accumulator must NOT be typed.
 		{"s = 1\ni = 0\nwhile i < 5:\n    s = s + 4000000000000000000\n    i = i + 1\nprint(s)\n", "s"},
 	} {

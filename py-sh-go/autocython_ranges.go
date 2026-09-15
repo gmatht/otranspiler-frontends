@@ -21,6 +21,7 @@ package pylib
 
 import (
 	"math"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -255,19 +256,136 @@ func runWhile(ctx gen.IWhile_stmtContext, e env, assigned map[string]bool, depth
 	if len(blocks) == 0 {
 		return
 	}
-	// unknown trip count: run once, then widen everything the body assigns.
-	bodyAssigned := map[string]bool{}
-	be := e.clone()
-	runNode(blocks[0], be, bodyAssigned, depth+1)
-	for k := range bodyAssigned {
-		assigned[k] = true
-		delete(e, k)
+	body := blocks[0]
+	if name, bound, ok := whileCounterBound(ctx, e); ok {
+		// A bounded counter (`while i < K: i = i + k`) is an invariant, so
+		// keep it proved across the body's fixed point.
+		assigned[name] = true
+		e.set(name, bound)
+		for i := 0; i < 6; i++ {
+			before := e.clone()
+			runNode(body, e, assigned, depth+1)
+			e.set(name, bound)
+			if envStable(e, before) {
+				break
+			}
+			if i == 5 {
+				widenChanged(e, before)
+			}
+		}
+		e.set(name, bound)
+	} else {
+		// unknown trip count: run once, then widen everything the body assigns.
+		bodyAssigned := map[string]bool{}
+		be := e.clone()
+		runNode(body, be, bodyAssigned, depth+1)
+		for k := range bodyAssigned {
+			assigned[k] = true
+			delete(e, k)
+		}
 	}
 	// the loop condition may contain a walrus (`while (n := f()):`); its
 	// target is left ⊤ (never proved), which is sound.
 	if len(blocks) > 1 {
 		runNode(blocks[1], e, assigned, depth+1)
 	}
+}
+
+var reCounterCond = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)(<=|>=|<|>)([+-]?[0-9]+)$`)
+
+// whileCounterBound proves `while <name> <op> <int literal>:` where the body's
+// only assignment to <name> is a constant step in the matching direction.
+// The bound is widened by one step so it also covers the value the counter
+// holds when the loop exits.
+func whileCounterBound(ctx gen.IWhile_stmtContext, e env) (string, iv, bool) {
+	ne := ctx.Namedexpr_test()
+	if ne == nil {
+		return "", iv{}, false
+	}
+	m := reCounterCond.FindStringSubmatch(ne.GetText())
+	if m == nil {
+		return "", iv{}, false
+	}
+	name, op, litText := m[1], m[2], m[3]
+	lit, err := strconv.ParseInt(litText, 10, 64)
+	if err != nil {
+		return "", iv{}, false
+	}
+	init, ok := e[name]
+	if !ok {
+		return "", iv{}, false
+	}
+	blocks := ctx.AllBlock()
+	if len(blocks) == 0 {
+		return "", iv{}, false
+	}
+	delta, ok := counterUpdate(blocks[0], name)
+	if !ok || delta == 0 {
+		return "", iv{}, false
+	}
+	up := op == "<" || op == "<="
+	if (up && delta < 0) || (!up && delta > 0) {
+		return "", iv{}, false
+	}
+	if up {
+		hi, ok := addOvf(lit-1, delta)
+		if !ok {
+			return "", iv{}, false
+		}
+		return name, known(init.lo, hi), true
+	}
+	lo, ok := addOvf(lit+1, -delta)
+	if !ok {
+		return "", iv{}, false
+	}
+	return name, known(lo, init.hi), true
+}
+
+// counterUpdate returns the constant step applied to name in the body, and
+// ok=false if the body assigns name in any other way (or not at all).
+func counterUpdate(body antlr.Tree, name string) (int64, bool) {
+	assigns := regexp.MustCompile(`^` + regexp.QuoteMeta(name) + `(\+?=|-=)`)
+	inc := regexp.MustCompile(`^` + regexp.QuoteMeta(name) + `=` + regexp.QuoteMeta(name) + `\+([0-9]+)$`)
+	dec := regexp.MustCompile(`^` + regexp.QuoteMeta(name) + `=` + regexp.QuoteMeta(name) + `-([0-9]+)$`)
+	plusFirst := regexp.MustCompile(`^` + regexp.QuoteMeta(name) + `=([0-9]+)\+` + regexp.QuoteMeta(name) + `$`)
+	augInc := regexp.MustCompile(`^` + regexp.QuoteMeta(name) + `\+=([0-9]+)$`)
+	augDec := regexp.MustCompile(`^` + regexp.QuoteMeta(name) + `-=([0-9]+)$`)
+
+	var delta int64
+	found := false
+	okAll := true
+	walkTree(body, func(t antlr.Tree) {
+		es, isExpr := t.(gen.IExpr_stmtContext)
+		if !isExpr {
+			return
+		}
+		text := es.GetText()
+		if !assigns.MatchString(text) {
+			return
+		}
+		if found { // more than one assignment to the counter
+			okAll = false
+			return
+		}
+		found = true
+		switch {
+		case inc.MatchString(text):
+			delta, _ = strconv.ParseInt(inc.FindStringSubmatch(text)[1], 10, 64)
+		case dec.MatchString(text):
+			d, _ := strconv.ParseInt(dec.FindStringSubmatch(text)[1], 10, 64)
+			delta = -d
+		case plusFirst.MatchString(text):
+			delta, _ = strconv.ParseInt(plusFirst.FindStringSubmatch(text)[1], 10, 64)
+		case augInc.MatchString(text):
+			delta, _ = strconv.ParseInt(augInc.FindStringSubmatch(text)[1], 10, 64)
+		case augDec.MatchString(text):
+			d, _ := strconv.ParseInt(augDec.FindStringSubmatch(text)[1], 10, 64)
+			delta = -d
+		default:
+			okAll = false
+		}
+	})
+	return delta, found && okAll
 }
 
 func runIf(ctx gen.IIf_stmtContext, e env, assigned map[string]bool, depth int) {
