@@ -12,7 +12,7 @@
 # Also measures the vendored grammars-v4 Python3 grammars (real, in-repo
 # at py-sh-go/grammars/) over the Python corpus.
 #
-# Usage: bash frontends/coverage/antlr-coverage.sh
+# Usage: bash coverage/antlr-coverage.sh
 set -u
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 FE="$ROOT/frontends"
