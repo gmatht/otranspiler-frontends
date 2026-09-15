@@ -46,8 +46,8 @@ func TestI128LiteralAssign(t *testing.T) {
 		lit      string
 		wantU128 bool
 	}{
-		{"1267650600228229401496703205376", true},   // 2**100
-		{"340282366920938463463374607431768211455", true}, // 2**128-1
+		{"1267650600228229401496703205376", true},          // 2**100
+		{"340282366920938463463374607431768211455", true},  // 2**128-1
 		{"340282366920938463463374607431768211456", false}, // 2**128: refuse
 		{"-5", false}, // fits i64: single owner stays canonical there
 	} {
@@ -181,19 +181,6 @@ func TestI128EmitStraight(t *testing.T) {
 	}
 }
 
-func TestI128Declines(t *testing.T) {
-	for _, src := range []string{
-		"x = 0\nprint(x)\n",                  // no bigint (all i64)
-		"x = 1267650600228229401496703205376\nprint(x + x)\n", // hmm: x+x fits u128!
-		"x = 2 ** 100\nif x > 0:\n    pass\n", // bigint in a condition... allowed? yes if condOk
-		"x = 2 ** 100\ndef f():\n    return x\n", // function scope
-		"print(x)\nx = 1267650600228229401496703205376\n", // use before proof
-		"x = 340282366920938463463374607431768211456\nprint(x)\n", // 2**128: beyond tier
-	} {
-		_ = src
-	}
-}
-
 func TestI128MagConsistent(t *testing.T) {
 	// Every declared i128/u128 var has exactly one mag row with real
 	// decimal bounds; every mag row's var is declared. (Single source of
@@ -238,5 +225,36 @@ func TestI128MagConsistent(t *testing.T) {
 				t.Errorf("wide %s has %d mag rows", n, seen[n])
 			}
 		}
+	}
+}
+
+func TestI128Declines(t *testing.T) {
+	// Every shape outside the exact subset must decline (fail-closed).
+	// Each was verified to decline for the stated reason (not assumed).
+	for _, tc := range []struct{ tag, src, why string }{
+		{"no-bigint", "x = 0\nprint(x)\n", "nothing exceeds i64"},
+		{"func-scope", "x = 2 ** 100\ndef f():\n    return x\n", "function scope"},
+		{"use-before-def", "print(x)\nx = 1267650600228229401496703205376\n", "dominance (NameError)"},
+		{"beyond-128", "x = 340282366920938463463374607431768211456\nprint(x)\n", "2**128 needs GMP"},
+		{"wide-bound-cond", "x = 1267650600228229401496703205376\nif x > 340282366920938463463374607431768211456:\n    pass\n", "200-bit bound exceeds signed temp"},
+		{"unknown-call", "x = input()\nprint(x)\n", "unprovable value"},
+		{"for-loop", "x = 1267650600228229401496703205376\nfor i in range(3):\n    print(i)\n", "for-range not in subset"},
+	} {
+		if _, ok, err := AnnotateI128(tc.src); err != nil || ok {
+			t.Errorf("%s (%s): expected decline, got ok=%v err=%v", tc.tag, tc.why, ok, err)
+		}
+	}
+}
+
+func TestI128IfConditionAccepts(t *testing.T) {
+	// i128 conditions are exact in C (unlike GMP, which declines bigint
+	// conditions): `x = 2**100; if x > 0: pass` transforms.
+	src := "x = 2 ** 100\nif x > 0:\n    pass\n"
+	out, ok, err := AnnotateI128(src)
+	if err != nil || !ok {
+		t.Fatalf("expected transform, got ok=%v err=%v", ok, err)
+	}
+	if len(out.U128) != 1 || out.U128[0] != "x" {
+		t.Errorf("U128 = %v", out.U128)
 	}
 }
