@@ -558,6 +558,13 @@ pinned by `spec_collect_rejects_baked_array_index_in_bare_arith`.
   `# cython: language_level=3` header, `import cython`, a
   `cython.declare(<name>=cython.longlong, ...)` line for the proved scalars,
   and the **unmodified** source (so the file stays valid CPython);
+- **levels** (`--no-opts`, `--simple-opts-only`, default *full*) — all
+  behaviour-preserving, trading cleverness for surprise: none emits no
+  declarations, simple proves only i64 literals + literal-bounded counters,
+  full runs the interval analysis. `--gmp` (the bigint transform, §9 Q3) is
+  reserved and not implemented: with it off — the default — bigints stay
+  exact Python ints (~1× CPython, no faster), because GMP is `.pyx`-only and
+  needs `-lgmp`;
 - **soundness is a sound i64 interval analysis** (`autocython_ranges.go`):
   a scalar's abstract value is an interval or ⊤; arithmetic is interval
   arithmetic with **any overflow → ⊤**; `a % m` with `m > 0` and a provably

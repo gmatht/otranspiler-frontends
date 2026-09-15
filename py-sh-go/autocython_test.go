@@ -19,11 +19,33 @@ func typed(out *CythonOutput, name string) bool {
 
 func annotate(t *testing.T, src string) *CythonOutput {
 	t.Helper()
-	out, err := AnnotateCython(src)
+	out, err := AnnotateCython(src, DefaultOptions())
 	if err != nil {
 		t.Fatalf("annotate %q: %v", src, err)
 	}
 	return out
+}
+
+// TestAnnotateLevels pins the three levels: none declares nothing, simple
+// proves i64 literals + literal-bounded counters, full adds the interval
+// analysis (here the accumulator h). All are behaviour-preserving.
+func TestAnnotateLevels(t *testing.T) {
+	src := "h = 0\nfor i in range(2000000):\n    h = (h * 31 + i) % 1000000007\nprint(h)\n"
+	none, err := AnnotateCython(src, Options{Level: OptNone})
+	if err != nil || len(none.Typed) != 0 {
+		t.Fatalf("none: typed=%v err=%v", none.Typed, err)
+	}
+	simple, err := AnnotateCython(src, Options{Level: OptSimple})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !typed(simple, "i") || typed(simple, "h") {
+		t.Fatalf("simple: want i only, got %v", simple.Typed)
+	}
+	full := annotate(t, src)
+	if !typed(full, "h") || !typed(full, "i") {
+		t.Fatalf("full: want h and i, got %v", full.Typed)
+	}
 }
 
 func TestAnnotateRollingHash(t *testing.T) {
@@ -128,7 +150,7 @@ func TestAnnotateScalarCoverage(t *testing.T) {
 }
 
 func TestAnnotateRejectsSyntaxError(t *testing.T) {
-	if _, err := AnnotateCython("def f(:\n    pass\n"); err == nil {
+	if _, err := AnnotateCython("def f(:\n    pass\n", DefaultOptions()); err == nil {
 		t.Fatal("expected a syntax error")
 	}
 }
