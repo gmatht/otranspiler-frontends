@@ -1,9 +1,10 @@
 // py-sh-go: Python source -> shIR JSON (A1 contract), ANTLR4+Go.
 //
-// The full antlr4-generated Python parser is TODO (grammars/ holds the
-// official Python3 grammar — generation is the worker's job). This file
-// is a hand-rolled recursive-descent parser + lowerer for the v1
-// shell-flavored Python subset (the t01-t52 language-ladder corpus):
+// The full antlr4-generated Python parser is in gen/ (`make gen`; expose
+// it with `py-sh-go --parse <file.py>`, see parse.go). This file is the
+// hand-rolled recursive-descent parser + lowerer for the v1 shell-flavored
+// Python subset (the t01-t101 language-ladder corpus) and is still what
+// `--shir` lowers from; lowering from the ANTLR tree is the next slice:
 //
 //	print(...) / f-strings / %-format       → echo / printf
 //	assignments / tuple assignment           → Assign (arith via Arith)

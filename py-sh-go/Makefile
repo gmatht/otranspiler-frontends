@@ -1,28 +1,39 @@
 # py-sh-go: Python source -> shIR JSON (A1 contract), ANTLR4+Go.
-# The hand-rolled recursive-descent parser + lowerer in main.go handles the
-# v1 shell-flavored Python subset (the t01-t52 language-ladder corpus);
-# `build` compiles it (the antlr4 generation from grammars/Python3Lexer.g4
-# + Python3Parser.g4 is the WORKER's job — it is not a build blocker).
+# Two parsers live here:
+#   * gen/ — the FULL ANTLR4 Go Python 3 parser (generated from the
+#     upstream grammars in grammars/; regenerate with `make gen`). It is
+#     the coverage front end: `py-sh-go --parse <file.py>` accepts
+#     essentially all Python (classes, decorators, async, comprehensions,
+#     match, ...; the upstream grammar's one gap is the walrus operator).
+#   * main.go — the hand-rolled recursive-descent parser + lowerer for the
+#     v1 shell-flavored Python subset (the t01-t101 corpus), still the
+#     path that emits A1. Lowering from the ANTLR tree is the next slice.
+#
 # `test` runs the INGRESS-ACCEPTANCE oracle (the core deserializer must
 # accept the emitted A1) + the EXECUTED-STDOUT gate: the transpiled
 # ESTree run's stdout must match the native python3 run for every test.
 # A passing test = real progress (correct output); a mismatch = the gap
-# the worker's pi should fix.
+# the worker's pi should fix. `parse-test` gates the ANTLR front end over
+# testdata/ + corpus/.
 
 ANTLR4 ?= antlr4
-CLI ?= $(abspath ../../otranspilerl/target/debug/otranspilerl-cli)
+CLI ?= $(abspath ../../../otranspilerl/target/debug/otranspilerl-cli)
 GO ?= /snap/go/current/bin/go
 
-.PHONY: all gen build test worker clean
+.PHONY: all gen build test parse-test worker clean
 
 all: build
 
-# TODO: generate the Go parser from grammars/Python3Lexer.g4 +
-# Python3Parser.g4. The worker (run_worker.sh -> pi/deepseek-v4-flash)
-# wires this. The stub in main.go is the initial impl.
+# Regenerate gen/ from grammars/ (dev-time only; the generated parser is
+# committed). Needs the ANTLR jar: ANTLR_JAR=... make gen
+# The in-repo grammars are the Java-targeted upstream files; tools/
+# gen_parser.sh retargets the `this.` actions for the Go receivers.
 gen:
-	@echo "TODO: antlr4 -Dlanguage=Go -package py_sh_go -visitor -o gen grammars/Python3Lexer.g4 grammars/Python3Parser.g4" >&2
-	@exit 1
+	ANTLR_JAR=$(ANTLR_JAR) ./tools/gen_parser.sh
+
+# ANTLR front-end coverage gate: testdata/*.py (all 98) + corpus/real_python.py.
+parse-test:
+	$(GO) test -run 'TestParse' .
 
 # Build the CLI (a thin wrapper over the pylib library at the module root).
 build:
@@ -48,8 +59,8 @@ build:
 # fresh automatically). A missing binary with a failed rebuild is still
 # a hard error. The estree worker owns the core build; core-requests/
 # py-sh-go-20260812-165614-glsl-wip-breaks-otranspilerl-cli-build.md tracks it.
-CORE ?= $(abspath ../../sh2perl)
-OTL ?= $(abspath ../../otranspilerl)
+CORE ?= $(abspath ../..)
+OTL ?= $(abspath ../../../otranspilerl)
 # otranspilerl-cli statically links the debashl core: a CLI OR a core
 # source change both stale the oracle.
 CORE_SRC := $(wildcard $(OTL)/src/*.rs $(CORE)/src/*.rs $(CORE)/src/parser/*.rs)
@@ -100,7 +111,7 @@ test: build $(CLI)
 	      # still be settling (cargo unlinks the old binary while the \
 	      # new one links; 2026-08-12 12:31 probes hit exit 127 in that \
 	      # window even after a successful rebuild). \
-	      (cd $(CORE) && cargo build --bin otranspilerl-cli > /dev/null 2>&1); \
+	      (cd $(OTL) && cargo build --bin otranspilerl-cli > /dev/null 2>&1); \
 	      probe_ok=0; \
 	      for i in 1 2 3 4 5; do \
 	        sleep 2; \
@@ -116,7 +127,7 @@ test: build $(CLI)
 	  fi; \
 	done
 	@echo "--- executed-stdout comparison (native vs JS/ESTree) ---"
-	@bash "$(abspath ../../harness/frontend-stdout.sh)" py ./py-sh-go testdata "$(CLI)" || exit 1
+	@bash "$(abspath ../../../harness/frontend-stdout.sh)" py ./py-sh-go testdata "$(CLI)" || exit 1
 
 worker: test
 	@echo "py-sh-go worker gate: ingress acceptance + executed-stdout passed"
