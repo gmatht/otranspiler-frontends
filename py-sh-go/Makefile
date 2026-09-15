@@ -46,6 +46,7 @@ py2cy-test: py2cy
 	MODE=py bash coverage/py2cy-parity.sh
 	MODE=pyx bash coverage/py2cy-parity.sh
 	bash coverage/semantics-parity.sh
+	bash coverage/container-parity.sh
 
 # Bigint transform: .pyx with cdef mpz_t + GMP calls (docs/AUTO_CYTHON.md
 # Stage 1b). Needs cython + gmp.h; declines fall back to the exact

@@ -263,3 +263,34 @@ func TestAnnotateFloat(t *testing.T) {
 		t.Fatalf("mixed x must not be typed: %v", out2.Typed)
 	}
 }
+
+func TestAnnotateIntList(t *testing.T) {
+	src := "xs = []\nfor i in range(10):\n    xs.append(i * i)\nprint(len(xs))\nprint(xs[3])\n"
+	out, _ := AnnotateCython(src, Options{Level: OptFull, Mode: ModePyx})
+	for _, want := range []string{
+		"_sh_push_i64", "cdef long long *xs = NULL", "print(xs_len)",
+		"xs = _sh_push_i64(xs, &xs_len, &xs_cap, i*i)",
+	} {
+		if !strings.Contains(out.Source, want) {
+			t.Fatalf("missing %q:\n%s", want, out.Source)
+		}
+	}
+	if strings.Contains(out.Source, "xs = []") {
+		t.Fatalf("empty-list assignment not removed:\n%s", out.Source)
+	}
+	// pure-Python mode has no C pointer: leave the list alone
+	if py, _ := AnnotateCython(src, DefaultOptions()); strings.Contains(py.Source, "_sh_push_i64") {
+		t.Fatalf("container leaked into py mode:\n%s", py.Source)
+	}
+	// REFUSE > GUESS: unsupported uses stay a Python list
+	for _, bad := range []string{
+		"xs = []\nfor i in range(3):\n    xs.append(i)\nfor v in xs:\n    print(v)\n", // iteration
+		"xs = []\nfor i in range(3):\n    xs.append(\"s\")\nprint(len(xs))\n",           // non-int
+		"xs = []\nfor i in range(3):\n    xs.append(i)\nprint(sum(xs))\n",              // reduction
+		"xs = []\nfor i in range(3):\n    xs.append(i)\nprint(xs)\n",                  // bare read
+	} {
+		if o, _ := AnnotateCython(bad, Options{Level: OptFull, Mode: ModePyx}); strings.Contains(o.Source, "_sh_push_i64") {
+			t.Errorf("unexpected transform for %q:\n%s", bad, o.Source)
+		}
+	}
+}

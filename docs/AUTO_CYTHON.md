@@ -577,6 +577,13 @@ pinned by `spec_collect_rejects_baked_array_index_in_bare_arith`.
   `/` is true division and always float; `+ - * % // **` yield a float when
   either operand is). A name assigned both an int and a float is neither.
   `--pyx` groups declarations by C type;
+- **typed int lists** (`.pyx` only): `xs = []; xs.append(<i64 expr>)` with
+  `len(xs)`/`xs[i]` is rewritten to a growable `long long *xs`
+  (`_sh_push_i64`); any other use of the list (iteration, `sum`, a bare
+  read, a non-int element) leaves it a Python list. REFUSE > GUESS, so the
+  transform only fires when every use is one of those forms. The list shape
+  measures 0.58 s vs 0.78 s CPython and 0.92 s pure Cython (the append
+  becomes a C store, not a boxed `PyList` append);
 - **usage safety**: a typed variable forces its whole expression into C, so
   any typed name in an expression that is not provably i64-safe (wrap-prone
   `+ - *`, shifts, bitwise) is refused as well — `x = 2**63-1; y = x + 1`

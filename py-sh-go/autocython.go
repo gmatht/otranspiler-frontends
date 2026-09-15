@@ -105,9 +105,11 @@ func AnnotateCython(src string, opts Options) (*CythonOutput, error) {
 	moduleAssigned := map[string]bool{}
 	funcInts, funcFloats := map[string]bool{}, map[string]bool{}
 	var ins []insertion
+	var moduleEnv env
 	if opts.Level != OptNone {
 		p := proveAll(tree, opts.Level)
 		moduleAssigned = p.assigned
+		moduleEnv = p.env
 		if fi, ok := tree.(gen.IFile_inputContext); ok {
 			all := unionSets(p.ints, p.floats)
 			bad := unsafeTypedNames(fi, p.env, p.ints, all)
@@ -117,11 +119,29 @@ func AnnotateCython(src string, opts Options) (*CythonOutput, error) {
 		ins, funcInts, funcFloats = collectFuncDecls(tree, strings.Split(src, "\n"), opts.Level, opts.Mode)
 	}
 
+	// typed int lists -> a C `long long` vector (a .pyx-only transform)
+	body, containerDecls := src, ""
+	containerNames := map[string]bool{}
+	if opts.Level != OptNone && opts.Mode == ModePyx {
+		if nb, cd, cn, ok := rewriteContainers(tree, src, moduleEnv); ok {
+			body, containerDecls = nb, cd
+			for _, n := range cn {
+				containerNames[n] = true
+			}
+		}
+	}
+	if len(ins) > 0 {
+		body = applyInsertions(body, ins)
+	}
+
 	typed := map[string]bool{}
 	for _, m := range []map[string]bool{moduleInts, moduleFloats, funcInts, funcFloats} {
 		for n := range m {
 			typed[n] = true
 		}
+	}
+	for n := range containerNames {
+		typed[n] = true
 	}
 	assigned := map[string]bool{}
 	for n := range moduleAssigned {
@@ -135,25 +155,28 @@ func AnnotateCython(src string, opts Options) (*CythonOutput, error) {
 
 	var names, refused []string
 	for n := range assigned {
-		if typed[n] {
+		switch {
+		case typed[n]:
 			names = append(names, n)
-		} else {
+		case containerNames[n]:
+			// a C vector is not a scalar declaration
+		default:
 			refused = append(refused, n)
 		}
 	}
 	sort.Strings(names)
 	sort.Strings(refused)
 
-	body := src
-	if len(ins) > 0 {
-		body = applyInsertions(src, ins)
-	}
 	var b strings.Builder
 	b.WriteString("# cython: language_level=3\n")
+	if containerDecls != "" {
+		b.WriteString(i64PushHelper)
+	}
 	if opts.Mode == ModePy {
 		b.WriteString("import cython\n")
 	}
 	b.WriteString(declLines(sortedKeys(moduleInts), sortedKeys(moduleFloats), opts.Mode))
+	b.WriteString(containerDecls)
 	b.WriteString(body)
 	return &CythonOutput{Source: b.String(), Typed: names, Refused: refused}, nil
 }
