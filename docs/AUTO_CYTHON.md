@@ -572,6 +572,11 @@ pinned by `spec_collect_rejects_baked_array_index_in_bare_arith`.
   scope, no `import cython`). `--gmp` implies `--pyx`. `--pyx` is faster
   where scalars dominate (`rolling_hash` 0.081 vs 0.107 s) and is the form
   the hand-written goldens use;
+- **scalar types**: `int` -> `cython.longlong`/`cdef long long`, and
+  `float` -> `cython.double`/`cdef double` (Python floats are IEEE doubles;
+  `/` is true division and always float; `+ - * % // **` yield a float when
+  either operand is). A name assigned both an int and a float is neither.
+  `--pyx` groups declarations by C type;
 - **usage safety**: a typed variable forces its whole expression into C, so
   any typed name in an expression that is not provably i64-safe (wrap-prone
   `+ - *`, shifts, bitwise) is refused as well — `x = 2**63-1; y = x + 1`

@@ -56,6 +56,17 @@ print(c)'
 run aug_overflow 'x = 9223372036854775800
 x += 100
 print(x)'
+run float_ops 'a = 1.5
+b = 2.0
+c = a * b + 1
+d = 1
+e = d / 2
+print(c, e)'
+
+run float_neg 'a = -5.0
+b = 3.0
+print(a % b, a // b, a / b)'
+
 run identity_is 'a = 1000
 b = a + 0
 print(a is b, a == b)'

@@ -91,7 +91,6 @@ func TestAnnotateWhileCounter(t *testing.T) {
 
 func TestAnnotateRefusedShapes(t *testing.T) {
 	for _, tc := range []struct{ src, refuse string }{
-		{"x = 1.5\n", "x"},
 		{"x = n\n", "x"},
 		{"x = True\n", "x"},
 		{"x = a < b\n", "x"},
@@ -237,5 +236,30 @@ func TestAnnotateIdentityNotTyped(t *testing.T) {
 	// `id(x)` boxes a fresh object each call
 	if out := annotate(t, "a = 5\nprint(id(a))\n"); typed(out, "a") {
 		t.Fatalf("id() must disable typing: %v", out.Typed)
+	}
+}
+
+func TestAnnotateFloat(t *testing.T) {
+	out := annotate(t, "a = 1.5\nb = 2.0\nc = a * b + 1\nd = 1\ne = d / 2\n")
+	for _, n := range []string{"a", "b", "c", "e"} {
+		if !typed(out, n) {
+			t.Fatalf("expected %s typed; got %v", n, out.Typed)
+		}
+	}
+	if !strings.Contains(out.Source, "c=cython.double") || !strings.Contains(out.Source, "d=cython.longlong") {
+		t.Fatalf("expected double c and longlong d:\n%s", out.Source)
+	}
+	// a single `/` (true division) is a float even for int operands
+	if !strings.Contains(out.Source, "e=cython.double") {
+		t.Fatalf("true division must be double:\n%s", out.Source)
+	}
+	// pyx mode groups by C type
+	pyx, _ := AnnotateCython("a = 1.5\nd = 1\n", Options{Level: OptFull, Mode: ModePyx})
+	if !strings.Contains(pyx.Source, "cdef double a") || !strings.Contains(pyx.Source, "cdef long long d") {
+		t.Fatalf("pyx grouping wrong:\n%s", pyx.Source)
+	}
+	// mixed int/float assignment is neither
+	if out2 := annotate(t, "x = 1\nx = 1.5\n"); typed(out2, "x") {
+		t.Fatalf("mixed x must not be typed: %v", out2.Typed)
 	}
 }

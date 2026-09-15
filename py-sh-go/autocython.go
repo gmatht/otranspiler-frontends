@@ -101,40 +101,36 @@ func AnnotateCython(src string, opts Options) (*CythonOutput, error) {
 		return nil, fmt.Errorf("python2cython: %s", errs[0])
 	}
 
-	moduleTyped, moduleAssigned := map[string]bool{}, map[string]bool{}
-	funcTyped := map[string]bool{}
+	moduleInts, moduleFloats := map[string]bool{}, map[string]bool{}
+	moduleAssigned := map[string]bool{}
+	funcInts, funcFloats := map[string]bool{}, map[string]bool{}
 	var ins []insertion
-	switch opts.Level {
-	case OptNone:
-		// passthrough: no declarations at all
-	default:
-		var moduleEnv env
-		moduleTyped, moduleAssigned, moduleEnv = proveNames(tree, opts.Level)
+	if opts.Level != OptNone {
+		p := proveAll(tree, opts.Level)
+		moduleAssigned = p.assigned
 		if fi, ok := tree.(gen.IFile_inputContext); ok {
-			for n := range unsafeTypedNames(fi, moduleEnv, moduleTyped) {
-				delete(moduleTyped, n)
-			}
+			all := unionSets(p.ints, p.floats)
+			bad := unsafeTypedNames(fi, p.env, p.ints, all)
+			moduleInts = subtract(p.ints, bad)
+			moduleFloats = subtract(p.floats, bad)
 		}
-		var fnNames []string
-		ins, fnNames = collectFuncDecls(tree, strings.Split(src, "\n"), opts.Level, opts.Mode)
-		for _, n := range fnNames {
-			funcTyped[n] = true
-		}
+		ins, funcInts, funcFloats = collectFuncDecls(tree, strings.Split(src, "\n"), opts.Level, opts.Mode)
 	}
 
 	typed := map[string]bool{}
-	for n := range moduleTyped {
-		typed[n] = true
-	}
-	for n := range funcTyped {
-		typed[n] = true
+	for _, m := range []map[string]bool{moduleInts, moduleFloats, funcInts, funcFloats} {
+		for n := range m {
+			typed[n] = true
+		}
 	}
 	assigned := map[string]bool{}
 	for n := range moduleAssigned {
 		assigned[n] = true
 	}
-	for n := range funcTyped {
-		assigned[n] = true
+	for _, m := range []map[string]bool{funcInts, funcFloats} {
+		for n := range m {
+			assigned[n] = true
+		}
 	}
 
 	var names, refused []string
@@ -157,40 +153,97 @@ func AnnotateCython(src string, opts Options) (*CythonOutput, error) {
 	if opts.Mode == ModePy {
 		b.WriteString("import cython\n")
 	}
-	if len(moduleTyped) > 0 {
-		b.WriteString(declLine(sortedKeys(moduleTyped), opts.Mode))
-	}
+	b.WriteString(declLines(sortedKeys(moduleInts), sortedKeys(moduleFloats), opts.Mode))
 	b.WriteString(body)
 	return &CythonOutput{Source: b.String(), Typed: names, Refused: refused}, nil
 }
 
-func declLine(names []string, mode Mode) string {
+func declLines(ints, floats []string, mode Mode) string {
+	if len(ints) == 0 && len(floats) == 0 {
+		return ""
+	}
 	if mode == ModePyx {
-		return "cdef long long " + strings.Join(names, ", ") + "\n"
+		var b strings.Builder
+		if len(ints) > 0 {
+			b.WriteString("cdef long long " + strings.Join(ints, ", ") + "\n")
+		}
+		if len(floats) > 0 {
+			b.WriteString("cdef double " + strings.Join(floats, ", ") + "\n")
+		}
+		return b.String()
 	}
-	decls := make([]string, len(names))
-	for i, n := range names {
-		decls[i] = n + "=cython.longlong"
+	type decl struct{ name, ctype string }
+	var ds []decl
+	for _, n := range ints {
+		ds = append(ds, decl{n, "longlong"})
 	}
-	return "cython.declare(" + strings.Join(decls, ", ") + ")\n"
+	for _, n := range floats {
+		ds = append(ds, decl{n, "double"})
+	}
+	sort.Slice(ds, func(i, j int) bool { return ds[i].name < ds[j].name })
+	parts := make([]string, len(ds))
+	for i, d := range ds {
+		parts[i] = d.name + "=cython." + d.ctype
+	}
+	return "cython.declare(" + strings.Join(parts, ", ") + ")\n"
 }
 
-// proveNames runs the chosen analysis and returns the proved + assigned names
-// plus the interval env (used by the usage-safety scan).
-func proveNames(tree antlr.Tree, level Level) (map[string]bool, map[string]bool, env) {
+func indentLines(s, indent string) string {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	for i := range lines {
+		lines[i] = indent + lines[i]
+	}
+	return strings.Join(lines, "\n")
+}
+
+// proof is the per-scope result: i64-typed names, double-typed names, every
+// assigned name, and the int interval env (for the usage-safety scan).
+type proof struct {
+	ints, floats, assigned map[string]bool
+	env                    env
+}
+
+// proveAll runs the chosen analysis for one scope.
+func proveAll(tree antlr.Tree, level Level) proof {
 	if level == OptSimple {
-		e, _ := proveRanges(tree)
-		typed, assigned := proveSimple(tree)
-		return typed, assigned, e
+		e, assigned := proveRanges(tree)
+		ints, _ := proveSimple(tree)
+		return proof{ints: ints, floats: map[string]bool{}, assigned: assigned, env: e}
 	}
 	e, assigned := proveRanges(tree)
-	typed := map[string]bool{}
+	allInt := intDomainFixpoint(tree)
+	ints := map[string]bool{}
 	for n, v := range e {
-		if v.ok {
-			typed[n] = true
+		if v.ok && allInt[n] {
+			ints[n] = true
 		}
 	}
-	return typed, assigned, e
+	floats := floatDomainFixpoint(tree)
+	for n := range ints {
+		delete(floats, n)
+	}
+	return proof{ints: ints, floats: floats, assigned: assigned, env: e}
+}
+
+func unionSets(a, b map[string]bool) map[string]bool {
+	u := map[string]bool{}
+	for k := range a {
+		u[k] = true
+	}
+	for k := range b {
+		u[k] = true
+	}
+	return u
+}
+
+func subtract(a, b map[string]bool) map[string]bool {
+	o := map[string]bool{}
+	for k := range a {
+		if !b[k] {
+			o[k] = true
+		}
+	}
+	return o
 }
 
 // insertion places text before a 1-based source line.
@@ -203,9 +256,9 @@ type insertion struct {
 // `cython.declare(...)` lines to insert at the top of each body (after a
 // docstring). Parameters are never declared: a parameter can be any Python
 // object, so forcing a C type would change behaviour for non-int callers.
-func collectFuncDecls(tree antlr.Tree, lines []string, level Level, mode Mode) ([]insertion, []string) {
+func collectFuncDecls(tree antlr.Tree, lines []string, level Level, mode Mode) ([]insertion, map[string]bool, map[string]bool) {
 	var ins []insertion
-	typed := map[string]bool{}
+	intsAll, floatsAll := map[string]bool{}, map[string]bool{}
 	walkTree(tree, func(n antlr.Tree) {
 		fn, ok := n.(gen.IFuncdefContext)
 		if !ok {
@@ -215,27 +268,35 @@ func collectFuncDecls(tree antlr.Tree, lines []string, level Level, mode Mode) (
 		if body == nil {
 			return
 		}
-		localTyped, assigned, e := proveNames(body, level)
-		for n := range unsafeTypedNames(body, e, localTyped) {
-			delete(localTyped, n)
-		}
+		p := proveAll(body, level)
+		all := unionSets(p.ints, p.floats)
+		bad := unsafeTypedNames(body, p.env, p.ints, all)
+		ints := subtract(p.ints, bad)
+		floats := subtract(p.floats, bad)
 		params := map[string]bool{}
-		if p := fn.Parameters(); p != nil {
-			for _, id := range reIdentAll.FindAllString(p.GetText(), -1) {
+		if prm := fn.Parameters(); prm != nil {
+			for _, id := range reIdentAll.FindAllString(prm.GetText(), -1) {
 				params[id] = true
 			}
 		}
-		var names []string
-		for nm := range localTyped {
-			if assigned[nm] && !params[nm] {
-				names = append(names, nm)
-				typed[nm] = true
+		var intNames, floatNames []string
+		for nm := range ints {
+			if p.assigned[nm] && !params[nm] {
+				intNames = append(intNames, nm)
+				intsAll[nm] = true
 			}
 		}
-		if len(names) == 0 {
+		for nm := range floats {
+			if p.assigned[nm] && !params[nm] {
+				floatNames = append(floatNames, nm)
+				floatsAll[nm] = true
+			}
+		}
+		if len(intNames) == 0 && len(floatNames) == 0 {
 			return
 		}
-		sort.Strings(names)
+		sort.Strings(intNames)
+		sort.Strings(floatNames)
 		stmts := body.AllStmt()
 		if len(stmts) == 0 {
 			return
@@ -255,9 +316,9 @@ func collectFuncDecls(tree antlr.Tree, lines []string, level Level, mode Mode) (
 			line = len(lines)
 		}
 		indent := leadingWS(lines[line-1])
-		ins = append(ins, insertion{line: line, text: indent + strings.TrimRight(declLine(names, mode), "\n")})
+		ins = append(ins, insertion{line: line, text: indentLines(declLines(intNames, floatNames, mode), indent)})
 	})
-	return ins, sortedKeys(typed)
+	return ins, intsAll, floatsAll
 }
 
 func isDocstring(s gen.IStmtContext) bool {

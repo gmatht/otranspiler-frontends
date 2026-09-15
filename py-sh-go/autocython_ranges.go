@@ -482,6 +482,80 @@ func widenChanged(e, before env) {
 	}
 }
 
+var reFloatLit = regexp.MustCompile(`^([0-9]+\.[0-9]*|\.[0-9]+|[0-9]+)([eE][+-]?[0-9]+)?$`)
+
+func isFloatLit(s string) bool {
+	return reFloatLit.MatchString(s) && strings.ContainsAny(s, ".eE")
+}
+
+// floatDomainFixpoint classifies each name as a Python float: EVERY
+// assignment must be float-domain (so `x = 1; x = 1.5` is neither).
+func floatDomainFixpoint(tree antlr.Tree) map[string]bool {
+	assigns := collectAssigns(tree)
+	dom := map[string]bool{}
+	for changed := true; changed; {
+		changed = false
+		for _, a := range assigns {
+			if floatDomain(a.rhs, dom) {
+				for _, t := range a.targets {
+					if !dom[t] {
+						dom[t] = true
+						changed = true
+					}
+				}
+			}
+		}
+	}
+	all := map[string]bool{}
+	for k := range dom {
+		all[k] = true
+	}
+	for _, a := range assigns {
+		if !floatDomain(a.rhs, dom) {
+			for _, t := range a.targets {
+				delete(all, t)
+			}
+		}
+	}
+	return all
+}
+
+// floatDomain: Python floats are IEEE doubles, so `+ - * / % // **` on C
+// doubles match Python (given the default cdivision=False).
+func floatDomain(s string, dom map[string]bool) bool {
+	s = stripOuterParens(strings.TrimSpace(s))
+	if s == "" {
+		return false
+	}
+	if isFloatLit(s) || dom[s] {
+		return true
+	}
+	if strings.HasPrefix(s, "float(") && strings.HasSuffix(s, ")") {
+		return true
+	}
+	// `+ - * % // **` yield a float iff EITHER operand is a float (int op
+	// int stays int); a single `/` is true division and always a float.
+	if l, r, ok := splitTopTwo(s, "**"); ok {
+		return floatDomain(l, dom) || floatDomain(r, dom)
+	}
+	if l, r, ok := splitTopTwo(s, "//"); ok {
+		return floatDomain(l, dom) || floatDomain(r, dom)
+	}
+	if _, _, _, ok := splitTop(s, "/"); ok {
+		return true
+	}
+	if l, _, r, ok := splitTop(s, "+-"); ok {
+		return floatDomain(l, dom) || floatDomain(r, dom)
+	}
+	if l, _, r, ok := splitTop(s, "*%"); ok {
+		return floatDomain(l, dom) || floatDomain(r, dom)
+	}
+	if strings.HasPrefix(s, "-") {
+		return floatDomain(s[1:], dom)
+	}
+	return false
+}
+
 // unsafeTypedNames scans the arithmetic expressions of ONE scope and returns
 // the typed names that must NOT be declared: a typed variable makes its
 // whole expression evaluate in C, so every such expression must be provably
@@ -504,7 +578,7 @@ func banNames(text string, typed, bad map[string]bool) {
 	}
 }
 
-func unsafeTypedNames(n antlr.Tree, e env, typed map[string]bool) map[string]bool {
+func unsafeTypedNames(n antlr.Tree, e env, intTyped, allTyped map[string]bool) map[string]bool {
 	bad := map[string]bool{}
 	var walk func(antlr.Tree, bool)
 	walk = func(t antlr.Tree, root bool) {
@@ -515,7 +589,7 @@ func unsafeTypedNames(n antlr.Tree, e env, typed map[string]bool) map[string]boo
 		case gen.IExprContext:
 			text := ctx.GetText()
 			if strings.ContainsAny(text, "+-*&|^<>") && !evalText(text, e).ok {
-				banNames(text, typed, bad)
+				banNames(text, intTyped, bad)
 			}
 		case gen.IComparisonContext:
 			// `a is b` / `a is not b`: identity, which a C value cannot have
@@ -523,7 +597,7 @@ func unsafeTypedNames(n antlr.Tree, e env, typed map[string]bool) map[string]boo
 			for _, op := range ctx.AllComp_op() {
 				if op.IS() != nil {
 					for _, ex := range ctx.AllExpr() {
-						banNames(ex.GetText(), typed, bad)
+						banNames(ex.GetText(), allTyped, bad)
 					}
 					break
 				}
@@ -531,7 +605,7 @@ func unsafeTypedNames(n antlr.Tree, e env, typed map[string]bool) map[string]boo
 		case gen.IAtom_exprContext:
 			// `id(x)` boxes a C value into a fresh object on every call.
 			if reIdCall.MatchString(ctx.GetText()) {
-				for k := range typed {
+				for k := range allTyped {
 					bad[k] = true
 				}
 			}

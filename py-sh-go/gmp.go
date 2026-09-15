@@ -118,38 +118,80 @@ func classifyBigints(tree antlr.Tree) (big, longs map[string]bool) {
 	return big, longs
 }
 
-// intDomainFixpoint classifies each assigned name as a Python int.
+// assignT is one `a = b = <rhs>` statement's simple-name targets and RHS.
+type assignT struct {
+	targets []string
+	rhs     string
+}
+
+// collectAssigns gathers every plain (non-augmented, non-annotated)
+// assignment's simple-name targets and RHS text.
+func collectAssigns(tree antlr.Tree) []assignT {
+	var out []assignT
+	walkTree(tree, func(n antlr.Tree) {
+		ctx, ok := n.(gen.IExpr_stmtContext)
+		if !ok || ctx.Annassign() != nil || ctx.Augassign() != nil {
+			return
+		}
+		ts := ctx.AllTestlist_star_expr()
+		if len(ts) < 2 {
+			return
+		}
+		var tg []string
+		for _, t := range ts[:len(ts)-1] {
+			if nm := strings.TrimSpace(t.GetText()); isSimpleName(nm) {
+				tg = append(tg, nm)
+			}
+		}
+		out = append(out, assignT{tg, ts[len(ts)-1].GetText()})
+	})
+	return out
+}
+
+// intDomainFixpoint classifies each name as a Python int: EVERY assignment
+// (and a literal-bounded range counter) must be int-domain. "Any assignment"
+// would be wrong — `x = 1; x = 1.5` is not an int.
 func intDomainFixpoint(tree antlr.Tree) map[string]bool {
+	assigns := collectAssigns(tree)
+	seed := map[string]bool{}
+	walkTree(tree, func(n antlr.Tree) {
+		if ctx, ok := n.(gen.IFor_stmtContext); ok {
+			if nm := forTargetName(ctx); nm != "" {
+				if _, ok := rangeCounterIV(ctx); ok {
+					seed[nm] = true
+				}
+			}
+		}
+	})
 	dom := map[string]bool{}
+	for k := range seed {
+		dom[k] = true
+	}
 	for changed := true; changed; {
 		changed = false
-		walkTree(tree, func(n antlr.Tree) {
-			switch ctx := n.(type) {
-			case gen.IFor_stmtContext:
-				if nm := forTargetName(ctx); nm != "" && !dom[nm] {
-					dom[nm] = true
-					changed = true
-				}
-			case gen.IExpr_stmtContext:
-				if ctx.Annassign() != nil || ctx.Augassign() != nil {
-					return
-				}
-				ts := ctx.AllTestlist_star_expr()
-				if len(ts) < 2 {
-					return
-				}
-				if intDomain(ts[len(ts)-1].GetText(), dom) {
-					for _, t := range ts[:len(ts)-1] {
-						if nm := strings.TrimSpace(t.GetText()); isSimpleName(nm) && !dom[nm] {
-							dom[nm] = true
-							changed = true
-						}
+		for _, a := range assigns {
+			if intDomain(a.rhs, dom) {
+				for _, t := range a.targets {
+					if !dom[t] {
+						dom[t] = true
+						changed = true
 					}
 				}
 			}
-		})
+		}
 	}
-	return dom
+	all := map[string]bool{}
+	for k := range dom {
+		all[k] = true
+	}
+	for _, a := range assigns {
+		if !intDomain(a.rhs, dom) {
+			for _, t := range a.targets {
+				delete(all, t)
+			}
+		}
+	}
+	return all
 }
 
 // intDomain is the integer-domain classifier (a superset of the interval
