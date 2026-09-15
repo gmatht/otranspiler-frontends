@@ -1,5 +1,6 @@
 // autocython_test.go — the annotation-pass gate. Every declaration is a
-// proof: the pass must type the provable scalar shapes and refuse the rest.
+// proof: the interval analysis must type the provable scalar shapes and
+// refuse anything it cannot bound (soundness beats coverage).
 package pylib
 
 import (
@@ -16,35 +17,35 @@ func typed(out *CythonOutput, name string) bool {
 	return false
 }
 
-func TestAnnotateRollingHash(t *testing.T) {
-	// `i` is a literal-bounded range counter -> proved. `h` is reassigned
-	// with arithmetic (`h = (h*31+i) % M`), whose intermediate-fit needs a
-	// range analysis, so it is refused (stays exact Python int).
-	src := "h = 0\nfor i in range(2000000):\n    h = (h * 31 + i) % 1000000007\nprint(h)\n"
+func annotate(t *testing.T, src string) *CythonOutput {
+	t.Helper()
 	out, err := AnnotateCython(src)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("annotate %q: %v", src, err)
 	}
-	if !typed(out, "i") {
-		t.Fatalf("expected i typed; got %v", out.Typed)
+	return out
+}
+
+func TestAnnotateRollingHash(t *testing.T) {
+	// `i` is a literal-bounded range counter; `h` reaches the fixed point
+	// [0, 1000000006] via `% M` (with a provably non-negative lhs), and the
+	// i64 intermediates never overflow -> both proved.
+	src := "h = 0\nfor i in range(2000000):\n    h = (h * 31 + i) % 1000000007\nprint(h)\n"
+	out := annotate(t, src)
+	if !typed(out, "h") || !typed(out, "i") {
+		t.Fatalf("expected h and i typed; got %v (refused %v)", out.Typed, out.Refused)
 	}
-	if typed(out, "h") {
-		t.Fatalf("h must be refused (unproved arithmetic); got %v", out.Typed)
-	}
-	if !strings.Contains(out.Source, "cython.declare(i=cython.longlong)") {
+	if !strings.Contains(out.Source, "cython.declare(h=cython.longlong, i=cython.longlong)") {
 		t.Fatalf("declaration missing:\n%s", out.Source)
 	}
-	// the emitted file is runnable Python: the original source is intact.
+	// the emitted file is still runnable Python: the source is intact.
 	if !strings.HasSuffix(out.Source, src) {
 		t.Fatalf("source not preserved:\n%s", out.Source)
 	}
 }
 
 func TestAnnotateTypedShapes(t *testing.T) {
-	out, err := AnnotateCython("a = 1\nb = -5\nc = 0\nfor i in range(0, 10, 2):\n    pass\n")
-	if err != nil {
-		t.Fatal(err)
-	}
+	out := annotate(t, "a = 1\nb = -5\nc = 0\nfor i in range(0, 10, 2):\n    pass\n")
 	for _, n := range []string{"a", "b", "c", "i"} {
 		if !typed(out, n) {
 			t.Fatalf("expected %s typed; got %v (refused %v)", n, out.Typed, out.Refused)
@@ -52,27 +53,40 @@ func TestAnnotateTypedShapes(t *testing.T) {
 	}
 }
 
-func TestAnnotateRefusesUnproven(t *testing.T) {
-	for _, src := range []string{
-		"x = 1.5\n",                        // float literal
-		"x = n\n",                          // unknown name
-		"x = True\n",                       // bool
-		"x = a < b\n",                      // comparison -> bool
-		"x = 99999999999999999999999\n",    // int literal > i64
-		"for i in range(n):\n    pass\n",   // non-literal range bound
-		"for i in range(3.5):\n    pass\n", // non-int bound
-		"x = y = 0\n",                      // multi-target
-		"x = 0\nx += 1\n",                  // augmented assignment
-		// t101: a growing accumulator must NOT be typed (it overflows i64).
-		"s = 1\ni = 0\nwhile i < 5:\n    s = s + 4000000000000000000\n    i = i + 1\nprint(s)\n",
+func TestAnnotateRefusedShapes(t *testing.T) {
+	for _, tc := range []struct{ src, refuse string }{
+		{"x = 1.5\n", "x"},
+		{"x = n\n", "x"},
+		{"x = True\n", "x"},
+		{"x = a < b\n", "x"},
+		{"x = 99999999999999999999999\n", "x"},
+		{"for i in range(n):\n    pass\n", "i"},
+		{"for i in range(3.5):\n    pass\n", "i"},
+		{"for x in xs:\n    pass\n", "x"},
+		{"x = y = 0\n", "x"},
+		{"x = 0\nx += 1\n", "x"},
+		{"x = 9223372036854775807\ny = x + 1\n", "y"},
+		{"x = 4000000000\ny = x * x\n", "y"},
+		{"x = -5\ny = x % 3\n", "y"},
+		{"x = -5\ny = x // 3\n", "y"},
+		{"x = 0\ntry:\n    x = 5\nexcept:\n    pass\n", "x"},
+		{"x = 0\nmatch v:\n    case 1:\n        x = 1\n", "x"},
+		// t101: a growing while accumulator must NOT be typed.
+		{"s = 1\ni = 0\nwhile i < 5:\n    s = s + 4000000000000000000\n    i = i + 1\nprint(s)\n", "s"},
 	} {
-		out, err := AnnotateCython(src)
-		if err != nil {
-			t.Fatalf("%q: %v", src, err)
+		out := annotate(t, tc.src)
+		if typed(out, tc.refuse) {
+			t.Errorf("%s: %q must be refused; typed=%v", tc.refuse, tc.src, out.Typed)
 		}
-		if len(out.Typed) != 0 {
-			t.Errorf("unexpectedly typed %q -> %v", src, out.Typed)
-		}
+	}
+}
+
+// The one non-refusal in the list above: a `%` with a non-negative lhs keeps
+// the [0, m-1] bound.
+func TestAnnotateNonNegativeMod(t *testing.T) {
+	out := annotate(t, "x = 0\nfor i in range(10):\n    x = (x + i) % 7\n")
+	if !typed(out, "x") {
+		t.Fatalf("expected x typed; got %v", out.Typed)
 	}
 }
 

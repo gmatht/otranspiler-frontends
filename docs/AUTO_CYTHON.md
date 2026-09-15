@@ -558,28 +558,28 @@ pinned by `spec_collect_rejects_baked_array_index_in_bare_arith`.
   `# cython: language_level=3` header, `import cython`, a
   `cython.declare(<name>=cython.longlong, ...)` line for the proved scalars,
   and the **unmodified** source (so the file stays valid CPython);
-- **soundness rule for this slice** (narrow on purpose): a scalar is typed
-  iff every assignment to it is an i64-fitting integer literal, or it is the
-  target of a `for` over `range(<int literals>)` (a literal-bounded counter)
-  and every other assignment is an i64 literal. Arithmetic is **not**
-  propagated — `h = (h*31+i) % M` leaves `h` a Python object, because
-  proving the intermediate fits i64 needs a range analysis. t101's
-  `s = s + 4000000000000000000` (which overflows i64) is the pinned refusal;
+- **soundness is a sound i64 interval analysis** (`autocython_ranges.go`):
+  a scalar's abstract value is an interval or ⊤; arithmetic is interval
+  arithmetic with **any overflow → ⊤**; `a % m` with `m > 0` and a provably
+  **non-negative** `a` is `[0, m-1]` (Python floor-mod equals C truncation
+  only there); a `for x in range(<int literals>)` counter is bounded by the
+  endpoints; a `for` body is iterated to a fixed point with union-widening
+  (capped → ⊤); a `while` body and `try`/`match`/`async` subtrees widen
+  everything they assign to ⊤; `if`/`elif`/`else` join the branch states.
+  Everything not proved stays a Python object. Pinned refusals: t101's
+  growing `s = s + 4000000000000000000`, a negative-lhs `%`/`//` (Python vs
+  C), i64 overflow in `+`/`*`, and a conditional `try`/`match` assignment;
 - gate: `make py2cy-test` — `autocython_test.go` (the proof/refusal boundary)
   plus `coverage/py2cy-parity.sh` (annotate → `cython --embed` → stdout must
   equal CPython; 22/22 on the t01–t1x slice, t101 included).
 
-Measured on `bench/rolling_hash.py`, this slice proves only the counter `i`,
-so the speedup is small; the interesting variable `h` needs Stage 1's range
-analysis. Typing it by hand (`h`/`i` as `long long`) gives 0.06–0.10 s vs
-0.44–0.72 s CPython / 0.50 s pure Cython, i.e. the win is real once the
-range proof exists.
+Measured on `bench/rolling_hash.py` the analysis proves both `h` and `i`:
+**0.12 s vs 0.74 s CPython and 0.93 s pure Cython**, with identical stdout.
 
-**Next (Stage 1 proper):** reuse the core's range facts
-(`analyze_var_ranges`, `x % m -> [0,m-1]`, counted `range` bounds) so bounded
-accumulators are typed; then int lists/reductions and the bigint GMP FFI
-(`bignum_typed.pyx`). The clean way is the annotation planner over
-**CPython's `ast`** with the shIR facts as an optional input (§7, §10.3).
+**Next:** int lists/reductions (typed memoryview / `long long*`) and the
+bigint GMP FFI (`bignum_typed.pyx`); then the annotation planner over
+**CPython's `ast`** with the shIR facts as an optional input (§7, §10.3) so
+coverage becomes Cython's.
 
 ---
 
