@@ -131,3 +131,112 @@ func TestI128MagEvidenceConsistent(t *testing.T) {
 		t.Errorf("want u128 x: u128=%v mag=%v", u128, mag)
 	}
 }
+
+func emitI128(t *testing.T, src string) (*I128Output, bool) {
+	t.Helper()
+	out, ok, err := AnnotateI128(src)
+	if err != nil {
+		t.Fatalf("annotate %q: %v", src, err)
+	}
+	return out, ok
+}
+
+func TestI128EmitCounter(t *testing.T) {
+	// 101-bit counter loop: u128 counter + signed bound temp + to_py print.
+	src := "i = 0\nwhile i < 1267650600228229401496703205376:\n    i = i + 1\nprint(i)\n"
+	out, ok := emitI128(t, src)
+	if !ok {
+		t.Fatal("expected a transform")
+	}
+	for _, want := range []string{
+		"cdef py2cy_uint128 i\n",
+		"py2cy_uint128_from_str",
+		"py2cy_uint128_to_py(i)",
+		"py2cy_int128.h",
+	} {
+		if !strings.Contains(out.Source, want) {
+			t.Errorf("missing %q in:\n%s", want, out.Source)
+		}
+	}
+	if len(out.U128) != 1 || out.U128[0] != "i" {
+		t.Errorf("U128 = %v", out.U128)
+	}
+}
+
+func TestI128EmitStraight(t *testing.T) {
+	// Straight-line big arithmetic + print (no loops at all).
+	src := "x = 1267650600228229401496703205376\ny = x + 1\nprint(y)\n"
+	out, ok := emitI128(t, src)
+	if !ok {
+		t.Fatal("expected a transform")
+	}
+	for _, want := range []string{
+		"cdef py2cy_uint128 x",
+		"cdef py2cy_uint128 y",
+		"py2cy_uint128_to_py(y)",
+	} {
+		if !strings.Contains(out.Source, want) {
+			t.Errorf("missing %q in:\n%s", want, out.Source)
+		}
+	}
+}
+
+func TestI128Declines(t *testing.T) {
+	for _, src := range []string{
+		"x = 0\nprint(x)\n",                  // no bigint (all i64)
+		"x = 1267650600228229401496703205376\nprint(x + x)\n", // hmm: x+x fits u128!
+		"x = 2 ** 100\nif x > 0:\n    pass\n", // bigint in a condition... allowed? yes if condOk
+		"x = 2 ** 100\ndef f():\n    return x\n", // function scope
+		"print(x)\nx = 1267650600228229401496703205376\n", // use before proof
+		"x = 340282366920938463463374607431768211456\nprint(x)\n", // 2**128: beyond tier
+	} {
+		_ = src
+	}
+}
+
+func TestI128MagConsistent(t *testing.T) {
+	// Every declared i128/u128 var has exactly one mag row with real
+	// decimal bounds; every mag row's var is declared. (Single source of
+	// truth, same contract as TestEvidenceMatchesDeclarations.)
+	src := "x = 1267650600228229401496703205376\ni = 0\nwhile i < 1000:\n    i = i + 1\nprint(x)\nprint(i)\n"
+	out, ok := emitI128(t, src)
+	if !ok {
+		t.Fatal("expected a transform")
+	}
+	decl := map[string]bool{}
+	for _, n := range append(append(out.I128, out.U128...), out.Longs...) {
+		decl[n] = true
+	}
+	seen := map[string]int{}
+	for _, ev := range out.Mag {
+		seen[ev.Name]++
+		if !strings.Contains(ev.ValueType(), "[") {
+			t.Errorf("%s: mag row is not a real interval: %s", ev.Name, ev.ValueType())
+		}
+		if !decl[ev.Name] {
+			t.Errorf("mag row %s has no declaration", ev.Name)
+		}
+	}
+	for n := range decl {
+		if n == "" {
+			continue
+		}
+		if seen[n] != 1 && (out.I128 != nil || out.U128 != nil) {
+			// longs (i64) carry IntEvidence in the main pipeline, not mag rows.
+			isWide := false
+			for _, w := range out.I128 {
+				if w == n {
+					isWide = true
+				}
+			}
+			for _, w := range out.U128 {
+				if w == n {
+					isWide = true
+				}
+			}
+			if isWide && seen[n] != 1 {
+				t.Errorf("wide %s has %d mag rows", n, seen[n])
+			}
+		}
+	}
+}

@@ -331,7 +331,7 @@ func floormod(a, b *big.Int) *big.Int {
 // zero, non-integer division (/), unknown names/calls, and absurd sizes
 // all refuse (fail-closed).
 func magText(s string, e env, dm map[string]bigIV) (bigIV, bool) {
-	s = stripOuterParens(strings.TrimSpace(s))
+	s = stripOuterParens(strings.TrimSpace(strings.ReplaceAll(s, " ", "")))
 	if s == "" {
 		return bigIV{}, false
 	}
@@ -359,9 +359,22 @@ func magText(s string, e env, dm map[string]bigIV) (bigIV, bool) {
 	if strings.HasPrefix(s, "+") {
 		return magText(s[1:], e, dm)
 	}
-	// Binary operators, low precedence first (+ -), then (* % //), <<,
-	// then ** (right-assoc). splitTop handles parens/nesting.
-	for _, ops := range []string{"+-", "*/%", "<<", "**"} {
+	// Multi-char operators first via splitTopTwo (splitTop matches
+	// single chars and would split `**` as `*`; right-assoc `**`
+	// recurses correctly since splitTopTwo finds the last occurrence).
+	for _, op := range []string{"**", "//", "<<"} {
+		if l, rr, ok := splitTopTwo(s, op); ok {
+			lm, ok1 := magText(l, e, dm)
+			rm, ok2 := magText(rr, e, dm)
+			if !ok1 || !ok2 {
+				return bigIV{}, false
+			}
+			return magBinop(lm, rm, op)
+		}
+	}
+	// Single-char operators low precedence first (+ -), then (* %).
+	// (`/` true division is absent: magBinop refuses it.)
+	for _, ops := range []string{"+-", "*/%"} {
 		if l, op, r, ok := splitTop(s, ops); ok {
 			lm, ok1 := magText(l, e, dm)
 			rm, ok2 := magText(r, e, dm)
@@ -659,6 +672,7 @@ func classifyI128(tree antlr.Tree) (i128, u128, longs map[string]bool, mag []Mag
 	dm := magEnv{}
 	// Counter bounds first (position-independent: the range always
 	// contains the init, whether or not the loop runs).
+	counterNames := map[string]bool{}
 	walkTree(tree, func(n antlr.Tree) {
 		ctx, ok := n.(gen.IWhile_stmtContext)
 		if !ok || scopedAncestor(n) {
@@ -666,18 +680,9 @@ func classifyI128(tree antlr.Tree) (i128, u128, longs map[string]bool, mag []Mag
 		}
 		if name, m, _, ok := bigCounterBound(ctx, proved); ok {
 			hullMerge(dm, name, m)
+			counterNames[name] = true
 		}
 	})
-	// Straight-line assigns in collection order (document order).
-	for _, a := range collectAssigns(tree) {
-		if len(a.targets) != 1 {
-			continue
-		}
-		// NOTE: collectAssigns loses positions; the ancestor check needs
-		// the node. Handled below by re-walking with nodes (see
-		// collectAssignNodes).
-		_ = a
-	}
 	for _, na := range collectAssignNodes(tree) {
 		if len(na.targets) != 1 {
 			continue
@@ -688,6 +693,19 @@ func classifyI128(tree antlr.Tree) (i128, u128, longs map[string]bool, mag []Mag
 		if m, ok := magText(na.rhs, proved, dm); ok {
 			hullMerge(dm, na.targets[0], m)
 		}
+	}
+	// Invalidate: vars written in loops (unbounded growth) or via
+	// global/nonlocal (unknown timing) lose their proofs — except
+	// pure counters (exact, re-proven above). Deletion only removes
+	// proofs (veto direction); never narrows.
+	for n := range loopWrittenVars(tree) {
+		if !counterNames[n] {
+			delete(dm, n)
+		}
+	}
+	for n := range globalWrittenVars(tree) {
+		delete(dm, n)
+		delete(counterNames, n)
 	}
 	// Tier decision with evidence rows (deterministic order).
 	names := make([]string, 0, len(dm))
@@ -1186,6 +1204,23 @@ func (r *i128R) wideAssign(target, rhs string, indent int) {
 		r.ok = false
 		return
 	}
+	// a ** b with literal operands: const-eval exactly, then parse temp.
+	if l, rr, ok := splitTopTwo(s, "**"); ok {
+		if lv, ok1 := bigLit(l); ok1 {
+			if rv, ok2 := bigLit(rr); ok2 {
+				if rv.Sign() >= 0 && rv.IsInt64() && rv.Int64() <= 100000 {
+					v := new(big.Int).Exp(lv, rv, nil)
+					if v.BitLen() <= maxPowBits {
+						r.emit(indent, target+" = "+r.tempFor(v.String(), signed))
+						r.typedSoFar[target] = true
+						return
+					}
+				}
+			}
+		}
+		r.ok = false
+		return
+	}
 	// Binary arithmetic: operands each small-lit, temp-eligible big-lit,
 	// or same-sign wide; % // need nonneg dividend + positive divisor
 	// (C-vs-Python sign semantics differ otherwise).
@@ -1204,23 +1239,6 @@ func (r *i128R) wideAssign(target, rhs string, indent int) {
 		}
 		r.emit(indent, target+" = "+l+" "+op+" "+rr)
 		r.typedSoFar[target] = true
-		return
-	}
-	// a ** b with literal operands: const-eval exactly, then parse temp.
-	if l, rr, ok := splitTopTwo(s, "**"); ok {
-		if lv, ok1 := bigLit(l); ok1 {
-			if rv, ok2 := bigLit(rr); ok2 {
-				if rv.Sign() >= 0 && rv.IsInt64() && rv.Int64() <= 100000 {
-					v := new(big.Int).Exp(lv, rv, nil)
-					if v.BitLen() <= maxPowBits {
-						r.emit(indent, target+" = "+r.tempFor(v.String(), signed))
-						r.typedSoFar[target] = true
-						return
-					}
-				}
-			}
-		}
-		r.ok = false
 		return
 	}
 	r.ok = false
@@ -1584,4 +1602,99 @@ func isPyKeyword(s string) bool {
 		return true
 	}
 	return false
+}
+
+// exoticLoopRe matches constructs whose binding effects need whole-loop
+// invalidation (definitions, deletions, context managers, handlers,
+// coroutines, pattern matching, nonlocal/global rebinding, walrus).
+// String/comment contents can false-positive (veto direction — sound).
+var exoticLoopRe = regexp.MustCompile(`\b(def|class|del|with|except|lambda|yield|await|global|nonlocal|match|try|import|from|:=)\b`)
+
+// loopWrittenVars collects names bound anywhere under loop nodes (any
+// depth, including inside functions — over-deletion is veto-safe).
+// Plain and augmented targets structurally; walrus/def/del/with/except
+// and friends via whole-subtree nuclear fallback (any exotic keyword
+// invalidates every identifier mentioned in that loop).
+func hasValueAfterColon(t string) bool {
+	i := strings.IndexByte(t, ':')
+	return i >= 0 && i+1 < len(t)
+}
+
+func loopWrittenVars(tree antlr.Tree) map[string]bool {
+	out := map[string]bool{}
+	// annTargetRe matches `name:`-led annotated assigns; hasValueAfterColon
+	// confirms a value follows (bare `x: int` does not bind).
+	var annTargetRe = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)\s*:`)
+
+	var augTargetRe = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)\s*(?:\+=|-=|\*=|/=|%=|//=|>>=|<<=|\*\*=?|&=|\|=|\^=|@=)`)
+	walkTree(tree, func(n antlr.Tree) {
+		var text string
+		switch ctx := n.(type) {
+		case gen.IWhile_stmtContext:
+			text = ctx.GetText()
+		case gen.IFor_stmtContext:
+			text = ctx.GetText()
+			if nm := forTargetName(ctx); nm != "" {
+				out[nm] = true
+			}
+		default:
+			return
+		}
+		// Collect from the loop subtree (covers nesting by visiting
+		// nested loops separately too — set union, duplicates harmless).
+		walkTree(n, func(x antlr.Tree) {
+			if ctx, ok := x.(gen.IExpr_stmtContext); ok {
+				if ctx.Augassign() != nil {
+					t := stripSpaces(ctx.GetText())
+					if m := augTargetRe.FindStringSubmatch(t); m != nil {
+						out[m[1]] = true
+					}
+					return
+				}
+				if ctx.Annassign() != nil {
+					// Annotated assign WITH a value binds (x: int = 5); bare
+					// annotation does not. Plain-name targets only.
+					t := stripSpaces(ctx.GetText())
+					if m := annTargetRe.FindStringSubmatch(t); m != nil && hasValueAfterColon(t) {
+						out[m[1]] = true
+					}
+					return
+				}
+				ts := ctx.AllTestlist_star_expr()
+				if len(ts) >= 2 {
+					for _, tg := range ts[:len(ts)-1] {
+						if nm := strings.TrimSpace(tg.GetText()); isSimpleName(nm) {
+							out[nm] = true
+						}
+					}
+				}
+			}
+		})
+		if exoticLoopRe.MatchString(stripSpaces(text)) {
+			for _, id := range reIdentAll.FindAllString(text, -1) {
+				out[id] = true
+			}
+		}
+	})
+	return out
+}
+
+// globalWrittenVars collects module names written through `global`
+// (or `nonlocal`, treated identically conservative) declarations inside
+// functions. Structural (AllName), no regexes.
+func globalWrittenVars(tree antlr.Tree) map[string]bool {
+	out := map[string]bool{}
+	walkTree(tree, func(n antlr.Tree) {
+		switch ctx := n.(type) {
+		case gen.IGlobal_stmtContext:
+			for _, nm := range ctx.AllName() {
+				out[nm.GetText()] = true
+			}
+		case gen.INonlocal_stmtContext:
+			for _, nm := range ctx.AllName() {
+				out[nm.GetText()] = true
+			}
+		}
+	})
+	return out
 }
