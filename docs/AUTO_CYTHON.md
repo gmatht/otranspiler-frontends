@@ -591,6 +591,59 @@ coverage becomes Cython's.
 
 ---
 
+## 13. Benchmarks (reproducible)
+
+`coverage/py2cy-bench.sh` measures the **annotation pass** on the bench
+shapes — the same files `bench_cython.sh` uses — at their own fixed N, so
+the numbers are comparable run-to-run without calibration. Reproduce:
+
+```sh
+cd frontends/py-sh-go
+REPS=5 ./coverage/py2cy-bench.sh
+```
+
+Requires `cython`, `python3-config` and (for the `--gmp` row) `gmp.h`. Every
+implementation is parity-checked against CPython *before* it is timed; the
+reported time is the best of `REPS`.
+
+One capture (`REPS=4`, `gcc -O2`, Cython 3.0.8):
+
+| shape | impl | time(s) | vs CPython |
+|---|---|---|---|
+| `rolling_hash` (range 2e6) | CPython | 0.741 | 1.00× |
+| | Cython (pure) | 0.904 | 0.82× |
+| | **py2cy (default)** | **0.119** | **6.25×** |
+| | hand-typed `.pyx` | 0.073 | 10.17× |
+| `sum_squares` (range 2e6) | CPython | 0.595 | 1.00× |
+| | Cython (pure) | 0.780 | 0.76× |
+| | **py2cy (default)** | **0.421** | **1.41×** |
+| `bignum_mul` (while 1e5) | CPython | 0.748 | 1.00× |
+| | Cython (pure) | 0.769 | 0.97× |
+| | **py2cy --gmp** | **0.241** | **3.10×** |
+| | hand-typed `.pyx` | 0.222 | 3.36× |
+
+Reading it:
+
+- **Typing is the whole win.** Pure Cython is ≤ CPython on every shape
+  (0.76–0.97×); the same source plus py2cy's declarations is 1.4–6.3×.
+- **The hand-typed `.pyx` still edges py2cy** on `rolling_hash` (0.073 vs
+  0.119): the golden wraps the loop in a function and uses function-local
+  `cdef long long`, while py2cy emits module-level `cython.declare`, which
+  is a little slower. On bigint they are within noise (0.222 vs 0.241).
+- **Partial typing shows up honestly.** `sum_squares` proves only the
+  counter `i`: `xs` stays a Python list (pure-Python mode has no typed
+  `list[int]`) and the exact sum needs `__int128`, which Cython cannot
+  express — hence 1.41×, not 30×.
+- **GMP pays on bigint** (3.10×, near the hand-written golden), at the cost
+  of `.pyx`-only output and `-lgmp`.
+- All of these **link libpython** (`cython --embed`): short programs carry a
+  ~57 ms startup the `py-sh-go → C` path (~1 ms) does not.
+
+Caveat: absolute times move ~2× run-to-run on a loaded shared box; the
+ordering and the ratios are the stable result. Timing is informational (the
+repo's testing policy) — the parity oracles (`coverage/py2cy-parity.sh`,
+`coverage/gmp-parity.sh`, and `make py2cy-test gmp-test`) are the gate.
+
 ## 12. References
 
 In-tree:
