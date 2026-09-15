@@ -612,6 +612,16 @@ pinned by `spec_collect_rejects_baked_array_index_in_bare_arith`.
 - gate: `make py2cy-test` — `autocython_test.go` (the proof/refusal boundary)
   plus `coverage/py2cy-parity.sh` (annotate → `cython --embed` → stdout must
   equal CPython; 22/22 on the t01–t1x slice, t101 included).
+- **evidence guardrails** (`autocython_evidence_test.go`): the table is checked
+  against **CPython**, not against itself. The counter shapes carry their true
+  min/max and the proof must *contain* them (soundness), with exactness pinned
+  for unit-step counters; `ValueType()` must be a real interval — never the
+  profiler's `1..8` magnitude *bucket* dressed up as a range; and the emitted
+  `cdef`/`cython.declare` type must equal `EvidenceFor(name).Width`, so the
+  declaration and the "why" column cannot drift apart (one proof, two views).
+  These guardrails caught an **unsound** `while i > K` lower bound —
+  `i=10; while i>0: i=i-1` reported `Int[2,10]` while `i` is `0` at the print —
+  and an off-by-one on `<=`/`>=` (`while i <= 5` reported max 5, actual 6).
 
 Measured on `bench/rolling_hash.py` the analysis proves both `h` and `i`:
 **0.12 s vs 0.74 s CPython and 0.93 s pure Cython**, with identical stdout.

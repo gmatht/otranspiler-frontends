@@ -29,7 +29,7 @@ run() { # <name> <source>
     echo "FAIL $name (cc)"; fail=$((fail+1)); return
   fi
   local got want
-  got="$("$tmp/$name")"; want="$(python3 "$tmp/$name.py")"
+  got="$(PYTHONUNBUFFERED=1 "$tmp/$name")"; want="$(PYTHONUNBUFFERED=1 python3 "$tmp/$name.py")"
   if [ "$got" = "$want" ]; then ok=$((ok+1)); else echo "FAIL $name [$got] vs [$want]"; fail=$((fail+1)); fi
 }
 

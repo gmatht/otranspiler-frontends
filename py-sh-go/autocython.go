@@ -76,8 +76,22 @@ func DefaultOptions() Options { return Options{Level: OptFull, Mode: ModePy} }
 // CythonOutput is the result of the annotation pass.
 type CythonOutput struct {
 	Source  string   // pure-Python-mode Cython (also valid CPython)
-	Typed   []string // names emitted as cdef long long
+	Typed   []string // names emitted as C ints (any width)
 	Refused []string // names left as Python objects (informational)
+	// Evidence separates the proved VALUE range from the required C STORAGE
+	// width (autocython_width.go): the same proof is honest for both the
+	// annotation and the "why" column of the evidence table.
+	Evidence []IntEvidence
+}
+
+// EvidenceFor returns the evidence for one name (ok=false if unproved).
+func (o *CythonOutput) EvidenceFor(name string) (IntEvidence, bool) {
+	for _, e := range o.Evidence {
+		if e.Name == name {
+			return e, true
+		}
+	}
+	return IntEvidence{}, false
 }
 
 var reSimple = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
@@ -104,6 +118,8 @@ func AnnotateCython(src string, opts Options) (*CythonOutput, error) {
 	moduleInts, moduleFloats := map[string]bool{}, map[string]bool{}
 	moduleAssigned := map[string]bool{}
 	funcInts, funcFloats := map[string]bool{}, map[string]bool{}
+	moduleWidths := map[string]IntEvidence{}
+	funcWidths := map[string]IntEvidence{}
 	var ins []insertion
 	var moduleEnv env
 	if opts.Level != OptNone {
@@ -116,7 +132,12 @@ func AnnotateCython(src string, opts Options) (*CythonOutput, error) {
 			moduleInts = subtract(p.ints, bad)
 			moduleFloats = subtract(p.floats, bad)
 		}
-		ins, funcInts, funcFloats = collectFuncDecls(tree, strings.Split(src, "\n"), opts.Level, opts.Mode)
+		for n, ev := range p.widths {
+			if moduleInts[n] {
+				moduleWidths[n] = ev
+			}
+		}
+		ins, funcInts, funcFloats, funcWidths = collectFuncDecls(tree, strings.Split(src, "\n"), opts.Level, opts.Mode)
 	}
 
 	// typed int lists -> a C `long long` vector (a .pyx-only transform)
@@ -175,20 +196,48 @@ func AnnotateCython(src string, opts Options) (*CythonOutput, error) {
 	if opts.Mode == ModePy {
 		b.WriteString("import cython\n")
 	}
-	b.WriteString(declLines(sortedKeys(moduleInts), sortedKeys(moduleFloats), opts.Mode))
+	b.WriteString(declLines(sortedKeys(moduleInts), sortedKeys(moduleFloats), opts.Mode, moduleWidths))
 	b.WriteString(containerDecls)
 	b.WriteString(body)
-	return &CythonOutput{Source: b.String(), Typed: names, Refused: refused}, nil
+	evidence := make([]IntEvidence, 0, len(moduleWidths)+len(funcWidths))
+	for n, ev := range moduleWidths {
+		ev.Name = n
+		evidence = append(evidence, ev)
+	}
+	for n, ev := range funcWidths {
+		ev.Name = n
+		evidence = append(evidence, ev)
+	}
+	sort.Slice(evidence, func(i, j int) bool { return evidence[i].Name < evidence[j].Name })
+	return &CythonOutput{Source: b.String(), Typed: names, Refused: refused, Evidence: evidence}, nil
 }
 
-func declLines(ints, floats []string, mode Mode) string {
+// declLines groups the int scalars by their required C storage width
+// (autocython_width.go): a value whose range AND every intermediate fit
+// 32 bits earns `cdef int`, everything else `cdef long long`. A name with no
+// evidence entry (only possible if the analysis changed under us) defaults to
+// the conservative i64.
+func declLines(ints, floats []string, mode Mode, widths map[string]IntEvidence) string {
 	if len(ints) == 0 && len(floats) == 0 {
 		return ""
 	}
+	byWidth := map[Width][]string{}
+	for _, n := range ints {
+		w := widths[n].Width
+		if w != WidthI32 {
+			w = WidthI64
+		}
+		byWidth[w] = append(byWidth[w], n)
+	}
+	for w := range byWidth {
+		sort.Strings(byWidth[w])
+	}
 	if mode == ModePyx {
 		var b strings.Builder
-		if len(ints) > 0 {
-			b.WriteString("cdef long long " + strings.Join(ints, ", ") + "\n")
+		for _, w := range []Width{WidthI32, WidthI64} {
+			if len(byWidth[w]) > 0 {
+				b.WriteString("cdef " + w.cType() + " " + strings.Join(byWidth[w], ", ") + "\n")
+			}
 		}
 		if len(floats) > 0 {
 			b.WriteString("cdef double " + strings.Join(floats, ", ") + "\n")
@@ -197,16 +246,18 @@ func declLines(ints, floats []string, mode Mode) string {
 	}
 	type decl struct{ name, ctype string }
 	var ds []decl
-	for _, n := range ints {
-		ds = append(ds, decl{n, "longlong"})
+	for _, w := range []Width{WidthI32, WidthI64} {
+		for _, n := range byWidth[w] {
+			ds = append(ds, decl{n, w.cythonType()})
+		}
 	}
 	for _, n := range floats {
-		ds = append(ds, decl{n, "double"})
+		ds = append(ds, decl{n, "cython.double"})
 	}
 	sort.Slice(ds, func(i, j int) bool { return ds[i].name < ds[j].name })
 	parts := make([]string, len(ds))
 	for i, d := range ds {
-		parts[i] = d.name + "=cython." + d.ctype
+		parts[i] = d.name + "=" + d.ctype
 	}
 	return "cython.declare(" + strings.Join(parts, ", ") + ")\n"
 }
@@ -224,6 +275,7 @@ func indentLines(s, indent string) string {
 type proof struct {
 	ints, floats, assigned map[string]bool
 	env                    env
+	widths                 map[string]IntEvidence // C storage width per int scalar
 }
 
 // proveAll runs the chosen analysis for one scope.
@@ -231,7 +283,8 @@ func proveAll(tree antlr.Tree, level Level) proof {
 	if level == OptSimple {
 		e, assigned := proveRanges(tree)
 		ints, _ := proveSimple(tree)
-		return proof{ints: ints, floats: map[string]bool{}, assigned: assigned, env: e}
+		return proof{ints: ints, floats: map[string]bool{}, assigned: assigned, env: e,
+			widths: intEvidence(tree, e, ints)}
 	}
 	e, assigned := proveRanges(tree)
 	allInt := intDomainFixpoint(tree)
@@ -245,7 +298,8 @@ func proveAll(tree antlr.Tree, level Level) proof {
 	for n := range ints {
 		delete(floats, n)
 	}
-	return proof{ints: ints, floats: floats, assigned: assigned, env: e}
+	return proof{ints: ints, floats: floats, assigned: assigned, env: e,
+		widths: intEvidence(tree, e, ints)}
 }
 
 func unionSets(a, b map[string]bool) map[string]bool {
@@ -279,9 +333,10 @@ type insertion struct {
 // `cython.declare(...)` lines to insert at the top of each body (after a
 // docstring). Parameters are never declared: a parameter can be any Python
 // object, so forcing a C type would change behaviour for non-int callers.
-func collectFuncDecls(tree antlr.Tree, lines []string, level Level, mode Mode) ([]insertion, map[string]bool, map[string]bool) {
+func collectFuncDecls(tree antlr.Tree, lines []string, level Level, mode Mode) ([]insertion, map[string]bool, map[string]bool, map[string]IntEvidence) {
 	var ins []insertion
 	intsAll, floatsAll := map[string]bool{}, map[string]bool{}
+	widthsAll := map[string]IntEvidence{}
 	walkTree(tree, func(n antlr.Tree) {
 		fn, ok := n.(gen.IFuncdefContext)
 		if !ok {
@@ -296,17 +351,37 @@ func collectFuncDecls(tree antlr.Tree, lines []string, level Level, mode Mode) (
 		bad := unsafeTypedNames(body, p.env, p.ints, all)
 		ints := subtract(p.ints, bad)
 		floats := subtract(p.floats, bad)
+		// never declare a parameter (any object at the call site) or a name
+		// the function declares `global`/`nonlocal` (a local cdef would shadow
+		// the outer binding).
 		params := map[string]bool{}
 		if prm := fn.Parameters(); prm != nil {
 			for _, id := range reIdentAll.FindAllString(prm.GetText(), -1) {
 				params[id] = true
 			}
 		}
+		walkTree(body, func(t antlr.Tree) {
+			switch g := t.(type) {
+			case gen.IGlobal_stmtContext:
+				for _, nm := range g.AllName() {
+					params[nm.GetText()] = true
+				}
+			case gen.INonlocal_stmtContext:
+				for _, nm := range g.AllName() {
+					params[nm.GetText()] = true
+				}
+			}
+		})
 		var intNames, floatNames []string
+		widths := map[string]IntEvidence{}
 		for nm := range ints {
 			if p.assigned[nm] && !params[nm] {
 				intNames = append(intNames, nm)
 				intsAll[nm] = true
+				if ev, ok := p.widths[nm]; ok {
+					widths[nm] = ev
+					widthsAll[nm] = ev
+				}
 			}
 		}
 		for nm := range floats {
@@ -339,9 +414,9 @@ func collectFuncDecls(tree antlr.Tree, lines []string, level Level, mode Mode) (
 			line = len(lines)
 		}
 		indent := leadingWS(lines[line-1])
-		ins = append(ins, insertion{line: line, text: indentLines(declLines(intNames, floatNames, mode), indent)})
+		ins = append(ins, insertion{line: line, text: indentLines(declLines(intNames, floatNames, mode, widths), indent)})
 	})
-	return ins, intsAll, floatsAll
+	return ins, intsAll, floatsAll, widthsAll
 }
 
 func isDocstring(s gen.IStmtContext) bool {

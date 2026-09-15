@@ -49,20 +49,66 @@ func TestAnnotateLevels(t *testing.T) {
 }
 
 func TestAnnotateRollingHash(t *testing.T) {
-	// `i` is a literal-bounded range counter; `h` reaches the fixed point
-	// [0, 1000000006] via `% M` (with a provably non-negative lhs), and the
-	// i64 intermediates never overflow -> both proved.
+	// `i` is a literal-bounded range counter -> int; `h`'s VALUE reaches the
+	// fixed point [0, 1000000006] (which fits int on its own), but the
+	// assignment `h = (h*31 + i) % M` computes the intermediate `h*31` in h's
+	// C type, and that reaches 3.1e10 -> h's STORAGE must be long long. This
+	// is the value-range vs storage-width split: the proof is about the value,
+	// the declaration is about the storage.
 	src := "h = 0\nfor i in range(2000000):\n    h = (h * 31 + i) % 1000000007\nprint(h)\n"
 	out := annotate(t, src)
 	if !typed(out, "h") || !typed(out, "i") {
 		t.Fatalf("expected h and i typed; got %v (refused %v)", out.Typed, out.Refused)
 	}
-	if !strings.Contains(out.Source, "cython.declare(h=cython.longlong, i=cython.longlong)") {
-		t.Fatalf("declaration missing:\n%s", out.Source)
+	if !strings.Contains(out.Source, "cython.declare(h=cython.longlong, i=cython.int)") {
+		t.Fatalf("declaration missing or wrong width:\n%s", out.Source)
+	}
+	// the evidence keeps the two facts separate and explains the width
+	ev, ok := out.EvidenceFor("h")
+	if !ok {
+		t.Fatalf("no evidence for h: %+v", out.Evidence)
+	}
+	if ev.Lo != 0 || ev.Hi != 1000000006 {
+		t.Fatalf("h value range: got [%d,%d]", ev.Lo, ev.Hi)
+	}
+	if ev.Width != WidthI64 || ev.WidthFrom != fromIntermediate || ev.Intermediate != "h*31" {
+		t.Fatalf("h width evidence: %+v", ev)
+	}
+	if !strings.Contains(ev.Reason(), "h*31 intermediate needs long long") {
+		t.Fatalf("h reason not honest about the intermediate: %q", ev.Reason())
+	}
+	if evi, _ := out.EvidenceFor("i"); evi.Width != WidthI32 {
+		t.Fatalf("i must earn int, got %v", evi.Width)
 	}
 	// the emitted file is still runnable Python: the source is intact.
 	if !strings.HasSuffix(out.Source, src) {
 		t.Fatalf("source not preserved:\n%s", out.Source)
+	}
+}
+
+// TestAnnotateWidthSmallRange pins the other half of the split: a variable
+// whose value range AND whose every assigned intermediate fit 32 bits earns
+// `int`, not the unconditional `long long` the pass used to emit.
+func TestAnnotateWidthSmallRange(t *testing.T) {
+	src := "h = 0\nfor i in range(10):\n    h = (h + i) % 7\nprint(h)\n"
+	out := annotate(t, src)
+	if !strings.Contains(out.Source, "cython.declare(h=cython.int, i=cython.int)") {
+		t.Fatalf("small-range scalars must earn int:\n%s", out.Source)
+	}
+	for _, n := range []string{"h", "i"} {
+		ev, ok := out.EvidenceFor(n)
+		if !ok || ev.Width != WidthI32 {
+			t.Fatalf("%s must be i32 with evidence; got %+v", n, ev)
+		}
+		if !strings.Contains(ev.Reason(), "fits int") {
+			t.Fatalf("%s reason: %q", n, ev.Reason())
+		}
+	}
+	// a value range that needs more than 32 bits is i64 for that reason alone
+	big := annotate(t, "x = 5000000000\n")
+	ev, ok := big.EvidenceFor("x")
+	if !ok || ev.Width != WidthI64 || ev.WidthFrom != fromValue {
+		t.Fatalf("x must be i64 from its value range; got %+v", ev)
 	}
 }
 
@@ -160,7 +206,7 @@ func TestAnnotateFunctionScope(t *testing.T) {
 	if !typed(out, "h") || !typed(out, "i") {
 		t.Fatalf("expected h and i typed; got %v (refused %v)", out.Typed, out.Refused)
 	}
-	if !strings.Contains(out.Source, "    cython.declare(h=cython.longlong, i=cython.longlong)") {
+	if !strings.Contains(out.Source, "    cython.declare(h=cython.int, i=cython.int)") {
 		t.Fatalf("function declaration missing:\n%s", out.Source)
 	}
 }
@@ -188,7 +234,7 @@ func TestAnnotatePyxMode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.Source, "cdef long long h, i") {
+	if !strings.Contains(out.Source, "cdef int h, i") {
 		t.Fatalf("expected cdef declaration:\n%s", out.Source)
 	}
 	if strings.Contains(out.Source, "import cython") {
@@ -199,13 +245,19 @@ func TestAnnotatePyxMode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(fn.Source, "    cdef long long h") {
+	if !strings.Contains(fn.Source, "    cdef int h") {
 		t.Fatalf("expected function-local cdef:\n%s", fn.Source)
 	}
 	// pure-Python mode is unchanged
 	py, _ := AnnotateCython("h = 0\n", DefaultOptions())
-	if !strings.Contains(py.Source, "cython.declare(h=cython.longlong)") {
+	if !strings.Contains(py.Source, "cython.declare(h=cython.int)") {
 		t.Fatalf("py mode changed:\n%s", py.Source)
+	}
+	// a wider intermediate selects cdef long long, and the two widths are
+	// emitted as separate declarations (the C loop shape).
+	wide, _ := AnnotateCython("h = 0\nfor i in range(2000000):\n    h = (h * 31 + i) % 1000000007\nprint(h)\n", opts)
+	if !strings.Contains(wide.Source, "cdef int i") || !strings.Contains(wide.Source, "cdef long long h") {
+		t.Fatalf("width split not emitted in pyx mode:\n%s", wide.Source)
 	}
 }
 
@@ -246,8 +298,8 @@ func TestAnnotateFloat(t *testing.T) {
 			t.Fatalf("expected %s typed; got %v", n, out.Typed)
 		}
 	}
-	if !strings.Contains(out.Source, "c=cython.double") || !strings.Contains(out.Source, "d=cython.longlong") {
-		t.Fatalf("expected double c and longlong d:\n%s", out.Source)
+	if !strings.Contains(out.Source, "c=cython.double") || !strings.Contains(out.Source, "d=cython.int") {
+		t.Fatalf("expected double c and int d:\n%s", out.Source)
 	}
 	// a single `/` (true division) is a float even for int operands
 	if !strings.Contains(out.Source, "e=cython.double") {
@@ -255,7 +307,7 @@ func TestAnnotateFloat(t *testing.T) {
 	}
 	// pyx mode groups by C type
 	pyx, _ := AnnotateCython("a = 1.5\nd = 1\n", Options{Level: OptFull, Mode: ModePyx})
-	if !strings.Contains(pyx.Source, "cdef double a") || !strings.Contains(pyx.Source, "cdef long long d") {
+	if !strings.Contains(pyx.Source, "cdef double a") || !strings.Contains(pyx.Source, "cdef int d") {
 		t.Fatalf("pyx grouping wrong:\n%s", pyx.Source)
 	}
 	// mixed int/float assignment is neither
@@ -291,6 +343,16 @@ func TestAnnotateIntList(t *testing.T) {
 	} {
 		if o, _ := AnnotateCython(bad, Options{Level: OptFull, Mode: ModePyx}); strings.Contains(o.Source, "_sh_push_i64") {
 			t.Errorf("unexpected transform for %q:\n%s", bad, o.Source)
+		}
+	}
+}
+
+func TestAnnotateFunctionGlobalNotShadowed(t *testing.T) {
+	// a function-local cdef `g` would shadow `global g`
+	out := annotate(t, "g = 0\ndef f():\n    global g\n    g = 1\nf()\nprint(g)\n")
+	for _, line := range strings.Split(out.Source, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "cython.declare(g=") && strings.HasPrefix(line, "    ") {
+			t.Fatalf("function must not declare a global:\n%s", out.Source)
 		}
 	}
 }

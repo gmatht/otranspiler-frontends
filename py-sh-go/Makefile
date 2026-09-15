@@ -20,7 +20,7 @@ ANTLR4 ?= antlr4
 CLI ?= $(abspath ../../../otranspilerl/target/debug/otranspilerl-cli)
 GO ?= /snap/go/current/bin/go
 
-.PHONY: all gen build test parse-test py2cy py2cy-test gmp-test worker clean
+.PHONY: all gen build test parse-test py2cy py2cy-test py2cy-test-all gmp-test worker clean
 
 all: build
 
@@ -51,6 +51,11 @@ py2cy-test: py2cy
 # Bigint transform: .pyx with cdef mpz_t + GMP calls (docs/AUTO_CYTHON.md
 # Stage 1b). Needs cython + gmp.h; declines fall back to the exact
 # pure-Python output.
+# full corpus sweep (all 98 testdata) in both modes — slower than py2cy-test.
+py2cy-test-all: py2cy
+	MODE=py bash coverage/py2cy-parity.sh 'testdata/*.py'
+	MODE=pyx bash coverage/py2cy-parity.sh 'testdata/*.py'
+
 gmp-test: py2cy
 	$(GO) test -run TestGMP .
 	bash coverage/gmp-parity.sh

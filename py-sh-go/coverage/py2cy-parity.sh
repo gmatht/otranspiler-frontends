@@ -31,8 +31,8 @@ for f in ${1:-testdata/t0*.py testdata/t1*.py}; do
       $(python3-config --includes) $(python3-config --ldflags --embed) 2>/dev/null; then
     echo "FAIL $bn (cc)"; fail=$((fail+1)); continue
   fi
-  got="$(timeout 20 "$tmp/$bn" 2>/dev/null)"
-  want="$(timeout 20 python3 "$f" 2>/dev/null)"
+  got="$(PYTHONUNBUFFERED=1 timeout 20 "$tmp/$bn" 2>/dev/null)"
+  want="$(PYTHONUNBUFFERED=1 timeout 20 python3 "$f" 2>/dev/null)"
   if [ "$got" = "$want" ]; then
     ok=$((ok+1))
   else

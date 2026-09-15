@@ -376,13 +376,39 @@ func whileCounterBound(ctx gen.IWhile_stmtContext, e env) (string, iv, bool) {
 		return "", iv{}, false
 	}
 	if up {
-		hi, ok := addOvf(lit-1, delta)
+		// The largest value the counter takes is the loop EXIT value: the
+		// biggest in-range value plus one step. `while i < K` runs for
+		// i <= K-1 and exits at K; `while i <= K` runs for i <= K and exits
+		// at K+1. (The old `lit-1 + delta` treated both as `<`, so `<=`
+		// under-reported the max by one — an UNSOUND range.)
+		b := lit
+		if op == "<" {
+			var ok bool
+			if b, ok = addOvf(lit, -1); !ok {
+				return "", iv{}, false
+			}
+		}
+		hi, ok := addOvf(b, delta)
 		if !ok {
 			return "", iv{}, false
 		}
 		return name, known(init.lo, hi), true
 	}
-	lo, ok := addOvf(lit+1, -delta)
+	// Down-counter: the smallest value is the loop exit value. `while i > K`
+	// runs for i >= K+1 and exits at K; `while i >= K` runs for i >= K and
+	// exits at K-1. delta is negative, so bound + delta. (The old
+	// `lit+1 + -delta` ADDED the step magnitude instead of subtracting it
+	// and treated both as `>`, so it reported a lower bound ABOVE K —
+	// excluding the exit value: `i=10; while i>0: i=i-1` said Int[2,10]
+	// when i is 0 at the print.)
+	b := lit
+	if op == ">" {
+		var ok bool
+		if b, ok = addOvf(lit, 1); !ok {
+			return "", iv{}, false
+		}
+	}
+	lo, ok := addOvf(b, delta)
 	if !ok {
 		return "", iv{}, false
 	}
