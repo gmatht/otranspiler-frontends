@@ -183,3 +183,52 @@ func declaredWidths(t *testing.T, src string, mode Mode) map[string]Width {
 	}
 	return out
 }
+
+// TestEvidenceBigBoundRefuses — bignum_mul regression. The loop bound has
+// 67 digits (i64max has 19), so the counter analysis must abstain: no Int
+// evidence for `i` at any level, in any render mode — in particular never
+// the profiler's `1..8` width bucket dressed up as `Int[1,8]` — and no
+// declaration. `x` is a 101-bit bigint, likewise no Int evidence.
+// (A display once showed exactly that bogus row with a fabricated "proved
+// by the interval analysis" reason; the analysis itself refuses.)
+func TestEvidenceBigBoundRefuses(t *testing.T) {
+	src := "x = 2 ** 100\ni = 0\n" +
+		"while i < 1000000000000000000000000000000000000000000000000000000000000000000:\n" +
+		"    x = x * 3\n    i = i + 1\nprint(x % 1000000007)\n"
+	modes := []Options{
+		{Level: OptNone, Mode: ModePy},
+		{Level: OptSimple, Mode: ModePy},
+		{Level: OptFull, Mode: ModePy},
+		{Level: OptFull, Mode: ModePyx},
+		{Level: OptFull, Mode: ModePyx, GMP: true},
+	}
+	for _, opts := range modes {
+		out, err := AnnotateCython(src, opts)
+		if err != nil {
+			t.Fatalf("%+v: %v", opts, err)
+		}
+		if ev, ok := out.EvidenceFor("i"); ok {
+			t.Errorf("%+v: Int evidence for unbounded counter i: %s (Lo=%d Hi=%d)",
+				opts, ev.ValueType(), ev.Lo, ev.Hi)
+		}
+		if typed(out, "i") {
+			t.Errorf("%+v: i typed without proof: %v", opts, out.Typed)
+		}
+		if ev, ok := out.EvidenceFor("x"); ok {
+			t.Errorf("%+v: Int evidence for 101-bit bigint x: %s", opts, ev.ValueType())
+		}
+		// Display-boundary guard: every emitted row is a real interval.
+		for _, ev := range out.Evidence {
+			if !reValueType.MatchString(ev.ValueType()) {
+				t.Errorf("%+v: %s is not an interval", opts, ev.Name)
+			}
+			if ev.Lo > ev.Hi {
+				t.Errorf("%+v: %s inverted range", opts, ev.Name)
+			}
+		}
+		decl := declaredWidths(t, out.Source, opts.Mode)
+		if _, ok := decl["i"]; ok {
+			t.Errorf("%+v: i declared without proof", opts)
+		}
+	}
+}
