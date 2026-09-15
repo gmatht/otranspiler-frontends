@@ -4,7 +4,10 @@
 #     upstream grammars in grammars/; regenerate with `make gen`). It is
 #     the coverage front end: `py-sh-go --parse <file.py>` accepts
 #     essentially all Python (classes, decorators, async, comprehensions,
-#     match, ...; the upstream grammar's one gap is the walrus operator).
+#     match, positional-only params, numeric `_` separators, soft `case`,
+#     ...). The upstream grammars-v4 files additionally lacked the walrus
+#     operator; the in-repo grammar carries all of the above (see
+#     corpus/walrus.py and corpus/py38_plus.py).
 #   * main.go — the hand-rolled recursive-descent parser + lowerer for the
 #     v1 shell-flavored Python subset (the t01-t101 corpus), still the
 #     path that emits A1. Lowering from the ANTLR tree is the next slice.

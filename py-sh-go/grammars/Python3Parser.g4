@@ -86,7 +86,17 @@ parameters
 
 typedargslist
     : (
-        tfpdef ('=' test)? (',' tfpdef ('=' test)?)* (
+        tfpdef ('=' test)? (',' tfpdef ('=' test)?)* ',' '/' (',' (
+            tfpdef ('=' test)? (',' tfpdef ('=' test)?)* (
+                ',' (
+                    '*' tfpdef? (',' tfpdef ('=' test)?)* (',' ('**' tfpdef ','?)?)?
+                    | '**' tfpdef ','?
+                )?
+            )?
+            | '*' tfpdef? (',' tfpdef ('=' test)?)* (',' ('**' tfpdef ','?)?)?
+            | '**' tfpdef ','?
+        )?)?
+        | tfpdef ('=' test)? (',' tfpdef ('=' test)?)* (
             ',' (
                 '*' tfpdef? (',' tfpdef ('=' test)?)* (',' ('**' tfpdef ','?)?)?
                 | '**' tfpdef ','?
@@ -103,7 +113,17 @@ tfpdef
 
 varargslist
     : (
-        vfpdef ('=' test)? (',' vfpdef ('=' test)?)* (
+        vfpdef ('=' test)? (',' vfpdef ('=' test)?)* ',' '/' (',' (
+            vfpdef ('=' test)? (',' vfpdef ('=' test)?)* (
+                ',' (
+                    '*' vfpdef? (',' vfpdef ('=' test)?)* (',' ('**' vfpdef ','?)?)?
+                    | '**' vfpdef ','?
+                )?
+            )?
+            | '*' vfpdef? (',' vfpdef ('=' test)?)* (',' ('**' vfpdef ','?)?)?
+            | '**' vfpdef ','?
+        )?)?
+        | vfpdef ('=' test)? (',' vfpdef ('=' test)?)* (
             ',' (
                 '*' vfpdef? (',' vfpdef ('=' test)?)* (',' ('**' vfpdef ','?)?)?
                 | '**' vfpdef (',')?
@@ -610,6 +630,7 @@ name
     : NAME
     | '_'
     | 'match'
+    | 'case'
     ;
 
 testlist_comp

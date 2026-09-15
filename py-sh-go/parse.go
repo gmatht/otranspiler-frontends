@@ -1,9 +1,12 @@
 // parse.go — the full-Python ANTLR4 front end.
 //
 // py-sh-go's lowering path (main.go) is still a hand-rolled recursive
-// descent parser for the v1 subset. This file exposes the *complete*
-// Python 3.13-minus-walrus parse produced by the generated ANTLR grammar
-// (gen/), so coverage can grow by lowering from the real parse tree instead
+// descent parser for the v1 subset. This file exposes the complete
+// Python 3 parse produced by the generated ANTLR grammar
+// (gen/ — upstream grammars-v4 plus in-repo additions: CPython's
+// namedexpr_test, positional-only `/`, numeric underscores, and
+// `case` as an ordinary identifier), so coverage can grow by lowering
+// from the real parse tree instead
 // of extending a hand lexer. ParsePython returns the tree plus the syntax
 // errors; a caller that wants the old behaviour keeps using ShirExact.
 package pylib

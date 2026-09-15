@@ -113,16 +113,17 @@ STRING_LITERAL: ( [rR] | [uU] | [fF] | ( [fF] [rR]) | ( [rR] [fF]))? ( SHORT_STR
 BYTES_LITERAL: ( [bB] | ( [bB] [rR]) | ( [rR] [bB])) ( SHORT_BYTES | LONG_BYTES);
 
 /// decimalinteger ::=  nonzerodigit digit* | "0"+
-DECIMAL_INTEGER: NON_ZERO_DIGIT DIGIT* | '0'+;
+/// (underscores may separate digits: 1_000, 0_0)
+DECIMAL_INTEGER: NON_ZERO_DIGIT (DIGIT | '_' DIGIT)* | '0' ('_'? '0')*;
 
 /// octinteger     ::=  "0" ("o" | "O") octdigit+
-OCT_INTEGER: '0' [oO] OCT_DIGIT+;
+OCT_INTEGER: '0' [oO] ('_'? OCT_DIGIT)+;
 
 /// hexinteger     ::=  "0" ("x" | "X") hexdigit+
-HEX_INTEGER: '0' [xX] HEX_DIGIT+;
+HEX_INTEGER: '0' [xX] ('_'? HEX_DIGIT)+;
 
 /// bininteger     ::=  "0" ("b" | "B") bindigit+
-BIN_INTEGER: '0' [bB] BIN_DIGIT+;
+BIN_INTEGER: '0' [bB] ('_'? BIN_DIGIT)+;
 
 /// floatnumber   ::=  pointfloat | exponentfloat
 FLOAT_NUMBER: POINT_FLOAT | EXPONENT_FLOAT;
@@ -228,13 +229,13 @@ fragment POINT_FLOAT: INT_PART? FRACTION | INT_PART '.';
 fragment EXPONENT_FLOAT: ( INT_PART | POINT_FLOAT) EXPONENT;
 
 /// intpart       ::=  digit+
-fragment INT_PART: DIGIT+;
+fragment INT_PART: DIGIT (DIGIT | '_' DIGIT)*;
 
 /// fraction      ::=  "." digit+
-fragment FRACTION: '.' DIGIT+;
+fragment FRACTION: '.' DIGIT (DIGIT | '_' DIGIT)*;
 
 /// exponent      ::=  ("e" | "E") ["+" | "-"] digit+
-fragment EXPONENT: [eE] [+-]? DIGIT+;
+fragment EXPONENT: [eE] [+-]? DIGIT (DIGIT | '_' DIGIT)*;
 
 /// shortbytes     ::=  "'" shortbytesitem* "'" | '"' shortbytesitem* '"'
 /// shortbytesitem ::=  shortbyteschar | bytesescapeseq
