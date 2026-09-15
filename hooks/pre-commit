@@ -1,0 +1,105 @@
+#!/bin/sh
+# o4 git guard — pre-commit checks that actually fit a commit hook.
+#
+# The previous guard (an untracked .git/hooks/pre-commit, present in exactly two
+# working copies) checked two things and nothing else, so it could not have
+# caught the defects that actually reached us:
+#
+#   * committed merge-conflict markers in sh2perl/src/shir_nodes/enc.rs
+#     (a broken commit — the hook had no marker check at all);
+#   * an unbalanced sh2perl/src/transforms/text_ops.rs and a call into the
+#     deleted `crate::generator` module (compile-level, invisible to a
+#     staged-blob check);
+#   * the un-ignored frontends tree, where 3.6 MB build-on-test binaries were
+#     one `git add -A` from being committed — in a repo (a fresh `git init`)
+#     that had NO hooks installed, because .git/hooks is per-checkout and
+#     untracked, so it is never cloned.
+#
+# Three rules, all on STAGED content:
+#   1. no file larger than PIR_COMMIT_MAX_BYTES (default 1 MiB) — the old rule,
+#      which the old header advertised as configurable but never read;
+#   2. no binary blobs (git's own numstat verdict);
+#   3. no merge-conflict markers in ADDED lines.
+#
+# Rule 3 looks at the staged diff's `+` lines rather than whole files, so
+# pre-existing content cannot false-positive, and `=======` alone is NOT a
+# marker (a markdown underline is not a conflict).  Intentional fixtures:
+# PIR_ALLOW_MARKERS=1.
+#
+# Everything under EXCLUDE is skipped: those paths are not this repository's
+# content.  `frontends/` is the important one — the frontends are a SEPARATE
+# repository now (otranspiler-frontends, mounted as sh2perl/frontends), so this
+# repo neither owns nor should police them.
+#
+# Usage:
+#   pre-commit            check the staged content (what git runs)
+#   pre-commit --all      check every tracked file (gates, CI, release checks)
+#   install.sh            activate this guard in a clone (sets core.hooksPath)
+# Bypass one commit: git commit --no-verify
+set -u
+
+# Paths this repo does not own (submodules, worktrees, vendor/scratch/build).
+EXCLUDE='^(frontends/|sh2perl/|backends/|s2p\.rust/|s2p_go/|node_modules/|target/|\.git/|\.pir/|\.scratch/|gate-reports/|triage/|junk/)'
+MARKER='^\+(<<<<<<<|>>>>>>>)( |$)'
+
+ALL=0
+[ "${1:-}" = "--all" ] && ALL=1
+
+MAX=${PIR_COMMIT_MAX_BYTES:-1048576}
+case "$MAX" in (*[!0-9]*|'') MAX=1048576;; esac
+allow_markers=${PIR_ALLOW_MARKERS:-0}
+
+bad=0
+if [ "$ALL" -eq 1 ]; then
+  files=$(git ls-files | grep -Ev "$EXCLUDE" || true)
+else
+  files=$(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null | grep -Ev "$EXCLUDE" || true)
+fi
+
+while IFS= read -r f; do
+  [ -z "$f" ] && continue
+
+  # ── rule 1 + 2: size and binary, on the staged/index content ──────────
+  if [ "$ALL" -eq 0 ] && git cat-file -e ":$f" 2>/dev/null; then
+    sz=$(git cat-file -s ":$f" 2>/dev/null || echo 0)
+    case "$sz" in (*[!0-9]*) sz=0;; esac
+    if [ "$sz" -gt "$MAX" ]; then
+      echo "o4 guard: '$f' is $sz bytes (> $MAX); commit aborted" >&2
+      bad=1
+    fi
+    if git diff --cached --numstat -- "$f" 2>/dev/null | awk 'NF>=3 && $1=="-" && $2=="-"{f=1} END{exit !f}'; then
+      echo "o4 guard: '$f' looks binary; commit aborted" >&2
+      bad=1
+    fi
+  fi
+
+  # ── rule 3: conflict markers in ADDED lines ───────────────────────────
+  if [ "$allow_markers" = "0" ]; then
+    if [ "$ALL" -eq 1 ]; then
+      if git grep -nIE '^(<<<<<<<|>>>>>>>)( |$)' -- "$f" 2>/dev/null | head -n 3 | grep . >&2; then
+        echo "o4 guard: '$f' contains a merge-conflict marker (see above); commit aborted" >&2
+        bad=1
+      fi
+    else
+      hits=$(git diff --cached -U0 -- "$f" 2>/dev/null | grep -nE "$MARKER" | head -n 3 || true)
+      if [ -n "$hits" ]; then
+        printf '%s\n' "$hits" >&2
+        echo "o4 guard: '$f' ADDS a merge-conflict marker (see above); commit aborted" >&2
+        bad=1
+      fi
+    fi
+  fi
+done <<EOF
+$files
+EOF
+
+if [ "$bad" -ne 0 ]; then
+  cat >&2 <<'MSG'
+o4 guard: commit blocked.
+  - conflict markers: resolve them; for an intentional fixture use PIR_ALLOW_MARKERS=1
+  - size: raise the threshold with PIR_COMMIT_MAX_BYTES=<bytes>
+  - wrong on purpose for one commit: git commit --no-verify
+MSG
+  exit 1
+fi
+exit 0
