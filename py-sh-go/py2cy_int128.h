@@ -13,14 +13,14 @@
 #ifndef PY2CY_INT128_H
 #define PY2CY_INT128_H
 
-typedef __int128_t py2cy_i128;
-typedef __uint128_t py2cy_u128;
+typedef __int128_t py2cy_int128;
+typedef __uint128_t py2cy_uint128;
 
 /* Decimal string (optional leading '-') to signed __int128. The caller
  * guarantees the value fits (py2cy proves magnitude before emitting). */
-static py2cy_i128 py2cy_i128_from_str(const char *s) {
+static py2cy_int128 py2cy_int128_from_str(const char *s) {
     int neg = 0;
-    py2cy_i128 v = 0;
+    py2cy_int128 v = 0;
     if (*s == '-') { neg = 1; s++; }
     while (*s >= '0' && *s <= '9') {
         v = v * 10 + (*s - '0');
@@ -30,10 +30,10 @@ static py2cy_i128 py2cy_i128_from_str(const char *s) {
 }
 
 /* Decimal string (digits only) to unsigned __int128. Caller guarantees fit. */
-static py2cy_u128 py2cy_u128_from_str(const char *s) {
-    py2cy_u128 v = 0;
+static py2cy_uint128 py2cy_uint128_from_str(const char *s) {
+    py2cy_uint128 v = 0;
     while (*s >= '0' && *s <= '9') {
-        v = v * 10 + (py2cy_u128)(*s - '0');
+        v = v * 10 + (py2cy_uint128)(*s - '0');
         s++;
     }
     return v;
@@ -41,13 +41,13 @@ static py2cy_u128 py2cy_u128_from_str(const char *s) {
 
 /* Exact __int128 -> Python int via byte array (no precision loss, no
  * static buffers — safe for nested/multi-arg prints). Needs Python.h. */
-static PyObject *py2cy_i128_to_py(py2cy_i128 v) {
+static PyObject *py2cy_int128_to_py(py2cy_int128 v) {
     int one = 1;
     int little = *(char *)&one;
     return _PyLong_FromByteArray((unsigned char *)&v, 16, little, 1);
 }
 
-static PyObject *py2cy_u128_to_py(py2cy_u128 v) {
+static PyObject *py2cy_uint128_to_py(py2cy_uint128 v) {
     int one = 1;
     int little = *(char *)&one;
     return _PyLong_FromByteArray((unsigned char *)&v, 16, little, 0);

@@ -796,12 +796,17 @@ func hullMerge(dm magEnv, name string, m bigIV) {
 // small literal or a real C integer. Anything else declines.
 const i128Block = `from libc.stdio cimport printf
 cdef extern from "py2cy_int128.h":
-    ctypedef unsigned long long int128
-    ctypedef unsigned long long uint128
-    int128 py2cy_i128_from_str(const char*)
-    uint128 py2cy_u128_from_str(const char*)
-    object py2cy_i128_to_py(int128)
-    object py2cy_u128_to_py(uint128)`
+    # Fake 64-bit stand-ins so Cython generates C; the header
+    # defines the SAME names as real __int128/__uint128 (Cython emits
+    # the names, C resolves them to 128 bits). Never use these names
+    # for values Cython itself converts (print/auto-box) — the renderer
+    # routes all conversions through the helpers below.
+    ctypedef unsigned long long py2cy_int128
+    ctypedef unsigned long long py2cy_uint128
+    py2cy_int128 py2cy_int128_from_str(const char*)
+    py2cy_uint128 py2cy_uint128_from_str(const char*)
+    object py2cy_int128_to_py(py2cy_int128)
+    object py2cy_uint128_to_py(py2cy_uint128)`
 
 // I128Output is a `.pyx`-mode result for the middle tier.
 // AnnotateI128 parses src and, if every integer variable is provably i64
@@ -830,17 +835,17 @@ func AnnotateI128(src string) (*I128Output, bool, error) {
 		b.WriteString("cdef long long " + n + "\n")
 	}
 	for _, n := range r.sortedI128() {
-		b.WriteString("cdef int128 " + n + "\n")
+		b.WriteString("cdef py2cy_int128 " + n + "\n")
 	}
 	for _, n := range r.sortedU128() {
-		b.WriteString("cdef uint128 " + n + "\n")
+		b.WriteString("cdef py2cy_uint128 " + n + "\n")
 	}
 	for _, t := range r.sortedTemps() {
 		info := r.tempInfo[t]
 		if info.signed {
-			b.WriteString("cdef int128 " + t + "\n")
+			b.WriteString("cdef py2cy_int128 " + t + "\n")
 		} else {
-			b.WriteString("cdef uint128 " + t + "\n")
+			b.WriteString("cdef py2cy_uint128 " + t + "\n")
 		}
 		b.WriteString(t + " = " + parseCall(info.signed, info.lit) + "\n")
 	}
@@ -854,9 +859,9 @@ func AnnotateI128(src string) (*I128Output, bool, error) {
 
 func parseCall(signed bool, lit string) string {
 	if signed {
-		return `py2cy_i128_from_str("` + lit + `")`
+		return `py2cy_int128_from_str("` + lit + `")`
 	}
-	return `py2cy_u128_from_str("` + lit + `")`
+	return `py2cy_uint128_from_str("` + lit + `")`
 }
 
 // classifyI128Full classifies i128/u128 (magnitude proof) plus longs
@@ -926,6 +931,23 @@ func (r *i128R) sortedTemps() []string {
 func (r *i128R) isWide(n string) bool   { return r.i128[n] || r.u128[n] }
 func (r *i128R) signedOf(n string) bool { return r.i128[n] }
 
+// readsMarked reports whether every classified (i128/u128/long) name
+// read in the text is already marked (its proving assignment executed).
+// Unmarked reads decline: a C var would read garbage where Python raises
+// NameError. f-strings veto (braces defeat stripping — fail-closed).
+func (r *i128R) readsMarked(s string) bool {
+	if strings.Contains(s, `f"`) || strings.Contains(s, `f'`) {
+		return false
+	}
+	clean := stripStrings(s)
+	for _, id := range reIdentAll.FindAllString(clean, -1) {
+		if (r.i128[id] || r.u128[id] || r.longs[id]) && !r.typedSoFar[id] {
+			return false
+		}
+	}
+	return true
+}
+
 // tempFor registers a big-int literal temper (module-top, deduped).
 // signed selects the parse helper; callers guarantee fit (proven).
 func (r *i128R) tempFor(lit string, signed bool) string {
@@ -945,6 +967,10 @@ func (r *i128R) tempFor(lit string, signed bool) string {
 		signed bool
 		lit    string
 	}{signed, lit}
+	if r.typedSoFar == nil {
+		r.typedSoFar = map[string]bool{}
+	}
+	r.typedSoFar[t] = true
 	return t
 }
 
@@ -1011,6 +1037,12 @@ func (r *i128R) exprStmt(e gen.IExpr_stmtContext, indent int) {
 		return
 	}
 	rhs := ts[1].GetText()
+	// Dominance: RHS reads of classified-but-unproven vars decline
+	// (NameError preservation).
+	if !r.readsMarked(rhs) {
+		r.ok = false
+		return
+	}
 	// Augmented assigns (`+=` etc.) on wide targets with
 	// small-literal or wide RHS (transparent C compound ops).
 	if e.Augassign() != nil {
@@ -1047,6 +1079,11 @@ func (r *i128R) exprStmt(e gen.IExpr_stmtContext, indent int) {
 // single i128/u128 vars (via to_py helpers — never Cython's fake-64-bit
 // conversion), single longs vars (%lld). Anything else declines.
 func (r *i128R) print(arg string) {
+	// Dominance: an unproven var reads garbage where Python raises.
+	if isSimpleName(arg) && (r.i128[arg] || r.u128[arg] || r.longs[arg]) && !r.typedSoFar[arg] {
+		r.ok = false
+		return
+	}
 	arg = strings.TrimSpace(arg)
 	switch {
 	case arg == "":
@@ -1054,9 +1091,9 @@ func (r *i128R) print(arg string) {
 	case isStringLit(arg):
 		r.emit(r.lastIndent, `printf("`+cStrEscape(unquote(arg))+`\n")`)
 	case isSimpleName(arg) && r.i128[arg]:
-		r.emit(r.lastIndent, `print(py2cy_i128_to_py(`+arg+`))`)
+		r.emit(r.lastIndent, `print(py2cy_int128_to_py(`+arg+`))`)
 	case isSimpleName(arg) && r.u128[arg]:
-		r.emit(r.lastIndent, `print(py2cy_u128_to_py(`+arg+`))`)
+		r.emit(r.lastIndent, `print(py2cy_uint128_to_py(`+arg+`))`)
 	case isSimpleName(arg) && r.longs[arg]:
 		r.emit(r.lastIndent, `printf("%lld\n", `+arg+`)`)
 	default:
@@ -1089,9 +1126,17 @@ func cStrEscape(s string) string {
 func (r *i128R) wideAssign(target, rhs string, indent int) {
 	signed := r.i128[target]
 	s := strings.ReplaceAll(strings.TrimSpace(rhs), " ", "")
-	// Big literal (any size): temp (declared + parsed once at top).
+	// Small literals are direct C constants (exact, never a conversion).
+	// Big literals go through parse temps (Cython would convert them
+	// through the fake 64-bit type).
+	if isSmallInt(s) {
+		r.emit(indent, target+" = "+s)
+		r.typedSoFar[target] = true
+		return
+	}
 	if reBigLit.MatchString(s) {
 		r.emit(indent, target+" = "+r.tempFor(s, signed))
+		r.typedSoFar[target] = true
 		return
 	}
 	// Bare name: same-sign copy direct; cross-sign only with containment
@@ -1099,6 +1144,7 @@ func (r *i128R) wideAssign(target, rhs string, indent int) {
 	if isSimpleName(s) {
 		if (r.i128[s] && signed) || (r.u128[s] && !signed) {
 			r.emit(indent, target+" = "+s)
+			r.typedSoFar[target] = true
 			return
 		}
 		if r.isWide(s) {
@@ -1109,6 +1155,7 @@ func (r *i128R) wideAssign(target, rhs string, indent int) {
 		// (real i64, converts exactly) — otherwise decline.
 		if r.longs[s] {
 			r.emit(indent, target+" = "+s)
+			r.typedSoFar[target] = true
 			return
 		}
 		r.ok = false
@@ -1117,6 +1164,7 @@ func (r *i128R) wideAssign(target, rhs string, indent int) {
 	// Small literal: direct C constant (exact, never a conversion).
 	if isSmallInt(s) {
 		r.emit(indent, target+" = "+s)
+		r.typedSoFar[target] = true
 		return
 	}
 	// Unary minus/plus on a provable operand.
@@ -1132,6 +1180,7 @@ func (r *i128R) wideAssign(target, rhs string, indent int) {
 				return
 			}
 			r.emit(indent, target+" = "+s)
+			r.typedSoFar[target] = true
 			return
 		}
 		r.ok = false
@@ -1153,7 +1202,8 @@ func (r *i128R) wideAssign(target, rhs string, indent int) {
 			r.ok = false
 			return
 		}
-		r.emit(indent, target+" = "+l+op+rr)
+		r.emit(indent, target+" = "+l+" "+op+" "+rr)
+		r.typedSoFar[target] = true
 		return
 	}
 	// a ** b with literal operands: const-eval exactly, then parse temp.
@@ -1164,6 +1214,7 @@ func (r *i128R) wideAssign(target, rhs string, indent int) {
 					v := new(big.Int).Exp(lv, rv, nil)
 					if v.BitLen() <= maxPowBits {
 						r.emit(indent, target+" = "+r.tempFor(v.String(), signed))
+						r.typedSoFar[target] = true
 						return
 					}
 				}
@@ -1238,6 +1289,14 @@ func augOp(text, lhs string) string {
 // //= and %= are declined (floor/modulo need the nonneg+positive proof
 // the classifier does not track per-statement).
 func (r *i128R) augAssign(lhs, rhs, op string, indent int) {
+	if !r.typedSoFar[lhs] {
+		r.ok = false
+		return
+	}
+	if !r.readsMarked(rhs) {
+		r.ok = false
+		return
+	}
 	if op == "//=" || op == "%=" {
 		r.ok = false
 		return
@@ -1358,7 +1417,12 @@ func (r *i128R) compound(cs gen.ICompound_stmtContext, indent int) {
 			r.ok = false
 			return
 		}
-		r.emit(indent, "while "+r.condRewrite(cond)+":")
+		cond = r.condRewrite(cond)
+		if !r.readsMarked(cond) {
+			r.ok = false
+			return
+		}
+		r.emit(indent, "while "+cond+":")
 		r.block(w.Block(0), indent+1)
 	case cs.If_stmt() != nil:
 		ifs := cs.If_stmt()
@@ -1377,6 +1441,10 @@ func (r *i128R) compound(cs gen.ICompound_stmtContext, indent int) {
 					return
 				}
 				cond = r.condRewrite(tests[0].GetText())
+				if !r.readsMarked(cond) {
+					r.ok = false
+					return
+				}
 				r.emit(indent, "if "+cond+":")
 			} else if isElse {
 				r.emit(indent, "else:")
@@ -1386,8 +1454,11 @@ func (r *i128R) compound(cs gen.ICompound_stmtContext, indent int) {
 					return
 				}
 				cond = r.condRewrite(tests[i].GetText())
-				_ = cond
-				r.emit(indent, "elif "+r.condRewrite(tests[i].GetText())+":")
+				if !r.readsMarked(cond) {
+					r.ok = false
+					return
+				}
+				r.emit(indent, "elif "+cond+":")
 			}
 			r.block(b, indent+1)
 		}

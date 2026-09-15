@@ -28,7 +28,8 @@ func usage() {
   --simple-opts-only  only i64 literals and literal-bounded counters
   --py                pure-Python mode (default; .py valid under CPython)
   --pyx               Cython .pyx with cdef declarations
-  --gmp               rewrite bigints to GMP (implies --pyx)`)
+  --gmp               rewrite bigints to GMP (implies --pyx)
+  --i128              rewrite 65..128-bit ints to __int128 (implies --pyx)`)
 }
 
 func main() {
@@ -52,6 +53,9 @@ func main() {
 		case "--gmp":
 			opts.GMP = true
 			opts.Mode = pylib.ModePyx // GMP is .pyx-only
+		case "--i128":
+			opts.I128 = true
+			opts.Mode = pylib.ModePyx // i128 is .pyx-only
 		default:
 			if strings.HasPrefix(a, "--") {
 				fmt.Fprintln(os.Stderr, "py2cy: unknown flag "+a)
@@ -69,6 +73,19 @@ func main() {
 		fmt.Fprintln(os.Stderr, "py2cy: "+err.Error())
 		os.Exit(2)
 	}
+	if opts.I128 {
+		// __int128 middle tier: .pyx with cdef int128/uint128 + helpers.
+		// Decline (out of exact subset) falls back to the exact
+		// pure-Python output.
+		if i128, ok, err := pylib.AnnotateI128(string(src)); err != nil {
+			fmt.Fprintln(os.Stderr, "py2cy: "+err.Error())
+			os.Exit(2)
+		} else if ok {
+			os.Stdout.WriteString(i128.Source)
+			return
+		}
+		fmt.Fprintln(os.Stderr, "py2cy: --i128: no rewritable 65..128-bit int; falling back to pure-Python annotation")
+	}
 	if opts.GMP {
 		// bigint transform: .pyx with cdef mpz_t + GMP calls. Decline (no
 		// rewritable bigint) falls back to the exact pure-Python output.
@@ -85,6 +102,9 @@ func main() {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "py2cy: "+err.Error())
 		os.Exit(2)
+	}
+	if opts.Mode == pylib.ModePyx && out.Declined {
+		fmt.Fprintln(os.Stderr, "py2cy: --pyx declined (source uses identifiers reserved in Cython .pyx files); emitting pure-Python mode instead")
 	}
 	os.Stdout.WriteString(out.Source)
 }
