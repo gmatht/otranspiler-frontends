@@ -163,6 +163,13 @@ accepts:
 - int lists + `sum`/`min`/`max` → a typed array (memoryview or `long long*`
   + length) and a native reduction;
 - bigint → the GMP FFI block (Stage 1b), reproducing `bignum_typed.pyx`;
+- 65..128-bit ints → the `__int128` middle tier (Stage 1c, `py2cy --i128`):
+  exact big-interval proof (literals, big-bound counters, straight-line
+  arithmetic — never width buckets), `cdef py2cy_int128/py2cy_uint128`
+  with the vendored `py2cy_int128.h` (fake 64-bit ctypedefs so Cython
+  generates C; all conversions routed through exact parse/to-Python
+  helpers), refuse-everything-else discipline incl. renderer dominance
+  (reads before proof decline, preserving NameError);
 - **every construct outside the subset is refused** in the current
   "REFUSE > GUESS" style, so Stage 1 is honest about its envelope.
 

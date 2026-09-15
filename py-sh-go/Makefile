@@ -63,6 +63,13 @@ gmp-test: py2cy
 	$(GO) test -run TestGMP .
 	bash coverage/gmp-parity.sh
 
+# __int128 middle tier: magnitude proof + renderer + parity fixtures.
+# Needs cython + a CC with __int128 (GCC/Clang); the vendored
+# py2cy_int128.h travels with the harness into the temp build dir.
+i128-test: py2cy
+	$(GO) test -run 'TestI128|TestMag' .
+	bash coverage/i128-parity.sh
+
 # Build the CLI (a thin wrapper over the pylib library at the module root).
 build:
 	$(GO) build -o py-sh-go ./cmd/py-sh-go
