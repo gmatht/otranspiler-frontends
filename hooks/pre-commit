@@ -45,8 +45,17 @@ MARKER='^\+(<<<<<<<|>>>>>>>)( |$)'
 ALL=0
 [ "${1:-}" = "--all" ] && ALL=1
 
-MAX=${PIR_COMMIT_MAX_BYTES:-1048576}
-case "$MAX" in (*[!0-9]*|'') MAX=1048576;; esac
+# Default 8 MiB, NOT 1 MiB.  The cap exists to catch artifacts, and the
+# project's own sources are large text files: sh2perl/src/shir.rs is 2.1 MB and
+# src/c_backend.rs 1.9 MB, so a 1 MiB default refused every commit touching them
+# (the previous, untracked guard had the same 1 MiB default, and --no-verify was
+# in fact used for a 1.9 MB c_backend.rs).  What the cap must still stop:
+# .frontend_gate.tsv (8.6 MB, a generated run-state report) and the oversized
+# logs/rlibs (100 MB+).  Binaries are refused at ANY size by rule 2, which is
+# the rule that actually catches build output; PIR_PUSH_MAX_BYTES guards the
+# 100 MB push-set limit separately.
+MAX=${PIR_COMMIT_MAX_BYTES:-8388608}
+case "$MAX" in (*[!0-9]*|'') MAX=8388608;; esac
 allow_markers=${PIR_ALLOW_MARKERS:-0}
 
 bad=0

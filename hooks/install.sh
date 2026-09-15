@@ -51,7 +51,7 @@ done
 cat <<EOF
 
 The guard is now active for the repositories listed above:
-  pre-commit            size (> \$PIR_COMMIT_MAX_BYTES, default 1 MiB), binary
+  pre-commit            size (> \$PIR_COMMIT_MAX_BYTES, default 8 MiB), binary
                         blobs, and merge-conflict markers in added lines
   pre-commit --all      the same marker check over every tracked file
   pre-push              oversized blobs in the PUSH SET (shim -> the tracked
