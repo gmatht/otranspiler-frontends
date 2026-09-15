@@ -77,8 +77,8 @@ func TestAnnotateRefusedShapes(t *testing.T) {
 		{"for i in range(n):\n    pass\n", "i"},
 		{"for i in range(3.5):\n    pass\n", "i"},
 		{"for x in xs:\n    pass\n", "x"},
-		{"x = y = 0\n", "x"},
-		{"x = 0\nx += 1\n", "x"},
+		{"x = 0\nx += n\n", "x"},
+		{"x = 9223372036854775807\nx += 1\n", "x"},
 		{"x = 9223372036854775807\ny = x + 1\n", "y"},
 		{"x = 4000000000\ny = x * x\n", "y"},
 		{"x = -5\ny = x % 3\n", "y"},
@@ -106,6 +106,24 @@ func TestAnnotateNonNegativeMod(t *testing.T) {
 	out := annotate(t, "x = 0\nfor i in range(10):\n    x = (x + i) % 7\n")
 	if !typed(out, "x") {
 		t.Fatalf("expected x typed; got %v", out.Typed)
+	}
+}
+
+func TestAnnotateScalarCoverage(t *testing.T) {
+	for _, tc := range []struct{ src, name string }{
+		{"x = y = 0\n", "y"},
+		{"x = 0\nx += 5\n", "x"},
+		{"x = 10\nx -= 3\n", "x"},
+		{"x = 3\nx *= 4\n", "x"},
+		{"x = -5\ny = abs(x)\n", "y"},
+		{"x = 3\ny = min(x, 10)\n", "y"},
+		{"x = 3\ny = max(x, 1)\n", "y"},
+		{"x = 3\ny = int(x)\n", "y"},
+	} {
+		out := annotate(t, tc.src)
+		if !typed(out, tc.name) {
+			t.Errorf("%q: expected %s typed; got %v (refused %v)", tc.src, tc.name, out.Typed, out.Refused)
+		}
 	}
 }
 

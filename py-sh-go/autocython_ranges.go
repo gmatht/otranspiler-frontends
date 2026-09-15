@@ -125,30 +125,78 @@ func runNode(n antlr.Tree, e env, assigned map[string]bool, depth int) {
 }
 
 func runExprStmt(ctx gen.IExpr_stmtContext, e env, assigned map[string]bool) {
-	targets := func(ts []gen.ITestlist_star_exprContext) {
-		for _, t := range ts {
-			nm := strings.TrimSpace(t.GetText())
-			if isSimpleName(nm) {
-				assigned[nm] = true
-				delete(e, nm)
-			}
+	mark := func(nm string) {
+		if isSimpleName(nm) {
+			assigned[nm] = true
+			delete(e, nm)
 		}
 	}
-	if ctx.Annassign() != nil || ctx.Augassign() != nil {
-		targets(ctx.AllTestlist_star_expr())
+	if ctx.Annassign() != nil {
+		// annotated assignment is not a proof
+		for _, t := range ctx.AllTestlist_star_expr() {
+			mark(strings.TrimSpace(t.GetText()))
+		}
+		return
+	}
+	if ctx.Augassign() != nil {
+		// `x <op>= <rhs>` — fold the interval when both sides are proved
+		if nm, op, rhs, ok := parseAug(ctx.GetText()); ok && isSimpleName(nm) {
+			assigned[nm] = true
+			lhs, lok := e[nm]
+			r := evalText(rhs, e)
+			var out iv
+			if lok {
+				out = applyAug(op, lhs, r)
+			}
+			e.set(nm, out)
+			return
+		}
+		for _, t := range ctx.AllTestlist_star_expr() {
+			mark(strings.TrimSpace(t.GetText()))
+		}
 		return
 	}
 	ts := ctx.AllTestlist_star_expr()
-	if len(ts) != 2 {
-		targets(ts)
+	if len(ts) < 2 {
+		for _, t := range ts {
+			mark(strings.TrimSpace(t.GetText()))
+		}
 		return
 	}
-	lhs := strings.TrimSpace(ts[0].GetText())
-	if !isSimpleName(lhs) {
-		return
+	// `x = y = <expr>`: every target gets the same proved interval
+	rhs := evalText(ts[len(ts)-1].GetText(), e)
+	for _, t := range ts[:len(ts)-1] {
+		mark(strings.TrimSpace(t.GetText()))
+		if nm := strings.TrimSpace(t.GetText()); isSimpleName(nm) {
+			e.set(nm, rhs)
+		}
 	}
-	assigned[lhs] = true
-	e.set(lhs, evalText(ts[1].GetText(), e))
+}
+
+var reAug = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)(\+=|-=|\*=|%=|//=)(.+)$`)
+
+func parseAug(text string) (name, op, rhs string, ok bool) {
+	m := reAug.FindStringSubmatch(text)
+	if m == nil {
+		return "", "", "", false
+	}
+	return m[1], m[2][:len(m[2])-1], m[3], true
+}
+
+func applyAug(op string, lhs, r iv) iv {
+	switch op {
+	case "+":
+		return addIV(lhs, r)
+	case "-":
+		return subIV(lhs, r)
+	case "*":
+		return mulIV(lhs, r)
+	case "%":
+		return applyBin("%", lhs, r)
+	case "/": // `//=`
+		return floorDivIV(lhs, r)
+	}
+	return iv{}
 }
 
 func forTargetName(ctx gen.IFor_stmtContext) string {
@@ -475,7 +523,91 @@ func evalTextDepth(text string, e env, depth int) iv {
 	if v, okk := e[s]; okk {
 		return v
 	}
+	if v, ok := evalCall(s, e, depth); ok {
+		return v
+	}
 	return iv{}
+}
+
+// evalCall handles the pure-int builtins the interval lattice is closed
+// under: int(x) (identity on an int interval), abs(x), min/max of two
+// proved ints.
+func evalCall(s string, e env, depth int) (iv, bool) {
+	if !strings.HasSuffix(s, ")") {
+		return iv{}, false
+	}
+	for _, name := range []string{"int", "abs", "min", "max"} {
+		if !strings.HasPrefix(s, name+"(") {
+			continue
+		}
+		inner := s[len(name)+1 : len(s)-1]
+		switch name {
+		case "int":
+			return evalTextDepth(inner, e, depth+1), true
+		case "abs":
+			v := evalTextDepth(inner, e, depth+1)
+			if !v.ok || v.lo == math.MinInt64 {
+				return iv{}, true
+			}
+			lo, hi := v.lo, v.hi
+			if lo < 0 {
+				lo = -lo
+			}
+			if hi < 0 {
+				hi = -hi
+			}
+			if lo > hi {
+				lo, hi = hi, lo
+			}
+			return known(lo, hi), true
+		default: // min / max
+			l, r, ok := splitTopComma(inner)
+			if !ok {
+				return iv{}, true
+			}
+			a := evalTextDepth(l, e, depth+1)
+			b := evalTextDepth(r, e, depth+1)
+			if !a.ok || !b.ok {
+				return iv{}, true
+			}
+			if name == "min" {
+				return known(min64(a.lo, b.lo), min64(a.hi, b.hi)), true
+			}
+			return known(max64(a.lo, b.lo), max64(a.hi, b.hi)), true
+		}
+	}
+	return iv{}, false
+}
+
+func splitTopComma(s string) (string, string, bool) {
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			depth--
+		case ',':
+			if depth == 0 {
+				return s[:i], s[i+1:], true
+			}
+		}
+	}
+	return "", "", false
+}
+
+func min64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func max64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // splitTop splits s at a top-level operator from the given set, preferring
