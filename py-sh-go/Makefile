@@ -20,7 +20,7 @@ ANTLR4 ?= antlr4
 CLI ?= $(abspath ../../../otranspilerl/target/debug/otranspilerl-cli)
 GO ?= /snap/go/current/bin/go
 
-.PHONY: all gen build test parse-test worker clean
+.PHONY: all gen build test parse-test py2cy py2cy-test worker clean
 
 all: build
 
@@ -34,6 +34,16 @@ gen:
 # ANTLR front-end coverage gate: testdata/*.py (all 98) + corpus/real_python.py.
 parse-test:
 	$(GO) test -run 'TestParse' .
+
+# Python -> typed-Cython annotation pass (docs/AUTO_CYTHON.md). The unit tests
+# pin the proof/refusal boundary; the parity oracle compiles the emitted
+# pure-Python-mode Cython and requires CPython-identical stdout.
+py2cy:
+	$(GO) build -o py2cy ./cmd/py2cy
+
+py2cy-test: py2cy
+	$(GO) test -run TestAnnotate .
+	bash coverage/py2cy-parity.sh
 
 # Build the CLI (a thin wrapper over the pylib library at the module root).
 build:
