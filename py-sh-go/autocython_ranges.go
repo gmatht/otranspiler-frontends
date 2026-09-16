@@ -1678,3 +1678,336 @@ func boolStr(b bool) string {
 	}
 	return "false"
 }
+
+// escWrite is one assignment that escapes its scope through `global`
+// (targets module scope): plain/augmented/walrus/annotated-with-value
+// carry RHS text for the width check; for-targets carry the loop
+// context (elements proven from the iterable); unknown forms
+// (with/except/del/import/match captures, def/class names) always veto.
+// Module-level for-targets are included too: the domain kill-sets miss
+// them (a float looped over ints mistypes instead of refusing).
+type escWrite struct {
+	name    string
+	rhs     string
+	unknown bool
+	forCtx  gen.IFor_stmtContext
+	iter    string
+	module  bool // module-level write (flow-visible) vs nested escaping
+}
+
+// collectEscapingWrites finds assignments that escape their scope. Only
+// two shapes can surprise the scope proofs: a nested write governed by
+// a `global` declaration (a module write the module proof cannot see),
+// and a module-level for-target (missed by every kill-set). Plain
+// module assigns are already in all proofs and need no check.
+func collectEscapingWrites(tree antlr.Tree) []escWrite {
+	var out []escWrite
+	type scope struct {
+		globals map[string]bool
+	}
+	// scopes[0] is module (its `global` decls are no-ops; only its
+	// for-targets matter). Lambdas push decl-free scopes (a walrus there
+	// binds lambda-local, verified by probe — never escaping).
+	scopes := []scope{{globals: map[string]bool{}}}
+	cur := func() *scope { return &scopes[len(scopes)-1] }
+	emit := func(name, rhs string) {
+		out = append(out, escWrite{name: name, rhs: rhs})
+	}
+	emitUnknown := func(name string) {
+		out = append(out, escWrite{name: name, unknown: true})
+	}
+	covered := func(name string) bool { return cur().globals[name] }
+	coveredAny := func(names []string) []string {
+		var hit []string
+		for _, n := range names {
+			if cur().globals[n] {
+				hit = append(hit, n)
+			}
+		}
+		return hit
+	}
+
+	var walk func(n antlr.Tree, header bool)
+	walk = func(n antlr.Tree, header bool) {
+		switch t := n.(type) {
+		case gen.IFuncdefContext, gen.IClassdefContext:
+			// The defined name binds in the ENCLOSING scope first.
+			var nm string
+			var body antlr.Tree
+			if fn, ok := n.(gen.IFuncdefContext); ok {
+				if fn.Name() != nil {
+					nm = fn.Name().GetText()
+				}
+				body = fn.Block()
+			} else if cl, ok := n.(gen.IClassdefContext); ok {
+				if cl.Name() != nil {
+					nm = cl.Name().GetText()
+				}
+				body = cl.Block()
+			}
+			// The defined name binds in the ENCLOSING scope (checked
+			// before pushing the new one).
+			if nm != "" && len(scopes) > 1 && cur().globals[nm] {
+				emitUnknown(nm)
+			}
+			scopes = append(scopes, scope{globals: map[string]bool{}})
+			for i := 0; i < n.GetChildCount(); i++ {
+				c := n.GetChild(i)
+				walk(c, c != body)
+			}
+			scopes = scopes[:len(scopes)-1]
+			return
+		case gen.ILambdefContext:
+			scopes = append(scopes, scope{globals: map[string]bool{}})
+			for i := 0; i < n.GetChildCount(); i++ {
+				walk(n.GetChild(i), false)
+			}
+			scopes = scopes[:len(scopes)-1]
+			return
+		case gen.IGlobal_stmtContext:
+			if len(scopes) > 1 {
+				for _, nm := range t.AllName() {
+					cur().globals[nm.GetText()] = true
+				}
+			}
+		case gen.IExpr_stmtContext:
+			if len(scopes) > 1 {
+				for _, a := range plainEntries(t) {
+					for _, nm := range coveredAny(a.targets) {
+						emit(nm, a.rhs)
+					}
+				}
+				if t.Augassign() != nil {
+					if nm, op, rhs, ok := parseAug(t.GetText()); ok && isSimpleName(nm) {
+						if covered(nm) {
+							emit(nm, nm+op+"("+rhs+")")
+						}
+					}
+				}
+			}
+		case gen.INamedexpr_testContext:
+			if len(t.AllTest()) == 2 {
+				if nm := strings.TrimSpace(t.Test(0).GetText()); isSimpleName(nm) {
+					// A walrus in a header (default/decorator) binds
+					// the ENCLOSING scope (defaults evaluate there);
+					// anywhere else it binds the current scope
+					// (lambdas count — verified lambda-local).
+					if header {
+						if len(scopes) >= 2 {
+							if scopes[len(scopes)-2].globals[nm] {
+								emit(nm, t.Test(1).GetText())
+							}
+						}
+					} else if covered(nm) {
+						emit(nm, t.Test(1).GetText())
+					}
+				}
+			}
+		case gen.IFor_stmtContext:
+			target := t.Exprlist()
+			var names []string
+			if target != nil {
+				names = bareTargetNames(target.GetText())
+			}
+			iter := ""
+			if tl := t.Testlist(); tl != nil {
+				iter = tl.GetText()
+			}
+			if len(scopes) == 1 {
+				// module for-targets: missed by every kill-set.
+				for _, nm := range names {
+					out = append(out, escWrite{name: nm, forCtx: t, iter: iter, module: true})
+				}
+			} else {
+				for _, nm := range coveredAny(names) {
+					out = append(out, escWrite{name: nm, forCtx: t, iter: iter})
+				}
+			}
+		case gen.IWith_itemContext:
+			if t.AS() != nil && len(scopes) > 1 {
+				for _, nm := range coveredAny(bareTargetNames(t.GetText())) {
+					emitUnknown(nm)
+				}
+			}
+		case gen.IExcept_clauseContext:
+			if t.AS() != nil && t.Name() != nil && len(scopes) > 1 {
+				if covered(t.Name().GetText()) {
+					emitUnknown(t.Name().GetText())
+				}
+			}
+		case gen.IDel_stmtContext:
+			if len(scopes) > 1 {
+				if el := t.Exprlist(); el != nil {
+					for _, nm := range coveredAny(reIdentAll.FindAllString(el.GetText(), -1)) {
+						emitUnknown(nm)
+					}
+				}
+			}
+		case gen.IImport_stmtContext:
+			if len(scopes) > 1 {
+				walkTree(t, func(x antlr.Tree) {
+					if tn, ok := x.(antlr.TerminalNode); ok &&
+						tn.GetSymbol().GetTokenType() == gen.Python3ParserNAME {
+						if covered(tn.GetText()) {
+							emitUnknown(tn.GetText())
+						}
+					}
+				})
+				// fall through to generic child walk below would
+				// double-visit; the walkTree above already covered it.
+				return
+			}
+		case gen.ICase_blockContext:
+			if len(scopes) > 1 {
+				if ps := t.Patterns(); ps != nil {
+					for _, nm := range coveredAny(reIdentAll.FindAllString(ps.GetText(), -1)) {
+						emitUnknown(nm)
+					}
+				}
+			}
+		}
+		for i := 0; i < n.GetChildCount(); i++ {
+			walk(n.GetChild(i), false)
+		}
+	}
+	walk(tree, false)
+	return out
+}
+
+// bareTargetNames extracts bound names from a for/with target: balanced
+// `[...]` spans (subscript bases must preexist, never bind) and `.attr`
+// parts are stripped; the rest binds (`*a` binds a). Over-approximating
+// (a non-binding name slipped in) only vetoes — always sound.
+func bareTargetNames(s string) []string {
+	var b strings.Builder
+	depth := 0
+	for _, r := range s {
+		switch r {
+		case '[':
+			depth++
+		case ']':
+			if depth > 0 {
+				depth--
+			}
+		default:
+			if depth == 0 {
+				b.WriteRune(r)
+			}
+		}
+	}
+	s = reAttrDot.ReplaceAllString(b.String(), "")
+	seen := map[string]bool{}
+	var out []string
+	for _, nm := range reIdentAll.FindAllString(s, -1) {
+		if !seen[nm] {
+			seen[nm] = true
+			out = append(out, nm)
+		}
+	}
+	return out
+}
+
+var reAttrDot = regexp.MustCompile(`\.[A-Za-z_][A-Za-z0-9_]*`)
+
+// vetGlobalWrites removes module declarations broken by escaping writes
+// (collectEscapingWrites). The rule trusts each proof exactly where it
+// sees: text RHS values were already domain-checked by the whole-tree
+// kills, so only the storage width is re-verified (globig); for-targets
+// are missed by every kill-set, so their elements decide (fortarget).
+// Module-level int for-targets are trusted to the interval env (the
+// flow sees them — modforbig refuses there); nested ones prove elements
+// from literals/ranges with the module env, else refuse. Floats drop on
+// any non-float element (literals-only float lists keep them).
+func vetGlobalWrites(tree antlr.Tree, e env, widths map[string]IntEvidence, ints, floats map[string]bool) {
+	floatSnap := map[string]bool{}
+	for n := range floats {
+		floatSnap[n] = true
+	}
+	isIntStrict := func(t string) bool {
+		t = stripOuterParens(strings.TrimSpace(t))
+		return reIntLit.MatchString(t) && intLiteralFits64(t)
+	}
+	floatElemsOK := func(iter string) bool {
+		s := strings.TrimSpace(iter)
+		if len(s) < 2 || s[0] != '[' || s[len(s)-1] != ']' {
+			return false
+		}
+		inner := strings.TrimSpace(s[1 : len(s)-1])
+		if inner == "" {
+			return true // vacuous: never writes
+		}
+		for _, p := range splitTopCommas(inner) {
+			if !floatDomain(p, map[string]bool{}, isIntStrict) {
+				return false
+			}
+		}
+		return true
+	}
+	for _, w := range collectEscapingWrites(tree) {
+		if w.unknown {
+			delete(ints, w.name)
+			delete(floats, w.name)
+			continue
+		}
+		if w.forCtx != nil {
+			vetForTarget(w, e, widths, ints, floats, floatElemsOK)
+			continue
+		}
+		if !ints[w.name] {
+			continue // floats with text RHS are covered by the kill-set
+		}
+		iv := evalText(w.rhs, e)
+		ev, ok := widths[w.name]
+		if !ok || !iv.ok {
+			delete(ints, w.name)
+			continue
+		}
+		if ev.Width == WidthI32 && !fitsI32(iv.lo, iv.hi) {
+			delete(ints, w.name)
+		}
+	}
+}
+
+// vetForTarget vets one for-target write: module-level int targets are
+// trusted to the interval env (the flow sees them); everything else
+// proves elements from the iterable (range bounds, int-list literals,
+// float-only literals) with width-fit for ints, else refuses.
+func vetForTarget(w escWrite, e env, widths map[string]IntEvidence, ints, floats map[string]bool, floatElemsOK func(string) bool) {
+	if w.module && ints[w.name] {
+		return // the flow proof already bounded this write
+	}
+	if iv, ok := rangeCounterIV(w.forCtx, e); ok {
+		delete(floats, w.name)
+		vetWidth(w.name, iv, widths, ints)
+		return
+	}
+	if lf, ok := evalListLiteral(w.iter, e); ok {
+		if lf.length == 0 {
+			return // vacuous: never writes
+		}
+		delete(floats, w.name)
+		vetWidth(w.name, lf.elem, widths, ints)
+		return
+	}
+	if floatElemsOK(w.iter) && floats[w.name] {
+		delete(ints, w.name) // elements are floats; an int decl would mistype
+		return
+	}
+	delete(ints, w.name)
+	delete(floats, w.name)
+}
+
+// vetWidth keeps an int declaration only when proved elements fit it.
+func vetWidth(name string, elem iv, widths map[string]IntEvidence, ints map[string]bool) {
+	if !ints[name] {
+		return
+	}
+	ev, ok := widths[name]
+	if !ok {
+		delete(ints, name)
+		return
+	}
+	if ev.Width == WidthI32 && !fitsI32(elem.lo, elem.hi) {
+		delete(ints, name)
+	}
+}

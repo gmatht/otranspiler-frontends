@@ -379,6 +379,11 @@ func AnnotateCython(src string, opts Options) (*CythonOutput, error) {
 			moduleInts = subtract(p.ints, bad)
 			moduleFloats = subtract(p.floats, bad)
 		}
+		// Nested `global` writes are module writes the module proof
+		// cannot see (interval env and width stop at scope boundaries):
+		// veto any module declaration they break. Narrow ones keep
+		// working (globig_small, gfor); wide ones refuse (globig).
+		vetGlobalWrites(tree, p.env, p.widths, moduleInts, moduleFloats)
 		for n, ev := range p.widths {
 			if moduleInts[n] {
 				moduleWidths[n] = ev

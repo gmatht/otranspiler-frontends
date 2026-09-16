@@ -145,6 +145,64 @@ def total(xs: IntList) -> int:
     return s
 print(total([1, 2, 3]))'
 
+# A name a nested function writes through `global` is a module write the
+# module proof cannot see. Declaring it narrow while the nested write is
+# wide truncates (globig prints 0) or mistypes (fortarget prints 2.0).
+# Narrow nested writes keep their declaration (globig_small, gfor).
+run global_bigint 'x = 0
+def f():
+    global x
+    x = 2**100
+f()
+print(x)'
+run global_small_kept 'x = 0
+def f():
+    global x
+    x = 5
+f()
+print(x)'
+run global_for_float 'x = 0.5
+def f():
+    global x
+    for x in [1, 2]:
+        pass
+f()
+print(x, type(x).__name__)'
+run global_for_bigint 'x = 0
+def f():
+    global x
+    for x in [2**100]:
+        pass
+f()
+print(x)'
+run global_for_range 'x = 0
+def f():
+    global x
+    for x in range(10):
+        pass
+f()
+print(x)'
+run global_aug_bigint 'x = 0
+def f():
+    global x
+    x += 2**100
+f()
+print(x)'
+run global_float_kept 'x = 0
+def f():
+    global x
+    x = 1.5
+f()
+print(x)'
+run nonlocal_bigint 'def o():
+    y = 0
+    def f():
+        nonlocal y
+        y = 2**100
+    f()
+    return y
+print(o())'
+
 echo "semantics parity: $ok ok, $fail fail"
 [ "$fail" -eq 0 ]
 
