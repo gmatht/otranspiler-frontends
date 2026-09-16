@@ -1045,6 +1045,25 @@ func (r *i128R) exprStmt(e gen.IExpr_stmtContext, indent int) {
 		return
 	}
 	ts := e.AllTestlist_star_expr()
+	// Augmented assigns dispatch before the plain-arity gate (their
+	// testlist shape differs): target must be a plain wide name.
+	if e.Augassign() != nil {
+		if m := reAugAssign.FindStringSubmatch(stripSpaces(text)); m != nil {
+			lhs, op, rhs := m[1], m[2]+"=", m[3]
+			if !r.isWide(lhs) {
+				r.ok = false
+				return
+			}
+			if !r.readsMarked(rhs) {
+				r.ok = false
+				return
+			}
+			r.augAssign(lhs, rhs, op, indent)
+			return
+		}
+		r.ok = false
+		return
+	}
 	if e.Annassign() != nil || len(ts) != 2 {
 		r.ok = false
 		return
@@ -1061,17 +1080,7 @@ func (r *i128R) exprStmt(e gen.IExpr_stmtContext, indent int) {
 		r.ok = false
 		return
 	}
-	// Augmented assigns (`+=` etc.) on wide targets with
-	// small-literal or wide RHS (transparent C compound ops).
-	if e.Augassign() != nil {
-		op := augOp(text, lhs)
-		if op == "" || !r.isWide(lhs) {
-			r.ok = false
-			return
-		}
-		r.augAssign(lhs, rhs, op, indent)
-		return
-	}
+	// (Augmented assigns dispatch before the arity gate above.)
 	if r.isWide(lhs) {
 		r.wideAssign(lhs, rhs, indent)
 		return
@@ -1170,8 +1179,10 @@ func (r *i128R) wideAssign(target, rhs string, indent int) {
 			return
 		}
 		// Small/unknown names: only exact if the name is a proven long
-		// (real i64, converts exactly) — otherwise decline.
-		if r.longs[s] {
+		// (real i64, converts exactly) — and only into SIGNED targets
+		// (a negative long would wrap mod 2^128 into unsigned, or raise
+		// OverflowError through the fake type — decline cross-sign).
+		if r.longs[s] && signed {
 			r.emit(indent, target+" = "+s)
 			r.typedSoFar[target] = true
 			return
@@ -1188,7 +1199,29 @@ func (r *i128R) wideAssign(target, rhs string, indent int) {
 	// Unary minus/plus on a provable operand.
 	if strings.HasPrefix(s, "-") || strings.HasPrefix(s, "+") {
 		inner := s[1:]
-		if r.isWide(inner) || isSmallInt(inner) || reBigLit.MatchString(inner) {
+		// Big literals must not render inline (Cython would convert
+		// through the fake type): parse temp, then negate if needed.
+		if reBigLit.MatchString(inner) && !isSmallInt(inner) {
+			if strings.HasPrefix(s, "-") && !signed {
+				r.ok = false
+				return
+			}
+			// Temp holds the MAGNITUDE (may exceed what the negated value
+			// needs, e.g. -2**127): fit-check it.
+			if v, ok := bigLit(inner); !ok || (signed && v.BitLen() > 127) || (!signed && v.BitLen() > 128) {
+				r.ok = false
+				return
+			}
+			t := r.tempFor(inner, signed)
+			if strings.HasPrefix(s, "-") {
+				r.emit(indent, target+" = -"+t)
+			} else {
+				r.emit(indent, target+" = "+t)
+			}
+			r.typedSoFar[target] = true
+			return
+		}
+		if r.isWide(inner) || isSmallInt(inner) {
 			if strings.HasPrefix(s, "-") && !signed {
 				// Negating into unsigned wraps mod 2^128 in C but is
 				// exact-negative in Python: decline (fail-closed).
@@ -1291,15 +1324,10 @@ func (r *i128R) nonnegSmallDivisor(target, l, rr string) bool {
 }
 
 // augOp extracts the compound operator for `v <op>= rhs` text.
-func augOp(text, lhs string) string {
-	rest := strings.TrimSpace(strings.TrimPrefix(text, lhs))
-	for _, op := range []string{"**=", "<<=", ">>=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^="} {
-		if strings.HasPrefix(rest, op) {
-			return op
-		}
-	}
-	return ""
-}
+// reAugAssign splits spaceless `target<op>=value` text. Multi-char
+// operators come first so `**=`/`//=`/`<<=` never split as singles;
+// the trailing `=` is consumed by the pattern (op group excludes it).
+var reAugAssign = regexp.MustCompile("^([A-Za-z_][A-Za-z0-9_]*)(\\*\\*|<<|>>|//|\\+|-|\\*|/|%|&|\\||\\^)=(.+)$")
 
 // augAssign handles `v <op>= rhs` with v wide: transparent C compound ops
 // need no conversion, but the RHS must be small-literal or wide (a big
@@ -1322,6 +1350,28 @@ func (r *i128R) augAssign(lhs, rhs, op string, indent int) {
 	s := strings.ReplaceAll(rhs, " ", "")
 	if r.isWide(s) || isSmallInt(s) {
 		r.emit(indent, lhs+" "+op+" "+s)
+		return
+	}
+	// Big literals go through a parse temp (same rule as assigns);
+	// the value must fit the temp's signedness (else the parse loop
+	// overflows — fail-closed).
+	if reBigLit.MatchString(s) {
+		v, ok := bigLit(s)
+		if !ok {
+			r.ok = false
+			return
+		}
+		if r.i128[lhs] {
+			if v.BitLen() > 127 {
+				r.ok = false
+				return
+			}
+		} else if v.BitLen() > 128 {
+			r.ok = false
+			return
+		}
+		t := r.tempFor(s, r.i128[lhs])
+		r.emit(indent, lhs+" "+op+" "+t)
 		return
 	}
 	r.ok = false

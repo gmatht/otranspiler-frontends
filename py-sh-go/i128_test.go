@@ -258,3 +258,55 @@ func TestI128IfConditionAccepts(t *testing.T) {
 		t.Errorf("U128 = %v", out.U128)
 	}
 }
+
+func TestI128UnaryBigTemp(t *testing.T) {
+	// `-<101-bit>` must not render inline (Cython would convert through
+	// the fake type): negated parse temp into signed i128.
+	src := "x = -1267650600228229401496703205376\nprint(x)\n"
+	out, ok, err := AnnotateI128(src)
+	if err != nil || !ok {
+		t.Fatalf("expected transform, got ok=%v err=%v", ok, err)
+	}
+	if len(out.I128) != 1 || out.I128[0] != "x" {
+		t.Errorf("I128 = %v", out.I128)
+	}
+	if !strings.Contains(out.Source, "x = -__py2cy_c") {
+		t.Errorf("negated temp missing in:\n%s", out.Source)
+	}
+}
+
+func TestI128CrossSignHull(t *testing.T) {
+	// `u` takes 2**100 then -5: hull is not nonneg, so SIGNED i128 (a
+	// u128 here would wrap the -5). The `u = s` copy stays direct.
+	src := "s = -5\nu = 1267650600228229401496703205376\nu = s\nprint(u)\n"
+	out, ok, err := AnnotateI128(src)
+	if err != nil || !ok {
+		t.Fatalf("expected transform, got ok=%v err=%v", ok, err)
+	}
+	if len(out.I128) != 1 || out.I128[0] != "u" {
+		t.Errorf("I128 = %v (want [u]); U128 = %v", out.I128, out.U128)
+	}
+	if !strings.Contains(out.Source, "u = s\n") {
+		t.Errorf("signed copy missing in:\n%s", out.Source)
+	}
+}
+
+func TestI128AugAssign(t *testing.T) {
+	// `x += 1` and `x += <big>` (via temp) on u128 accumulators.
+	src := "x = 1267650600228229401496703205376\nx += 1\nprint(x)\n"
+	out, ok, err := AnnotateI128(src)
+	if err != nil || !ok {
+		t.Fatalf("expected transform, got ok=%v err=%v", ok, err)
+	}
+	if !strings.Contains(out.Source, "x += 1") {
+		t.Errorf("compound missing in:\n%s", out.Source)
+	}
+	src2 := "x = 1267650600228229401496703205376\nx += 1267650600228229401496703205376\nprint(x)\n"
+	out2, ok2, err2 := AnnotateI128(src2)
+	if err2 != nil || !ok2 {
+		t.Fatalf("expected transform, got ok=%v err=%v", ok2, err2)
+	}
+	if !strings.Contains(out2.Source, "x += __py2cy_c") {
+		t.Errorf("temp compound missing in:\n%s", out2.Source)
+	}
+}
