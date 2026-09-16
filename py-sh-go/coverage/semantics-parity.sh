@@ -71,6 +71,18 @@ run div_unknown 'def f(a, b):
     return a / b
 print(f(7.0, 2))'
 
+run aug_float_keep 'x = 0.0
+i = 0
+while i < 3:
+    x += i * 0.5
+    i = i + 1
+print(x)'
+run aug_float_refuse 'def f():
+    return 2.5
+x = 0.0
+x += f()
+print(x)'
+
 run identity_is 'a = 1000
 b = a + 0
 print(a is b, a == b)'

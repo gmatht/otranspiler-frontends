@@ -106,7 +106,7 @@ func pyxBlockingNames(tree antlr.Tree) map[string]bool {
 	walkTree(tree, func(n antlr.Tree) {
 		if ctx, ok := n.(gen.INameContext); ok {
 			if pyReservedCython[ctx.GetText()] {
-			bad[ctx.GetText()] = true
+				bad[ctx.GetText()] = true
 			}
 			return
 		}

@@ -484,7 +484,7 @@ func runExprStmt(ctx gen.IExpr_stmtContext, e env, lists map[string]listFact, ta
 	}
 }
 
-var reAug = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)(\+=|-=|\*=|%=|//=)(.+)$`)
+var reAug = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)(//=|\*\*=|<<=|>>=|\+=|-=|\*=|/=|%=|&=|\|=|\^=|@=)(.+)$`)
 
 func parseAug(text string) (name, op, rhs string, ok bool) {
 	m := reAug.FindStringSubmatch(text)
@@ -504,8 +504,8 @@ func applyAug(op string, lhs, r iv) iv {
 		return mulIV(lhs, r)
 	case "%":
 		return applyBin("%", lhs, r)
-	case "/": // `//=`
-		return floorDivIV(lhs, r)
+	case "/": // `/=`: true division is float, unrepresentable: unknown
+		return iv{}
 	}
 	return iv{}
 }
@@ -905,6 +905,27 @@ func isFloatLit(s string) bool {
 // assignment must be float-domain (so `x = 1; x = 1.5` is neither).
 func floatDomainFixpoint(tree antlr.Tree, isInt func(string) bool) map[string]bool {
 	assigns := collectAssigns(tree)
+	// Augmented assignments rebind too: `x += e` must keep x numeric or x
+	// loses its float — the emitted `double += e` raises where Python
+	// returns a value (e.g. `0.0 + tensor` is a tensor). Desugar to
+	// `x <op> (e)` for the check; shift/bitwise/matmul aug-ops can never
+	// stay float (shifts have no float arm, so `0<<0` kills).
+	walkTree(tree, func(n antlr.Tree) {
+		ctx, ok := n.(gen.IExpr_stmtContext)
+		if !ok || ctx.Augassign() == nil {
+			return
+		}
+		nm, op, rhs, ok := parseAug(ctx.GetText())
+		if !ok || !isSimpleName(nm) {
+			return
+		}
+		switch op {
+		case "+", "-", "*", "/", "//", "%", "**":
+			assigns = append(assigns, assignT{[]string{nm}, nm + op + "(" + rhs + ")"})
+		default:
+			assigns = append(assigns, assignT{[]string{nm}, "0<<0"})
+		}
+	})
 	dom := map[string]bool{}
 	for changed := true; changed; {
 		changed = false

@@ -586,7 +586,9 @@ pinned by `spec_collect_rejects_baked_array_index_in_bare_arith`.
   an operator yields a float only when both operands prove numeric — proved
   float or proved int — and, except for `/`, at least one is a float, so
   `T / 2` over an unknown `T` (tensor division, not a float) stays Python).
-  A name assigned both an int and a float is neither.
+  Augmented assignments participate (`x += e` checks as `x + (e)`), since
+  `double += obj` raises where Python returns a value; shift/bitwise aug-ops
+  can never stay float. A name assigned both an int and a float is neither.
   `--pyx` groups declarations by C type;
 - **typed int lists** (`.pyx` only): `xs = []; xs.append(<i64 expr>)` with
   `len(xs)`/`xs[i]` is rewritten to a growable `long long *xs`

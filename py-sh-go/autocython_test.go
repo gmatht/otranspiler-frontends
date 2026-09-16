@@ -507,10 +507,10 @@ func TestPyxDeclinesReservedIdentifiers(t *testing.T) {
 	for name, src := range map[string]string{
 		"from-import": "from x import include\ny = 2\nprint(y)\n",
 		"attribute":   "print(x.include)\n",
-		"fstring":     `v = 1
+		"fstring": `v = 1
 print(f"{v} {include}")
 `,
-		"cdef-name":   "include = 5\nprint(include)\n",
+		"cdef-name": "include = 5\nprint(include)\n",
 	} {
 		out, err := AnnotateCython(src, pyx)
 		if err != nil {
@@ -541,5 +541,27 @@ print(f"{v} {include}")
 	}
 	if out.Declined {
 		t.Errorf("ModePy must never decline")
+	}
+}
+
+func TestFloatAugAssignNeedsNumericRHS(t *testing.T) {
+	// `x = 0.0; x += <unknown>` must not be double: `double += obj`
+	// raises where Python returns a value (e.g. `0.0 + tensor`).
+	for _, src := range []string{
+		"x = 0.0\nx += f()\n",
+		"x = 0.0\nx += t\n",
+		"x = 1.5\nx <<= 1\n",
+		"x = 1.5\nx /= t\n",
+	} {
+		if out := annotate(t, src); typed(out, "x") {
+			t.Errorf("%q: x must not be typed; got %v", src, out.Typed)
+		}
+	}
+	// Numeric aug operands keep the double.
+	if out := annotate(t, "x = 0.0\nx += 2\n"); !typed(out, "x") {
+		t.Errorf("numeric aug must keep double; typed=%v", out.Typed)
+	}
+	if out := annotate(t, "x = 1.5\ni = 0\nwhile i < 3:\n    x += i * 0.5\n    i = i + 1\n"); !typed(out, "x") {
+		t.Errorf("int-expr aug must keep double; typed=%v", out.Typed)
 	}
 }
