@@ -565,3 +565,45 @@ func TestFloatAugAssignNeedsNumericRHS(t *testing.T) {
 		t.Errorf("int-expr aug must keep double; typed=%v", out.Typed)
 	}
 }
+
+func TestScopeBindingsKillDomains(t *testing.T) {
+	// Every non-plain binding form must drop a scalar: with/except/del/
+	// import/match/walrus targets, annotated rebinds, and names bound only
+	// inside functions (module scope must not claim them).
+	for _, src := range []string{
+		"fh = 0\nwith open(f) as fh:\n    print(fh.read())\n",
+		"e = 0\ntry:\n    1/0\nexcept ZeroDivisionError as e:\n    print(e)\n",
+		"x = 1\ndel x\nprint(\"done\")\n",
+		"x = 1\nimport os as x\nprint(x)\n",
+		"x = 0\nmatch [1, 2]:\n    case [x, y]:\n        print(x)\n",
+		"x = 1\ny = [(x := str(i)) for i in range(3)]\n",
+		"x = 1.5\nx: str = \"s\"\n",
+		"x = 0\ndef f():\n    global x\n    x *= 1.5\n",
+	} {
+		if out := annotate(t, src); len(out.Typed) != 0 {
+			t.Errorf("%q: expected no declarations, got %v", src, out.Typed)
+		}
+	}
+	// A float bound only inside a function must not gain a MODULE
+	// declaration (it printed 0.0 where CPython raises NameError); the
+	// function-local declaration itself stays.
+	out := annotate(t, "def f():\n    y = 1.5\n    return y\nprint(y)\n")
+	if strings.Contains(out.Source, "\ncython.declare(y=") {
+		t.Errorf("function-local float leaked to module scope:\n%s", out.Source)
+	}
+	if !strings.Contains(out.Source, "    cython.declare(y=") {
+		t.Errorf("function-local float must stay declared:\n%s", out.Source)
+	}
+	// Controls that must STAY typed.
+	for _, tc := range []struct{ src, name string }{
+		{"x = 0\nx += 2\nprint(x)\n", "x"},
+		{"y = (n := 5)\nprint(n)\n", "n"},
+		{"if (n := 6):\n    print(n)\n", "n"},
+		{"x = 5\ndel y\nprint(x)\n", "x"},
+		{"x = 5\nwith open(f) as fh:\n    print(fh.read())\nprint(x)\n", "x"},
+	} {
+		if out := annotate(t, tc.src); !typed(out, tc.name) {
+			t.Errorf("%q: expected %s typed; got %v", tc.src, tc.name, out.Typed)
+		}
+	}
+}

@@ -112,7 +112,7 @@ func gmpErr(msg string) error    { return gmpError("python2cython(gmp): " + msg)
 // classifyBigints returns the unbounded-int (mpz_t) and i64-proved vars.
 func classifyBigints(tree antlr.Tree) (big, longs map[string]bool) {
 	proved, assigned := proveRanges(tree)
-	dom := intDomainFixpoint(tree)
+	dom := intDomainFixpoint(tree, proved)
 	big, longs = map[string]bool{}, map[string]bool{}
 	for n := range assigned {
 		switch {
@@ -131,35 +131,49 @@ type assignT struct {
 	rhs     string
 }
 
-// collectAssigns gathers every plain (non-augmented, non-annotated)
-// assignment's simple-name targets and RHS text.
+// collectAssigns gathers every binding the domain proofs must see: plain
+// assignments, annotated assigns WITH a value (`x: T = v` rebinds; a bare
+// `x: T` does not), and walrus bindings (`x := e`, anywhere). Obscure
+// bindings (with/except/del/import/match, see obscureAssigns) ride along
+// with a never-provable RHS so every domain drops them.
 func collectAssigns(tree antlr.Tree) []assignT {
 	var out []assignT
 	walkTree(tree, func(n antlr.Tree) {
-		ctx, ok := n.(gen.IExpr_stmtContext)
-		if !ok || ctx.Annassign() != nil || ctx.Augassign() != nil {
+		if ctx, ok := n.(gen.IExpr_stmtContext); ok {
+			out = append(out, plainEntries(ctx)...)
 			return
 		}
-		ts := ctx.AllTestlist_star_expr()
-		if len(ts) < 2 {
-			return
-		}
-		var tg []string
-		for _, t := range ts[:len(ts)-1] {
-			if nm := strings.TrimSpace(t.GetText()); isSimpleName(nm) {
-				tg = append(tg, nm)
+		if ctx, ok := n.(gen.INamedexpr_testContext); ok {
+			if len(ctx.AllTest()) != 2 {
+				return
 			}
+			if nm := strings.TrimSpace(ctx.Test(0).GetText()); isSimpleName(nm) {
+				out = append(out, assignT{[]string{nm}, ctx.Test(1).GetText()})
+			}
+			return
 		}
-		out = append(out, assignT{tg, ts[len(ts)-1].GetText()})
 	})
+	for _, a := range obscureAssigns(tree) {
+		out = append(out, a)
+	}
 	return out
 }
 
 // intDomainFixpoint classifies each name as a Python int: EVERY assignment
 // (and a literal-bounded range counter) must be int-domain. "Any assignment"
 // would be wrong — `x = 1; x = 1.5` is not an int.
-func intDomainFixpoint(tree antlr.Tree) map[string]bool {
+//
+// A name the interval lattice PROVED is seeded as int-domain: the lattice only
+// ever holds int intervals, so a proved name is an int unless the body later
+// clobbers it with a non-int assignment (the kill pass below still applies).
+// That is how a bounded parameter and the `range(param)` counter enter the
+// domain — the dual arm's guarded parameter is exactly such a name.
+func intDomainFixpoint(tree antlr.Tree, e env) map[string]bool {
 	assigns := collectAssigns(tree)
+	// Augmented assigns rebind (and nested ones may escape via `global`
+	// with a float result): desugared entries let the kill-loop below see
+	// them. Precision is preserved — an int-domain aug RHS keeps the name.
+	assigns = append(assigns, augAssigns(tree)...)
 	taint := closedOverNames(tree)
 	// intDomainFixpoint has no flow sensitivity, so a name used as `NAME.` /
 	// `NAME[` anywhere may have been mutated after its list assignment and
@@ -167,10 +181,15 @@ func intDomainFixpoint(tree antlr.Tree) map[string]bool {
 	// in order; this is the conservative analogue).
 	attrUsed := attrUsedNames(tree)
 	seed := map[string]bool{}
+	for n, v := range e {
+		if v.ok {
+			seed[n] = true
+		}
+	}
 	walkTree(tree, func(n antlr.Tree) {
 		if ctx, ok := n.(gen.IFor_stmtContext); ok {
 			if nm := forTargetName(ctx); nm != "" {
-				if _, ok := rangeCounterIV(ctx); ok {
+				if _, ok := rangeCounterIV(ctx, e); ok {
 					seed[nm] = true
 				}
 			}
@@ -536,7 +555,15 @@ func (r *pyxR) compound(cs gen.ICompound_stmtContext, indent int) {
 			r.ok = false
 			return
 		}
-		if !r.longs[target] && !r.big[target] {
+		// The target must be a `long long`, NEVER an mpz_t: Cython binds
+		// Python ints to the loop variable, and `cdef mpz_t i` is an
+		// ARRAY (not assignable), so `for i in range(5): mpz_add_ui(i, …)`
+		// is unparseable. Reachable whenever a body clobbers the counter
+		// with an i64-overflowing value: the counter is assigned,
+		// int-domain and not range-proved, so the classifier calls it
+		// bigint. REFUSE > GUESS — decline, and the caller falls back to
+		// the exact pure-Python output.
+		if !r.longs[target] {
 			r.ok = false
 			return
 		}

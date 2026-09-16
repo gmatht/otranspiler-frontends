@@ -239,6 +239,8 @@ existing analogue in the C backend, which is why this is *bounded* work:
 | **startup** | `--embed` ≈ 57 ms libpython | document it; prefer extension-module mode where the caller already has a Python |
 | **operators over unknown operands** | only typed when both sides prove numeric | tensor division (`T / 2`) stays Python, never `double` |
 | **Cython-reserved identifiers** | `--pyx` declines the file to pure-Python mode | `include`/`cdef`/`DEF`/f-string spans fail as `.pyx` in every position |
+| **non-plain bindings** | walrus/augmented/annotated/with/except/del/import/match all participate | `x += tensor`, `(x := str)`, `with open() as x` no longer mistyped |
+| **nested-scope creation** | enclosing scopes ignore nested `def`/`class` bindings | function-local floats stay out of the module proof |
 
 The governing rule is unchanged: **an annotation is a proof, not a guess.**
 Every declaration is emitted only when the core has *proved* it; anything
@@ -589,6 +591,15 @@ pinned by `spec_collect_rejects_baked_array_index_in_bare_arith`.
   Augmented assignments participate (`x += e` checks as `x + (e)`), since
   `double += obj` raises where Python returns a value; shift/bitwise aug-ops
   can never stay float. A name assigned both an int and a float is neither.
+- **every binding form is seen**: the domain proofs count plain assigns,
+  `x: T = v` rebinds, `x := e` walrus bindings (in conditions too), and
+  augmented assigns — not just `x = e`. Bindings no domain can prove
+  (`with`/`except` targets, `del`eted names, anything `import` binds,
+  match-capture names) actively kill scalar status, as do assignments under
+  nested `def`/`class` for the enclosing scope's *creation* proof (a float
+  bound only inside a function no longer becomes a module float). The flow
+  pass folds statement-position walrus precisely and kills the rest; `del`
+  matches on the exprlist (the raw text reads `delx`).
   `--pyx` groups declarations by C type;
 - **typed int lists** (`.pyx` only): `xs = []; xs.append(<i64 expr>)` with
   `len(xs)`/`xs[i]` is rewritten to a growable `long long *xs`

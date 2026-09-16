@@ -83,6 +83,39 @@ x = 0.0
 x += f()
 print(x)'
 
+run scope_func_float 'def f():
+    y = 1.5
+    return y
+print(f())'
+run walrus_lit 'y = (n := 5)
+print(n, y)'
+run walrus_refuse 'x = 1
+y = [(x := str(i)) for i in range(3)]
+print(x, y)'
+run with_refuse 'fh = 0
+with open("/dev/null") as fh:
+    print(fh.read(1) == "")'
+run except_refuse 'e = 0
+try:
+    1/0
+except ZeroDivisionError as e:
+    print(type(e).__name__)'
+run del_ok 'x = 1
+del x
+print("done")'
+run annassign_value 'x = 1.5
+x: str = "s"
+print(x)'
+run import_as 'x = 1
+import os as x
+print(x.__name__)'
+run global_aug 'x = 0
+def f():
+    global x
+    x *= 1.5
+f()
+print(x, type(x).__name__)'
+
 run identity_is 'a = 1000
 b = a + 0
 print(a is b, a == b)'

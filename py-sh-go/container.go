@@ -108,7 +108,13 @@ func rewriteContainers(tree antlr.Tree, src string, e env) (string, string, []st
 	var reps []replacement
 	var decls strings.Builder
 	var names []string
+	// A name rebound by with/except/del/import/match/walrus is not the
+	// list anymore, even with a `name = []` assignment on record.
+	obscure := obscureSet(tree)
 	for name, asgn := range assigns {
+		if obscure[name] {
+			continue
+		}
 		// every mention of the name must be covered by a supported use or the
 		// `name = []` assignment itself.
 		ok := true

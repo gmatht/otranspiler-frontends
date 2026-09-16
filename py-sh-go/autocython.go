@@ -274,11 +274,28 @@ type CythonOutput struct {
 	// Declined is set when a `.pyx` emission was requested but refused: the
 	// Source then holds the exact pure-Python output instead, which the
 	// caller emits as-is (it compiles under either extension).
-	Declined bool
+	Declined      bool
+	DeclineReason string // why, for the caller's diagnostic
+	// Dual lists the entry-guarded dual arms (dualguard.go): per function the
+	// guarded parameter, the assumed range — which IS the emitted guard's
+	// bounds — and the locals the fast twin types. The twin's own declarations
+	// live in its `@cython.locals`, not in `Typed`/`Evidence`, because they hold
+	// only under the guard.
+	Dual []DualGuard
 	// Evidence separates the proved VALUE range from the required C STORAGE
 	// width (autocython_width.go): the same proof is honest for both the
 	// annotation and the "why" column of the evidence table.
 	Evidence []IntEvidence
+}
+
+// DualGuard reports one entry-guarded dual arm (dualguard.go): the function,
+// the parameter the guard covers, the assumed range (which the emitted guard
+// uses verbatim), and the locals the fast twin types.
+type DualGuard struct {
+	Func   string
+	Param  string
+	Lo, Hi int64
+	Locals []string
 }
 
 // EvidenceFor returns the evidence for one name (ok=false if unproved).
@@ -311,20 +328,27 @@ func AnnotateCython(src string, opts Options) (*CythonOutput, error) {
 	if len(errs) > 0 {
 		return nil, fmt.Errorf("python2cython: %s", errs[0])
 	}
+	lines := strings.Split(src, "\n")
 	if opts.Mode == ModePyx {
 		if bad := pyxBlockingNames(tree); len(bad) > 0 {
 			// Fine Python, unparseable `.pyx`: decline and yield the exact
 			// pure-Python output (which compiles under either extension).
-			py := opts
-			py.Mode = ModePy
-			out, err := AnnotateCython(src, py)
-			if err != nil {
-				return nil, err
-			}
-			out.Declined = true
-			return out, nil
+			return declineToPy(src, opts,
+				"the source uses identifiers reserved in Cython .pyx files")
+		}
+		if len(findDualFuncs(tree, lines, opts.Level)) > 0 {
+			// The entry-guarded twin (dualguard.go) is spelled with
+			// pure-Python mode's @cython.cfunc/@cython.locals and a
+			// `type(x) is int` guard; a .pyx emission cannot carry it. The
+			// pure-Python output compiles either way, so decline into it
+			// rather than dropping the fast arm.
+			return declineToPy(src, opts,
+				"an entry-guarded dual arm needs pure-Python-mode @cython.locals/@cython.cfunc")
 		}
 	}
+	// the entry-guarded dual arms: a function whose integers are unprovable
+	// only because a parameter is gets a guarded fast twin (dualguard.go).
+	duals := findDualFuncs(tree, lines, opts.Level)
 
 	moduleInts, moduleFloats := map[string]bool{}, map[string]bool{}
 	moduleAssigned := map[string]bool{}
@@ -348,8 +372,9 @@ func AnnotateCython(src string, opts Options) (*CythonOutput, error) {
 				moduleWidths[n] = ev
 			}
 		}
-		ins, funcInts, funcFloats, funcWidths = collectFuncDecls(tree, strings.Split(src, "\n"), opts.Level, opts.Mode)
+		ins, funcInts, funcFloats, funcWidths = collectFuncDecls(tree, lines, opts.Level, opts.Mode)
 	}
+	ins = mergeDualInsertions(ins, duals)
 
 	// typed int lists -> a C `long long` vector (a .pyx-only transform)
 	body, containerDecls := src, ""
@@ -400,7 +425,9 @@ func AnnotateCython(src string, opts Options) (*CythonOutput, error) {
 	sort.Strings(refused)
 
 	moduleDecl := declLines(sortedKeys(moduleInts), sortedKeys(moduleFloats), opts.Mode, moduleWidths)
-	anyDecl := len(moduleInts)+len(moduleFloats)+len(funcInts)+len(funcFloats) > 0
+	// A dual twin is spelled with `cython.cfunc`/`cython.longlong`, so it needs
+	// the import even when nothing else in the module earned a declaration.
+	anyDecl := len(moduleInts)+len(moduleFloats)+len(funcInts)+len(funcFloats) > 0 || len(duals) > 0
 	// Everything the pass adds is spliced AFTER the module docstring and any
 	// `from __future__` imports: `import cython`, `cimport`, `cdef` and
 	// `cython.declare` are all statements, and a future import must come
@@ -430,7 +457,55 @@ func AnnotateCython(src string, opts Options) (*CythonOutput, error) {
 		evidence = append(evidence, ev)
 	}
 	sort.Slice(evidence, func(i, j int) bool { return evidence[i].Name < evidence[j].Name })
-	return &CythonOutput{Source: b.String(), Typed: names, Refused: refused, Evidence: evidence}, nil
+	dual := make([]DualGuard, 0, len(duals))
+	for _, d := range duals {
+		dual = append(dual, DualGuard{Func: d.name, Param: d.param, Lo: d.lo, Hi: d.hi, Locals: d.locals})
+	}
+	return &CythonOutput{Source: b.String(), Typed: names, Refused: refused, Evidence: evidence, Dual: dual}, nil
+}
+
+// declineToPy re-runs the pass in pure-Python mode and marks the result as a
+// decline, so a `.pyx` request degrades to the form that compiles.
+func declineToPy(src string, opts Options, reason string) (*CythonOutput, error) {
+	py := opts
+	py.Mode = ModePy
+	out, err := AnnotateCython(src, py)
+	if err != nil {
+		return nil, err
+	}
+	out.Declined = true
+	out.DeclineReason = reason
+	return out, nil
+}
+
+// mergeDualInsertions splices each dual arm into the insertion list: the twin
+// immediately before the definition it guards, and the guard prologue at the
+// top of that function's body (before any declaration the function already
+// carries — `cython.declare` is valid anywhere in a body).
+func mergeDualInsertions(ins []insertion, duals []dualFunc) []insertion {
+	if len(duals) == 0 {
+		return ins
+	}
+	// first the guards, against the list the proof pass produced
+	for _, d := range duals {
+		merged := false
+		for i := range ins {
+			if ins[i].line == d.firstLn {
+				ins[i].text = d.guard + "\n" + ins[i].text
+				merged = true
+				break
+			}
+		}
+		if !merged {
+			ins = append(ins, insertion{line: d.firstLn, text: d.guard})
+		}
+	}
+	// then the twins, so a twin insertion can never be mistaken for a body
+	// insertion of a later function
+	for _, d := range duals {
+		ins = append(ins, insertion{line: d.defLine, text: d.twin})
+	}
+	return ins
 }
 
 // declLines groups the int scalars by their required C storage width
@@ -558,7 +633,7 @@ func proveAll(tree antlr.Tree, level Level) proof {
 			widths: intEvidence(tree, e, ints)}
 	}
 	e, assigned := proveRanges(tree)
-	allInt := intDomainFixpoint(tree)
+	allInt := intDomainFixpoint(tree, e)
 	ints := map[string]bool{}
 	for n, v := range e {
 		if v.ok && allInt[n] {
@@ -568,7 +643,21 @@ func proveAll(tree antlr.Tree, level Level) proof {
 	// isInt answers whether a leaf expression denotes a Python int: an i64
 	// literal, a proved interval, or an int-domain name. It never recurses
 	// into floatDomain, so the numericity check cannot loop.
-	isInt := func(t string) bool {
+	floats := floatDomainFixpoint(tree, intLeafPredicate(e, allInt))
+	for n := range ints {
+		delete(floats, n)
+	}
+	return proof{ints: ints, floats: floats, assigned: assigned, env: e,
+		widths: intEvidence(tree, e, ints)}
+}
+
+// intLeafPredicate is the leaf test the float-domain classifier needs: does this
+// expression certainly denote a Python int? An i64 literal, an interval the env
+// PROVES, or a name the env/domain classified as an int. It must never claim an
+// int for a non-int (a `/` is typed `double` only when both operands pass), and
+// it never recurses into floatDomain, so the two classifiers cannot loop.
+func intLeafPredicate(e env, allInt map[string]bool) func(string) bool {
+	return func(t string) bool {
 		t = stripOuterParens(strings.TrimSpace(t))
 		if reIntLit.MatchString(t) && intLiteralFits64(t) {
 			return true
@@ -581,12 +670,6 @@ func proveAll(tree antlr.Tree, level Level) proof {
 		}
 		return allInt[t]
 	}
-	floats := floatDomainFixpoint(tree, isInt)
-	for n := range ints {
-		delete(floats, n)
-	}
-	return proof{ints: ints, floats: floats, assigned: assigned, env: e,
-		widths: intEvidence(tree, e, ints)}
 }
 
 func unionSets(a, b map[string]bool) map[string]bool {
@@ -765,7 +848,7 @@ func proveSimple(tree antlr.Tree) (map[string]bool, map[string]bool) {
 		switch ctx := n.(type) {
 		case gen.IFor_stmtContext:
 			if nm := forTargetName(ctx); nm != "" {
-				if _, ok := rangeCounterIV(ctx); ok {
+				if _, ok := rangeCounterIV(ctx, env{}); ok {
 					get(nm).rangeCounter = true
 				}
 			}
@@ -804,6 +887,20 @@ func proveSimple(tree antlr.Tree) (map[string]bool, map[string]bool) {
 		if v.allLiterals && (v.rangeCounter || v.assignments > 0) {
 			typed[nm] = true
 		}
+	}
+	// Walrus, with/except/del/import/match bindings are invisible to the
+	// walk above: a literal-typed name rebound by any of them must drop.
+	// (A walrus with a literal value genuinely is that literal, so keep it.)
+	for _, a := range walrusAssigns(tree) {
+		if intLiteralFits64(strings.TrimSpace(a.rhs)) {
+			continue
+		}
+		for _, t := range a.targets {
+			delete(typed, t)
+		}
+	}
+	for n := range obscureSet(tree) {
+		delete(typed, n)
 	}
 	return typed, assigned
 }

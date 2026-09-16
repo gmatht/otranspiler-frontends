@@ -363,7 +363,20 @@ func bodyMutatesName(body antlr.Tree, name string) bool {
 // proveRanges walks a parsed module and returns the proved intervals plus the
 // set of everything assigned (so the caller can report the refusals).
 func proveRanges(tree antlr.Tree) (env, map[string]bool) {
+	return proveRangesSeeded(tree, nil)
+}
+
+// proveRangesSeeded is proveRanges starting from an ASSUMED entry environment.
+// The entry-guarded dual arm (dualguard.go) proves a function body under a
+// hypothesis about a parameter (`n ∈ [0, 2^31-1]`); the hypothesis is never a
+// proof — it is discharged at run time by the matching guard — so this entry
+// point exists to make the assumption explicit and reviewable, not to relax
+// the lattice. A nil seed is the ordinary whole-program proof.
+func proveRangesSeeded(tree antlr.Tree, seed env) (env, map[string]bool) {
 	e := env{}
+	for k, v := range seed {
+		e[k] = v
+	}
 	lists := map[string]listFact{}
 	assigned := map[string]bool{}
 	runNode(tree, e, lists, closedOverNames(tree), assigned, 0)
@@ -379,12 +392,16 @@ func runNode(n antlr.Tree, e env, lists map[string]listFact, taint map[string]bo
 		// own scope: do not prove module-level ranges through them
 		return
 	case gen.IDel_stmtContext:
-		// `del xs[i]` mutates the list; `del xs` unbinds the name
-		for _, id := range reIdentAll.FindAllString(ctx.GetText(), -1) {
-			if isSimpleName(id) {
-				assigned[id] = true
-				delete(e, id)
-				delete(lists, id)
+		// `del xs[i]` mutates the list; `del xs` unbinds the name.
+		// (GetText() drops whitespace, so match on the exprlist: the
+		// full text reads `delx` and never matches a real name.)
+		if el := ctx.Exprlist(); el != nil {
+			for _, id := range reIdentAll.FindAllString(el.GetText(), -1) {
+				if isSimpleName(id) {
+					assigned[id] = true
+					delete(e, id)
+					delete(lists, id)
+				}
 			}
 		}
 		return
@@ -392,6 +409,31 @@ func runNode(n antlr.Tree, e env, lists map[string]listFact, taint map[string]bo
 		// conditional / unknown-iteration bodies: widen everything they assign
 		markUnknownSubtree(ctx, e, lists, assigned)
 		return
+	case gen.IWith_stmtContext:
+		// `with ... as name` rebinds to an unknown value; the body and
+		// item expressions still run below via the child recursion.
+		for _, item := range ctx.AllWith_item() {
+			if item.AS() != nil && item.Expr() != nil {
+				if nm := strings.TrimSpace(item.Expr().GetText()); isSimpleName(nm) {
+					assigned[nm] = true
+					delete(e, nm)
+					delete(lists, nm)
+				}
+			}
+		}
+	case gen.INamedexpr_testContext:
+		// `x := e` rebinds: mark assigned but drop the flow fact (a
+		// while-condition walrus varies every iteration, so folding
+		// here would be stale). Precise folds happen at the single-
+		// eval sites (runExprStmt, runIf conditions). Children still
+		// run below for nested walrus expressions.
+		if len(ctx.AllTest()) == 2 {
+			if nm := strings.TrimSpace(ctx.Test(0).GetText()); isSimpleName(nm) {
+				assigned[nm] = true
+				delete(e, nm)
+				delete(lists, nm)
+			}
+		}
 	case gen.IFor_stmtContext:
 		runFor(ctx, e, lists, taint, assigned, depth)
 		return
@@ -418,6 +460,18 @@ func runNode(n antlr.Tree, e env, lists map[string]listFact, taint map[string]bo
 }
 
 func runExprStmt(ctx gen.IExpr_stmtContext, e env, lists map[string]listFact, taint map[string]bool, assigned map[string]bool) {
+	// Walrus bindings in statement position evaluate once, in order:
+	// fold them precisely (pre-order: an outer walrus sees unknown for
+	// its inner walrus, which then folds exactly).
+	walkTree(ctx, func(w antlr.Tree) {
+		if wc, ok := w.(gen.INamedexpr_testContext); ok && len(wc.AllTest()) == 2 {
+			if nm := strings.TrimSpace(wc.Test(0).GetText()); isSimpleName(nm) {
+				assigned[nm] = true
+				e.set(nm, evalText(wc.Test(1).GetText(), e))
+				delete(lists, nm)
+			}
+		}
+	})
 	mark := func(nm string) {
 		if isSimpleName(nm) {
 			assigned[nm] = true
@@ -540,6 +594,10 @@ func markUnknownSubtree(n antlr.Tree, e env, lists map[string]listFact, assigned
 			}
 		case gen.IFor_stmtContext:
 			mark(forTargetName(c))
+		case gen.IExcept_clauseContext:
+			if c.AS() != nil && c.Name() != nil {
+				mark(c.Name().GetText())
+			}
 		}
 	})
 	// the subtree may mutate a tracked list without assigning it
@@ -547,7 +605,17 @@ func markUnknownSubtree(n antlr.Tree, e env, lists map[string]listFact, assigned
 	killListMutations(n, lists)
 }
 
-func rangeCounterIV(ctx gen.IFor_stmtContext) (iv, bool) {
+// rangeCounterIV proves the values a `for NAME in range(...)` counter takes.
+//
+// An endpoint is either an int literal or an expression the env PROVES: the
+// counter is bounded by the endpoints either way, so `n = 5; for i in
+// range(n)` bounds i by [0,5] exactly as `range(5)` does — and the guarded
+// parameter of a dual arm (dualguard.go) bounds it the same way. A proved
+// endpoint stays an interval rather than a point, so the result is a sound
+// over-approximation whenever the endpoint itself is not exact. The literal
+// case is byte-identical to the original: only an endpoint that is not an int
+// literal consults the env.
+func rangeCounterIV(ctx gen.IFor_stmtContext, e env) (iv, bool) {
 	if forTargetName(ctx) == "" {
 		return iv{}, false
 	}
@@ -563,21 +631,26 @@ func rangeCounterIV(ctx gen.IFor_stmtContext) (iv, bool) {
 	if len(args) < 1 || len(args) > 3 {
 		return iv{}, false
 	}
-	vals := make([]int64, 0, len(args))
+	bounds := make([]iv, 0, len(args))
 	for _, a := range args {
 		a = strings.TrimSpace(a)
-		v, err := strconv.ParseInt(a, 10, 64)
-		if err != nil {
-			return iv{}, false
+		if v, err := strconv.ParseInt(a, 10, 64); err == nil {
+			bounds = append(bounds, known(v, v))
+			continue
 		}
-		vals = append(vals, v)
+		if v := evalText(a, e); v.ok {
+			bounds = append(bounds, v)
+			continue
+		}
+		return iv{}, false
 	}
 	var a, b int64
-	switch len(vals) {
+	switch len(bounds) {
 	case 1:
-		a, b = 0, vals[0]
-	case 2, 3:
-		a, b = vals[0], vals[1]
+		a, b = min64(0, bounds[0].lo), max64(0, bounds[0].hi)
+	default: // 2 or 3 args: the start/stop hull; the step can only widen
+		a = min64(bounds[0].lo, bounds[1].lo)
+		b = max64(bounds[0].hi, bounds[1].hi)
 	}
 	if b < a {
 		a, b = b, a
@@ -631,7 +704,7 @@ func runFor(ctx gen.IFor_stmtContext, e env, lists map[string]listFact, taint ma
 		}
 		assigned[name] = true
 		delete(lists, name)
-		if c, ok := rangeCounterIV(ctx); ok {
+		if c, ok := rangeCounterIV(ctx, e); ok {
 			e.set(name, c)
 		} else {
 			delete(e, name)
@@ -834,6 +907,16 @@ func runIf(ctx gen.IIf_stmtContext, e env, lists map[string]listFact, taint map[
 	// every condition is evaluated and may mutate through an alias
 	for _, ne := range ctx.AllNamedexpr_test() {
 		killListMutations(ne, lists)
+		// Single evaluation: fold walrus bindings precisely.
+		walkTree(ne, func(w antlr.Tree) {
+			if wc, ok := w.(gen.INamedexpr_testContext); ok && len(wc.AllTest()) == 2 {
+				if nm := strings.TrimSpace(wc.Test(0).GetText()); isSimpleName(nm) {
+					assigned[nm] = true
+					e.set(nm, evalText(wc.Test(1).GetText(), e))
+					delete(lists, nm)
+				}
+			}
+		})
 	}
 	merged := e.clone()
 	var mergedLists map[string]listFact
@@ -903,13 +986,89 @@ func isFloatLit(s string) bool {
 
 // floatDomainFixpoint classifies each name as a Python float: EVERY
 // assignment must be float-domain (so `x = 1; x = 1.5` is neither).
-func floatDomainFixpoint(tree antlr.Tree, isInt func(string) bool) map[string]bool {
-	assigns := collectAssigns(tree)
-	// Augmented assignments rebind too: `x += e` must keep x numeric or x
-	// loses its float — the emitted `double += e` raises where Python
-	// returns a value (e.g. `0.0 + tensor` is a tensor). Desugar to
-	// `x <op> (e)` for the check; shift/bitwise/matmul aug-ops can never
-	// stay float (shifts have no float arm, so `0<<0` kills).
+// obscureRHS never proves in any domain (a quoted name): bindings whose
+// values no domain may claim are emitted with it so every domain drops
+// them. Covers `with`/`except` targets, `del`eted names, anything `import`
+// binds, and match-capture names.
+const obscureRHS = `"__obscure__"`
+
+// obscureAssigns collects the bindings whose values no domain can prove
+// (see obscureRHS). The kill is deliberately broad — e.g. value patterns
+// (`case Color.RED`) mention names that are reads, not binds — losing a
+// declaration there is sound and rare.
+func obscureAssigns(tree antlr.Tree) []assignT {
+	var out []assignT
+	kill := func(nm string) {
+		if isSimpleName(nm) {
+			out = append(out, assignT{[]string{nm}, obscureRHS})
+		}
+	}
+	walkTree(tree, func(n antlr.Tree) {
+		switch t := n.(type) {
+		case gen.IWith_itemContext:
+			if t.AS() != nil && t.Expr() != nil {
+				kill(strings.TrimSpace(t.Expr().GetText()))
+			}
+		case gen.IExcept_clauseContext:
+			if t.AS() != nil && t.Name() != nil {
+				kill(t.Name().GetText())
+			}
+		case gen.IDel_stmtContext:
+			if el := t.Exprlist(); el != nil {
+				for _, id := range reIdentAll.FindAllString(el.GetText(), -1) {
+					kill(id)
+				}
+			}
+		case gen.IImport_stmtContext:
+			walkTree(t, func(x antlr.Tree) {
+				if tn, ok := x.(antlr.TerminalNode); ok &&
+					tn.GetSymbol().GetTokenType() == gen.Python3ParserNAME {
+					kill(tn.GetText())
+				}
+			})
+		case gen.ICase_blockContext:
+			if ps := t.Patterns(); ps != nil {
+				for _, id := range reIdentAll.FindAllString(ps.GetText(), -1) {
+					kill(id)
+				}
+			}
+		}
+	})
+	return out
+}
+
+// obscureSet is obscureAssigns as a name set (e.g. for the container guard).
+func obscureSet(tree antlr.Tree) map[string]bool {
+	out := map[string]bool{}
+	for _, a := range obscureAssigns(tree) {
+		for _, t := range a.targets {
+			out[t] = true
+		}
+	}
+	return out
+}
+
+// walrusAssigns treats `x := e` as `x = e` for the domain proofs: a walrus
+// rebinds its target (possibly to a non-numeric) wherever it appears.
+func walrusAssigns(tree antlr.Tree) []assignT {
+	var out []assignT
+	walkTree(tree, func(n antlr.Tree) {
+		ctx, ok := n.(gen.INamedexpr_testContext)
+		if !ok || len(ctx.AllTest()) != 2 {
+			return
+		}
+		if nm := strings.TrimSpace(ctx.Test(0).GetText()); isSimpleName(nm) {
+			out = append(out, assignT{[]string{nm}, ctx.Test(1).GetText()})
+		}
+	})
+	return out
+}
+
+// augAssigns desugars `x <op>= e` to `x <op> (e)` for the domain proofs.
+// Every operator desugars uniformly: unprovable results (shifts in both
+// domains, `/` in the int domain) simply fail their domain check.
+func augAssigns(tree antlr.Tree) []assignT {
+	var out []assignT
 	walkTree(tree, func(n antlr.Tree) {
 		ctx, ok := n.(gen.IExpr_stmtContext)
 		if !ok || ctx.Augassign() == nil {
@@ -919,17 +1078,111 @@ func floatDomainFixpoint(tree antlr.Tree, isInt func(string) bool) map[string]bo
 		if !ok || !isSimpleName(nm) {
 			return
 		}
-		switch op {
-		case "+", "-", "*", "/", "//", "%", "**":
-			assigns = append(assigns, assignT{[]string{nm}, nm + op + "(" + rhs + ")"})
-		default:
-			assigns = append(assigns, assignT{[]string{nm}, "0<<0"})
-		}
+		out = append(out, assignT{[]string{nm}, nm + op + "(" + rhs + ")"})
 	})
+	return out
+}
+
+// scopeAssigns splits bindings into the kill-set (every plain/augmented/
+// walrus/annotated binding in the subtree, any depth — anything that can
+// unbind a name) and the creation-set (those visible at the tree's own
+// scope: bindings under a nested `def`/`class` belong to that scope, not
+// here). Skipping nested scopes wholesale is conservative: a float bound
+// only via a decorator, default or `global` there merely stays untyped.
+func scopeAssigns(tree antlr.Tree) (all, visible []assignT) {
+	emit := func(dst *[]assignT, a assignT) { *dst = append(*dst, a) }
+	var walk func(n antlr.Tree, nested bool)
+	walk = func(n antlr.Tree, nested bool) {
+		switch t := n.(type) {
+		case gen.IFuncdefContext, gen.IClassdefContext:
+			nested = true
+		case gen.IExpr_stmtContext:
+			for _, a := range plainEntries(t) {
+				emit(&all, a)
+				if !nested {
+					emit(&visible, a)
+				}
+			}
+			if t.Augassign() == nil {
+				break
+			}
+			if nm, op, rhs, ok := parseAug(t.GetText()); ok && isSimpleName(nm) {
+				a := assignT{[]string{nm}, nm + op + "(" + rhs + ")"}
+				emit(&all, a)
+				if !nested {
+					emit(&visible, a)
+				}
+			}
+		case gen.INamedexpr_testContext:
+			if len(t.AllTest()) != 2 {
+				break
+			}
+			if nm := strings.TrimSpace(t.Test(0).GetText()); isSimpleName(nm) {
+				a := assignT{[]string{nm}, t.Test(1).GetText()}
+				emit(&all, a)
+				if !nested {
+					emit(&visible, a)
+				}
+			}
+		}
+		for i := 0; i < n.GetChildCount(); i++ {
+			walk(n.GetChild(i), nested)
+		}
+	}
+	walk(tree, false)
+	return all, visible
+}
+
+// plainEntries mirrors collectAssigns for one statement: plain multi-target
+// assigns plus annotated assigns WITH a value (`x: T = v` rebinds; a bare
+// `x: T` does not).
+func plainEntries(ctx gen.IExpr_stmtContext) []assignT {
+	var out []assignT
+	if ctx.Augassign() != nil {
+		return nil
+	}
+	if an := ctx.Annassign(); an != nil {
+		if an.ASSIGN() == nil || len(an.AllTest()) != 2 {
+			return nil
+		}
+		ts := ctx.AllTestlist_star_expr()
+		if len(ts) < 1 {
+			return nil
+		}
+		val := an.Test(1).GetText()
+		for _, t := range ts {
+			if nm := strings.TrimSpace(t.GetText()); isSimpleName(nm) {
+				out = append(out, assignT{[]string{nm}, val})
+			}
+		}
+		return out
+	}
+	ts := ctx.AllTestlist_star_expr()
+	if len(ts) < 2 {
+		return nil
+	}
+	var tg []string
+	for _, t := range ts[:len(ts)-1] {
+		if nm := strings.TrimSpace(t.GetText()); isSimpleName(nm) {
+			tg = append(tg, nm)
+		}
+	}
+	return append(out, assignT{tg, ts[len(ts)-1].GetText()})
+}
+
+func floatDomainFixpoint(tree antlr.Tree, isInt func(string) bool) map[string]bool {
+	// Creation needs scope-visible bindings only (a float bound solely
+	// inside a nested `def`/`class` must not become a float here); the
+	// kill-set sees every binding at any depth. Obscure bindings (with/
+	// except/del/import/match) can never prove, only kill.
+	killAssigns, visibleAssigns := scopeAssigns(tree)
+	obscure := obscureAssigns(tree)
+	killAssigns = append(killAssigns, obscure...)
+	visibleAssigns = append(visibleAssigns, obscure...)
 	dom := map[string]bool{}
 	for changed := true; changed; {
 		changed = false
-		for _, a := range assigns {
+		for _, a := range visibleAssigns {
 			if floatDomain(a.rhs, dom, isInt) {
 				for _, t := range a.targets {
 					if !dom[t] {
@@ -944,7 +1197,7 @@ func floatDomainFixpoint(tree antlr.Tree, isInt func(string) bool) map[string]bo
 	for k := range dom {
 		all[k] = true
 	}
-	for _, a := range assigns {
+	for _, a := range killAssigns {
 		if !floatDomain(a.rhs, dom, isInt) {
 			for _, t := range a.targets {
 				delete(all, t)

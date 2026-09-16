@@ -66,6 +66,9 @@ run reserved_decline 'include = 100000
 x = 2 ** 100
 print(x)
 print(include)'
+run fallback_walrus_bigint 'y = (x := 2 ** 100)
+print(x)
+print(y)'
 
 echo "gmp parity: $ok ok, $fail fail"
 [ "$fail" -eq 0 ]
