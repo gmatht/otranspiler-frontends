@@ -169,7 +169,8 @@ type ExceptS struct {
 	Body  []Stmt
 }
 type ImportS struct{}
-type GlobalS struct{}
+type GlobalS struct{ Names []string }
+type NonlocalS struct{ Names []string }
 
 // ─────────────────────────────────────────────────────────────────────
 // Lexer
@@ -515,7 +516,9 @@ func (p *parser) parseStmt() (Stmt, error) {
 		case "import":
 			return &ImportS{}, nil
 		case "global":
-			return &GlobalS{}, nil
+			return parseScopeNames(toks[1:], "global")
+		case "nonlocal":
+			return parseScopeNames(toks[1:], "nonlocal")
 		case "pass":
 			return nil, nil
 		case "print":
@@ -592,6 +595,33 @@ func (p *parser) parseFunc(toks []tok, indent int) (Stmt, error) {
 		return nil, err
 	}
 	return &FuncS{Name: name, Params: params, Body: body}, nil
+}
+
+// parseScopeNames parses `global a, b` / `nonlocal a, b` name lists.
+// A bare keyword with no names is still a syntax error (never silently
+// dropped: an empty list would claim nothing while the source meant to
+// bind outer scope).
+func parseScopeNames(toks []tok, what string) (Stmt, error) {
+	var names []string
+	for _, t := range toks {
+		if t.kind == tEOF {
+			continue
+		}
+		if t.text == "," {
+			continue
+		}
+		if t.kind != tIdent {
+			return nil, fmt.Errorf("%s: expected name, got %q", what, t.text)
+		}
+		names = append(names, t.text)
+	}
+	if len(names) == 0 {
+		return nil, fmt.Errorf("%s: expected at least one name", what)
+	}
+	if what == "nonlocal" {
+		return &NonlocalS{Names: names}, nil
+	}
+	return &GlobalS{Names: names}, nil
 }
 
 func (p *parser) parseIf(toks []tok, indent int) (Stmt, error) {
@@ -3025,6 +3055,17 @@ func functionParamsStmt(name string, params []string, body []map[string]any) map
 	return map[string]any{"type": "Function", "name": name, "params": par, "body": toAnyStmts(body)}
 }
 
+// scopeNamesStmt builds a Global/Nonlocal A1 node: the names a scope
+// binds outward. Absent entirely when empty (callers only build these
+// for non-empty lists, so old emits without them stay byte-identical).
+func scopeNamesStmt(typ string, names []string) map[string]any {
+	arr := make([]any, len(names))
+	for i, n := range names {
+		arr[i] = n
+	}
+	return map[string]any{"type": typ, "names": arr}
+}
+
 func returnStmt(v map[string]any) map[string]any {
 	return map[string]any{"type": "Return", "value": v}
 }
@@ -4422,8 +4463,12 @@ func (l *lowerer) stmtsIR(stmts []Stmt) ([]map[string]any, error) {
 
 func (l *lowerer) stmtIR(s Stmt) ([]map[string]any, error) {
 	switch t := s.(type) {
-	case *ImportS, *GlobalS:
+	case *ImportS:
 		return nil, nil
+	case *GlobalS:
+		return []map[string]any{scopeNamesStmt("Global", t.Names)}, nil
+	case *NonlocalS:
+		return []map[string]any{scopeNamesStmt("Nonlocal", t.Names)}, nil
 	case *PrintS:
 		return l.printIR(t)
 	case *AssignS:
