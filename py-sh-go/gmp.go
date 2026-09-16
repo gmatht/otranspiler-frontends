@@ -228,7 +228,7 @@ func intDomainFixpoint(tree antlr.Tree, e env) map[string]bool {
 					changed = true
 				}
 			}
-			if intDomain(a.rhs, dom) {
+			if intDomainListAgg(a.rhs, dom, intLists) {
 				for _, t := range a.targets {
 					if !dom[t] {
 						dom[t] = true
@@ -261,7 +261,7 @@ func intDomainFixpoint(tree antlr.Tree, e env) map[string]bool {
 		all[k] = true
 	}
 	for _, a := range assigns {
-		if !intDomain(a.rhs, dom) {
+		if !intDomainListAgg(a.rhs, dom, intLists) {
 			for _, t := range a.targets {
 				delete(all, t)
 			}
@@ -273,24 +273,34 @@ func intDomainFixpoint(tree antlr.Tree, e env) map[string]bool {
 // intDomain is the integer-domain classifier (a superset of the interval
 // lattice: a value can be an int without a proved bound).
 func intDomain(s string, dom map[string]bool) bool {
+	return intDomainWith(s, dom, nil)
+}
+
+// intDomainWith is intDomain with an extra LEAF atom test (the list
+// reductions), consulted before the scalar rules. The predicate never
+// recurses, so the two classifiers cannot loop.
+func intDomainWith(s string, dom map[string]bool, extra func(string) bool) bool {
 	s = stripOuterParens(strings.TrimSpace(s))
 	if s == "" || strings.ContainsAny(s, `"'`) {
 		return false
 	}
+	if extra != nil && extra(s) {
+		return true
+	}
 	if l, r, ok := splitTopTwo(s, "**"); ok {
-		return intDomain(l, dom) && intDomain(r, dom)
+		return intDomainWith(l, dom, extra) && intDomainWith(r, dom, extra)
 	}
 	if l, r, ok := splitTopTwo(s, "//"); ok {
-		return intDomain(l, dom) && intDomain(r, dom)
+		return intDomainWith(l, dom, extra) && intDomainWith(r, dom, extra)
 	}
 	if l, _, r, ok := splitTop(s, "+-"); ok {
-		return intDomain(l, dom) && intDomain(r, dom)
+		return intDomainWith(l, dom, extra) && intDomainWith(r, dom, extra)
 	}
 	if l, _, r, ok := splitTop(s, "*%"); ok {
-		return intDomain(l, dom) && intDomain(r, dom)
+		return intDomainWith(l, dom, extra) && intDomainWith(r, dom, extra)
 	}
 	if strings.HasPrefix(s, "-") {
-		return intDomain(s[1:], dom)
+		return intDomainWith(s[1:], dom, extra)
 	}
 	if reIntLit.MatchString(s) {
 		return true
@@ -300,14 +310,37 @@ func intDomain(s string, dom map[string]bool) bool {
 	}
 	for _, fn := range []string{"int", "abs", "len"} {
 		if strings.HasPrefix(s, fn+"(") && strings.HasSuffix(s, ")") {
-			return intDomain(s[len(fn)+1:len(s)-1], dom)
+			return intDomainWith(s[len(fn)+1:len(s)-1], dom, extra)
 		}
 	}
 	for _, fn := range []string{"min", "max"} {
 		if strings.HasPrefix(s, fn+"(") && strings.HasSuffix(s, ")") {
 			l, r, ok := splitTopComma(s[len(fn)+1 : len(s)-1])
-			return ok && intDomain(l, dom) && intDomain(r, dom)
+			return ok && intDomainWith(l, dom, extra) && intDomainWith(r, dom, extra)
 		}
+	}
+	return false
+}
+
+// intDomainListAgg is intDomain plus the list reductions: `len(xs)`,
+// `max(xs)`, `min(xs)` and `sum(xs)` over an int list are Python ints. The
+// list facts live outside the scalar domain, so the plain classifier cannot
+// see them; without this a `total = sum(arr)` accumulator is not even
+// int-domain and the proved interval never reaches a declaration.
+func intDomainListAgg(s string, dom, lists map[string]bool) bool {
+	return intDomainWith(s, dom, func(t string) bool { return isListReduction(t, dom, lists) })
+}
+
+// isListReduction is a LEAF test: `fn(<int list>)` for the reduction
+// builtins (a leaf, so it never recurses into intDomainWith).
+func isListReduction(t string, dom, lists map[string]bool) bool {
+	for _, fn := range []string{"len", "max", "min", "sum"} {
+		pre := fn + "("
+		if !strings.HasPrefix(t, pre) || !strings.HasSuffix(t, ")") {
+			continue
+		}
+		inner := t[len(pre) : len(t)-1]
+		return !strings.Contains(inner, ",") && isIntListExpr(inner, dom, lists)
 	}
 	return false
 }

@@ -495,7 +495,7 @@ func runExprStmt(ctx gen.IExpr_stmtContext, e env, lists map[string]listFact, ta
 		if nm, op, rhs, ok := parseAug(ctx.GetText()); ok && isSimpleName(nm) {
 			assigned[nm] = true
 			lhs, lok := e[nm]
-			r := evalText(rhs, e)
+			r := evalText(rhs, bindListAggregates(rhs, e, lists))
 			var out iv
 			if lok {
 				out = applyAug(op, lhs, r)
@@ -518,7 +518,10 @@ func runExprStmt(ctx gen.IExpr_stmtContext, e env, lists map[string]listFact, ta
 	}
 	// `x = y = <expr>`: every target gets the same proved interval
 	rhsText := ts[len(ts)-1].GetText()
-	rhs := evalText(rhsText, e)
+	// Reductions over proved lists (`len/max/min/sum`) are bound into
+	// the evaluation env (list_reduce.go): the evaluator has no list
+	// facts, so a composite like `sum(xs) + 1` would otherwise be ⊤.
+	rhs := evalText(rhsText, bindListAggregates(rhsText, e, lists))
 	// `b = arr` shares the object: either name may mutate through the other,
 	// so the fact is dropped (aliases are never propagated).
 	if nm := strings.TrimSpace(rhsText); isSimpleName(nm) {
@@ -929,16 +932,16 @@ func runIf(ctx gen.IIf_stmtContext, e env, lists map[string]listFact, taint map[
 			mergedLists = beLists
 		} else {
 			merged.joinFrom(be)
-		// a list fact survives the join only when every branch agrees
-		// on the length; the elements join.
-		for k, v := range mergedLists {
-			o, ok := beLists[k]
-			if !ok || o.length != v.length {
-				delete(mergedLists, k)
-			} else {
-				mergedLists[k] = listFact{length: v.length, elem: join(v.elem, o.elem)}
+			// a list fact survives the join only when every branch agrees
+			// on the length; the elements join.
+			for k, v := range mergedLists {
+				o, ok := beLists[k]
+				if !ok || o.length != v.length {
+					delete(mergedLists, k)
+				} else {
+					mergedLists[k] = listFact{length: v.length, elem: join(v.elem, o.elem)}
+				}
 			}
-		}
 		}
 	}
 	for k := range e {
@@ -1442,6 +1445,11 @@ func max64(a, b int64) int64 {
 // splitTop splits s at a top-level operator from the given set, preferring
 // the RIGHTMOST split (left-associative evaluation still yields a sound
 // hull). Returns ok=false when no top-level operator exists.
+//
+// The left `*` of a `**` is not an operator: splitting there would hand the
+// evaluator a malformed operand (`2**200` -> `*200`). Nothing in the lattice
+// models power, so skipping it only turns a would-be ⊤ into a ⊤ by another
+// route; treating it as multiplication is what would be wrong.
 func splitTop(s, ops string) (string, string, string, bool) {
 	depth := 0
 	for i := len(s) - 1; i >= 0; i-- {
@@ -1452,7 +1460,8 @@ func splitTop(s, ops string) (string, string, string, bool) {
 			depth--
 		default:
 			if depth == 0 && strings.IndexByte(ops, s[i]) >= 0 && i > 0 &&
-				strings.IndexByte("+-*/%", s[i-1]) < 0 {
+				strings.IndexByte("+-*/%", s[i-1]) < 0 &&
+				!(s[i] == '*' && i+1 < len(s) && s[i+1] == '*') {
 				return s[:i], string(s[i]), s[i+1:], true
 			}
 		}
@@ -1601,4 +1610,12 @@ func balanced(s string) bool {
 		}
 	}
 	return depth == 0
+}
+
+func itoa(n int) string { return strconv.Itoa(n) }
+func boolStr(b bool) string {
+	if b {
+		return "true"
+	}
+	return "false"
 }

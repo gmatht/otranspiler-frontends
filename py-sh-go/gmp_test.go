@@ -55,15 +55,45 @@ func TestGMPTransformVariants(t *testing.T) {
 
 func TestGMPDeclines(t *testing.T) {
 	for _, src := range []string{
-		"x = 0\nprint(x)\n",                  // no bigint
-		"x = 2 ** 100\nprint(x + x)\n",       // expression the printer can't rewrite
-		"x = 2 ** 100\nif x > 0:\n    pass\n",// bigint in a condition
-		"for x in xs:\n    pass\n",           // non-range iteration
-		"x = 2 ** 100\ndef f():\n    return x\n", // function scope (out of subset)
+		"x = 0\nprint(x)\n",                                          // no bigint
+		"x = 2 ** 100\nprint(x + x)\n",                               // expression the printer can't rewrite
+		"x = 2 ** 100\nif x > 0:\n    pass\n",                        // bigint in a condition
+		"for x in xs:\n    pass\n",                                   // non-range iteration
+		"x = 2 ** 100\ndef f():\n    return x\n",                     // function scope (out of subset)
 		"include = 100000\nx = 2 ** 100\nprint(x)\nprint(include)\n", // Cython-reserved name: .pyx unparseable
 	} {
 		if _, ok, err := AnnotateGMP(src); err != nil || ok {
 			t.Errorf("%q: expected decline, got ok=%v err=%v", src, ok, err)
+		}
+	}
+}
+
+// TestGMPDeclinesBigintLoopTarget pins a latent renderer bug found while
+// extending the range proof: a `for` target that needs bigint cannot be an
+// mpz_t. Cython binds Python ints to a `for` loop variable and `cdef mpz_t i`
+// is an ARRAY, so the emitted
+//
+//	for i in range(5):
+//	    mpz_add_ui(i, i, 9223372036854775807)
+//
+// does not compile — and the old renderer emitted exactly that whenever a
+// loop body clobbered a counter with a value that overflowed i64 (the counter
+// is `assigned`, not range-proved, and int-domain, so classifyBigints calls it
+// bigint). REFUSE > GUESS: the transform must decline, and the caller falls
+// back to the exact pure-Python output.
+func TestGMPDeclinesBigintLoopTarget(t *testing.T) {
+	for _, src := range []string{
+		// literal range: reachable today (the counter is int-domain + not proved)
+		"for i in range(5):\n    i = i + 9223372036854775807\nprint(i)\n",
+		// name range: same shape once the endpoint is a proved name
+		"n = 5\nfor i in range(n):\n    i = i + 9223372036854775807\nprint(i)\n",
+	} {
+		out, ok, err := AnnotateGMP(src)
+		if err != nil {
+			t.Fatalf("%q: %v", src, err)
+		}
+		if ok {
+			t.Errorf("%q: must decline a bigint loop target; got:\n%s", src, out.Source)
 		}
 	}
 }

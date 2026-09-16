@@ -155,7 +155,7 @@ func TestAnnotateRefusedShapes(t *testing.T) {
 		{"i = 0\nwhile i < n:\n    i = i + 1\n", "i"},
 		{"i = 0\nwhile i < 5:\n    i = i * 2\n", "i"},
 		{"i = 0\nwhile i < 5:\n    i = i + j\n", "i"},
-		{"i = 0\nwhile i < 5:\n    i = i - 1\n", "i"},          // wrong direction
+		{"i = 0\nwhile i < 5:\n    i = i - 1\n", "i"},            // wrong direction
 		{"i = 0\nwhile i < 5:\n    i = i + 1\n    i = 0\n", "i"}, // two updates
 		// t101: a growing while accumulator must NOT be typed.
 		{"s = 1\ni = 0\nwhile i < 5:\n    s = s + 4000000000000000000\n    i = i + 1\nprint(s)\n", "s"},
@@ -434,8 +434,8 @@ func TestAnnotateIntList(t *testing.T) {
 	// REFUSE > GUESS: unsupported uses stay a Python list
 	for _, bad := range []string{
 		"xs = []\nfor i in range(3):\n    xs.append(i)\nfor v in xs:\n    print(v)\n", // iteration
-		"xs = []\nfor i in range(3):\n    xs.append(\"s\")\nprint(len(xs))\n",           // non-int
-		"xs = []\nfor i in range(3):\n    xs.append(i)\nprint(sum(xs))\n",              // reduction
+		"xs = []\nfor i in range(3):\n    xs.append(\"s\")\nprint(len(xs))\n",         // non-int
+		"xs = []\nfor i in range(3):\n    xs.append(i)\nprint(sum(xs))\n",             // reduction
 		"xs = []\nfor i in range(3):\n    xs.append(i)\nprint(xs)\n",                  // bare read
 	} {
 		if o, _ := AnnotateCython(bad, Options{Level: OptFull, Mode: ModePyx}); strings.Contains(o.Source, "_sh_push_i64") {

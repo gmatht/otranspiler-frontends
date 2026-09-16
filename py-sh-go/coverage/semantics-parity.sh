@@ -127,3 +127,19 @@ print(f(-5, 3))'
 
 echo "semantics parity: $ok ok, $fail fail"
 [ "$fail" -eq 0 ]
+
+# The entry-guarded dual arm (docs/AUTO_CYTHON.md §11): both sides of the guard
+# must agree with CPython. The out-of-range calls (a 101-bit int, a float, a
+# negative) are the adversarial half — a missing or too-wide guard would wrap,
+# raise, or coerce them to a C integer.
+run dual_guard_both_arms 'def scaled(n):
+    t = 0
+    for i in range(20):
+        t = (t + i * n) % 1000000007
+    return t
+print(scaled(0))
+print(scaled(2147483647))
+print(scaled(2147483648))
+print(scaled(2 ** 100))
+print(scaled(2.5))
+print(scaled(-1))'

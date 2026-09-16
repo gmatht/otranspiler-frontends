@@ -37,8 +37,25 @@ for f in ${1:-testdata/t0*.py testdata/t1*.py}; do
       $(python3-config --includes) $(python3-config --ldflags --embed) 2>/dev/null; then
     echo "FAIL $bn (cc)"; fail=$((fail+1)); continue
   fi
-  got="$(PYTHONUNBUFFERED=1 timeout 20 "$tmp/$bn" 2>/dev/null)"
-  want="$(PYTHONUNBUFFERED=1 timeout 20 python3 "$f" 2>/dev/null)"
+  # BOTH sides read the SAME stdin, from the fixture's own input file when it
+  # has one (testdata/<name>.stdin) and /dev/null otherwise. Two programs cannot
+  # share one inherited stdin: the first consumes it and the second only sees
+  # EOF, so a stdin-reading fixture (t36, t61) compared a real line against
+  # nothing — a "parity" failure that said nothing about the emitted code.
+  stdin=/dev/null
+  if [ -f "testdata/$bn.stdin" ]; then stdin="testdata/$bn.stdin"; fi
+  got="$(PYTHONUNBUFFERED=1 timeout 20 "$tmp/$bn" <"$stdin" 2>/dev/null)"
+  want="$(PYTHONUNBUFFERED=1 timeout 20 python3 "$f" <"$stdin" 2>/dev/null)"
+  # Pure-Python mode promises a file that is still CPython: `import cython`
+  # and its decorators (cython.declare, and the @cython.cfunc/@cython.locals
+  # the dual arm emits) must be no-ops there, so the annotated file has to run
+  # under python3 with the same stdout as the source.
+  if [ "$MODE" = py ]; then
+    pygot="$(PYTHONUNBUFFERED=1 timeout 20 python3 "$tmp/$bn.py" <"$stdin" 2>/dev/null)"
+    if [ "$pygot" != "$want" ]; then
+      echo "FAIL $bn (not runnable CPython: [$pygot] vs [$want])"; fail=$((fail+1)); continue
+    fi
+  fi
   if [ "$got" = "$want" ]; then
     ok=$((ok+1))
   else

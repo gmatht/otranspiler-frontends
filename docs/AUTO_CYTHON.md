@@ -501,8 +501,90 @@ Two clean Cython forms:
 Crucially, because Cython's exactness comes for free from Python `int` and
 objects, the dual loop there is a **pure cost optimisation**: v1 can emit a
 single exact arm (Python `int`) and add versioning only if `bench_cython.sh`
-shows it pays. So this is a **v2 optimisation deferral, not a capability gap** —
-and when we do want it, the workaround is the structured form we already emit.
+shows it pays. So this is a **pure cost optimisation, not a capability gap** —
+and when we want it, the form is the structured one below.
+
+### 11.0 The dual arm that landed: a guarded parameter, not a guard on a loop
+
+The first shipped slice (`dualguard.go`, part of the default OptFull pass in
+pure-Python mode, §12a) applies the
+**entry-guarded** form where the missing fact actually comes from, which in
+practice is not the loop but the FUNCTION PARAMETER: a parameter can be any
+object at the call site, so its type is ⊤, so `i * n` is ⊤ and the accumulator
+is ⊤ — the function gets no declarations at all and is exact-but-slow for every
+caller. Making the missing fact a hypothesis the caller's value must pass
+recovers the fast arm without guessing:
+
+```python
+@cython.cfunc
+@cython.locals(n=cython.longlong, i=cython.int, t=cython.longlong)
+def _py2cy_fast_scaled(n):
+    <body, verbatim>
+
+def scaled(n):
+    if type(n) is int and 0 <= n <= 2147483647:
+        return _py2cy_fast_scaled(n)
+    <body, verbatim>
+```
+
+Three properties make this sound, and the tests pin all three:
+
+1. **The guard's bounds ARE the interval the twin was proved under.** One
+   variable feeds both, so a guard cannot drift wider than the proof (the
+   miscompile) or narrower (dead code).
+2. **`type(p) is int`, not `isinstance`.** A `bool` is an `int` subclass and an
+   `int` subclass may carry an exotic `__index__`; an exact-type check admits
+   only genuine ints, whose C conversion is exactly the value. Floats, `True`
+   and everything else take the exact arm.
+3. **The parameter is `cython.longlong`, never narrower than the guard** — a
+   narrower C type would raise (or wrap) on a guard-accepted value. Locals keep
+   their own evidence-derived widths, because those are computed inside the
+   function and bounded by the proof.
+
+The body appears twice and executes **once** per call (the dispatcher picks one
+arm), which is why this form needs no purity gate — unlike the replay form,
+whose eligibility is soundness-critical and must stay a shared predicate, not a
+copy.
+
+Two further rules are part of the contract:
+
+- **Not provably bigint.** If the body contains a value the analysis *proves*
+  outside i64 — a literal, or a constant expression/chain that folds to one —
+  the guarded i64 arm is refused: arbitrary precision is the point of that code,
+  and the `--gmp` tier is its answer, not a dual arm. The test is conservative
+  and exact where it can be: `2 ** 100` vetoes, `2 ** 200 % 1000000007` does not
+  (the divisor bounds the result), and `2 ** 63 - 1` does not (the value fits).
+- **The guard must buy a local.** Typing only the parameter is refused, which
+  keeps ordinary `def f(a, b): return a % b` sources byte-identical to before.
+
+Hypotheses are tried **widest first** and are always **non-negative**, which is
+a consequence rather than a heuristic: proof strength is antitone in the width
+of the assumption (every transfer function is monotone, ⊤ is top), so a signed
+range can never prove a body that the non-negative range of the same width does
+not — while it *refuses* exactly the `%`/`//` shapes this feature exists for
+(those need a proved non-negative dividend).
+
+**Measured** (`scaled(n)` from §12a's shape: a 200 000-iteration loop, 20
+in-range calls; `gcc -O2`, Cython 3.0.8, best of 4 — `--no-opts` is the same
+source with no declarations at all, i.e. the "before" state of this feature):
+
+| impl | time(s) | vs CPython |
+|---|---|---|
+| CPython | 0.83 | 1.0× |
+| Cython (pure, = `--no-opts`) | 0.86 | ~1.0× |
+| **py2cy (dual arm)** | **0.11** | **7.5×** |
+
+So the guarded arm is not a marginal trick: this is a function that previously
+earned *no* declaration (`n` unprovable ⇒ `i * n` unprovable ⇒ `t` unprovable)
+and is now 7.5× CPython, while every out-of-range caller keeps the exact
+semantics.
+
+The runtime half of the argument is `coverage/py2cy-parity.sh` +
+`testdata/t102_dual_guard.py`, whose out-of-range calls (a 101-bit int, a float,
+a negative, and the first value past `2**31-1`) would wrap, raise, or coerce
+under a missing or too-wide guard — and the gate also re-runs the emitted
+pure-Python-mode file under **CPython** and requires the same stdout, which is
+what pins `@cython.cfunc`/`@cython.locals` as no-ops there.
 
 For completeness: `goto` exists in the ecosystem only as **A1 input** (a C
 source's `Goto`), and the shared ingress rewrites it to structured flow
@@ -646,6 +728,29 @@ pinned by `spec_collect_rejects_baked_array_index_in_bare_arith`.
   Everything not proved stays a Python object. Pinned refusals: t101's
   growing `s = s + 4000000000000000000`, a negative-lhs `%`/`//` (Python vs
   C), i64 overflow in `+`/`*`, and a conditional `try`/`match` assignment;
+- **entry-guarded dual arms** (dualguard.go, OptFull, pure-Python mode only;
+  §11.0): a function whose integers are unprovable only because a PARAMETER is
+  gets a `@cython.cfunc` twin typed under a hypothesis plus a guard that
+  discharges it, so the fast arm runs only for values the proof covered and
+  every other call takes the source program verbatim. Reported per function in
+  `CythonOutput.Dual` (function, guarded parameter, the assumed range — the
+  guard's bounds — and the typed locals). `testdata/t102_dual_guard.py` pins
+  both sides of the guard at run time (`scaled(2147483647)` in range,
+  `scaled(2147483648)` / `scaled(2 ** 100)` / `scaled(2.5)` out; 7.5× CPython on
+  the §11.0 micro-bench) and a `semantics-parity.sh` case adds the adversarial
+  call set. A structural test pins what is NOT observable at run time by design:
+  a sound annotation is semantically invisible, so "the fast arm fired" is
+  asserted structurally (twin present + typed, guard bounds == the proved range,
+  one call site) and "both sides of the guard are correct" at run time. A `.pyx` request
+  **declines** to pure-Python mode (the twin is a pure-Python-mode spelling),
+  with the reason on stderr, and the gate compiles the fallback;
+- **provably-bigint veto** on the dual arm: a body that proves a value outside
+  i64 (a literal, or a constant expression/chain that folds to one) is left
+  alone — the `--gmp` tier is that program's answer. `2 ** 100` vetoes,
+  `2 ** 200 % 1000000007` does not (the divisor bounds the result), `2 ** 63 - 1`
+  does not (the value fits). The folder is `foldBigConst` (stdlib `math/big`,
+  split lowest-precedence-operator first, so `2**200 % m` is not read as
+  `2 ** (200 % m)`);
 - gate: `make py2cy-test` — `autocython_test.go` (the proof/refusal boundary)
   plus `coverage/py2cy-parity.sh` (annotate → `cython --embed` → stdout must
   equal CPython; 22/22 on the t01–t1x slice, t101 included).
@@ -662,6 +767,17 @@ pinned by `spec_collect_rejects_baked_array_index_in_bare_arith`.
 
 Measured on `bench/rolling_hash.py` the analysis proves both `h` and `i`:
 **0.12 s vs 0.74 s CPython and 0.93 s pure Cython**, with identical stdout.
+
+**Also fixed while writing the dual arm (a latent renderer bug the gate could
+not see because no fixture covered it).** `classifyBigints` calls a *for* target
+that is assigned, int-domain and not range-proved a bigint — reachable whenever
+a loop body clobbers its counter past i64 (`for i in range(5): i = i +
+9223372036854775807`). The GMP renderer emitted `cdef mpz_t i` with
+`for i in range(5):` and the body's `mpz_add_ui(i, …)` — unparseable, since an
+`mpz_t` is an ARRAY and Cython binds Python ints to a loop variable. It now
+declines (REFUSE > GUESS) and the caller falls back to the exact pure-Python
+output; `TestGMPDeclinesBigintLoopTarget` pins both the literal-range and
+named-range shapes, and `coverage/gmp-parity.sh` would fail to compile either.
 
 **Next:** int lists/reductions (typed memoryview / `long long*`) and the
 bigint GMP FFI (`bignum_typed.pyx`); then the annotation planner over

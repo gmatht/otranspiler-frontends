@@ -104,7 +104,11 @@ func main() {
 		os.Exit(2)
 	}
 	if opts.Mode == pylib.ModePyx && out.Declined {
-		fmt.Fprintln(os.Stderr, "py2cy: --pyx declined (source uses identifiers reserved in Cython .pyx files); emitting pure-Python mode instead")
+		reason := out.DeclineReason
+		if reason == "" {
+			reason = "a construct needs pure-Python mode"
+		}
+		fmt.Fprintln(os.Stderr, "py2cy: --pyx declined ("+reason+"); emitting pure-Python mode instead")
 	}
 	os.Stdout.WriteString(out.Source)
 }
