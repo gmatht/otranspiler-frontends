@@ -326,6 +326,18 @@ var pyKeywords = map[string]bool{
 func AnnotateCython(src string, opts Options) (*CythonOutput, error) {
 	tree, errs := ParsePython(src)
 	if len(errs) > 0 {
+		// PEP 695 (3.12+) type parameters do not parse with the pre-12
+		// grammar (pep695.go): lower them and retry. This only fires on
+		// files that already fail, so it cannot change the output for
+		// anything that parses today; a declined lowering keeps the
+		// original error.
+		if lowered, ok := lowerPEP695(src); ok {
+			if t2, e2 := ParsePython(lowered); len(e2) == 0 {
+				src, tree, errs = lowered, t2, nil
+			}
+		}
+	}
+	if len(errs) > 0 {
 		return nil, fmt.Errorf("python2cython: %s", errs[0])
 	}
 	lines := strings.Split(src, "\n")

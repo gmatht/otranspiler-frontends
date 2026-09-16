@@ -116,6 +116,7 @@ $(CLI): $(CORE_SRC)
 test: build $(CLI)
 	@for f in testdata/*.py; do \
 	  bn=$$(basename $$f); \
+	  case $$bn in t103_pep695.py) echo "SKIP $$bn (PEP 695: py2cy lowering fixture, not SHIR ingress)"; continue;; esac; \
 	  ./py-sh-go --shir $$f --raw > /tmp/$$bn.mine 2>/dev/null || { echo "FAIL $$bn (frontend emit)"; exit 1; }; \
 	  # Ingress acceptance: the core consumes SHELL, not py source, so \
 	  # byte-equality vs otranspilerl-cli --shir is impossible. The progress signal \

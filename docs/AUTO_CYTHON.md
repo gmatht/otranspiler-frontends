@@ -751,6 +751,32 @@ pinned by `spec_collect_rejects_baked_array_index_in_bare_arith`.
   does not (the value fits). The folder is `foldBigConst` (stdlib `math/big`,
   split lowest-precedence-operator first, so `2**200 % m` is not read as
   `2 ** (200 % m)`);
+- **PEP 695 lowering** (`pep695.go`, `testdata/t103_pep695.py`): `def f[T]`,
+  `class C[T]` and `type X = ...` do not parse with the pre-12 grammar, so
+  any file using them failed outright. The pass rewrites them to pre-12
+  syntax (`T = typing.TypeVar("T", ...)`, `class C(Base,
+  typing.Generic[T])`, `X = ...`) and AnnotateCython retries; the hook only
+  fires on files that already fail, so nothing that parses today can
+  change. Each parameter gets a **fresh cell** (`T_f`, display name
+  preserved, so reprs match) with textual rebinding of every owned read:
+  siblings and shadowing stay independent, module reads stay NameErrors,
+  and no lowering ever occupies a source name. Bounds/constraints splice
+  verbatim (`T: (int, str)` → `TypeVar("T", int, str)`); `*Ts`/`**P`
+  become `TypeVarTuple`/`ParamSpec` (bounds on those decline). `type X`
+  is eager where 3.12 is lazy, so the RHS must prove safe (builtins,
+  `typing`, visible type parameters, earlier unconditional module names;
+  no lambdas/await/yield/walrus, no f-string surprises, no forward
+  references) or the file declines — and because a `type` alias is a
+  `TypeAliasType` (not callable, not subscriptable as a value, repr shows
+  the name), the alias *name* may only appear in bindings, deletions,
+  annotations (bare, or `P[args]` rewritten by positional substitution)
+  and isinstance second arguments over subscript-shaped values; calls,
+  subscripts, attributes, decorators, defaults and bare reads decline.
+  Blind spots decline or stay untouched: decorators and own-header
+  defaults never see type parameters (probed NameErrors), `match` needs
+  Cython 3.3+ anyway. Pinned by `pep695_test.go` (rewrite table +
+  declines), four `semantics-parity.sh` oracles, and the t103 parity
+  fixture (4-way: CPython native/lowered, Cython 3.0.8/3.3.0);
 - gate: `make py2cy-test` — `autocython_test.go` (the proof/refusal boundary)
   plus `coverage/py2cy-parity.sh` (annotate → `cython --embed` → stdout must
   equal CPython; 22/22 on the t01–t1x slice, t101 included).

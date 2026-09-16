@@ -125,6 +125,26 @@ run func_neg 'def f(a, b):
     return c
 print(f(-5, 3))'
 
+run pep695_generic 'def first[T](xs: list[T]) -> T:
+    return xs[0]
+print(first([10, 20]))'
+run pep695_bound 'def pick[T: int](x: T) -> T:
+    return x
+print(pick(3))'
+run pep695_class 'class Box[T]:
+    def __init__(self, v: T) -> None:
+        self.v = v
+    def get(self) -> T:
+        return self.v
+print(Box("s").get())'
+run pep695_alias 'type IntList = list[int]
+def total(xs: IntList) -> int:
+    s = 0
+    for x in xs:
+        s += x
+    return s
+print(total([1, 2, 3]))'
+
 echo "semantics parity: $ok ok, $fail fail"
 [ "$fail" -eq 0 ]
 
