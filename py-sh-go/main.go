@@ -1823,7 +1823,7 @@ type lowerer struct {
 	// so an integer whose interval is NOT proven within ±2^53 lowers to
 	// the bigint domain (exact JS BigInt arith); everything proven stays
 	// on the fast Number path. fnSites feeds the param intervals.
-	ranges  map[string][2]*big.Int
+	ranges map[string][2]*big.Int
 	// setElemDom tracks set/list element domains for sorted(): var →
 	// "int" (every recorded element proven within ±2^53) or "big".
 	// Recorded at add()/append() and all-int literals; POISONED
@@ -1831,8 +1831,8 @@ type lowerer struct {
 	// to the legacy pipeline, so a stale verdict can never survive a
 	// reassignment to non-int content.
 	setElemDom map[string]string
-	fnSites map[string][][]Expr // function name → per-call arg lists
-	fnRet   map[string]string   // function name → inferred return type ("list", …)
+	fnSites    map[string][][]Expr // function name → per-call arg lists
+	fnRet      map[string]string   // function name → inferred return type ("list", …)
 	// float-path/bound hoist temp names: the base is context-derived
 	// (floatName — `int(n**0.5)` -> `i_sqrt_n`), a per-context sequence
 	// disambiguates only on collision (usedHoist tracks the names in
@@ -2041,6 +2041,23 @@ func (l *lowerer) typeOf(e Expr) string {
 		if (t.Op == "+" || t.Op == "-" || t.Op == "*" || t.Op == "//" ||
 			t.Op == "%" || t.Op == "**") && floatPath(t) {
 			return "float"
+		}
+		// float-domain propagation (mirror autocython floatDomain):
+		// `+ - * / % // **` on two scalar numbers is a float when —
+		// except for `/` — at least one side is a float. `/` of two
+		// numbers is always float (true division). A side that is
+		// neither int/big/float (a string, list, unknown) keeps the
+		// legacy verdict below.
+		if t.Op == "/" {
+			if isNumType(l.typeOf(t.Lhs)) && isNumType(l.typeOf(t.Rhs)) {
+				return "float"
+			}
+		} else if t.Op == "+" || t.Op == "-" || t.Op == "*" || t.Op == "//" ||
+			t.Op == "%" || t.Op == "**" {
+			lt, rt := l.typeOf(t.Lhs), l.typeOf(t.Rhs)
+			if (lt == "float" || rt == "float") && isNumType(lt) && isNumType(rt) {
+				return "float"
+			}
 		}
 		if t.Op == "+" {
 			lt, rt := l.typeOf(t.Lhs), l.typeOf(t.Rhs)
@@ -2256,6 +2273,9 @@ func truncBig(n *big.Int) *big.Int {
 // be in the same domain or the JS op throws.
 func (l *lowerer) intDom(e Expr) string {
 	switch t := e.(type) {
+	case *LitFloat:
+		// a double literal trivially fits in a JS Number.
+		return "int"
 	case *BinOpE:
 		if l.intDom(t.Lhs) == "big" || l.intDom(t.Rhs) == "big" {
 			return "big"
@@ -2303,12 +2323,21 @@ func (l *lowerer) intDom(e Expr) string {
 		switch l.types[t.Name] {
 		case "big":
 			return "big"
-		case "int":
+		case "int", "float":
+			// a float var holds a double — an exact JS Number, never
+			// a BigInt (BigInt(1.5) throws).
 			return "int"
 		}
 		return "big"
 	}
 	return "big"
+}
+
+// isNumType — a scalar-number type verdict (an int/big/float value).
+// The float-domain rule (typeOf BinOp, noteElemAdd) admits only these;
+// strings, lists, dicts and unknowns keep their legacy verdicts.
+func isNumType(t string) bool {
+	return t == "int" || t == "big" || t == "float"
 }
 
 // floatPath — does this integer-context expression contain a float
@@ -4829,24 +4858,27 @@ func (l *lowerer) assignOne(target, op string, val Expr) ([]map[string]any, erro
 	// list literal → setArray / setArrayAppend (arr += (...)). `set()` —
 	// an empty Python set — lowers to the empty array (dedup + ordering
 	// happen at sorted(): sort -nu).
-	if lst, ok := val.(*ListE); ok || (func() bool { c, okc := val.(*CallE); return okc && len(c.Path) == 1 && c.Path[0] == "set" && len(c.Args) == 0 })() {
+	if lst, ok := val.(*ListE); ok || (func() bool {
+		c, okc := val.(*CallE)
+		return okc && len(c.Path) == 1 && c.Path[0] == "set" && len(c.Args) == 0
+	})() {
 		var elems []any
 		if lst != nil {
 			for _, el := range lst.Elems {
-			if s, ok := el.(*LitStr); ok {
-				elems = append(elems, st(s.Value))
-				continue
+				if s, ok := el.(*LitStr); ok {
+					elems = append(elems, st(s.Value))
+					continue
+				}
+				if n, ok := el.(*LitInt); ok {
+					elems = append(elems, st(n.Text))
+					continue
+				}
+				ir, err := l.argIR(el)
+				if err != nil {
+					return nil, err
+				}
+				elems = append(elems, ir)
 			}
-			if n, ok := el.(*LitInt); ok {
-				elems = append(elems, st(n.Text))
-				continue
-			}
-			ir, err := l.argIR(el)
-			if err != nil {
-				return nil, err
-			}
-			elems = append(elems, ir)
-		}
 		}
 		l.setType(target, "list")
 		if lst != nil {
@@ -4864,7 +4896,16 @@ func (l *lowerer) assignOne(target, op string, val Expr) ([]map[string]any, erro
 	if op == "+=" {
 		vty := l.typeOf(val)
 		dom := vty
-		if dom != "big" && l.typeOf(&NameE{Name: target}) == "big" {
+		// a float RHS with no float literal (`x += y`, `x += 1`) still
+		// accumulates in the structured Number domain (doubles); only a
+		// literal-float RHS keeps the legacy concat path (floatPath
+		// cannot lower through arithIRDom). The verdict stays float
+		// via tgtTy/vty below.
+		if dom == "float" && !floatPath(val) {
+			dom = "int"
+		}
+		tgtTy := l.typeOf(&NameE{Name: target})
+		if dom != "big" && tgtTy == "big" {
 			dom = "big"
 		}
 		// B1 guard: `v += v` doubles an unbounded accumulator.
@@ -4907,7 +4948,13 @@ func (l *lowerer) assignOne(target, op string, val Expr) ([]map[string]any, erro
 			} else {
 				ra := rhs["ast"].(map[string]any)
 				rhsAst = ra
-				l.setType(target, "int")
+				// a float operand (or float target) stays float:
+				// `x = 1.5; x += 1` is a double, not an int.
+				if vty == "float" || tgtTy == "float" {
+					l.setType(target, "float")
+				} else {
+					l.setType(target, "int")
+				}
 				delete(l.ranges, target)
 			}
 			ast := arithBin("+", arithVar(target), rhsAst)
@@ -4969,6 +5016,22 @@ func (l *lowerer) assignSimple(target string, val Expr) ([]map[string]any, error
 		}
 		return []map[string]any{assignStmt(target, st("0"))}, nil
 	}
+	// float-domain value with no float literal (`y = x + 1` from a float
+	// `x`, `q = 7 / 2` true division): the structured Arith lowering
+	// already evaluates with doubles, so it is kept byte-identical —
+	// only the verdict becomes float. (With a literal present the
+	// arith-string branch below owns the lowering.) The domain is
+	// forced plain ("int"-shaped, no Cast(Int64) BigInt homing — a
+	// double must stay a Number) and loop-growth guards are skipped: a
+	// float accumulator cannot be proven into the exact-int domain.
+	if l.typeOf(val) == "float" && !floatPath(val) {
+		if ir, err := l.arithIRDom(val, "int", false); err == nil {
+			l.setType(target, "float")
+			delete(l.ranges, target)
+			return []map[string]any{assignStmt(target, ir)}, nil
+		}
+		// else fall through to the legacy paths (which report the error)
+	}
 	// float-path arithmetic (int(x ** 0.5), …) — the runtime arith-string
 	// with JS doubles; the result is an integer-valued string the target
 	// reads back numerically.
@@ -4977,7 +5040,9 @@ func (l *lowerer) assignSimple(target string, val Expr) ([]map[string]any, error
 		if err != nil {
 			return nil, err
 		}
-		l.setType(target, "int")
+		// the verdict is the value's domain: float for `x = 1.5`, int
+		// for the int-valued `int(x ** 0.5)` idiom.
+		l.setType(target, l.typeOf(val))
 		if lo, hi, ok := l.rangeOf(val); ok {
 			l.ranges[target] = [2]*big.Int{lo, hi}
 		} else {
@@ -5212,17 +5277,17 @@ func buildProgram(stmts []Stmt) (*shiremit.Program, error) {
 // ceiling (see lowerer.exactHi).
 func buildProgramExact(stmts []Stmt, exactHi *big.Int) (*shiremit.Program, error) {
 	l := &lowerer{
-		exactHi: exactHi,
-		fns:     map[string]bool{},
-		types:   map[string]string{},
-		params:  map[string][]string{},
-		pipes:   map[string][][]map[string]any{},
-		ranges:  map[string][2]*big.Int{},
+		exactHi:    exactHi,
+		fns:        map[string]bool{},
+		types:      map[string]string{},
+		params:     map[string][]string{},
+		pipes:      map[string][][]map[string]any{},
+		ranges:     map[string][2]*big.Int{},
 		setElemDom: map[string]string{},
-		fnSites:   map[string][][]Expr{},
-		fnRet:     map[string]string{},
-		usedHoist: map[string]bool{},
-		hoistSeq:  map[string]int{},
+		fnSites:    map[string][][]Expr{},
+		fnRet:      map[string]string{},
+		usedHoist:  map[string]bool{},
+		hoistSeq:   map[string]int{},
 	}
 	l.collectFuncs(stmts)
 	irs, err := l.stmtsIR(stmts)
@@ -5232,12 +5297,16 @@ func buildProgramExact(stmts []Stmt, exactHi *big.Int) (*shiremit.Program, error
 	// A2 var_types: every assigned variable, sorted by name ("big" vars
 	// stay "Int" — the widthless kind the estree backend homes as an
 	// exact-precision binding; the C-only Int64 object kind would wrap
-	// assignments mod 2^64, breaking unbounded Python ints)
-	byName := map[string]string{}
+	// assignments mod 2^64, breaking unbounded Python ints). "float"
+	// vars are IEEE doubles: {"kind":"Float","width":64} (IrType::Float),
+	// additive — backends that ignore the annotation are unaffected.
+	byName := map[string]any{}
 	for name, ty := range l.types {
-		t := "Str"
+		t := any("Str")
 		if ty == "int" || ty == "big" {
 			t = "Int"
+		} else if ty == "float" {
+			t = shiremit.FloatType(64)
 		}
 		byName[name] = t
 	}

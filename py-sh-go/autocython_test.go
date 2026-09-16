@@ -251,10 +251,18 @@ func TestAnnotateBoundedListShapes(t *testing.T) {
 	if out := annotate(t, "total = 0\nfor v in [9223372036854775807, 9223372036854775807]:\n    total = total + v\nprint(total)\n"); typed(out, "total") {
 		t.Fatalf("overflowing accumulator must be refused: %v", out.Typed)
 	}
-	// over the unroll cap the loop falls back to the fixed point (refused, not slow)
+	// over the unroll cap a sum-shaped body is handled by the closed form
+	// (length × element), not by unrolling — exact, O(1), and correctly typed
 	big := "total = 0\nfor v in [" + strings.Repeat("7,", 299) + "7]:\n    total = total + v\nprint(total)\n"
-	if out := annotate(t, big); typed(out, "total") {
-		t.Fatalf("over-cap loop must be refused: %v", out.Typed)
+	if out := annotate(t, big); !typed(out, "total") {
+		t.Fatalf("over-cap sum loop must be typed via closed form: %v", out.Refused)
+	} else if ev, _ := out.EvidenceFor("total"); ev.Lo != 2100 || ev.Hi != 2100 {
+		t.Fatalf("over-cap sum loop range got [%d,%d], want [2100,2100]", ev.Lo, ev.Hi)
+	}
+	// a non-sum shape over the cap still falls back to the fixed point and is refused
+	big2 := "total = 0\nfor v in [" + strings.Repeat("7,", 299) + "7]:\n    total = total + v\n    w = v+1\nprint(total)\n"
+	if out := annotate(t, big2); typed(out, "total") {
+		t.Fatalf("over-cap non-sum loop must be refused: %v", out.Typed)
 	}
 }
 

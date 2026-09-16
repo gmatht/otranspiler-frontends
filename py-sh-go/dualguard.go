@@ -376,7 +376,7 @@ func proveDualTyped(body antlr.Tree, param string, seed env) (dualTwin, bool) {
 	for n := range floats {
 		allTyped[n] = true
 	}
-	ban := unsafeTypedNames(body, e, intTyped, allTyped)
+	ban := unsafeTypedNames(body, e, nil, intTyped, allTyped)
 	if param != "" && ban[param] {
 		return dualTwin{}, false
 	}

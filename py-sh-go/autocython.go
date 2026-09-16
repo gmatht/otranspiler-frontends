@@ -375,7 +375,7 @@ func AnnotateCython(src string, opts Options) (*CythonOutput, error) {
 		moduleEnv = p.env
 		if fi, ok := tree.(gen.IFile_inputContext); ok {
 			all := unionSets(p.ints, p.floats)
-			bad := unsafeTypedNames(fi, p.env, p.ints, all)
+			bad := unsafeTypedNames(fi, p.env, p.lists, p.ints, all)
 			moduleInts = subtract(p.ints, bad)
 			moduleFloats = subtract(p.floats, bad)
 		}
@@ -633,6 +633,7 @@ func indentLines(s, indent string) string {
 type proof struct {
 	ints, floats, assigned map[string]bool
 	env                    env
+	lists                  map[string]listFact    // proved list facts (reductions key on them)
 	widths                 map[string]IntEvidence // C storage width per int scalar
 }
 
@@ -644,7 +645,7 @@ func proveAll(tree antlr.Tree, level Level) proof {
 		return proof{ints: ints, floats: map[string]bool{}, assigned: assigned, env: e,
 			widths: intEvidence(tree, e, ints)}
 	}
-	e, assigned := proveRanges(tree)
+	e, assigned, lists := proveRangesWithLists(tree)
 	allInt := intDomainFixpoint(tree, e)
 	ints := map[string]bool{}
 	for n, v := range e {
@@ -659,7 +660,7 @@ func proveAll(tree antlr.Tree, level Level) proof {
 	for n := range ints {
 		delete(floats, n)
 	}
-	return proof{ints: ints, floats: floats, assigned: assigned, env: e,
+	return proof{ints: ints, floats: floats, assigned: assigned, env: e, lists: lists,
 		widths: intEvidence(tree, e, ints)}
 }
 
@@ -730,7 +731,7 @@ func collectFuncDecls(tree antlr.Tree, lines []string, level Level, mode Mode) (
 		}
 		p := proveAll(body, level)
 		all := unionSets(p.ints, p.floats)
-		bad := unsafeTypedNames(body, p.env, p.ints, all)
+		bad := unsafeTypedNames(body, p.env, p.lists, p.ints, all)
 		ints := subtract(p.ints, bad)
 		floats := subtract(p.floats, bad)
 		// never declare a parameter (any object at the call site) or a name

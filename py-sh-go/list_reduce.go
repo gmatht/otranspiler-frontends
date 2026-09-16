@@ -138,9 +138,11 @@ func additiveLoopAccumulator(body antlr.Tree, target string, e env, elem iv) (st
 	if !ok || !found || acc == "" {
 		return "", iv{}, false
 	}
-	// the loop target is rebound each trip; a body that also assigns it
-	// would break `E[v := elem]`
-	if bodyMutatesName(body, target) {
+	// The body can only write the accumulator (every other assignment
+	// was rejected above); if that accumulator IS the loop target,`
+	// E[v := elem]` no longer describes it — Python rebinds the target
+	// at the top of each trip.
+	if acc == target {
 		return "", iv{}, false
 	}
 	return acc, delta, true

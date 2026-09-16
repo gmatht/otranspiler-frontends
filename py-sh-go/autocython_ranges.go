@@ -1,3 +1,12 @@
+// autocython_ranges.go — SOUND interval analysis over the ANTLR tree
+//
+// Canonical lattice lives in `shir_passes/interval.rs` (IntervalConfig::bash
+// vs ::python — wrapping vs unbounded, trunc vs floor `%`). This file is
+// the Python ANTLR adapter that builds `env`/`listFact` from the parse
+// tree and will delegate to the core interval analysis via the IrProgram
+// JSON contract (PLAN.md §1). Kept for the pure-Go `go test` path until
+// the delegation lands; new logic goes in `shir_passes/interval.rs`.
+//
 // autocython_ranges.go — a small SOUND interval analysis over the ANTLR
 // tree, so the annotation pass can type bounded accumulators (AUTO_CYTHON.md
 // Stage 1): `h = (h*31+i) % 1000000007` is proved to stay in [0, m-1], not
@@ -339,8 +348,17 @@ func bodyMutatesName(body antlr.Tree, name string) bool {
 	walkTree(body, func(t antlr.Tree) {
 		if es, ok := t.(gen.IExpr_stmtContext); ok {
 			text := es.GetText()
-			if es.Augassign() != nil || es.Annassign() != nil {
-				if strings.Contains(text, name) {
+			if es.Augassign() != nil {
+				// the TARGET is what a compound assign rebinds — an exact
+				// test, not a substring one (`total += v` does not mutate
+				// `v` merely by mentioning it)
+				if nm, _, _, ok := parseAug(text); ok && nm == name {
+					mutated = true
+				}
+				return
+			}
+			if es.Annassign() != nil {
+				if nm, _, ok := strings.Cut(strings.TrimSpace(text), ":"); ok && nm == name {
 					mutated = true
 				}
 				return
@@ -363,7 +381,20 @@ func bodyMutatesName(body antlr.Tree, name string) bool {
 // proveRanges walks a parsed module and returns the proved intervals plus the
 // set of everything assigned (so the caller can report the refusals).
 func proveRanges(tree antlr.Tree) (env, map[string]bool) {
-	return proveRangesSeeded(tree, nil)
+	e, assigned, _ := proveRangesWithLists(tree)
+	return e, assigned
+}
+
+// proveRangesWithLists is proveRanges plus the list facts it proved. The
+// reduction proofs (`sum(xs)`, `len(xs)`, …) are keyed on those facts,
+// so a later guard that re-evaluates an expression containing one needs
+// them (see unsafeTypedNames).
+func proveRangesWithLists(tree antlr.Tree) (env, map[string]bool, map[string]listFact) {
+	e := env{}
+	lists := map[string]listFact{}
+	assigned := map[string]bool{}
+	runNode(tree, e, lists, closedOverNames(tree), assigned, 0)
+	return e, assigned, lists
 }
 
 // proveRangesSeeded is proveRanges starting from an ASSUMED entry environment.
@@ -684,25 +715,50 @@ func runFor(ctx gen.IFor_stmtContext, e env, lists map[string]listFact, taint ma
 		// runs exactly len times with the target rebound to the element
 		// interval each trip — sound and precise for accumulators, where
 		// the fixed-point path below would widen to ⊤.
-		if fact, ok := iterListFact(iter, e, lists); ok &&
-			(fact.length == 0 || fact.elem.ok) &&
-			fact.length <= maxBoundedIter {
+		if fact, ok := iterListFact(iter, e, lists); ok && (fact.length == 0 || fact.elem.ok) {
 			itName := strings.TrimSpace(iter)
 			if !isSimpleName(itName) {
 				itName = ""
 			}
 			if itName != name && !bodyMutatesName(blocks[0], itName) {
-				assigned[name] = true
-				delete(lists, name)
-				for k := 0; k < fact.length; k++ {
-					e.set(name, fact.elem)
-					runNode(blocks[0], e, lists, taint, assigned, depth+1)
+				// A sum-shaped body needs no unrolling at all: its whole effect is
+				// `acc += length x E[v := elem]`, so the bound holds for ANY trip
+				// count (exact unrolling is capped at maxBoundedIter).
+				if fact.elem.ok && fact.length > 0 {
+					if acc, delta, aok := additiveLoopAccumulator(blocks[0], name, e, fact.elem); aok {
+						if cur, have := e[acc]; have && cur.ok {
+							n := known(int64(fact.length), int64(fact.length))
+							if scaled := mulIV(n, delta); scaled.ok {
+								if res := addIV(cur, scaled); res.ok {
+									assigned[name] = true
+									delete(lists, name)
+									assigned[acc] = true
+									e.set(acc, res)
+									e.set(name, fact.elem)
+									if len(blocks) > 1 {
+										runNode(blocks[1], e, lists, taint, assigned, depth+1)
+									}
+									return
+								}
+							}
+						}
+					}
 				}
-				// len == 0 runs the body never: the target keeps its entry value
-				if len(blocks) > 1 {
-					runNode(blocks[1], e, lists, taint, assigned, depth+1)
+				// Otherwise unroll while that stays affordable; past the cap the
+				// body falls through to the fixed-point path below.
+				if fact.length <= maxBoundedIter {
+					assigned[name] = true
+					delete(lists, name)
+					for k := 0; k < fact.length; k++ {
+						e.set(name, fact.elem)
+						runNode(blocks[0], e, lists, taint, assigned, depth+1)
+					}
+					// len == 0 runs the body never: the target keeps its entry value
+					if len(blocks) > 1 {
+						runNode(blocks[1], e, lists, taint, assigned, depth+1)
+					}
+					return
 				}
-				return
 			}
 		}
 		assigned[name] = true
@@ -1274,7 +1330,7 @@ func banNames(text string, typed, bad map[string]bool) {
 	}
 }
 
-func unsafeTypedNames(n antlr.Tree, e env, intTyped, allTyped map[string]bool) map[string]bool {
+func unsafeTypedNames(n antlr.Tree, e env, lists map[string]listFact, intTyped, allTyped map[string]bool) map[string]bool {
 	bad := map[string]bool{}
 	var walk func(antlr.Tree, bool)
 	walk = func(t antlr.Tree, root bool) {
@@ -1284,7 +1340,10 @@ func unsafeTypedNames(n antlr.Tree, e env, intTyped, allTyped map[string]bool) m
 		switch ctx := t.(type) {
 		case gen.IExprContext:
 			text := ctx.GetText()
-			if strings.ContainsAny(text, "+-*&|^<>") && !evalText(text, e).ok {
+			// Reductions over a proved list are proved too (list_reduce.go),
+			// so `total + sum(xs)` is not an unprovable expression.
+			if strings.ContainsAny(text, "+-*&|^<>") &&
+				!evalText(text, bindListAggregates(text, e, lists)).ok {
 				banNames(text, intTyped, bad)
 			}
 		case gen.IComparisonContext:
