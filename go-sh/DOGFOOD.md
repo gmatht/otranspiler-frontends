@@ -356,3 +356,40 @@ The translated frontend also no longer fabricates an empty program
 | now | 41 | 66 | 17 |
 
 Gates: `fail-go` 124/124, `make test` 124/124.
+
+## The remaining frontier, root-caused (2026-10-15)
+
+The 17 refusals and the self-emit failure at `go-sh.go:113` reduce to ONE
+cause: **the translated frontend cannot parse `T{...}` struct literals,
+because struct layouts come out empty.**
+
+Chain, each link verified by probe:
+
+1. `parseTypeDecl` builds its field lists with a multi-target short
+   declaration of slice literals:
+   `fields, ftypes, fraws := []string{}, []string{}, []string{}`.
+2. In the translated run the field loop's append
+   (`fields = append(fields, names...)`) is called with **zero elements**,
+   so `fields`, `ftypes` and `fraws` all end up empty arrays while
+   `sh2.setArray`/`setArrayAppend` themselves behave correctly
+   (`assocNames=false arrays=true`, and a direct call with elements
+   populates the array normally).
+3. Empty layouts mean `p.structs["tok"]` is empty, so the
+   `if layout, ok := p.structs[t.text]` arm in `parsePrimary` misses and
+   `tok{...}` falls through to a plain var — the parser then dies at the
+   `{` (`expected ), got {`).
+4. That is exactly self-emit line 113,
+   `toks = append(toks, token{kind: tNL, line: line})`, and it accounts for
+   the struct-shaped refusals (t104/t108/t116/t95).
+
+The append's ELEMENTS are the next thing to trace: `names` is an any-list
+whose spread-splice reads empty at that point, so the suspect is the
+same-list aliasing/ordering that the `append(dst, src...)` splice fix
+addressed for `parseTopLevel`. A fix must be verified against the full
+ladder AND the self-emit, since a wrong splice rule here silently empties
+every layout.
+
+Nothing is committed for this: an attempted multi-target `setArray`
+lowering produced correct NATIVE A1 but did not change the translated
+run, so it is stashed rather than landed (`unverified multi-target slice
+fix`).
