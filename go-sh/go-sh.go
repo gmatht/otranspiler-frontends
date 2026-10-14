@@ -1919,18 +1919,22 @@ func (p *parser) anyListVar(name string) string {
 	return ""
 }
 
-// anyListReadWord: the word reading an any-list's id — a PARAM holds
-// it positionally ($N), a plain var in the store. (anyListVar returns
-// the NAME for map-key uses (anyElem); readers need this instead.)
+// anyListReadWord: the word reading a list-typed name's id — a PARAM
+// holds it positionally ($N), a plain var in the store. (anyListVar
+// returns the NAME for map-key uses (anyElem); readers need this
+// instead.) A slice param is not in anyLists but carries a list id under
+// the slice-param protocol, so it reads $N too.
 func (p *parser) anyListReadWord(name string) map[string]any {
-	if ln := p.anyListVar(name); ln != "" {
-		rn := p.resolveVar(name)
+	rn := p.resolveVar(name)
+	if p.paramSlice[name] || p.paramSlice[rn] || p.anyListVar(name) != "" {
 		if n, ok := p.paramNumber(name); ok {
 			return getVarExpr(strconv.Itoa(n))
 		}
 		if n, ok := p.paramNumber(rn); ok {
 			return getVarExpr(strconv.Itoa(n))
 		}
+	}
+	if ln := p.anyListVar(name); ln != "" {
 		return getVarExpr(ln)
 	}
 	return nil
@@ -10258,9 +10262,23 @@ func (p *parser) argToWord(e *expr) map[string]any {
 			"args": []any{strExpr(name)}, "purity": "PureCpu",
 		}
 		if p.anyListVar(e.name) != "" || isSliceParam {
+			// The id is read through anyListReadWord: a PARAM (slice or
+			// any-list) carries it POSITIONALLY ($N), so a plain
+			// getVar(name) reads "" and the splice silently receives
+			// nothing — which is how every struct layout came out empty
+			// (`fields = append(fields, names...)` in parseTypeDecl) and
+			// `T{...}` stopped parsing in the translated frontend.
+			//
+			// A nil word is NOT acceptable (the ingress rejects a null
+			// child arg and the whole program is lost), so a name that
+			// turns out to hold no id falls back to the store read.
+			lw := p.anyListReadWord(e.name)
+			if lw == nil {
+				lw = getVarExpr(name)
+			}
 			inner = map[string]any{
 				"type": "Call", "func": "listItems",
-				"args": []any{getVarExpr(name)}, "purity": "PureCpu",
+				"args": []any{lw}, "purity": "PureCpu",
 			}
 		}
 		return map[string]any{
