@@ -201,3 +201,57 @@ The loop converges when the mined ladder is green AND the app (the CLI,
 then the golib) passes as the final integration test — the golib's full
 translation is blocked on the contract boundary above, so the app-loop's
 termination criterion is deliberately scoped to the expressible subset.
+
+## Self-hosting run: the translated frontend on its own source (2026-10-14)
+
+The dogfood taken literally: transpile `go-sh.go` with the frontend, run
+the resulting JS under node, and use it to parse Go source. The oracle is
+the native binary's own A1.
+
+```
+# 1. native self-emit → ESTree → JS (the translated frontend)
+./go-sh --shir go-sh.go --raw > /tmp/self.a1.json
+$CLI - --target estree < /tmp/self.a1.json > /tmp/self.estree.json
+node -e 'import("./harness/estree-gen.mjs").then(m => …)'   # emit .mjs
+# 2. drive it: call the translated Shir() on an input
+node .dogfood/tfrontend.mjs <input.go> <out.json>           # workspace/.dogfood
+# 3. oracle
+./go-sh --shir <input.go> --raw > <native.json>             # byte-compare
+```
+
+### Result
+
+| measurement | value |
+|---|---|
+| translated golib runs under node | yes (13k lines → 5.2 MB A1 → 18 MB ESTree) |
+| translated `Shir()` on small inputs | byte-identical to native |
+| corpus ladder (`testdata/*.go`, 124 files) | **41 byte-identical / 83 differ** |
+| native self-emit of `go-sh.go` | succeeds (5,225,223 B A1, ingress OK) |
+| translated self-emit of `go-sh.go` | **not yet** — the statement-list assembly still loses statements |
+
+Comparison is with keys sorted and numeric strings normalized, so the two
+known marshalling artefacts (Go's `encoding/json` sorts map keys; the
+translated ints stringify as `"1"`) are excluded and the 83 are real
+divergence. The dominant classes are `stmts: ""` (statement-list assembly,
+e.g. the multi-assign `Block` return echoing a plain object) and
+unsupported constructs the *translated* golib trips over that the native
+one handles (map-typed params in value position, etc.).
+
+### Bugs this exposed (all fixed — see the commit for details)
+
+The value of the exercise: every one of these was invisible to the
+existing corpus, which only ever exercised the NATIVE frontend.
+
+1. **Reassigned params read stale positionals.** `n = n+1; return n`
+   returned the argument. Fixed with a body prescan + entry prologue +
+   store reads, and `params` omitted on shadowed functions.
+2. **Assoc element writes dropped entirely.** `m[k] = v` vanished for
+   every key shape including literal keys; now lowered to `assocSet`,
+   with `delete(m,k)` → `assocDel`.
+3. **Escaped rune literals decoded to the backslash.** `'\''` was 92, not
+   39 — so the lexer's own quote handling was wrong once translated.
+4. **`append(dst, src...)` nested instead of spliced** — the spread var
+   fell through `case "var"` and was pushed as one element, which is what
+   made `parseTopLevel` return an empty statement list.
+5. **Runtime value-channel coercion** (`harness/sh2-namespace.mjs`): three
+   sites `String()`-ed an A1 builder value into `"[object Object]"`.
