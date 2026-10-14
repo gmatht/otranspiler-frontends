@@ -245,7 +245,9 @@ func decodeGoStr(raw string) string {
 			b.WriteByte('\t')
 		case 'r':
 			b.WriteByte('\r')
-		case '\\', '"':
+		case '\\', '"', '\'':
+			// `\'` decodes (char literals: `'\''` is quote — the
+			// lexer's own quote/escape scanning self-hosted)
 			b.WriteByte(raw[i])
 		default:
 			b.WriteByte('\\')
@@ -487,6 +489,15 @@ type expr struct {
 	// func literal (lowered body, params in args)
 	body   []map[string]any
 	params []string
+	// func literal whose body reassigns a param (paramShadow prescan —
+	// the prologue seeds the store and all reads/writes use it): the
+	// A1 Function node must OMIT params, or the core's estree
+	// normalize_functions pass converts the seed into a native JS
+	// param and rewrites the store reads to it while the store writes
+	// (sh2.setVar calls) keep the store — a split brain. With params
+	// omitted the arrow takes no JS params and everything stays on
+	// the store (seeded from the positionals the caller binds).
+	noParams bool
 	// raw A1 cond JSON (if-init forms lower their cond directly,
 	// bypassing condTestString — the assign-Capture shape has no
 	// test-string form)
@@ -514,6 +525,13 @@ type parser struct {
 	idxKey      *expr                 // computed index expr (nil when the key is a literal)
 	idxLit      string                // literal index text ("" when computed)
 	maps        map[string]bool    // m := map[K]V{...} — assoc-array name
+	anyValMaps  map[string]bool    // map[string]any-VALUED maps — A1-fragment builders
+	                              // (Go-runtime state, never true assoc stores):
+	                              // element writes to them emit NOTHING (the Go map
+	                              // mutation is complete at parse time; the built
+	                              // node carries it wherever it flows)
+	emptyMaps   map[string]bool    // m := map[K]V{} (EMPTY literal) — no assocSet pairs
+	                              // emitted, so the first element write creates the array
 	bufs        map[string]string  // b := bytes.Buffer — accumulated contents
 	runtimeBufs map[string]bool    // buffers with runtime-dependent contents (WriteByte of a runtime byte)
 	cmds        map[string][]*expr // cmd := exec.Command(...) -> args
@@ -523,6 +541,15 @@ type parser struct {
 	fnParams    map[string]bool    // inside a func literal
 	fnParamOrd  []string           // ordered param names -> $1..
 	fnLocals    map[string]bool
+	// paramShadow: params REASSIGNED in the current function body
+	// (prescanParamWrites, before body parse). A reassigned param reads
+	// from the STORE (the prologue `name=$N` seeds it; the assignment
+	// updates it) — never the positional, which the assignment cannot
+	// update (`n = n + 1; return n` returned the stale arg). Params
+	// absent here keep the positional read (the core folds a
+	// never-written store read to "", so a positional read is the only
+	// sound shape for write-never params).
+	paramShadow map[string]bool
 	inFunc      bool
 	// variadic decl param (`parts ...string`) — excluded from the fixed
 	// $N positional mapping; the function-entry prelude splices the tail
@@ -1786,17 +1813,51 @@ func (p *parser) parseFuncLit() *expr {
 	// optional return type: T | pkg.T | []T | *T | (T, U) — erased
 	p.skipReturnType()
 	saveParams, saveOrd, saveLocals, saveIn := p.fnParams, p.fnParamOrd, p.fnLocals, p.inFunc
+	saveShadow := p.paramShadow
 	p.fnParams = map[string]bool{}
 	p.fnParamOrd = nil
 	p.fnLocals = map[string]bool{}
+	p.paramShadow = map[string]bool{}
 	p.inFunc = true
 	for _, prm := range params {
 		p.fnParams[prm] = true
 		p.fnParamOrd = append(p.fnParamOrd, prm)
 	}
-	body := p.parseBlockStmts()
+	body, shadow := p.parseFuncLitBody(params)
 	p.fnParams, p.fnParamOrd, p.fnLocals, p.inFunc = saveParams, saveOrd, saveLocals, saveIn
-	return &expr{kind: "func", params: params, body: body}
+	p.paramShadow = saveShadow
+	noParams := false
+	for _, prm := range params {
+		if shadow[prm] {
+			noParams = true
+			break
+		}
+	}
+	return &expr{kind: "func", params: params, body: body, noParams: noParams}
+}
+
+// parseFuncLitBody parses a `{ ... }` body with the paramShadow
+// prescan + prologue (shared by func literals and top-level decls —
+// the `{` must be the current token). Returns the body and the
+// shadowed-param set (for the Function node's params decision).
+func (p *parser) parseFuncLitBody(params []string) ([]map[string]any, map[string]bool) {
+	body := []map[string]any{}
+	shadow := map[string]bool{}
+	if p.tok().kind == tPunct && p.tok().text == "{" {
+		end := p.findBodyEnd(p.pos)
+		shadow = p.prescanParamWrites(p.pos, end, params)
+		for i, prm := range params {
+			if !shadow[prm] {
+				continue
+			}
+			// $N position read directly (paramNumber refuses
+			// shadowed params — the prologue needs the raw slot).
+			body = append(body, assignStmt(prm, getVarExpr(strconv.Itoa(i+1))))
+		}
+		p.paramShadow = shadow
+	}
+	body = append(body, p.parseBlockStmts()...)
+	return body, shadow
 }
 
 // skipType consumes one Go type expression in its entirety (balanced):
@@ -2314,9 +2375,200 @@ func (p *parser) parseFuncParams() []string {
 	return params
 }
 
-// paramNumber maps a param name to its $N position.
+// prescanParamWrites scans the token range [start, end) for writes to
+// any of the given param names and returns the written subset. The
+// caller scans the function BODY (from the `{` through its matching
+// `}`); the result seeds paramShadow before body parse, and the
+// function-entry prologue copies those params positional->store.
+//
+// Write forms (all assign the variable in Go semantics):
+//   - `name =` / `name :=` (plain and short-decl; `:=` with a param on
+//     the left assigns it when another target is new)
+//   - compound `name <op>=` for every Go assign-op
+//   - `name++` / `name--`
+//   - `var name ...` (a var decl SHADOWS the param; reads must see the
+//     var, i.e. the store, not the positional)
+//   - `for name =` / `for name :=`, `for _, name := range`, `for name
+//     := range` (loop-var assignment; the range-value form rebinds per
+//     iteration)
+//   - `switch name :=`, `if name :=`, `select`-less channel ops n/a
+//   - multi-target `a, name = f()` / `a, name := f()` (any ident in the
+//     target list followed by `=`/`:=`)
+// The scan is token-based (strings/comments are single tokens — they
+// can never false-positive; a keyword-named match is impossible since
+// Go keywords don't lex as tIdent... except predeclared `len`/`cap`
+// etc. which are idents but never params... they COULD be param names
+// (`func f(len int)`) — matched by name, correctly).
+// SOUNDNESS: over-approximation is safe (a spurious shadow only adds a
+// prologue copy + store reads of an identical value); UNDER-approximation
+// is a silent miscompile, so every assign-op is enumerated and the
+// `=`-detection excludes only the comparison/arrow spellings (`==`,
+// `=>`, `!=`... `!`/`=` handled by exact-text match on the single op).
+func (p *parser) prescanParamWrites(start, end int, params []string) map[string]bool {
+	want := map[string]bool{}
+	for _, prm := range params {
+		want[prm] = true
+	}
+	found := map[string]bool{}
+	isAssignOp := func(text string) bool {
+		switch text {
+		case "=", ":=",
+			"+=", "-=", "*=", "/=", "%=",
+			"<<=", ">>=", "&=", "|=", "^=", "&^=":
+			return true
+		}
+		return false
+	}
+	i := start
+	depth := 0
+	for i < end && i < len(p.toks) {
+		t := p.toks[i]
+		// track brace depth so a nested `func(){...}` literal's body is
+		// still scanned (its assigns are writes too if they name an
+		// outer param — Go closures capture; the A1 subs-share-store
+		// model carries them, so shadowing applies). `}` at depth 0
+		// ends the body.
+		if t.kind == tPunct {
+			if t.text == "{" {
+				depth++
+			} else if t.text == "}" {
+				if depth == 0 {
+					break
+				}
+				depth--
+			}
+		}
+		if t.kind == tIdent && want[t.text] {
+			// lookahead: `[i] =` element/member write does NOT rebind
+			// the name (skip the bracketed key, then require an
+			// assign-op — `a[i] = v` still leaves reads positional;
+			// the element lowering handles those; EXCEPT a full
+			// `=` rebind never happens through a subscript, so skip).
+			j := i + 1
+			if j < end && p.toks[j].kind == tPunct && p.toks[j].text == "[" {
+				// balanced skip to `]`
+				d := 1
+				j++
+				for j < end && d > 0 {
+					if p.toks[j].kind == tPunct {
+						if p.toks[j].text == "[" {
+							d++
+						} else if p.toks[j].text == "]" {
+							d--
+						}
+					}
+					j++
+				}
+				// `.field =` after the subscript — still not a rebind
+				if j+1 < end && p.toks[j].kind == tPunct && p.toks[j].text == "." {
+					// not a rebind (a read-only presence note; the
+					// map is untouched — an indexed write here
+					// would need the member-key assoc lowering)
+					i++
+					continue
+				}
+				// an element write (`a[i] = v`) mutates but never
+				// rebinds — positional reads stay valid
+				i++
+				continue
+			}
+			// `.field =` member write — not a rebind either
+			if j < end && p.toks[j].kind == tPunct && p.toks[j].text == "." {
+				i++
+				continue
+			}
+			// multi-target: `a, name = ...` — scan the comma list:
+			// if ANY ident in the `a, b, ...` chain before the
+			// assign-op is a wanted param, it is written.
+			k := i
+			isTargetList := false
+			for k < end {
+				if p.toks[k].kind == tIdent {
+					k++
+					// skip whitespace-less commas
+					if k < end && p.toks[k].kind == tPunct && p.toks[k].text == "," {
+						k++
+						continue
+					}
+					break
+				}
+				break
+			}
+			if k < end && (p.toks[k].kind == tOp || p.toks[k].kind == tPunct) && isAssignOp(p.toks[k].text) {
+				// the chain from i to k is a target list — mark every
+				// wanted param in it
+				for m := i; m < k; m++ {
+					if p.toks[m].kind == tIdent && want[p.toks[m].text] {
+						// `:=` with a SINGLE target that is a param and
+						// nothing else new: illegal Go, but treat as a
+						// write (sound — the prologue + store reads
+						// preserve the arg until the decl assigns).
+						found[p.toks[m].text] = true
+					}
+				}
+				isTargetList = true
+			}
+			if isTargetList {
+				i++
+				continue
+			}
+			// `name++` / `name--`
+			if j < end && p.toks[j].kind == tOp && (p.toks[j].text == "++" || p.toks[j].text == "--") {
+				found[t.text] = true
+				i++
+				continue
+			}
+		}
+		// `var name ...` shadows the param
+		if t.kind == tIdent && (t.text == "var") {
+			j := i + 1
+			// `var ( ... )` group: scan idents until `)`
+			if j < end && p.toks[j].kind == tPunct && p.toks[j].text == "(" {
+				j++
+				for j < end && !(p.toks[j].kind == tPunct && p.toks[j].text == ")") {
+					if p.toks[j].kind == tIdent && want[p.toks[j].text] {
+						found[p.toks[j].text] = true
+					}
+					j++
+				}
+			} else if j < end && p.toks[j].kind == tIdent && want[p.toks[j].text] {
+				found[p.toks[j].text] = true
+			}
+		}
+		i++
+	}
+	return found
+}
+
+// findBodyEnd returns the index just past the `}` matching the `{` at
+// openIdx (brace-balanced over tokens; strings are opaque).
+func (p *parser) findBodyEnd(openIdx int) int {
+	depth := 0
+	for i := openIdx; i < len(p.toks); i++ {
+		t := p.toks[i]
+		if t.kind != tPunct {
+			continue
+		}
+		if t.text == "{" {
+			depth++
+		} else if t.text == "}" {
+			depth--
+			if depth == 0 {
+				return i + 1
+			}
+		}
+	}
+	return len(p.toks)
+}
+
+// paramNumber maps a param name to its $N position. A reassigned
+// param (paramShadow) is NOT positional — its reads resolve to the
+// store (see prescanParamWrites).
 func (p *parser) paramNumber(name string) (int, bool) {
 	if !p.fnParams[name] {
+		return 0, false
+	}
+	if p.paramShadow[name] {
 		return 0, false
 	}
 	for i, prm := range p.fnParamOrd {
@@ -2556,10 +2808,12 @@ func (p *parser) parseTopLevel() []map[string]any {
 			// function scope (mirrors parseFuncLit)
 			saveParams, saveOrd, saveLocals, saveIn := p.fnParams, p.fnParamOrd, p.fnLocals, p.inFunc
 			saveVarTypes := p.varTypes
+			saveShadow := p.paramShadow
 			p.fnParams = map[string]bool{}
 			p.fnParamOrd = nil
 			p.fnLocals = map[string]bool{}
 			p.varTypes = map[string]string{}
+			p.paramShadow = map[string]bool{}
 			p.inFunc = true
 			for _, prm := range params {
 				p.fnParams[prm] = true
@@ -2605,12 +2859,22 @@ func (p *parser) parseTopLevel() []map[string]any {
 					"purity": "Emulable",
 				}))
 			}
-			body = append(body, p.parseBlockStmts()...)
+			fbody, shadow := p.parseFuncLitBody(params)
+			body = append(body, fbody...)
 			p.curFn = saveCur
 			p.fnParams, p.fnParamOrd, p.fnLocals, p.inFunc = saveParams, saveOrd, saveLocals, saveIn
+			p.paramShadow = saveShadow
 			p.varTypes = saveVarTypes
 			p.fnNames[nm] = true
-			__ptlFunc = append(__ptlFunc, map[string]any{"type": "Function", "name": nm, "params": params, "body": body})
+			emitParams := params
+			for _, prm := range params {
+				if shadow[prm] {
+					// reassigned param: omit params (see noParams)
+					emitParams = []string{}
+					break
+				}
+			}
+			__ptlFunc = append(__ptlFunc, map[string]any{"type": "Function", "name": nm, "params": emitParams, "body": body})
 		case p.atIdent("type"):
 			// [see parseTypeDecl for the erasure contract]
 			p.parseTypeDecl()
@@ -3503,8 +3767,15 @@ func (p *parser) parseVarSpec() []map[string]any {
 			p.pos++ // map
 			p.skipNL()
 			p.skipBalanced("[", "]")
+			anyValued := false
 			for p.tok().kind == tIdent {
+				if p.tok().text == "any" || p.tok().text == "interface" {
+					anyValued = true
+				}
 				p.next() // value type
+			}
+			if anyValued {
+				p.anyValMaps[names[0]] = true
 			}
 			return p.parseMapLiteralBody(names[0])
 		}
@@ -5135,12 +5406,14 @@ func (p *parser) parseMapLiteralBody(name string) []map[string]any {
 	// non-nil init: an EMPTY literal must marshal body as [],
 		// never null (the ingress rejects Block.body: not an array)
 		body := []map[string]any{}
+	empty := true
 	for {
 		p.skipNL()
 		if p.atPunct("}") {
 			p.pos++
 			break
 		}
+		empty = false
 		key := p.parseExpr()
 		if key.kind != "str" && key.kind != "num" && key.kind != "rawstr" {
 			p.failf("unsupported map key %q (v2) — keys must be literals", key.text)
@@ -5169,12 +5442,104 @@ func (p *parser) parseMapLiteralBody(name string) []map[string]any {
 			break
 		}
 	}
+	if empty {
+		p.emptyMaps[name] = true
+	}
 	return []map[string]any{{"type": "Block", "body": body}}
+}
+
+// emptyMapDecl: name was declared as an empty map (`m :=
+ // map[K]V{}` emits an empty Block — no assocSet pairs, so p.maps
+// misses it). The first element write creates the assoc array,
+// exactly like the pairs would have. Tracked explicitly (rather
+// than scanning emitted stmts) because decls reorder to the program
+// head while writes stay in body order.
+func (p *parser) emptyMapDecl(name string) bool {
+	return p.emptyMaps[name]
+}
+
+// parseAssocElemAssign lowers `m[key] = rhs` on an ASSOC map (m in
+// p.maps) directly to assocSet(m, keyWord, valWord) — the baked
+// `m[...]` target never survives the core. Called with the base name
+// (targets[0] BEFORE suffixing) and the parsed key expr; the `[`...`]`
+// are consumed and `p.pos` sits after `]`. The key rides the WORD
+// channel (literals verbatim, everything else through exprToWord —
+// member/call/index keys coerce at the runtime boundary, mirroring the
+// assocGet read path). Only plain `=`/`:=` with a single-expression
+// RHS; anything else (compound ops, func/map/slice-literal or make
+// RHS, call/member/++/-- statement forms, member writes through the
+// element) refuses loudly — no read-modify-write or composite-value
+// shapes yet.
+func (p *parser) parseAssocElemAssign(base string, keyE *expr) []map[string]any {
+	if p.atPunct(".") {
+		p.failf("member write through assoc element (v2) — no composite-value shape yet")
+	}
+	if p.atPunct("(") || p.atPunct("++") || p.atPunct("--") {
+		p.failf("unsupported assoc element statement form (v2) — only plain `=` assigns lower")
+	}
+	op := ""
+	switch {
+	case p.atPunct(":="):
+		op = ":="
+	case p.atPunct("="):
+		op = "="
+	default:
+		p.failf("expected assignment operator, got %q", p.tok().text)
+	}
+	_ = op
+	p.pos++
+	p.skipNL()
+	// A1-fragment builder map (`map[string]any` — Go-runtime state):
+	// element writes mutate the Go map at parse time; the built node
+	// carries them wherever it flows. No runtime effect to lower —
+	// consume the key and RHS WITHOUT lowering (composite values and
+	// arbitrary key exprs are fine here — nothing reaches the word
+	// channel) and emit nothing. (The ghost assoc array is never
+	// meaningfully read at runtime; reads of literal-pair keys hit
+	// the decl pairs.)
+	if p.anyValMaps[base] {
+		_ = keyE
+		_ = p.parseExpr()
+		p.skipNL()
+		return []map[string]any{}
+	}
+	// exotic RHS starters refuse before consuming (single-expression
+	// values only — no composite-literal or make shapes in elements)
+	if p.atIdent("func") || p.atIdent("map") || p.atIdent("make") {
+		p.failf("assoc element store of composite value (v2) — no composite-value shape yet")
+	}
+	if p.atPunct("[") {
+		p.failf("assoc element store of composite value (v2) — no composite-value shape yet")
+	}
+	if p.tok().kind == tPunct && (p.tok().text == "&" || p.tok().text == "*") {
+		p.failf("assoc element store through reference (v2) — references are read-only snapshots")
+	}
+	rhs := p.parseExpr()
+	p.skipNL()
+	var keyWord map[string]any
+	switch keyE.kind {
+	case "str", "rawstr":
+		keyWord = strExpr(keyE.text)
+	case "num":
+		keyWord = strExpr(keyE.text)
+	default:
+		keyWord = p.exprToWord(keyE)
+	}
+	return []map[string]any{{
+		"type": "Expr",
+		"expr": map[string]any{
+			"type": "Call", "func": "assocSet",
+			"args":   []any{strExpr(base), keyWord, p.exprToWord(rhs)},
+			"purity": "Emulable",
+		},
+	}}
 }
 
 func (p *parser) parseAssignStmt() []map[string]any {
 	// indexed-target parts from the previous statement must not leak:
 	// the maplit hook below consumes them within this call only.
+	// (emptyMaps is DECL-scoped, not statement-scoped — it persists
+	// across statements by design.)
 	p.idxBase, p.idxKey, p.idxLit = "", nil, ""
 	if p.tok().kind == tIdent && p.tok().text == "be" {
 	}
@@ -5214,18 +5579,16 @@ func (p *parser) parseAssignStmt() []map[string]any {
 		if !p.atPunct("]") {
 			if p.tok().kind == tNum {
 				idx = p.next().text
-			} else if p.tok().kind == tStr {
-				// a map-keyed assign: call["typeArgs"] = ta — the runtime's
-				// setVar("call[typeArgs]") assoc-store write (the key is a
-				// string even when the target is a jsonNew struct, not a
-				// registered assoc map)
-				idx = decodeGoStr(p.next().raw)
 			} else {
 				keyE = p.parseExpr()
 			}
 		}
 		p.expect(tPunct, "]")
-		if keyE != nil {
+		if keyE != nil && (p.maps[targets[0]] || p.maps[p.idxBase]) {
+			// ASSOC element write — handled wholly by
+			// parseAssocElemAssign below (after suffixing); skip
+			// arithKeyText (member/call keys fail there).
+		} else if keyE != nil {
 			if keyE.kind == "str" && p.maps[targets[0]] {
 				// ASSOC store with a literal string key — the raw text is
 				// the subscript (the runtime routes name[key] to the
@@ -5236,6 +5599,26 @@ func (p *parser) parseAssignStmt() []map[string]any {
 				// the subscript text with evalArith
 				idx = p.arithKeyText(keyE)
 			}
+		}
+		// ASSOC element write (`m[k] = v` on a map — literal AND
+		// computed keys): the baked `m[...]` target does NOT survive
+		// the core (every baked assoc write renders to nothing —
+		// litkey/varkey probes), so lower DIRECTLY to the proven
+		// assocSet Call (the map-literal t54 shape) via
+		// parseAssocElemAssign. An EMPTY map declaration (`m :=
+		// map[K]V{}`) emits no assocSet pairs, so p.maps misses it —
+		// treat an empty Block-bodied decl the same (the write
+		// creates the assoc array, like the pairs do). The key rides
+		// the WORD channel (map keys are strings); the value takes
+		// the single-expression path — exotic RHS (func/map/slice
+		// literals, make, member writes through the element) refuse
+		// loudly. `op` other than `=`/`:=` (compound element
+		// update) likewise refuses — no read-modify-write shape yet.
+		if keyE != nil && (p.maps[targets[0]] || p.emptyMapDecl(targets[0])) {
+			p.maps[targets[0]] = true
+			delete(p.emptyMaps, targets[0])
+			p.registerVar(targets[0], "Map")
+			return p.parseAssocElemAssign(targets[0], keyE)
 		}
 		// stash the structural parts for the maplit hook below (an
 		// indexed write of a map literal onto an any-list lowers to
@@ -5278,6 +5661,43 @@ func (p *parser) parseAssignStmt() []map[string]any {
 	}
 	// function call statement: f(args)
 	if p.atPunct("(") {
+		// delete(m, key) — Go builtin map deletion (NOT a sub call):
+		// assocDel over the map word + key word. Intercept before
+		// the generic exec lowering (which would emit a `delete`
+		// external command that exists nowhere).
+		if len(targets) == 1 && targets[0] == "delete" && memberBase == "" {
+			p.pos++
+			p.skipNL()
+			mapArg := p.parseExpr()
+			p.skipNL()
+			p.expect(tPunct, ",")
+			p.skipNL()
+			keyArg := p.parseExpr()
+			p.skipNL()
+			p.expect(tPunct, ")")
+			var mapWord map[string]any
+			if mapArg.kind == "var" {
+				// the assoc NAME (not a value read — assocDel
+				// addresses the store by name, mirroring assocSet)
+				mapWord = strExpr(p.resolveVar(mapArg.name))
+			} else if mapArg.kind == "member" {
+				if w, tag := p.structFieldWord(mapArg.name); tag != "none" && tag != "ref" {
+					mapWord = w
+				} else {
+					p.failf("delete on non-container %q (v2)", mapArg.name)
+				}
+			} else {
+				p.failf("delete on non-map value (v2) — only var and field maps lower")
+			}
+			return []map[string]any{{
+				"type": "Expr",
+				"expr": map[string]any{
+					"type": "Call", "func": "assocDel",
+					"args":   []any{mapWord, p.exprToWord(keyArg)},
+					"purity": "PureCpu",
+				},
+			}}
+		}
 		p.pos++
 		args := p.parseArgs()
 		var words []map[string]any
@@ -5562,6 +5982,14 @@ func (p *parser) parseAssignStmt() []map[string]any {
 		}
 	}
 	if p.atIdent("map") {
+		if p.mapLitIsAnyValued() {
+			// A1-fragment builder (`node := map[string]any{...}`):
+			// the PAIRS ride the Go map directly — but they were
+			// already parsed as assocSets by the shared path below.
+			// Mark any-valued so later element writes lower to
+			// nothing (Go-side mutation, no runtime effect).
+			p.anyValMaps[targets[0]] = true
+		}
 		me := p.parsePrimary() // the structlit expr (parsePrimary's map case)
 		// INDEXED any-list element write (`out[i] = map[string]any{...}`
 		// — toAnySlice's indexed fill): the maplit lowers to a
@@ -6450,6 +6878,11 @@ func (p *parser) parseAssignStmt() []map[string]any {
 		}
 		var elems []any
 		var appendPre []map[string]any
+		// A SPREAD element (`append(dst, src...)`) is a SPLICE, not a
+		// single element: for an any-list dst it lowers to listExtend.
+		spreadSeen := false
+		spreadW := map[string]any(nil)
+		spreadWord := ""
 		for _, a := range rhs.args[1:] {
 			switch a.kind {
 			case "str", "num", "rawstr":
@@ -6483,18 +6916,41 @@ func (p *parser) parseAssignStmt() []map[string]any {
 				// literal-only refusal was self-imposed. Lower through
 				// exprToWord (getVar after resolve): one element per
 				// appended VALUE, no field-splitting (Go semantics).
+				if a.spread {
+					// `append(dst, src...)`: SPLICE. For an any-list dst
+					// the branch below splices via listExtend; for a
+					// plain-Array dst (and a struct/array-typed var) the
+					// established Spread-node lowering still applies.
+					spreadSeen = true
+					spreadWord = p.paramName(a.name)
+					if p.anyListVar(a.name) == "" && p.anyListVar(rhs.args[0].name) == "" {
+						elems = append(elems, p.argToWord(a))
+					}
+					continue
+				}
 				elems = append(elems, p.exprToWord(a))
 			case "call", "index", "member", "fieldof", "add", "slice":
 				// computed elements ride as words (captures/reads; "add" =
 				// string concatenation: zig-sh-go's
 				// `params = append(params, pt+" "+pn.text)`; "slice" = the
 				// golib's `append(parts, src[i:])` A1-builder calls)
+				if a.spread {
+					spreadSeen = true
+					spreadW = p.exprToWord(a)
+					spreadWord = ""
+					continue
+				}
 				elems = append(elems, p.exprToWord(a))
 			default:
 				if a.spread {
 					// slice spread (`append(out, other...)`) — the Spread
 					// node expands the list at the runtime boundary
-					elems = append(elems, p.argToWord(a))
+					spreadSeen = true
+					spreadW = p.argToWord(a)
+					spreadWord = ""
+					if p.anyListVar(rhs.args[0].name) == "" {
+						elems = append(elems, p.argToWord(a))
+					}
 				} else {
 					p.failf("append elements must be literals or vars (v2)")
 				}
@@ -6532,12 +6988,34 @@ func (p *parser) parseAssignStmt() []map[string]any {
 		// `funcStmts = append(funcStmts, map[string]any{…})`)
 		if ln := p.anyListVar(rhs.args[0].name); ln != "" {
 			// ANY-LIST append (`out = append(out, tok{...})` — struct
-			// elements ride a list id): listPush each element.
-			out := append(appendPre, assignStmt(ln, map[string]any{
-				"type": "Call", "func": "listPush",
-				"args":   append([]any{getVarExpr(ln)}, elems...),
-				"purity": "PureCpu",
-			}))
+			// elements ride a list id): listPush each element. A SPREAD
+			// element (`stmts = append(stmts, sub...)` — the golib's own
+			// statement-list assembly) SPLICES via listExtend instead:
+			// pushing a list id as one element nests it and the inner
+			// statements are lost (self-host: stmts collapsed to
+			// "[object Object]"). The spread word is NOT in `elems`
+			// (the element loop records it separately for this branch).
+			out := appendPre
+			if len(elems) > 0 {
+				out = append(out, assignStmt(ln, map[string]any{
+					"type": "Call", "func": "listPush",
+					"args":   append([]any{getVarExpr(ln)}, elems...),
+					"purity": "PureCpu",
+				}))
+			}
+			if spreadSeen {
+				var srcW map[string]any
+				if spreadWord != "" {
+					srcW = getVarExpr(spreadWord)
+				} else {
+					srcW = spreadW
+				}
+				out = append(out, assignStmt(ln, map[string]any{
+					"type": "Call", "func": "listExtend",
+					"args":   []any{getVarExpr(ln), srcW},
+					"purity": "PureCpu",
+				}))
+			}
 			return out
 		}
 		out := append(appendPre, assignStmt(rhs.args[0].name, map[string]any{
@@ -6707,6 +7185,12 @@ func (p *parser) parseAssignStmt() []map[string]any {
 		if len(body) == 0 {
 			return nil
 		}
+		// The Block node must ride a VAR (echoing the var's node temp
+		// resolves structurally); an INLINE literal echoes a plain JS
+		// object, which the value channel stringifies to
+		// "[object Object]" and the whole multi-assign statement is lost
+		// (t47_self: `a, b := "x", "y"` vanished). Same rule as the
+		// bare-return lowering above (see the `return []map{…}` note).
 		return []map[string]any{{
 			"type": "Block",
 			"body": body,
@@ -6773,8 +7257,7 @@ func (p *parser) parseAssignStmt() []map[string]any {
 			p.tmpN++
 			p.registerVar(flag, "Str")
 			out := p.boolTreeStmts(rhs, flag)
-			out = append(out, assignStmt(targets[0],
-				map[string]any{"type": "Var", "name": flag, "sigil": nil}))
+			out = append(out, assignStmt(targets[0], getVarExpr(flag)))
 			return out
 		} else {
 			p.failf("unsupported comparison in word position (v2)")
@@ -7000,6 +7483,41 @@ func (p *parser) assignLiteral(rhs *expr) (string, bool) {
 		return rhs.text, true
 	}
 	return "", false
+}
+
+// mapLitIsAnyValued: the map literal at pos has an `any` (or
+// `interface{}`) VALUE type (`map[string]any{...}`) — an A1-fragment
+// builder, never a true assoc store. Token-peek only (no consumption):
+// `map` `[` K `]` V... where V is the ident `any` or the keyword
+// `interface`.
+func (p *parser) mapLitIsAnyValued() bool {
+	j := p.pos + 1 // [
+	depth := 0
+	for j < len(p.toks) {
+		t := p.toks[j]
+		if t.kind == tPunct {
+			if t.text == "[" {
+				depth++
+			} else if t.text == "]" {
+				depth--
+				if depth == 0 {
+					j++
+					break
+				}
+			}
+		}
+		j++
+	}
+	if j >= len(p.toks) {
+		return false
+	}
+	if p.toks[j].kind == tIdent && p.toks[j].text == "any" {
+		return true
+	}
+	if p.toks[j].kind == tIdent && p.toks[j].text == "interface" {
+		return true
+	}
+	return false
 }
 
 // parseMapLiteral: `map[K]V{ k: v, ... }` → one assocSet per pair (the
@@ -9114,8 +9632,12 @@ func (p *parser) parseIIFEStmt() []map[string]any {
 	name := "__iife_" + strconv.Itoa(p.tmpN)
 	p.tmpN++
 	p.fnNames[name] = true
+	emitParams := fn.params
+	if fn.noParams {
+		emitParams = []string{}
+	}
 	return []map[string]any{
-		{"type": "Function", "name": name, "params": fn.params, "body": fn.body},
+		{"type": "Function", "name": name, "params": emitParams, "body": fn.body},
 		execStmt(name, words, "Spawn"),
 	}
 }
@@ -9650,16 +10172,28 @@ func (p *parser) argToWord(e *expr) map[string]any {
 			sw := p.exprToWord(e)
 			return map[string]any{"type": "Spread", "expr": sw}
 		}
-		if e.kind != "var" || p.varTypes[p.resolveVar(e.name)] != "Array" {
+		rn := p.resolveVar(e.name)
+		isSliceParam := p.paramSlice[e.name] || p.paramSlice[rn]
+		if e.kind != "var" ||
+			(p.varTypes[rn] != "Array" && p.anyListVar(e.name) == "" && !isSliceParam) {
 			p.failf("variadic spread needs an array-typed var (v2)")
 		}
-		name := p.resolveVar(e.name)
+		name := rn
+		// an any-list var holds a LIST ID: splice its ITEMS, not its id
+		// (`append(dst, sub...)` — the golib's statement-list assembly).
+		inner := map[string]any{
+			"type": "Call", "func": "arrayItems",
+			"args": []any{strExpr(name)}, "purity": "PureCpu",
+		}
+		if p.anyListVar(e.name) != "" || isSliceParam {
+			inner = map[string]any{
+				"type": "Call", "func": "listItems",
+				"args": []any{getVarExpr(name)}, "purity": "PureCpu",
+			}
+		}
 		return map[string]any{
 			"type": "Spread",
-			"expr": map[string]any{
-				"type": "Call", "func": "arrayItems",
-				"args": []any{strExpr(name)}, "purity": "PureCpu",
-			},
+			"expr": inner,
 		}
 	}
 	// ARRAY var passed to a call (non-spread `f(arr)` — Go only allows
@@ -12938,6 +13472,8 @@ func Shir(src string) ([]byte, error) {
 		anyLists:    map[string]bool{},
 		anyElem:     map[string]string{},
 		maps:        map[string]bool{},
+		anyValMaps:  map[string]bool{},
+		emptyMaps:   map[string]bool{},
 		bufs:        map[string]string{},
 		cmds:        map[string][]*expr{},
 		stdinRdr:    map[string]bool{},

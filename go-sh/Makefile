@@ -7,8 +7,20 @@
 # mismatch = the gap the worker's pi should fix.
 
 ANTLR4 ?= antlr4
-CLI ?= $(abspath ../../otranspilerl/target/debug/otranspilerl-cli)
-BUILD_LOCK ?= $(abspath ../../harness/build-lock.sh)
+# Locate the workspace that owns the otranspilerl core + the harness scripts,
+# by WALKING UP from this Makefile instead of counting ../ levels (same
+# trap the c-sh-go Makefile documents: this tree is reached at two depths
+# — sh2perl/frontends/go-sh vs the workspace frontends/ symlink — so a
+# hardcoded ../../otranspilerl is right for one and points at the
+# nonexistent sh2perl/otranspilerl for the other).
+FE_DIR  := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
+WS_ROOT := $(shell d='$(FE_DIR)'; while [ "$$d" != / ] && [ "$$d" != . ]; do \
+              if [ -e "$$d/otranspilerl/Cargo.toml" ]; then echo "$$d"; break; fi; \
+              d=$$(dirname "$$d"); done)
+CLI ?= $(WS_ROOT)/otranspilerl/target/debug/otranspilerl-cli
+BUILD_LOCK ?= $(WS_ROOT)/harness/build-lock.sh
+OTRANS_MANIFEST ?= $(WS_ROOT)/otranspilerl/Cargo.toml
+FRONTEND_STDOUT := $(firstword $(wildcard $(WS_ROOT)/harness/frontend-stdout.sh))
 GO ?= /snap/go/current/bin/go
 
 .PHONY: all gen build test otranspilerl-cli-oracle worker clean
@@ -28,12 +40,12 @@ all: build
 otranspilerl-cli-oracle:
 	@if [ -x "$(CLI)" ]; then :; else \
 	  echo "oracle $$(basename $(CLI)) missing — rebuilding via build-lock.sh"; \
-	  if "$(BUILD_LOCK)" --role backend -- cargo build --manifest-path "$(abspath ../../otranspilerl/Cargo.toml)" --bin otranspilerl-cli; then \
+	  if "$(BUILD_LOCK)" --role backend -- cargo build --manifest-path "$(OTRANS_MANIFEST)" --bin otranspilerl-cli; then \
 	    echo "oracle rebuilt"; \
 	  else \
 	    echo "oracle build failed — stale serde cache? cleaning serde artifacts and retrying once"; \
-	    if "$(BUILD_LOCK)" --role backend -- cargo clean --manifest-path "$(abspath ../../otranspilerl/Cargo.toml)" -p serde_derive -p serde -p serde_core \
-	        && "$(BUILD_LOCK)" --role backend -- cargo build --manifest-path "$(abspath ../../otranspilerl/Cargo.toml)" --bin otranspilerl-cli; then \
+	    if "$(BUILD_LOCK)" --role backend -- cargo clean --manifest-path "$(OTRANS_MANIFEST)" -p serde_derive -p serde -p serde_core \
+	        && "$(BUILD_LOCK)" --role backend -- cargo build --manifest-path "$(OTRANS_MANIFEST)" --bin otranspilerl-cli; then \
 	      echo "oracle rebuilt after serde cache clean"; \
 	    else \
 	      echo "FAIL (oracle unavailable — could not build otranspilerl-cli; the core tree may be mid-WIP)"; \
@@ -76,7 +88,7 @@ test: build otranspilerl-cli-oracle
 	  fi; \
 	done
 	@echo "--- executed-stdout comparison (native vs JS/ESTree) ---"
-	@bash "$(abspath ../../harness/frontend-stdout.sh)" go ./go-sh testdata "$(CLI)" || exit 1
+	@bash "$(FRONTEND_STDOUT)" go ./go-sh testdata "$(CLI)" || exit 1
 
 worker: test
 	@echo "go-sh worker gate: ingress acceptance + executed-stdout passed"
