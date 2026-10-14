@@ -382,6 +382,24 @@ Chain, each link verified by probe:
    `toks = append(toks, token{kind: tNL, line: line})`, and it accounts for
    the struct-shaped refusals (t104/t108/t116/t95).
 
+### LANDED: the slice-param spread store (2026-10-15, third pass)
+
+`append(dst, src...)` with src a slice PARAM emitted
+`listItems(getVar("src"))` — but a param carries its list id POSITIONALLY,
+so that read is `""` and the splice appends nothing. Fixed (commit
+"go-sh: a slice-param spread must read its list id POSITIONALLY"):
+`anyListReadWord` now covers slice params and the spread call site uses
+it, with a store-read fallback so a nil word can never reach the A1 (a
+null child arg is rejected at ingress and loses the whole program).
+
+Verified: the slice-param A1 is now `listItems(getVar("1"))`; ladder
+unchanged (41 / 66 / 17); fail-go 124/124.
+
+The self-source chain is NOT yet fixed by this — the name that empties
+`fields` in `parseTypeDecl` reaches a different lowering, and further
+probes surfaced a second class (`unsupported call "" in word position`).
+Both need their own pass.
+
 ### The append, traced one level deeper (2026-10-15, second pass)
 
 The emitted JS for that line is:
