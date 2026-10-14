@@ -255,3 +255,53 @@ existing corpus, which only ever exercised the NATIVE frontend.
    made `parseTopLevel` return an empty statement list.
 5. **Runtime value-channel coercion** (`harness/sh2-namespace.mjs`): three
    sites `String()`-ed an A1 builder value into `"[object Object]"`.
+
+## Larger inputs: how far the translated frontend gets (2026-10-14)
+
+Beyond the corpus ladder, the translated frontend was run on the big
+real-world Go files in this repo (the sibling frontends' own sources).
+Two findings, both about **agreement** rather than raw capability:
+
+| input | native | translated |
+|---|---|---|
+| `frontends/fish-sh-go/fish-sh-go.go` (2453 lines) | REFUSE at 295 (`p.lex.nextTok`) | emits an EMPTY program, rc 0 |
+| `frontends/posix-sh-go/main.go` (3631 lines) | REFUSE at 349 (comparison operand `call`) | emits an EMPTY program, rc 0 |
+
+So on large inputs the translation does **not** dogfood the frontend: it
+runs (no crash, ~35–52 s per file) but diverges on the error path.
+
+### The error-path class (root cause)
+
+`Shir` reports failure via `run`'s panic recovery, and the CLI checks it:
+
+```go
+stmts, err := p.run()
+if err != nil { ... return nil, err }     // Shir
+out, err := golib.Shir(src)
+if err != nil { fmt.Fprintln(os.Stderr, ...); os.Exit(2) }   // cmd/main.go
+```
+
+Under translation that chain is broken at two points:
+
+1. **`if err != nil` on an error value lowers to the STATUS test**
+   (`"$?" -ne 0`) — the A1 has no error objects (documented: an error
+   return is dropped at the call site). Faithful to the design, but it
+   means the error must arrive as a failing status.
+2. **`run`'s recovery does not fail the status.** Its catch emits
+   `PANIC:` to stderr and `printf %v` into a *variable*, then returns
+   success — so the status test is false, `Shir` proceeds with nil
+   stmts, and `Emit` produces an empty program.
+
+Native prints the panic and exits **2**; the translated frontend prints
+the panic (to stderr) and **succeeds** with an empty program. A caller
+that checks the exit code — as `fail-go` does — sees "translated to an
+empty program", not "refused".
+
+`cmd/go-sh/main.go`'s `os.Exit(2)` is additionally unreachable in the
+translation for the documented external-unit reason: `golib.Shir` is a
+call into another compilation unit ("resolves only when the callee's
+unit is linked in"), so there is no error value to branch on.
+
+Recorded, not worked around: the fix is a status-return protocol for
+error-returning calls (or an error-channel A1 shape), which is a contract
+change rather than a frontend patch.
