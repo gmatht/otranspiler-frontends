@@ -382,14 +382,36 @@ Chain, each link verified by probe:
    `toks = append(toks, token{kind: tNL, line: line})`, and it accounts for
    the struct-shaped refusals (t104/t108/t116/t95).
 
-The append's ELEMENTS are the next thing to trace: `names` is an any-list
-whose spread-splice reads empty at that point, so the suspect is the
-same-list aliasing/ordering that the `append(dst, src...)` splice fix
-addressed for `parseTopLevel`. A fix must be verified against the full
-ladder AND the self-emit, since a wrong splice rule here silently empties
-every layout.
+### The append, traced one level deeper (2026-10-15, second pass)
 
-Nothing is committed for this: an attempted multi-target `setArray`
-lowering produced correct NATIVE A1 but did not change the translated
-run, so it is stashed rather than landed (`unverified multi-target slice
-fix`).
+The emitted JS for that line is:
+
+```js
+sh2.setArrayAppend("fields", [...sh2.listItems(sh2.getVar("names"))]);
+```
+
+`listItems` reads the OBJECT store, but `names` is a `[]string` —
+`isAnyListElem("string")` is FALSE, so plain-string slices ride the
+**shell array store**, not list ids. So `listItems(getVar("names"))` reads
+nothing and the append receives `[]`. Two candidate repairs were tried and
+both were reverted:
+
+- routing the read through `anyListReadWord` (param-aware) — needed a
+  fallback added immediately after, because for a non-list name it
+  returned nil and the A1 then carried a JSON `null`, which the ingress
+  rejects outright (`ext-child.args[0]: not an object`, whole program
+  lost);
+- keying the spread branch on the destination only — correct in
+  isolation (native A1 for `out = append(out, names...)` became
+  `listItems(getVar("1"))` for a slice param), but the self-source path
+  still emitted the old shape, so it did not fix the target.
+
+Net effect of both: gate stayed 124/124, ladder unchanged — so they were
+churn, not progress, and were reverted to keep the tree verified.
+
+The real fix is a single decision in the spread lowering: **splice a
+plain-array source from the array store** (`arrayItems`), and a list-id
+source from the list store (`listItems`), chosen by `isAnyListElem` of the
+source's element type. That choice must be verified against the ladder AND
+the self-emit, because a wrong splice rule silently empties every struct
+layout.
