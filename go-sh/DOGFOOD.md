@@ -328,7 +328,31 @@ The 17 are cases that used to fabricate an empty program (counted as
 divergence) and now correctly decline — so the "differ" number got smaller
 *and* more honest. No file regressed from identical.
 
-Still open: the failure surfaces as "no emit" rather than a non-zero exit
-status, because `return nil, err` still emits a bare `return`. The
-return-path rule needs the same element-exact matching at the return site;
-a naive version was measured and backed out (it broke the corpus).
+### COMPLETE (2026-10-15): the error return now exits non-zero
+
+The remaining half is fixed. `return nil, err` emits a value-channel write
+whose lowering RESETS `lastExit` to 0 (a correct successful-return rule),
+and that reset ran *after* `sh2.return` had set the failing status — so
+the caller still saw success. The failing status is now published AFTER
+the value emission (setLastExit(1), then the return).
+
+The rule also had to be narrowed: only a MULTI-SLOT return is an error
+return. A single-slot `return Emit(prog)` delegates to a callee whose own
+`(T, error)` results are the callee's business; counting it as "our error
+is non-nil" made every success path fail (the translated golib exited 1 on
+valid input) — caught by checking a known-good input, not just the error
+case.
+
+| input | native | translated |
+|---|---|---|
+| valid Go | rc=0 | **rc=0** |
+| unparseable Go | rc=2 | **rc=1** (non-zero) |
+
+The translated frontend also no longer fabricates an empty program
+(`reachedEmit=false`), and the ladder is unchanged and honest:
+
+| | identical | differ | refusing |
+|---|---|---|---|
+| now | 41 | 66 | 17 |
+
+Gates: `fail-go` 124/124, `make test` 124/124.
