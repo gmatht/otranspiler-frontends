@@ -400,6 +400,55 @@ The self-source chain is NOT yet fixed by this — the name that empties
 probes surfaced a second class (`unsupported call "" in word position`).
 Both need their own pass.
 
+### ROOT CAUSE FOUND: `paramSlice` is not function-scoped (2026-10-15, fourth pass)
+
+The empty struct layout traces to a **scope leak**, and it is a clean
+one-line finding with a non-trivial fix:
+
+`p.paramSlice` is written while parsing a parameter list
+(`go-sh.go:2351`) and is **never reset per function**. The function-scope
+save/restore in `parseFuncLit` and the decl path covers `fnParams`,
+`fnParamOrd`, `fnLocals`, `inFunc` (and `paramShadow`) — but NOT
+`paramSlice`.
+
+Consequence: a slice param in ANY earlier function permanently marks that
+NAME as a slice param. A same-named LOCAL in a later function then takes
+the param lowering — `listItems(getVar(name))` (the positional protocol)
+instead of `arrayItems(name)` (the shell-array read) — which reads `""`
+and makes the splice append **nothing**.
+
+That is exactly `parseTypeDecl`:
+
+```go
+names := []string{}                 // a LOCAL, in a later function
+names = append(names, ...)
+fields = append(fields, names...)   // -> listItems(getVar("names")) -> []
+```
+
+so `p.structs["tok"]` stays empty, `T{...}` is not recognised, and the
+parser dies at the `{` — self-emit line 113.
+
+Both attempted repairs were reverted, each for a measured reason:
+
+1. **reset `paramSlice` at function entry** — breaks parameter PARSING
+   itself, because `paramSlice` is read while the list is being built
+   (`params = append(params, names...)` at `go-sh.go:2380` then sees
+   `names` unmarked; self-emit dies at 2380).
+2. **gate the read on `fnParams`** (a name is a slice param only if it is a
+   param of the current function) — breaks the same phase for the
+   mirror-image reason: during parameter parsing `fnParams` is not yet
+   populated (self-emit dies at 2372).
+
+The correct fix is real scope modelling rather than a guard: `paramSlice`
+must be saved/restored around function bodies, while remaining visible
+during that function's OWN parameter parsing. A dedicated
+`paramParsing` phase flag (true while the param list is being consumed)
+is the smallest shape — mark/read freely while parsing params, and gate
+reads on the current function's params for the body.
+
+Both wrong turns are recorded so the next pass does not repeat them; the
+tree is left at the last verified commit with fail-go 124/124.
+
 ### The append, traced one level deeper (2026-10-15, second pass)
 
 The emitted JS for that line is:
