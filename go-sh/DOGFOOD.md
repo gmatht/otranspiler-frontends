@@ -302,6 +302,33 @@ translation for the documented external-unit reason: `golib.Shir` is a
 call into another compilation unit ("resolves only when the callee's
 unit is linked in"), so there is no error value to branch on.
 
-Recorded, not worked around: the fix is a status-return protocol for
-error-returning calls (or an error-channel A1 shape), which is a contract
-change rather than a frontend patch.
+### FIXED (2026-10-15): the recovered panic now fails the status
+
+The diagnosis above was too pessimistic — this needed no contract change.
+The A1 already expresses failure two ways, both used by this frontend:
+the status-return protocol (`sh2.return` sets `lastExit`) and the `Exit`
+statement. What was missing was one emission: an error-returning
+function's deferred recovery must leave a FAILING STATUS, since the
+caller's `if err != nil` is compiled to the status test `"$?" -ne 0`.
+
+`fnReturnsError` now matches result-list ELEMENTS (not a substring — the
+substring form fired for every signature that merely mentioned error, and
+stamped `Return 1` onto ordinary returns, which zeroed the self-emit).
+Pair-verified: `run() (int, error)` gets the failing Return;
+`plain() int` with the same defer/recover shape does not.
+
+Translation ladder, before and after:
+
+| | identical | differ | no-emit |
+|---|---|---|---|
+| before | 38 | 83 | 0 |
+| after | **41** | 66 | **17** |
+
+The 17 are cases that used to fabricate an empty program (counted as
+divergence) and now correctly decline — so the "differ" number got smaller
+*and* more honest. No file regressed from identical.
+
+Still open: the failure surfaces as "no emit" rather than a non-zero exit
+status, because `return nil, err` still emits a bare `return`. The
+return-path rule needs the same element-exact matching at the return site;
+a naive version was measured and backed out (it broke the corpus).
