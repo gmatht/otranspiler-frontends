@@ -3173,6 +3173,30 @@ func (p *parser) parseStmt() []map[string]any {
 			}
 			p.skipNL()
 		}
+		// ERROR-RETURN STATUS. In a function declaring an `error` result,
+		// the trailing slot IS the error, and a NON-NIL error is a
+		// failure the caller observes as the status test `"$?" -ne 0`
+		// (the A1 has no error objects). The strip loop below REMOVES
+		// that slot (an echoed empty word would leave a stray blank in
+		// the caller's capture), so the failure must be recorded HERE —
+		// before the strip — and carried onto the return.
+		//
+		// ONLY a MULTI-SLOT return is an error return. A single-slot
+		// `return Emit(prog)` is the delegated-result case: the callee's
+		// own (T, error) results are its business, and treating the
+		// returned value as "our error is non-nil" made every success
+		// path fail (the translated golib exited 1 on valid input).
+		// Nil-ness is judged by the same trailing-empty rule the strip
+		// uses (`nil`, or an empty literal), so a zero error keeps 0.
+		errReturn := false
+		if p.inFunc && p.fnReturnsError() && len(rexprs) > 1 {
+			last := rexprs[len(rexprs)-1]
+			nonzero := !((last.kind == "var" && last.name == "nil") ||
+				((last.kind == "str" || last.kind == "rawstr") && last.text == ""))
+			if nonzero {
+				errReturn = true
+			}
+		}
 		for len(rexprs) > 1 {
 			last := rexprs[len(rexprs)-1]
 			empty := (last.kind == "var" && last.name == "nil") ||
@@ -3351,9 +3375,26 @@ func (p *parser) parseStmt() []map[string]any {
 			// AN ERROR RETURN FAILS THE STATUS: `return nil, err` in a
 			// function declaring an `error` result is how the A1
 			// expresses failure (the caller tests `"$?" -ne 0`). A bare
-			// return would leave the status at 0 and hide the error —
-			// the translated go-sh then returned an empty program
-			// instead of refusing unparseable input.
+			// return leaves the status at 0 and hides the error — the
+			// translated go-sh then returned an empty program instead of
+			// refusing unparseable input.
+			//
+			// ORDER MATTERS: the value-channel echo above RESETS lastExit
+			// to 0 (a successful return must leave status 0), so the
+			// failing status must be published AFTER it (setLastExit, then
+			// the return). Emitting `Return 1` before the echo lost the
+			// status: `sh2.return` set it, the echo's `lastExit = 0` ran
+			// later, and the caller saw success.
+			if errReturn {
+				out = append(out, map[string]any{
+					"type": "Expr",
+					"expr": map[string]any{
+						"type": "Call", "func": "setLastExit",
+						"args":   []any{strExpr("1")},
+						"purity": "PureCpu",
+					},
+				})
+			}
 			out = append(out, map[string]any{
 				"type": "Expr",
 				"expr": map[string]any{
