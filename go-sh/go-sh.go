@@ -3347,6 +3347,13 @@ func (p *parser) parseStmt() []map[string]any {
 			// more statements follow (a tail return just ends anyway,
 			// so the extra stop is a no-op there). Without it an
 			// `if c { return x }` fell through to the tail code.
+			//
+			// AN ERROR RETURN FAILS THE STATUS: `return nil, err` in a
+			// function declaring an `error` result is how the A1
+			// expresses failure (the caller tests `"$?" -ne 0`). A bare
+			// return would leave the status at 0 and hide the error —
+			// the translated go-sh then returned an empty program
+			// instead of refusing unparseable input.
 			out = append(out, map[string]any{
 				"type": "Expr",
 				"expr": map[string]any{
@@ -3863,6 +3870,30 @@ func (p *parser) parseBlockStmtsRest() []map[string]any {
 			p.expect(tPunct, ")")
 			// the block's remaining statements become the Try body
 			rest := p.parseBlockStmtsRest()
+			// ERROR-RETURN VISIBILITY: in a function that declares an
+			// `error` result, a panic recovered by the deferred body is
+			// an error RETURN — the caller's `if err != nil` lowers to
+			// the status test `"$?" -ne 0`, so the recovery must leave a
+			// FAILING STATUS or the error is invisible and the caller
+			// proceeds with a zero-valued result (translated go-sh
+			// returned an empty program for unparseable input). The
+			// failing status rides a Return statement (sh2.return sets
+			// lastExit and unwinds the sub).
+			recBody := fn.body
+			if usedRcv && p.fnReturnsError() {
+				// build the list in place: copy the recovery body, then
+				// append the failing Return (a nested
+				// `append(append(…), …)` is outside the v2 append subset)
+				rb := []map[string]any{}
+				for _, st := range recBody {
+					rb = append(rb, st)
+				}
+				rb = append(rb, map[string]any{
+					"type":  "Return",
+					"value": strExpr("1"),
+				})
+				recBody = rb
+			}
 			if usedRcv {
 				out = append(out, map[string]any{
 					"type": "Try",
@@ -3871,7 +3902,7 @@ func (p *parser) parseBlockStmtsRest() []map[string]any {
 						"type":  "TryExcept",
 						"match": nil,
 						"as":    asName,
-						"body":  fn.body,
+						"body":  recBody,
 					}},
 					"else":    []any{},
 					"finally": []any{},
@@ -11460,6 +11491,46 @@ func (p *parser) isBoolLitReturn(e *expr) bool {
 	}
 	if r, ok := p.prescanRet[p.curFn]; ok {
 		return r == "bool"
+	}
+	return false
+}
+
+// fnReturnsError: the enclosing function declares an `error` in its
+// result list (named or trailing) — `func run() (stmts []T, err error)`.
+// Such a function's deferred recovery must FAIL THE STATUS, because the
+// A1 expresses `if err != nil` as a status test (`"$?" -ne 0`): an error
+// return that leaves the status at 0 is invisible to the caller, which
+// then proceeds with a zero-valued result. That is how a translated
+// frontend could return an EMPTY PROGRAM for input it could not parse.
+//
+// The match is on RESULT-LIST ELEMENTS, not a substring: a plain
+// `strings.Contains(ret, "error")` also fires for a function whose
+// result text merely mentions error somewhere (and for any signature
+// whose params were folded in), which made every function look
+// error-returning and stamped `Return 1` onto ordinary returns — the
+// self-emit then produced nothing at all. Elements are comma-separated
+// type names, so split and compare exactly (stripping pointer/slice
+// marks).
+func (p *parser) fnReturnsError() bool {
+	if p.curFn == "" {
+		return false
+	}
+	ret := ""
+	if sig, ok := p.fnSig[p.curFn]; ok && len(sig) > 1 {
+		ret = sig[1]
+	} else if r, ok := p.prescanRet[p.curFn]; ok {
+		ret = r
+	} else {
+		return false
+	}
+	parts := strings.Split(ret, ",")
+	for _, part := range parts {
+		t := strings.TrimSpace(part)
+		t = strings.TrimPrefix(t, "*")
+		t = strings.TrimPrefix(t, "[]")
+		if t == "error" {
+			return true
+		}
 	}
 	return false
 }
