@@ -466,6 +466,40 @@ the bool-tree emission for compound conds containing word-operand
 comparisons (the A1-word BinOp-eq from 2026-09-01) inside for-loops,
 then re-test the prefix-match shape.
 
+**goto/label RESOLVED for the canonical shapes (2026-10-15, commit
+6305338e3).** The `for { … default: goto L } L: rest` and `for { … goto L };
+L: rest` forms — posix-sh-go main.go:2072/2857, zsh-sh-go :2870, zig-sh-go
+main.go:1302 (`goto matched`) — now lower correctly and match native
+`go run`. The bug was never in the A1: the frontend has emitted `Label`/
+`Goto` since 2026-08-07 and `go-sh --shir` produces them correctly. It was
+in the shared `restructure_goto` pass, which had two independent defects:
+
+1. `descend_from` recorded a loop step only for `Branch::Body`, so a goto
+   reached through a `CaseClause`/`Then`/`Else`/`Stage` branch LOST the
+   enclosing loop (`default: goto L` inside a `for` recorded ZERO loop
+   steps, leaving `handle_nested` nothing to guard). It now threads the
+   nearest enclosing loop-step index down every branch, and records it
+   only for real loops (While/DoWhile/For/ForInit) — a Block/Subshell/
+   Function body also has a statement list, but a `break` in it targets an
+   enclosing SOURCE loop, so it must not inherit a guard.
+2. The tail guard was keyed on the label being a top-level sibling with a
+   gap to drain, so `for { … goto L }; L:` (label immediately adjacent) got
+   no guard at all — the loop ran to completion with the flag set.
+
+The jump is now classified by walking OUTWARD from the goto's own list: if
+the label is reachable without crossing a loop body it is a forward jump,
+lowered by dead-coding the skipped statements behind a literal-false test
+(no flag). Only what lies AFTER the jump's ancestor is skipped — never the
+ancestor itself, whose earlier statements run before the jump (`default:
+print; goto L` must still print). Verified against native `go run` for
+both shapes; pinned by `tests/goto_restructure_e2e.rs` and
+`tests/goto_c_frontend_pins.rs`.
+
+Still open on this line: the bool-tree/bound-gate interaction above (the
+compound `i+3 <= len && slice == spec` condition), and the `strings.Builder`
+value-channel gap that loses the buffered text in the full zig-sh-go
+scanner even once the goto is lowered.
+
 ### Remaining refusals by category (each with named blocking decision)
 
 ### Remaining refusals by category (each with named blocking decision)
