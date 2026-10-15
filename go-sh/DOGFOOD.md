@@ -799,3 +799,87 @@ stream for `x := 1` is correct (`x` `:=` `1` NL EOF, kind 2/7/3/1/0), so
 the failure is in the statement dispatcher: it consumes the whole input and
 then tries to lower a token it never read. That is the next single blocker
 — it gates every `:=`-bearing input, which is most of `go-sh.go`.
+
+### ELEVENTH pass (2026-10-16): the `:=`-blocker is CLOSED — the translated frontend parses Go
+
+The tenth pass left `parseAssignStmt` reaching `exprToWord` with an empty
+expr (`unsupported expression ""`) — it gated every `:=`-bearing input,
+i.e. most of `go-sh.go`. Root-caused and fixed. Five independent
+scoped-store defects, all one class again: a write or a *type
+registration* keying on the bare parsed name while every read resolves
+through `resolveVar` to the function-unique alias.
+
+**1. `registerVar` marked every name as a top-level global.** `outer`
+means "bound at TOP LEVEL", and it is load-bearing twice: `scopeLocalStoreName`
+keeps a global's bare name, and the `:=` scoping branch is *skipped* for
+one. Setting it unconditionally meant the FIRST `registerVar("e", …)`
+anywhere — `e := p.parseOr()` in parseExpr, via registerAssignType — made
+every later function's `e := …` skip scoping and declare the BARE slot
+while the body's reads used the alias. In parsePostfix that split `e` in
+two: the declaration wrote bare `e`, the loop read `e__N`, and the final
+`return e` echoed an empty module local, discarding parsePrimary's value.
+Now `outer` is set only outside a function.
+
+**2. The single-target call-capture path assigned the bare name.**
+`e := p.parsePrimary()` is a CALL rhs, so it takes the capture path
+(not the `:=` literal branch) — which emitted `assignStmt(name, capture)`
+with the bare `name`. Now resolved through `scopeLocalStoreName` before
+the type registration, list marks and both capture shapes, so all four
+agree on one slot.
+
+**3. The multi-target path registered the bare name** (`tg`). Same split
+for `sub, ok := p.spreadAppendPart(tmp, a)`.
+
+**4. `captureReturnTypeText` and the prescan collected every IDENT as a
+return position.** For `(stmts []map[string]any, ok bool)` that gave six
+entries (`stmts/map/string/any/ok/bool`) for two positions, so call sites
+indexed `retIds[0]` as the NAME `stmts`. A new shared
+`returnPosBases(toks, lo, hi)` splits a result clause on top-level commas
+and takes each position's type base, dropping a leading named binding
+(`stmts []T` → `T`) and hiding bracket-nested arguments (`map[string]any`
+→ `map`). Its first cut was O(n²) per part and ran once per `func` at
+prescan time — 1,048,573 calls / 113 s and a `Map maximum size exceeded`
+on `func f() {}`; it is now a single pass.
+
+**5. Grouped/named slice returns lost their slice-ness.** The prescan only
+detected `retRaw` STARTING with `[]`, so `([]T, error)` and
+`(stmts []T, ok bool)` were typed scalar and a spread of the result
+refused `variadic spread needs an array-typed var`.
+
+### Measured (same pipeline, translated frontend vs native `go run`)
+
+| input | tenth pass | eleventh pass |
+|---|---|---|
+| `package main` | MATCH | MATCH |
+| `func f() {}` | MATCH | MATCH |
+| `func main() { x := 1 }` | ERR `unsupported expression ""` | **MATCH** |
+| `func main() { x := 42 }` | HANG | **MATCH** |
+| `j := 0; j++` | ERR | **MATCH** |
+| `func main() { name := "world" }` | HANG | ERR (next blocker) |
+| `func f() {}` (bodies) | DIFFER (`stmts: ""`) | DIFFER (next blocker) |
+
+**5 of 7 probes now byte-identical to native** (tenth pass: 2 of 6, the
+rest hanging or panicking).
+
+Safety: the native frontend's A1 is **byte-identical for all 124 corpus
+files** (0 differing), `fail-go` 124/124, `make test` 124/124, and the
+executed-stdout check is unchanged from stock (123 pass / 1 empty — the
+stdin-reading test). So every fix here is behavior-preserving on the
+existing corpus while unblocking the self-host path.
+
+### Next blocker (single, precise)
+
+`parsePostfix` still returns empty for a **string-literal** RHS
+(`name := "world"`): `parsePrimary` returns the `str` object correctly in
+isolation and `e__N` is demonstrably set to the object id, but the
+function never reaches its `return e` — it panics inside the loop body
+(whereas the same shape with a NUMBER rhs, `x := 42`, now works). Same
+"value lost between the echo and its reader" family; start from
+`parsePostfix`'s `{`-branch (`callName(e)` / `structFields` lookup).
+
+Second: function bodies still assemble to `stmts: ""` (the statement-list
+return shape) even when the body is empty — see `func f() {}`.
+
+Third, performance: the translated frontend takes 14 s on a 9-line file
+(dominated by the `failf` unwind path), so corpus-sized runs need the
+per-file budget raised, not read as hangs.
