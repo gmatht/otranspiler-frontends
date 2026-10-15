@@ -449,6 +449,36 @@ reads on the current function's params for the body.
 Both wrong turns are recorded so the next pass does not repeat them; the
 tree is left at the last verified commit with fail-go 124/124.
 
+### Third attempt, and the missing piece (2026-10-15, fifth pass)
+
+A `paramParsing` phase flag was added (set while a parameter list is being
+consumed, consulted by the readers) so that `paramSlice` stays usable
+during parameter parsing but is ignored for same-named locals in a body.
+It had **no measurable effect**, and the reason is now known:
+
+**a new field on `parser` does not reach the translated run.** The A1
+carries `paramSlice` only as an `objGet` field-NAME string
+(`"paramSlice"` passed to `objGet`), never in an `objNew` field list, and
+adding `paramParsing: false` to the `p := &parser{…}` initialiser did not
+make it appear. Every gate that reads it therefore reads `undefined` and
+takes the false branch — a silent no-op, not an error.
+
+So the sequence is:
+
+1. the parser object's field list is built by `newstructStmts`, which
+   iterates the struct's **layout** (`p.structs[stype]`) —
+2. which is populated by `parseTypeDecl` —
+3. which is exactly the function broken by the unscoped `paramSlice`.
+
+The "field list" problem is therefore DOWNSTREAM of the same root cause,
+not a second blocker. The single thing to establish next is how a parser
+OBJECT gets its field set at all when the layout is empty (empirically,
+the baseline A1 shows the fields are read by name and the object is still
+usable, so something populates it outside `newstructStmts`), and then to
+thread the phase flag through that path.
+
+Four candidate repairs were measured and reverted; none is landed.
+
 ### The append, traced one level deeper (2026-10-15, second pass)
 
 The emitted JS for that line is:
