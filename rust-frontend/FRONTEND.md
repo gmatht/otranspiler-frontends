@@ -389,6 +389,69 @@ borrows `&x`, user functions, `String::from`/method calls, `match`,
 `vec!`, `eprintln!`/`dbg!`, floats, `{:?}`/named/width format specs,
 `loop`, indexing, dynamic range bounds, any other item/macro/statement.
 
+## v0.20 additions — `if let`, `matches!`, `push`, and the dogfooding scoreboard
+
+**The dogfooding measurement.** `harness/rust-dogfood.sh` runs this
+frontend over every `.rs` under `sh2perl/src/` (the v0.2 goal: "parse ALL
+the Rust in sh2perl's src/") and reports the lowered/refused split plus a
+first-blocker histogram, taken from a content-hashed snapshot of the tree
+so a concurrent editor cannot make the score jump mid-run.
+Baseline: **14/208 (6.7%)** files lower end-to-end, 194 refused.
+
+**The finding that matters more than the number.** An instrumented probe
+(catch_unwind at the per-function funnel) shows **~8460 blocked
+functions across ~24 blocker classes, long-tailed** — match patterns
+1821, nested item declarations 795, unknown call 754, non-identifier
+`let` 704, method on receiver 682, method on string 529, for-iterator
+374, match guard 322. Each refused FILE carries 10–49 of them.
+**Consequence: no single fix moves the whole-file count.** A fix is
+judged by the blocker CLASS it removes and the frontier it exposes, not
+by files gained. Measured over this change: `condition expression` fell
+13→5 in the first-blocker histogram and the `if-let` sites behind it
+became reachable, while the whole-file count stayed 14/208 and the
+function count stayed 693/9153. `--min` on the scoreboard is therefore a
+REGRESSION tripwire; **the histogram is the progress metric.**
+
+Added (each pinned by testdata t62/t63, each verified stdout-exact
+against native `rustc` by `harness/frontend-stdout.sh`):
+
+- **`if let`** — `if let Some(x) = e { .. } else { .. }` binds x and runs
+  then iff the scrutinee is not the None marker; `if let None = e` (which
+  syn parses as a BINDING ident — in pattern position `None` is the
+  absent variant, not a fresh binding) tests the marker directly; `_`
+  likewise. Works in statement, condition, `else if`, AND
+  value-returning-tail position (`if_value_node` gained an `out` slot so
+  the binding hoists where both branches can see it). The scrutinee
+  hoists to a temp so it evaluates ONCE.
+- **`matches!(v, PAT)`** in BOTH value and condition position, lowered
+  through the SAME `arm_cond`/`unit_variant_pat` conversion the match
+  lowering uses (so the two can never disagree). The subject must be a
+  plain variable — the test grammar reads `$var`, and re-evaluating a
+  call subject would run it twice (not exact) — with its own refusal
+  message. Or-patterns parse via `parse_multi_with_leading_vert`.
+- **`arr.push(v)` / `s.push_str(&p)`** in statement position —
+  `setArrayAppend(arr, [v])` and `s = concat(s, p)` (a new `str_concat`
+  helper emitting the A1 `Interpolate` shape). Both require a plain
+  variable receiver; `push` additionally requires a proven array.
+- **`Some(v)` / bare `None` typing** (`infer_ty`) — carried over from the
+  in-flight tree state; without it the option methods collapse only for
+  literals. `t61_let_opt.rs` depends on it.
+
+**Two exactness bugs this surfaced, both fixed:**
+
+- A bare `None` was lowering to `getVar("None")` — reading an unrelated
+  variable by accident. It is the absent marker and now emits the empty
+  string on the constructor path AND the bare-path route.
+- The `if let` condition was being written UNQUOTED (`$v = ""`). An
+  unquoted empty expansion vanishes under word-splitting, so the runtime
+  saw `[ = "" ]` and the branch never fired. The quoted form
+  (`"$v" = ""`) is what bash emits, for exactly this reason. Caught by
+  the executed-stdout oracle, NOT by inspection — the oracle, not the
+  emit, is the source of truth.
+
+Refused loudly (new pins t64/t65): `if let Some(<non-name>)`
+(destructuring), and `matches!` on a compound subject.
+
 ## Gate
 
 `make test` = refusal pins + ingress acceptance (`debashc

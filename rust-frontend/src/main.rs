@@ -63,6 +63,20 @@ fn test_call(s: &str) -> Value {
     json!({"args": [str_lit(s)], "func": "test", "purity": "Emulable", "type": "Call"})
 }
 
+/// String concatenation: the A1 `Interpolate` of two EXPR parts (the core's
+/// shape for `s="$a$b"`; see shir_json_in.rs "Interpolate"). Each part is
+/// stringified by the store's own semantics, which is exactly Rust's
+/// Display-free concatenation for the Str values this frontend produces.
+fn str_concat(lhs: Value, rhs: Value) -> Value {
+    json!({
+        "type": "Interpolate",
+        "parts": [
+            {"kind": "expr", "expr": lhs},
+            {"kind": "expr", "expr": rhs},
+        ]
+    })
+}
+
 fn expr_stmt(e: Value) -> Value {
     json!({"expr": e, "type": "Expr"})
 }
@@ -730,7 +744,7 @@ fn lower_local(local: &syn::Local, cx: &Cx, out: &mut Vec<Value>) -> Option<Valu
         return Some(match_value_node(m, BranchTarget::Var(&name), cx, false, out));
     }
     if let syn::Expr::If(ie) = &*init.expr {
-        let v = if_value_node(ie, BranchTarget::Var(&name), cx, false);
+        let v = if_value_node(ie, BranchTarget::Var(&name), cx, false, out);
         let ty = branch_ty(ie, cx);
         cx.vars.borrow_mut().insert(name.clone(), ty);
         return Some(v);
@@ -815,9 +829,14 @@ fn infer_ty(e: &syn::Expr, cx: &Cx) -> Ty {
         // a TUPLE literal is an array of the first element's proven type
         // REGISTERED-fn calls carry their declared return Ty
         syn::Expr::Call(c) => {
-            
             if let syn::Expr::Path(p2) = &*c.func {
                 if let Some(id) = single_path(p2) {
+                    // Some(v) constructor -> Opt(type of v), under the
+                    // None≡"" convention (the option methods then collapse
+                    // to the plain variable read).
+                    if id == "Some" && c.args.len() == 1 {
+                        return Ty::Opt(Box::new(infer_ty(&c.args[0], cx)));
+                    }
                     if let Some(t) = cx.fn_rets.get(&id.to_string()) {
                         return t.clone();
                     }
@@ -898,6 +917,18 @@ fn infer_ty(e: &syn::Expr, cx: &Cx) -> Ty {
                 if cx.enums.iter().any(|x| *x == e) {
                     return Ty::Enum(e);
                 }
+            }
+            // bare `None` — the absent marker's inner type is unknowable
+            // from the constructor alone (an `Option<&str>` annotation
+            // would pin it). Sound because the option methods collapse to
+            // the plain variable read regardless of the inner type.
+            if p.qself.is_none()
+                && p.path.leading_colon.is_none()
+                && p.path.segments.len() == 1
+                && p.path.segments[0].arguments.is_none()
+                && p.path.segments[0].ident == "None"
+            {
+                return Ty::Opt(Box::new(Ty::Unknown));
             }
             single_path(p)
                 .and_then(|id| {
@@ -980,6 +1011,61 @@ fn lower_expr_stmt(e: &syn::Expr, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) ->
                     ));
                 }
             }
+            // IMPURE statement-position mutators. Both are exactly
+            // representable because the mutator's effect on the store
+            // value is the same operation the A1 builtins perform:
+            //   arr.push(v)   -> setArrayAppend(arr, [v])   (native append)
+            //   s.push_str(p) -> s = s + p                  (string concat)
+            // Both require a PLAIN VARIABLE receiver (the builtin takes
+            // the variable NAME); any other receiver refuses, and `push`
+            // additionally requires a PROVEN array (pushing onto a string
+            // appends a char — a different value).
+            let recv_ty = infer_ty(&m.receiver, cx);
+            let plain_recv = match m.receiver.as_ref() {
+                syn::Expr::Path(p) if p.qself.is_none() => single_path(p),
+                _ => None,
+            };
+            if matches!(m.method.to_string().as_str(), "push" | "push_str") {
+                let method = m.method.to_string();
+                let Some(id) = plain_recv else {
+                    refuse(
+                        "push target (a plain variable receiver is required)",
+                        m.receiver.span(),
+                    );
+                };
+                let name = id.to_string();
+                if method == "push" {
+                    if !matches!(recv_ty, Ty::Arr(..)) {
+                        refuse(
+                            "`push` on an unproven (non-array) receiver",
+                            m.method.span(),
+                        );
+                    }
+                    if m.args.len() != 1 {
+                        refuse("push expects exactly one argument", m.span());
+                    }
+                    let v = &m.args[0];
+                    return Some(expr_stmt(json!({
+                        "args": [
+                            str_lit(&name),
+                            json!({"elements": vec![value_expr(v, cx)], "type": "Array"}),
+                        ],
+                        "func": "setArrayAppend", "purity": "Emulable", "type": "Call"
+                    })));
+                }
+                // String::push_str(&p) — Rust appends; the store value is a
+                // string, so `s = s + p` is the same value. Rust's
+                // push_str takes &str; the borrow erases (a shared borrow
+                // cannot mutate through the original).
+                if m.args.len() != 1 {
+                    refuse("push_str expects exactly one argument", m.span());
+                }
+                let rhs = match &m.args[0] {
+                    syn::Expr::Reference(r) => value_expr(&r.expr, cx),
+                    other => value_expr(other, cx),
+                };
+                return Some(assign_stmt(&name, str_concat(get_var(&name), rhs)));
+            }
             // everything else in statement position: only PURE methods
             // lower at all (the whitelist in value_expr), and a discarded
             // pure call is a no-op — drop it. Anything impure/unknown
@@ -1049,7 +1135,7 @@ fn plain_assign(a: &syn::ExprAssign, cx: &Cx, out: &mut Vec<Value>) -> Value {
     }
     // `x = if c {A} else {B}` — bind x in every branch
     if let syn::Expr::If(ie) = &*a.right {
-        return if_value_node(ie, BranchTarget::Var(&name.to_string()), cx, false);
+        return if_value_node(ie, BranchTarget::Var(&name.to_string()), cx, false, out);
     }
     // NOTE: infer BEFORE taking the write guard (infer_ty reads vars).
     let rhs_ty = infer_ty(&a.right, cx);
@@ -1086,7 +1172,103 @@ fn compound_assign(b: &syn::ExprBinary, cx: &Cx) -> Value {
     assign_stmt(&name, arith_bin(op, arith_var(&name), arith_expr(&b.right, cx)))
 }
 
+/// The `if let` pattern conversion: bind the payload (writing any binding
+/// into `out`, so it is visible to both branches) and return the A1
+/// condition node. Shared by the statement form (`if_stmt`) and the
+/// value/tail form (`if_value_node`) so the two can never disagree.
+///
+/// Under the None≡"" convention (the same one `?`, Ty::Opt and the option
+/// methods use) Some(v) IS v and None IS "". Only `Some(NAME)`, `None`
+/// and `_` are representable; anything else refuses — a payload the
+/// convention cannot distinguish from None (`Some("")`) would be a GUESS,
+/// and refusing is the standing rule.
+///
+/// The condition QUOTES the expansion (`"$v" = ""`): an unquoted empty
+/// expansion vanishes under word-splitting, so `[ $v = "" ]` would parse
+/// as `[ = "" ]` and never fire. bash emits the quoted form for exactly
+/// this reason.
+fn iflet_cond(tmp: &str, pat: &syn::Pat, cx: &Cx, out: &mut Vec<Value>) -> Value {
+    match pat {
+        syn::Pat::TupleStruct(ts) => {
+            let is_some = ts
+                .path
+                .segments
+                .last()
+                .map(|s| s.ident == "Some")
+                .unwrap_or(false);
+            if !is_some {
+                refuse("if-let pattern (only Some(x) / None)", pat.span());
+            }
+            let Some(inner) = ts.elems.first() else {
+                refuse("if-let `Some()` pattern with no binding", pat.span());
+            };
+            let syn::Pat::Ident(pi) = inner else {
+                refuse(
+                    "if-let `Some(<non-name>)` (the binding must be a plain name)",
+                    inner.span(),
+                );
+            };
+            let name = pi.ident.to_string();
+            cx.vars.borrow_mut().insert(name.clone(), Ty::Unknown);
+            out.push(assign_stmt(&name, get_var(tmp)));
+            test_call(&format!("\"${tmp}\" != \"\""))
+        }
+        syn::Pat::Path(p) => {
+            let is_none = p
+                .path
+                .segments
+                .last()
+                .map(|s| s.ident == "None")
+                .unwrap_or(false);
+            if !is_none {
+                refuse("if-let pattern (only Some(x) / None)", pat.span());
+            }
+            test_call(&format!("\"${tmp}\" = \"\""))
+        }
+        // `None` parses as a BINDING pattern (a single-segment path used
+        // as a pattern is parsed as Pat::Ident by syn); in pattern
+        // position a `None` name is the absent variant, not a fresh
+        // binding — an irrefutable binding named `None` would make the
+        // guard meaningless, so the ident reading is the only sensible
+        // one and matches rustc.
+        syn::Pat::Ident(pi) if pi.ident == "None" && pi.subpat.is_none() => {
+            test_call(&format!("\"${tmp}\" = \"\""))
+        }
+        syn::Pat::Wild(_) => test_call(&format!("\"${tmp}\" = \"\"")),
+        _ => refuse("if-let pattern (only Some(x) / None)", pat.span()),
+    }
+}
+
 fn if_stmt(ie: &syn::ExprIf, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) -> Value {
+    // `if let PAT = EXPR { .. } [else { .. }]` — the Option layer's None≡""
+    // convention. The scrutinee hoists to a temp so it evaluates ONCE
+    // (Rust evaluates an if condition once too), and the binding hoists
+    // into `out` so it is visible to both branches.
+    if let syn::Expr::Let(l) = &*ie.cond {
+        let n = {
+            let mut t = cx.tmp.borrow_mut();
+            *t += 1;
+            *t
+        };
+        let tmp = format!("__sh2if{n}");
+        out.push(assign_stmt(&tmp, value_expr(&l.expr, cx)));
+        let cond = iflet_cond(&tmp, &l.pat, cx, out);
+        let mut then = Vec::new();
+        lower_block(&ie.then_branch, cx, in_fn, &mut then);
+        let else_stmts: Vec<Value> = match &ie.else_branch {
+            None => vec![],
+            Some((_, inner)) => match &**inner {
+                syn::Expr::If(inner_if) => vec![if_stmt(inner_if, cx, in_fn, out)],
+                syn::Expr::Block(blk) => {
+                    let mut v = Vec::new();
+                    lower_block(&blk.block, cx, in_fn, &mut v);
+                    v
+                }
+                other => refuse("else form", other.span()),
+            },
+        };
+        return json!({"cond": cond, "then": then, "elsifs": [], "else": else_stmts, "type": "If"});
+    }
     // method-call leaves of the condition hoist to temps (If conditions
     // evaluate once — exact); the rest is test-grammar text
     let cond_expr = hoist_cond_calls(&ie.cond, cx, out);
@@ -2320,6 +2502,7 @@ fn if_value_node(
     target: BranchTarget,
     cx: &Cx,
     in_fn: bool,
+    out: &mut Vec<Value>,
 ) -> Value {
     fn push_branch(
         b: &syn::Block,
@@ -2353,13 +2536,28 @@ fn if_value_node(
             }
         }
     }
-    let cond = test_call(&test_string(&ie.cond, cx));
+    // `if let` in a value/tail position: the pattern test replaces the
+    // condition, and the scrutinee + binding hoist FIRST into `out` (so
+    // both branches can see them — the same shape the statement form
+    // emits).
+    let cond = if let syn::Expr::Let(l) = &*ie.cond {
+        let n = {
+            let mut t = cx.tmp.borrow_mut();
+            *t += 1;
+            *t
+        };
+        let tmp = format!("__sh2if{n}");
+        out.push(assign_stmt(&tmp, value_expr(&l.expr, cx)));
+        iflet_cond(&tmp, &l.pat, cx, out)
+    } else {
+        test_call(&test_string(&ie.cond, cx))
+    };
     let mut then = Vec::new();
     push_branch(&ie.then_branch, target, cx, in_fn, &mut then);
     let else_ = match &ie.else_branch {
         None => refuse("if-expression without else", ie.span()),
         Some((_, inner)) => match &**inner {
-            syn::Expr::If(inner_if) => vec![if_value_node(inner_if, target, cx, in_fn)],
+            syn::Expr::If(inner_if) => vec![if_value_node(inner_if, target, cx, in_fn, out)],
             syn::Expr::Block(blk) => {
                 let mut v = Vec::new();
                 push_branch(&blk.block, target, cx, in_fn, &mut v);
@@ -2477,12 +2675,13 @@ fn function_def(
                         // every path: per-branch Returns. loop tails still
                         // refuse.
                         match e {
-                            syn::Expr::If(ie) => body.push(if_value_node(
-                                ie,
-                                BranchTarget::Ret,
-                                cx,
-                                true,
-                            )),
+                            syn::Expr::If(ie) => {
+                                let mut hoist = Vec::new();
+                                let node =
+                                    if_value_node(ie, BranchTarget::Ret, cx, true, &mut hoist);
+                                body.extend(hoist);
+                                body.push(node);
+                            }
                             syn::Expr::Match(m) => {
                                 let node =
                                     match_value_node(m, BranchTarget::Ret, cx, true, &mut body);
@@ -2746,6 +2945,15 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
             let Some(name) = single_path(p) else {
                 refuse("path expression", p.span());
             };
+            // BARE `None` is the Option layer's ABSENT marker, whose store
+            // value is the empty string (the None≡"" convention — the same
+            // one `?`, Ty::Opt and the option methods use). It is NOT a
+            // variable read: `getVar("None")` would return "" only by
+            // accident of an unset name, and would silently read a user
+            // variable called `None` if one existed.
+            if name == "None" {
+                return str_lit("");
+            }
             get_var(&name.to_string())
         }
         syn::Expr::Binary(b) => {
@@ -2794,6 +3002,21 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
             // keeps native JS arrays, so this is the EXACT value shape
             // (infer_ty already types vec![] as Arr).
             let name = m.mac.path.segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
+            // `matches!(v, PAT)` in VALUE position is a bool. Lower it to
+            // a test call over the pattern — the SAME conversion the
+            // condition path and the match lowering use (matches_cond /
+            // arm_cond), so they can never disagree. The result is a
+            // native JS boolean via the test builtin, which prints like
+            // Rust's `{}` for bool.
+            if name == "matches" {
+                let cond_s = matches_cond(m.mac.tokens.clone(), m.span(), cx).unwrap_or_else(|| {
+                    refuse(
+                        "`matches!` pattern (only unit variants, or-patterns of them, and `_`)",
+                        m.span(),
+                    )
+                });
+                return test_call(&cond_s);
+            }
             if name != "vec" {
                 refuse(&format!("macro `{name}!` in value position"), m.span());
             }
@@ -3211,10 +3434,64 @@ fn int_literal(e: &syn::Expr, cx: &Cx) -> i64 {
 
 // ── conditions ──────────────────────────────────────────────────────
 
+/// Lower `matches!(subject, PAT)` to an exact test-grammar condition
+/// string. Shared by the value-position path (test_call) and the
+/// condition path (test_string) so the two can never disagree. The
+/// subject must be a PLAIN VARIABLE (the test grammar reads `$var`; a
+/// compound subject would be re-evaluated — not exact), and the pattern
+/// the same unit-variant/or/`_` set the match lowering accepts.
+fn matches_cond(
+    tokens: proc_macro2::TokenStream,
+    span: proc_macro2::Span,
+    cx: &Cx,
+) -> Option<String> {
+    struct MatchesArgs(syn::Expr, syn::Pat);
+    impl syn::parse::Parse for MatchesArgs {
+        fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+            let e: syn::Expr = input.parse()?;
+            input.parse::<syn::Token![,]>()?;
+            // or-patterns (`A | B`) are Pat::Or, not parse_single
+            let p: syn::Pat = syn::Pat::parse_multi_with_leading_vert(input)?;
+            Ok(MatchesArgs(e, p))
+        }
+    }
+    let MatchesArgs(subj, pat) = syn::parse2(tokens)
+        .unwrap_or_else(|e| refuse(&format!("`matches!` argument form: {e}"), span));
+    let Some(sv) = (match &subj {
+        syn::Expr::Path(p) if p.qself.is_none() => single_path(p).map(|i| i.to_string()),
+        _ => None,
+    }) else {
+        refuse(
+            "`matches!` on a compound subject in value/condition position \
+             (the test grammar reads a $variable; re-evaluating the subject \
+             would not be exact)",
+            span,
+        );
+    };
+    arm_cond(&sv, &pat, cx)
+}
+
 /// A boolean condition -> the `test` STRING grammar the runtime parses
 /// (`$x -gt 1`, `-a`/`-o` chains, `!`, parens) — the c-sh-go shapes.
 fn test_string(e: &syn::Expr, cx: &Cx) -> String {
     match e {
+        // `if matches!(x, PAT)` / `while matches!(..)` — the same exact
+        // conversion the value-position path uses (shared helper)
+        syn::Expr::Macro(m)
+            if m.mac
+                .path
+                .segments
+                .last()
+                .map(|s| s.ident == "matches")
+                .unwrap_or(false) =>
+        {
+            matches_cond(m.mac.tokens.clone(), m.span(), cx).unwrap_or_else(|| {
+                refuse(
+                    "`matches!` pattern (only unit variants, or-patterns of them, and `_`)",
+                    m.span(),
+                )
+            })
+        }
         // literal-bool conditions (`while true`, `if false`) — the test
         // grammar has no boolean literals, so they fold to always-true /
         // always-false numeric comparisons.
