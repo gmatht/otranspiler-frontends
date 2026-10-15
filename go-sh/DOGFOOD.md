@@ -512,3 +512,290 @@ source from the list store (`listItems`), chosen by `isAnyListElem` of the
 source's element type. That choice must be verified against the ladder AND
 the self-emit, because a wrong splice rule silently empties every struct
 layout.
+
+### FIXED (2026-10-15, sixth pass): every struct layout was correct; the layout SLICE was not
+
+The `T{...}` refusal (`line 113: expected ), got {` → `unknown field kind in
+struct token`) is now GREEN. The earlier passes all pursued "struct layouts
+come out empty" and measured `mapGet(structs,"tok") == ""`. That reading was
+a MEASUREMENT TRAP: the empty string was the value of a *different*
+container (`structFieldTypes`) being watched, not `structs`. Verified by
+dumping `p.structs` directly — it held `tok→"kind,text"` all along.
+
+Five independent defects, each confirmed by probe and gated at
+`fail-go` 124/124:
+
+1. **`getVar` returned a positional for a digit-named var**
+   (`harness/sh2-namespace.mjs`). The `^[1-9]$` positional arm ran BEFORE
+   the var store, so a digit-named Go temp read back as `$2`. The var store
+   is now consulted first (bash precedence: `2=x; echo $2` prints x).
+2. **`argToWord` routed a plain shell array through `listItems`.** The
+   documented unscoped-`paramSlice` leak marked a same-named LOCAL as a
+   slice param; the read site now trusts the CURRENT element typing
+   (`varTypes[rn]=="Array"` + not an any-list ⇒ not a slice param), so
+   `append(fields, names...)` splices via `arrayItems`.
+3. **`num_add` for every `+`/`-`.** `parseAdd` records `e.op`, but
+   `arithNumCalls`'s `case "add"` ignored it — so `p.toks[p.pos-1]` lowered
+   as `p.pos+1`. parseTypeDecl then read the token AFTER the type name and
+   registered the layout under the key `"{"` instead of `"tok"`. This was
+   THE blocker for the literal: `-` now emits `num_sub`.
+4. **A slice value written into a container lost its slice-ness.**
+   `exprToWord` reads an Array-typed var as `getVar(name)` (element 0); the
+   map-element-write site now emits `arrayItems(name)` when the RHS is an
+   Array-typed var.
+5. **`range` over a statically-empty, runtime-loaded array.** `names :=
+   []string{}` then `names = append(...)`: `p.arrays[name].elems` is empty,
+   so the For iterated `[]` and the body never ran. An Array-typed var with
+   empty static elems now falls through to the runtime
+   `param("slice", name, "@", "")` read.
+
+Plus the last link, which was a RUNTIME defect, not a frontend one:
+`p.structs[t.text]` is a `map[string][]string`, and the map VALUE (a slice)
+was destroyed on assignment. `setVar` space-JOINED array values, so
+`arrayToList(name)` — which reads the array store — saw `[]`, and the slice
+crossed the `parseStructLit(typeName, layout)` call boundary as an empty
+list (`listLen` 0 ⇒ the keyed-field loop never ran ⇒ "unknown field").
+`setVar` now keeps an Array value in the array store AND the joined scalar
+in the var store, so `${arr}` stays bash-faithful while `arrayToList`
+recovers the items. Frontend side: `registerAssignType` and the comma-ok
+map-read path register `layout` as Array (`registerVar` is first-write-wins,
+so the mark is written to `p.varTypes` directly).
+
+Result: the translated frontend now resolves `token{kind: …}` — `arg2` is a
+real list id and the keyed-field lookup succeeds. The self-emit advances to
+a NEW frontier (`unsupported call "" in word position`), i.e. past the
+struct-literal stage entirely.
+
+### SEVENTH pass (2026-10-15): the shared-slot class, and the new frontier
+
+`fail-go` 124/124 and `make test` 124/124 throughout. Native self-emit OK
+(5.34 MB). Two independent blockers fixed, and one new class found.
+
+**1. `structFields` was missing from the struct-name prescan.**
+`prescanFuncNames` pre-registered `structs`/`structFT`/`structRaw` but not
+`structFields` — the very map the composite-literal lowering tests for
+KNOWN-ness (`if _, ok := p.structFields[cname]; !ok`). A struct declared
+later in the file was therefore present in three maps and absent from the
+fourth, so `T{...}` fell through to the unknown-type path, the `{` was
+swallowed, and the parse derailed with an empty-callee call in
+`parseAssignStmt` (`unsupported call "" in word position`). Fixed.
+
+**2. Local slice/map declarations shared ONE global shell slot.**
+`var x []T` and `x := []T{}` lower to `setArray("x", …)` with every read
+lowering to the same bare name, so the NAME is the storage. This file
+declares `words` in 17 functions, `out` in 11, `args` in 6 — the later
+function's reset wiped the earlier one's items. Concretely, `parseArgs`
+returned an EMPTY arg list (`parseArgs 45->58 len=0`) because another
+function's `args` had clobbered the slot, which is what derailed the whole
+parse.
+
+Fixed with `scopeLocalStoreName`: a LOCAL slice/map declaration mints a
+function-unique store name (`words__7`), aliased through `varAlias` so
+reads and writes follow via `resolveVar`, unwound by `endFuncLocalScope()`
+at each function-exit restore site (decl path and func-literal path). A
+slice PARAM is never renamed (it rides the positional protocol), and the
+type-switch guard check was narrowed so a scoped local is not mistaken for
+a guard.
+
+Site fixes that followed: `append`'s destination, the `:=` plain-array and
+any-list branches, and the `:= []T{}` literal branch all now resolve the
+store name. **Verified effect:** 139 unique slots emitted, and the
+`parseArgs` empty-arg-list derailment is gone.
+
+**3. `for i := range <any-list>` (index-only) had no branch.**
+The value form (`for _, t := range tgts`) worked; the index-only form fell
+through to `for-index range needs an Array var…`. Added a `listLen(id)`
+case. Probes `tg5.go`/`tg7.go`/`tg2.go` (plain func, `make([]T,…,0)`,
+method-with-receiver) now parse.
+
+**New frontier (open):** `expected ), got {` at the `token{kind: tNL,
+line: …}` append inside `lex`'s `case c == '\n':` — `structs["token"]`
+reads back `""` in the translated run. Root-caused one level: the declared
+`names := []string{}` in `parseTypeDecl` emits `setArray` (a shell array)
+while the same name's `append` emits `listPush` (a list id), so the field
+accumulator stays empty. The append's classification calls `anyListVar`
+with an OBJECT ID (`anyListVar("obj#982362") => true`) instead of a name —
+`rhs.args[0].name` evaluates to an obj-store reference in the translated
+run. That is the next thing to fix; the decl and the append must agree on
+one storage model per scoped name.
+
+### EIGHTH pass (2026-10-15): the scalar/let slot class and closure scoping
+
+`fail-go` 124/124, `make test` 124/124, native self-emit OK (5.36 MB).
+**503 unique store slots** now emitted (was 139).
+
+**4. The scalar/`let` channel had the same shared-slot defect.**
+`x := p.parseExpr()` lowered to a **file-level store slot**, so every
+function's `arg`, `e`, `out`, `w`, `names`, `layout` collided. This file has
+`arg := p.parseExpr()` in **8** functions. Concretely, in `parsePrimary`
+`arg` was found holding the **parser object** (`anyListVar("obj#679241")`)
+because another function had written it last — so `arg.kind`, `arg.name`
+and every derived read were garbage, and the append classification flipped
+the accumulator to `listPush` while the declaration had emitted `setArray`.
+
+The general `:=` tail now routes through `scopeLocalStoreName` like the
+slice paths.
+
+**5. Nested func literals must INHERIT the enclosing scope (and top-level
+names must not be scoped at all).**
+Two regressions the scoping introduced, both caught by the corpus:
+
+- `t106_iife_closure` — a closure mutating an outer local. Reset of the
+  per-function alias set at func-literal entry severed the closure from the
+  enclosing function's slots. A literal now *extends* the name set and
+  unwinds only what it minted (symmetric save/restore of
+  `localAliases`/`fnLocalAliases`/`fnLocalAliasOrder`).
+- `t42_global_mut` — `g := 0` at top level then a closure writing `g = 1`.
+  The closure's write was scoped to `g__1` while every read outside still
+  resolved to the global `g`, so the mutation was silently lost. Added
+  `topLevelNames`: a name bound at top level keeps its bare store name
+  inside every nested closure.
+
+**A `goto` did not survive translation — FIXED 2026-10-15 (6305338e3).**
+The first cut of the append gate used `goto appendPlain`; the A1 has no
+goto node of its own, so it lowered to `sh2.unsupported("goto
+appendPlain")` and killed the run, and it was rewritten as a plain
+conditional. That workaround is no longer needed for the forward-jump
+shapes: `restructure_goto` now lowers `for { switch { … default: goto L }
+L: rest }` (this frontend's own `goto matched` scan) and `for { … goto L };
+L: rest` correctly. The bug was never in the A1 — the frontend emitted
+`Label`/`Goto` correctly and `go-sh --shir` has carried a `Goto` arm since
+2026-08-07 — it was in the shared goto-elimination pass, which dropped the
+enclosing loop for gotos reached through a `Case`/`If` branch and skipped
+the tail guard when the label sat inside the loop. See `FRONTEND.md`
+§"Next frontier" for the mechanism and the new tests.
+**Backward gotos and jumps across loop levels still refuse**, so keep
+writing straight-line code where a workaround is cheap.
+
+**Storage-model agreement.** Added `localModel` (per scoped slot:
+array/list/map) so a declaration's chosen model overrides a stale
+same-named mark from another function, plus a `varTypes[...]=="Array"`
+fallback. The declaration and its appends must agree; the remaining
+mismatch is recorded below.
+
+**Open (root-caused, not yet fixed):** in the full `go-sh.go`, some
+`names := []string{}` sites still emit `setArray` (shell array) while their
+`append` emits `listPush` (list id), so `parseTypeDecl`'s field accumulator
+stays empty and `structs["token"]` reads back `""` (the `expected ), got {`
+frontier at line 113's `token{kind: tNL, …}`). A minimal reproduction of the
+same shape (`names := []string{}` inside an `if`, then `append`) is
+CORRECT in isolation, so the trigger is a same-named `names` in an earlier
+function of THIS file re-marking `anyLists["names"]` after the declaration
+recorded `localModel["names__N"]`. The next step is to make the append read
+the model through the SAME key the declaration wrote (the scoped slot), and
+to clear `anyLists[bare]` at scoped-declaration time for every `:=`/`var`
+slice form — not just the ones already patched.
+
+### NINTH pass (2026-10-15): the struct-layout chain is CLOSED
+
+`fail-go` 124/124, `make test` 124/124, native self-emit OK.
+**506 unique store slots** emitted; **zero** `listItems`-on-shell-array
+splices remain (was 2 at the last count).
+
+**The last link: the scoped slot was never TYPED.** Every `x := []T{...}`
+literal path minted a function-unique store name and cleared the stale
+marks, but registered `varTypes` only under the **bare** name. `argToWord`'s
+spread gate, the `for i := range x` bound and the append model check all
+consult `varTypes[resolveVar(name)]` — i.e. the SCOPED slot — so a plain
+shell array came back untyped and took the LIST paths:
+
+    fields__134 = append(fields__134, names__137...)
+      -> setArrayAppend("fields__134", [...listItems(getVar("names__137"))])
+
+`names__137` is a shell array (`setArray`), so `listItems` read the object
+store and spliced `[]`. `parseTypeDecl`'s field accumulator therefore
+stayed empty, `p.structs["tok"]` was `[]`, and `token{kind: tNL, …}`
+refused with `expected ), got {`. Now:
+
+    setArrayAppend("fields__134", [...arrayItems("names__137")])
+
+The fix registers the scoped slot in all three `:=`/`var` slice-literal
+branches (`parseVarSpec`, `parseAssignStmt`'s plain-array and `[]T{...}`
+branches): `registerVar(stn,"Array")` + `varTypes[stn]="Array"` +
+`localModel[stn]="array"`, and clears the bare-name marks so a same-named
+any-list from another function cannot re-flip the decision.
+
+**The translated frontend is now executing, not refusing.** The frontier
+moved from a parse REFUSAL to a runtime failure:
+
+| stage | outcome |
+|---|---|
+| before this pass | `failf: expected ), got {` (refused at lex's `token{…}`) |
+| after | runs **922 s**, then `RangeError: Invalid array length` (12 GiB heap) |
+
+So the struct-literal blocker is gone and the remaining work is genuinely
+execution-side: a computed array length goes out of range somewhere in the
+translated run. The next step is to locate that site — it is a real bug in
+the translated code path, not a refusal.
+
+Recorded here so the next pass starts from execution, not from the layout
+question: `p.structs` is populated correctly (`token -> kind,text,raw,line`,
+`parser -> 57 fields`), `arrayItems` is the plain-array splice and
+`listItems` the list-id splice, and the choice is keyed on the SCOPED slot's
+`varTypes`/`localModel`.
+
+### TENTH pass (2026-10-16): the self-hosted lexer runs — the infinite loop is gone
+
+The ninth pass left the translated frontend hanging (`922 s`, then a 12 GiB
+`RangeError`). It was not a runaway allocation. **Four scoped-store defects
+in the frontend made the self-hosted frontend loop forever**, all of the
+same class: a declaration, a write and a read resolving to *different*
+store names, because `targets[0]` holds the BARE parsed name while
+`resolveVar`/`paramName` return the function-unique alias that
+`scopeLocalStoreName` mints (`j` -> `j__396`).
+
+Measured on the same pipeline, translated frontend vs native `go run`:
+
+| input | stock translated | fixed translated |
+|---|---|---|
+| `package main` | MATCH | MATCH |
+| `func f() {}` | **HANG** | MATCH |
+| `func main() { x := 1 }` | **HANG** | ERR (unsupported expr) |
+| `j := 0; j++` | **HANG** | ERR (unsupported expr) |
+| three more probes | **HANG** | ERR / DIFFER |
+
+Four of six previously-hanging inputs now terminate, two byte-identically.
+
+**1. `j++` / `j--` wrote the bare name** (`parseAssignStmt`). The loop
+variable of `funcLitAhead`'s
+`for j < len(p.toks) && p.toks[j].kind == tNL { j++ }` was incremented at
+`j` while the condition read `j__396`, so it never advanced. Fixed by
+scoping the target through `scopeLocalStoreName` (idempotent, and returns
+the bare name outside a function, so the C-style ForInit step lowering —
+which already passes resolved names — is unaffected).
+
+**2. `name := lit` emitted `local <bare>=<lit>`** (the `:=` literal
+early-return). The declaration wrote the bare slot while every read used
+the alias: `lex`'s `i := 0` initialised `i` against reads of `i__4`, so
+`for i < len(src)` never advanced and **the lexer itself spun**. Six sites
+in this file.
+
+**3. `x += expr` wrote the bare name** — including the `i += len(op)`
+operator-length advance, whose `arith` text is a bare name too. `i` never
+moved, so the scan re-read the same byte; the multi-char operator table
+`{..., "++", "--"}` therefore never matched and `:=`/`++` came out as the
+*two* puncts `:` `=` / `+` `+`. That then mis-parsed as two statements and
+died in `parseAssignStmt` with "unsupported statement starting with =".
+
+**4. `for _, v := range <array>` iterated the bare name.** The range base
+was looked up as `p.arrays[rv.name]`/`p.varTypes[rv.name]` and its iter
+word emitted `param("slice", rv.name, "@", "")` — all bare — while the
+declaration had stored under `multiOps__2`. The loop iterated an empty
+array and its body never ran (this is what actually broke `lex`'s
+operator table *after* fix 3).
+
+Verified: native frontend still emits **byte-identical A1 for 122/124
+corpus files**; the two that differ (`t41_local_var`, `t96_typed_params`)
+differ ONLY in the scoped name now being used consistently, and both still
+produce identical program output. `fail-go` 124/124, `make test` 124/124
+with the fixed binary, and the 123/124 stdout-match corpus check is
+unchanged from stock (the one EMPTY, `t61_while_read.go`, needs stdin).
+
+### Next frontier (execution-side, now that the loop is gone)
+
+The translated frontend reaches `exprToWord` with an EMPTY expr at
+`parseAssignStmt` and fails with `unsupported expression ""`. The token
+stream for `x := 1` is correct (`x` `:=` `1` NL EOF, kind 2/7/3/1/0), so
+the failure is in the statement dispatcher: it consumes the whole input and
+then tries to lower a token it never read. That is the next single blocker
+— it gates every `:=`-bearing input, which is most of `go-sh.go`.
