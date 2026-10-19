@@ -2375,16 +2375,29 @@ func isNumType(t string) bool {
 // runtime arith-string evaluated with JS doubles (the exact computation
 // native python does), not the integer Arith AST.
 func floatPath(e Expr) bool {
+	return floatPathIn(e, nil)
+}
+
+// floatPathIn is floatPath with an optional type oracle: a NameE whose
+// inferred type is "float" counts as a float leaf even without a literal
+// (`x * 2` with float x — the leaf carries no literal, but the value is
+// a double and the integer Arith AST would silently truncate/print it
+// as an int: t104 `print(x * 2)` printed 5 for 5.0). Pass nil for the
+// legacy literal-only check (int-domains, isqrt idiom — a float-typed
+// name there must NOT divert: those paths handle the domain via typeOf).
+func floatPathIn(e Expr, types map[string]string) bool {
 	switch t := e.(type) {
 	case *LitFloat:
 		return true
-	case *LitInt, *NameE, *BoolLit:
+	case *LitInt, *BoolLit:
 		return false
+	case *NameE:
+		return types != nil && types[t.Name] == "float"
 	case *BinOpE:
-		return floatPath(t.Lhs) || floatPath(t.Rhs)
+		return floatPathIn(t.Lhs, types) || floatPathIn(t.Rhs, types)
 	case *CallE:
 		if len(t.Path) == 1 && t.Path[0] == "int" && len(t.Args) == 1 {
-			return floatPath(t.Args[0])
+			return floatPathIn(t.Args[0], types)
 		}
 		return false
 	}
@@ -2883,6 +2896,14 @@ func numNode(n int64) map[string]any {
 	return map[string]any{"type": "Int", "value": n}
 }
 
+// boolNode builds an IrExpr::Bool node ({"type":"Bool","value":B}).
+// Python True prints as "True", not "1" — stringifying to "1"/"0"
+// would type as int downstream and change output once declared, so a
+// bool keeps its own node (backends render it per language).
+func boolNode(b bool) map[string]any {
+	return map[string]any{"type": "Bool", "value": b}
+}
+
 // parsePyInt parses a Python integer literal (underscores, 0x/0o/0b
 // prefixes, decimal) into an int64 for typed call args. ok=false when
 // unparseable or out of int64 range — the caller keeps the string form
@@ -3167,11 +3188,15 @@ func (l *lowerer) argIR(e Expr) (map[string]any, error) {
 		return st(t.Value), nil
 	case *LitInt:
 		return st(t.Text), nil
+	case *LitFloat:
+		// A float literal in word position is the literal text, exactly
+		// as the core frontend renders the equivalent shell word: the
+		// core types `echo 2.5` as IrExpr::Str("2.5") (there is no
+		// float word node in A1), so st(Text) is byte-identical to it.
+		// Same shape as the LitInt case above — the de-tokenized text.
+		return st(t.Text), nil
 	case *BoolLit:
-		if t.Value {
-			return st("1"), nil
-		}
-		return st("0"), nil
+		return boolNode(t.Value), nil
 	case *NameE:
 		// inside a function body, params read the positionals
 		if pos, ok := l.curParams[t.Name]; ok {
@@ -3184,7 +3209,7 @@ func (l *lowerer) argIR(e Expr) (map[string]any, error) {
 		if t.Op == "+" && (l.typeOf(t) == "str") {
 			return l.concatIR(t), nil
 		}
-		if floatPath(t) {
+		if floatPathIn(t, l.types) {
 			// a float-path subexpression inside a string/word context
 			// (print("bound=", int(n**0.5) + 1)) — the runtime arith-string
 			return l.hoistFloatIR(t)
@@ -4735,6 +4760,14 @@ func (l *lowerer) printIR(t *PrintS) ([]map[string]any, error) {
 			words = append(words, interpolate([]any{interpLit("["), interpExpr(ir), interpLit("]")}))
 			continue
 		}
+		// Python str(float): integral doubles print with `.0`
+		// (t104: `print(x * 2)` with float x evaluated to Number 5 —
+		// the `sh2.pyFloat` runtime helper re-adds the `.0` python
+		// prints; ints/strings are untouched — only float-typed args
+		// wrap, so `print(5)` still prints `5`).
+		if l.typeOf(a) == "float" {
+			ir = call("pyFloat", []any{ir})
+		}
 		words = append(words, ir)
 	}
 	return append(pre, exprStmt(execCall("echo", words))), nil
@@ -5056,10 +5089,7 @@ func (l *lowerer) assignSimple(target string, val Expr) ([]map[string]any, error
 		return []map[string]any{assignStmt(target, st(v.Text))}, nil
 	case *BoolLit:
 		l.setType(target, "int")
-		if v.Value {
-			return []map[string]any{assignStmt(target, st("1"))}, nil
-		}
-		return []map[string]any{assignStmt(target, st("0"))}, nil
+		return []map[string]any{assignStmt(target, boolNode(v.Value))}, nil
 	}
 	// float-domain value with no float literal (`y = x + 1` from a float
 	// `x`, `q = 7 / 2` true division): the structured Arith lowering
