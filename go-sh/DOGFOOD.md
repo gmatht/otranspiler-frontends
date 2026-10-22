@@ -883,3 +883,38 @@ return shape) even when the body is empty — see `func f() {}`.
 Third, performance: the translated frontend takes 14 s on a 9-line file
 (dominated by the `failf` unwind path), so corpus-sized runs need the
 per-file budget raised, not read as hangs.
+
+### Pass 12 (2026-10-23): the seventh-pass source committed, and the build fix
+
+The seventh pass above was committed only as this document — the source
+side (`scopeLocalStoreName`, `localSeq`/`localAliases`/`localModel`,
+the scoped `topLevelNames`) stayed in the worktree, uncommitted, while
+the worker sat on provider quota walls. It is now committed as-is, no
+edits, after re-verifying it on the gates.
+
+Verified (all three green):
+
+| gate | result |
+|---|---|
+| `make test` (A1 ingress + executed stdout) | **125/125** |
+| `fail-go --gate` (Go→JS end-to-end) | **125/125** |
+| `fail-go --app frontends/go-sh/cmd/go-sh/main.go` | **GREEN** |
+
+- **Probe `t119_local_slot_isolation` pins the shared-slot class.** Two
+  functions each declaring `var words []string`, the caller reading it
+  after a call. Pre-fix the callee's reset is visible in the caller
+  (`a 2 B`); post-fix `a 1 A`, byte-identical to native `go run`. The
+  probe FAILS against HEAD of `go-sh.go` and passes after, so it is a
+  real regression test, not a pass-through.
+- **Self-emit**: `./go-sh --shir go-sh.go` emits 5.43 MB and the core
+  deserializer accepts it (`--target estree` → 18.3 MB JS); HEAD's emit
+  is also accepted, so the gain is semantic (slot isolation), not
+  ingress.
+- **Build fix (the reported failure)**: `make build` died with
+  `make: /snap/go/current/bin/go: No such file or directory`
+  (Error 127) — the hardcoded snap path, on a box whose Go is
+  `/usr/bin/go` (apt golang-go 1.22.2). Same class py-sh-go fixed in
+  57245668; `GO` now takes the first of the snap path and
+  `command -v go`, and resolves to `/usr/bin/go` under a minimal
+  `PATH=/usr/bin:/bin`. The `pir failed (rc=5)` lines in the worker log
+  were never compile errors — they are HTTP 429 quota walls.

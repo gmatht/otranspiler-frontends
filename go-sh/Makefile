@@ -21,7 +21,13 @@ CLI ?= $(WS_ROOT)/otranspilerl/target/debug/otranspilerl-cli
 BUILD_LOCK ?= $(WS_ROOT)/harness/build-lock.sh
 OTRANS_MANIFEST ?= $(WS_ROOT)/otranspilerl/Cargo.toml
 FRONTEND_STDOUT := $(firstword $(wildcard $(WS_ROOT)/harness/frontend-stdout.sh))
-GO ?= /snap/go/current/bin/go
+# Go toolchain: prefer the snap install when present, else the system `go`
+# (apt golang-go -> /usr/bin/go). The hardcoded snap path wedged the whole
+# gate with `make: /snap/go/current/bin/go: No such file or directory`
+# (Error 127 on `build`) on boxes where the snap is not installed, while the
+# frontend itself was healthy. Same fix py-sh-go took in 57245668;
+# harness/frontend-stdout.sh already falls back to `go` on PATH.
+GO ?= $(firstword $(wildcard /snap/go/current/bin/go) $(shell command -v go 2>/dev/null))
 
 .PHONY: all gen build test otranspilerl-cli-oracle worker clean
 

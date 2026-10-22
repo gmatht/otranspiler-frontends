@@ -402,8 +402,8 @@ func execStmtTA(cmd string, words []map[string]any, purity string, typeArgs []st
 				"args":     []any{strExpr(cmd), map[string]any{"type": "Array", "elements": elems}},
 				"purity":   purity,
 				"typeArgs": ta,
-				},
-			}
+			},
+		}
 	}
 	return map[string]any{
 		"type": "Expr",
@@ -515,23 +515,23 @@ type parser struct {
 	toks []token
 	pos  int
 	// semantic side-state (the Go subset's shell-shaped meanings)
-	varTypes    map[string]string // name -> "Int" | "Str" | "Array" | "Map"
-	consts      map[string]int    // evaluated int const values (const refs)
-	constStrs   map[string]string // evaluated string const values
-	arrays      map[string]arrayInfo
-	anyLists    map[string]bool       // vars holding objStore list ids (struct/any elements)
-	anyElem     map[string]string     // var -> list element struct type
-	idxBase     string                // indexed-assign base (`out` in `out[i] = …`) — consumed by the maplit hook below
-	idxKey      *expr                 // computed index expr (nil when the key is a literal)
-	idxLit      string                // literal index text ("" when computed)
-	maps        map[string]bool    // m := map[K]V{...} — assoc-array name
-	anyValMaps  map[string]bool    // map[string]any-VALUED maps — A1-fragment builders
-	                              // (Go-runtime state, never true assoc stores):
-	                              // element writes to them emit NOTHING (the Go map
-	                              // mutation is complete at parse time; the built
-	                              // node carries it wherever it flows)
-	emptyMaps   map[string]bool    // m := map[K]V{} (EMPTY literal) — no assocSet pairs
-	                              // emitted, so the first element write creates the array
+	varTypes   map[string]string // name -> "Int" | "Str" | "Array" | "Map"
+	consts     map[string]int    // evaluated int const values (const refs)
+	constStrs  map[string]string // evaluated string const values
+	arrays     map[string]arrayInfo
+	anyLists   map[string]bool   // vars holding objStore list ids (struct/any elements)
+	anyElem    map[string]string // var -> list element struct type
+	idxBase    string            // indexed-assign base (`out` in `out[i] = …`) — consumed by the maplit hook below
+	idxKey     *expr             // computed index expr (nil when the key is a literal)
+	idxLit     string            // literal index text ("" when computed)
+	maps       map[string]bool   // m := map[K]V{...} — assoc-array name
+	anyValMaps map[string]bool   // map[string]any-VALUED maps — A1-fragment builders
+	// (Go-runtime state, never true assoc stores):
+	// element writes to them emit NOTHING (the Go map
+	// mutation is complete at parse time; the built
+	// node carries it wherever it flows)
+	emptyMaps map[string]bool // m := map[K]V{} (EMPTY literal) — no assocSet pairs
+	// emitted, so the first element write creates the array
 	bufs        map[string]string  // b := bytes.Buffer — accumulated contents
 	runtimeBufs map[string]bool    // buffers with runtime-dependent contents (WriteByte of a runtime byte)
 	cmds        map[string][]*expr // cmd := exec.Command(...) -> args
@@ -607,6 +607,29 @@ type parser struct {
 	receiverTypes map[string]string
 	// temp-var sequence for cond hoists (function-call conditions)
 	tmpSeq int
+	// localSeq: function-scoped renaming for LOCAL slice/map declarations.
+	// A Go `var x []T` lowers to setArray("x", …) and every READ lowers to
+	// the same bare name, so two functions that both declare `words` (or
+	// `out`, `args`, `names` — `words` appears in 17 functions of this
+	// very file) share ONE shell-array slot: whoever runs last wins, and
+	// the earlier function's accumulated items vanish. Each local decl
+	// gets a unique store name (`words__3`), aliased through varAlias so
+	// reads/writes resolve to it, and the alias is dropped at function
+	// exit (fnLocalAliases records what to unwind).
+	localSeq int
+	// topLevelNames: names introduced at top level (globals). They keep
+	// their bare store name inside every nested closure.
+	topLevelNames map[string]bool
+	// localModel: the STORAGE MODEL chosen for a scoped local slot
+	// ("array" | "list" | "map"). The declaration and every subsequent
+	// append must agree; consulting anyLists/varTypes independently let a
+	// stale same-named mark from another function flip the append to
+	// listPush while the declaration had emitted setArray — the
+	// accumulator stayed empty and every struct layout registered as "".
+	localModel        map[string]string
+	localAliases      map[string]string
+	fnLocalAliases    map[string]bool
+	fnLocalAliasOrder []string
 }
 
 type splitNInfo struct {
@@ -793,14 +816,14 @@ func (p *parser) parsePostfix() *expr {
 		switch {
 		case p.atPunct("{"):
 			// composite literal: `token{kind: tNL, line: line}` (named) or
-		// `tok{"a", "b"}` (positional) — a struct VALUE. Lowered to
-		// the jsonNew helper (the go-sh self-hosting contract: structs
-		// are JSON object strings). Only fires for a KNOWN struct type
-		// (a `3 {` for-body brace must not parse as a literal).
+			// `tok{"a", "b"}` (positional) — a struct VALUE. Lowered to
+			// the jsonNew helper (the go-sh self-hosting contract: structs
+			// are JSON object strings). Only fires for a KNOWN struct type
+			// (a `3 {` for-body brace must not parse as a literal).
 			// PACKAGE MODE: `&shiremit.Program{...}` — a cross-package
-		// type is qualified; the layout is keyed by the LAST segment
-		// (the concatenated package's own type decls register bare
-		// names).
+			// type is qualified; the layout is keyed by the LAST segment
+			// (the concatenated package's own type decls register bare
+			// names).
 			cname := callName(e)
 			if _, ok := p.structFields[cname]; !ok {
 				if dot := strings.LastIndex(cname, "."); dot >= 0 {
@@ -1814,6 +1837,15 @@ func (p *parser) parseFuncLit() *expr {
 	p.skipReturnType()
 	saveParams, saveOrd, saveLocals, saveIn := p.fnParams, p.fnParamOrd, p.fnLocals, p.inFunc
 	saveShadow := p.paramShadow
+	saveLocalAliases := p.fnLocalAliases
+	saveLocalAliasOrder := p.fnLocalAliasOrder
+	saveLocalMap := p.localAliases
+	// A func LITERAL shares its enclosing function's store slots (the
+	// closure contract: `n := 0; func(){ n = 1 }()` mutates the outer n),
+	// so the enclosing scope's aliases MUST stay visible — only the
+	// name set is extended, never reset. Resetting here made the closure
+	// write a fresh slot and t42_global_mut / t106_iife_closure lost
+	// their assignments.
 	p.fnParams = map[string]bool{}
 	p.fnParamOrd = nil
 	p.fnLocals = map[string]bool{}
@@ -1826,6 +1858,12 @@ func (p *parser) parseFuncLit() *expr {
 	body, shadow := p.parseFuncLitBody(params)
 	p.fnParams, p.fnParamOrd, p.fnLocals, p.inFunc = saveParams, saveOrd, saveLocals, saveIn
 	p.paramShadow = saveShadow
+	// unwind ONLY the aliases this literal minted (restore the saved
+	// snapshots; endFuncLocalScope would drop the enclosing set too)
+	p.endFuncLocalScope()
+	p.fnLocalAliases = saveLocalAliases
+	p.fnLocalAliasOrder = saveLocalAliasOrder
+	p.localAliases = saveLocalMap
 	noParams := false
 	for _, prm := range params {
 		if shadow[prm] {
@@ -2198,6 +2236,8 @@ func (p *parser) skipReturnType() {
 func (p *parser) parseFuncParamsWithTypes(recvName, recvType string) []string {
 	savePT := p.paramTypes
 	p.paramTypes = map[string]string{}
+	// this function's slice params are recorded into the live map;
+	// paramSlice is function-scoped via the caller's save/restore
 	params := p.parseFuncParams()
 	// receiver first
 	if recvType != "" {
@@ -2230,6 +2270,122 @@ func paramsCSV(ps []string) string {
 	return out
 }
 
+// returnPosBases extracts ONE type base per RETURN POSITION from a token
+// span covering a Go result clause, in order.
+//
+// Go result clauses have three shapes and only the last is a plain type
+// list:
+//
+//	(T, U)                 -> [T, U]
+//	(stmts []T, ok bool)   -> [T, bool]   (NAMED results)
+//	[]map[string]any       -> [any]       (bare, no parens)
+//
+// Walking every ident and keeping it (the original approach) conflated all
+// three: `(stmts []map[string]any, ok bool)` yielded
+// [stmts map string any ok bool] — six entries for two positions. Call
+// sites index these PER POSITION, so retIds[0] read as the NAME `stmts`
+// rather than a type, a multi-target call assigning the slice slot
+// registered "Str", and a later spread of that value failed
+// "variadic spread needs an array-typed var".
+//
+// The rule implemented here: split the clause on TOP-LEVEL commas (commas
+// outside `[]`/`()`), and from each part take the LAST ident that is a type
+// rather than a named binding. A leading ident followed by a type start
+// (`[`, `*`, ident — i.e. `name T`) is a binding, not the type.
+func returnPosBases(toks []token, lo, hi int) []string {
+	// Single pass, no nested scans: this runs over every `func` in the
+	// file at prescan time, so an O(n^2) walk here is felt on the
+	// self-host path.
+	var out []string
+	// A grouped clause `(T, U)` is entirely inside its own parens, so the
+	// BASELINE depth is 1: only brackets nested INSIDE the group push it
+	// higher. Treating the outer `(` as depth 0 keeps every top-level type
+	// ident visible while still hiding `map[string]any`'s arguments.
+	depth := 0
+	if lo < hi && lo < len(toks) {
+		t0 := toks[lo]
+		if t0.kind == tPunct && t0.text == "(" {
+			depth = 1
+		}
+	}
+	// the ident index of the CURRENT position's base type, and the ident
+	// count seen in this position (to drop a leading named binding)
+	baseIdx := -1
+	secondIdx := -1 // the 2nd depth-0 ident: the type when the 1st is a named binding
+	nIdents := 0
+	closePart := func() {
+		// `name T` (a NAMED result) puts the type in the SECOND depth-0
+		// ident; a bare `T` has only the first. Using the second when it
+		// exists is what drops `stmts` from `(stmts []map[string]any, …)`.
+		if secondIdx >= 0 {
+			baseIdx = secondIdx
+		}
+		if baseIdx >= 0 {
+			name := toks[baseIdx].text
+			// a POINTER element (`[]*expr`) keeps its `*` so
+			// callFirstListElem returns "" (pointer elements ride shell
+			// arrays as arena-id strings, never the list-id path).
+			pi := baseIdx - 1
+			if pi >= 0 {
+				pt := toks[pi]
+				if (pt.kind == tPunct || pt.kind == tOp) && pt.text == "*" {
+					name = "*" + name
+				}
+			}
+			out = append(out, name)
+		}
+		baseIdx = -1
+		secondIdx = -1
+		nIdents = 0
+	}
+	for i := lo; i < hi && i < len(toks); i++ {
+		t := toks[i]
+		if t.kind == tPunct || t.kind == tOp {
+			switch t.text {
+			case "[":
+				depth++
+				continue
+			case "]":
+				depth--
+				continue
+			case ",":
+				if depth <= 1 {
+					closePart()
+					continue
+				}
+				continue
+			}
+		}
+		if t.kind != tIdent {
+			continue
+		}
+		// An ident at depth 0 starts (or continues) this position's type;
+		// one INSIDE brackets is a type ARGUMENT (`map[string]any`), which
+		// must not become the position's base. Track the depth-0 ident as
+		// the base, and let bracketed idents only extend it: `map[...]`
+		// records `map`, whose element kind the callers already treat as a
+		// container.
+		if depth <= 1 {
+			nIdents++
+			if nIdents == 1 {
+				baseIdx = i
+			} else if nIdents == 2 {
+				secondIdx = i
+			}
+		} else if baseIdx < 0 {
+			baseIdx = i
+		}
+		continue
+	}
+	closePart()
+	// Drop a leading NAMED binding per position (`stmts []map[string]any`
+	// would otherwise be reported as `stmts`). The names carry no type
+	// information the call sites need, so removing a leading entry whose
+	// successor token begins a type is the whole rule.
+	return out
+}
+
+
 func (p *parser) captureReturnTypeText() string {
 	start := p.pos
 	p.skipReturnType()
@@ -2246,20 +2402,11 @@ func (p *parser) captureReturnTypeText() string {
 		}
 		return b.String()
 	}
+	ids = returnPosBases(p.toks, start, p.pos)
 	for i := start; i < p.pos && i < len(p.toks); i++ {
-		if p.toks[i].kind == tIdent {
-			id := p.toks[i].text
-			// a POINTER element (`[]*expr`) keeps its `*` so
-			// callFirstListElem returns "" (pointer elements ride shell
-			// arrays as arena-id strings, never the list-id path) —
-			// without it `[]*expr` is misread as a struct-slice.
-			if i > 0 && p.toks[i-1].kind == tPunct && p.toks[i-1].text == "*" {
-				id = "*" + id
-			}
-			ids = append(ids, id)
-		}
 		if (p.toks[i].kind == tPunct || p.toks[i].kind == tOp) && p.toks[i].text == "[" {
 			slice = true
+			break
 		}
 	}
 	if len(ids) > 0 {
@@ -2398,6 +2545,7 @@ func (p *parser) parseFuncParams() []string {
 //   - `switch name :=`, `if name :=`, `select`-less channel ops n/a
 //   - multi-target `a, name = f()` / `a, name := f()` (any ident in the
 //     target list followed by `=`/`:=`)
+//
 // The scan is token-based (strings/comments are single tokens — they
 // can never false-positive; a keyword-named match is impossible since
 // Go keywords don't lex as tIdent... except predeclared `len`/`cap`
@@ -2813,11 +2961,24 @@ func (p *parser) parseTopLevel() []map[string]any {
 			saveParams, saveOrd, saveLocals, saveIn := p.fnParams, p.fnParamOrd, p.fnLocals, p.inFunc
 			saveVarTypes := p.varTypes
 			saveShadow := p.paramShadow
+			// paramSlice is function-scoped: the param list above has
+			// already been consumed (so THIS function's slice params are
+			// marked), and restoring after the body stops a slice param
+			// in one function from marking a same-named LOCAL in a later
+			// one. Without this the leak made parseTypeDecl's
+			// `fields = append(fields, names...)` splice through
+			// listItems(getVar("names")) — a plain shell array read as a
+			// list id — so every struct layout came out empty and T{...}
+			// refused (the dogfood self-emit blocker).
+			saveSlice := p.paramSlice
 			p.fnParams = map[string]bool{}
 			p.fnParamOrd = nil
 			p.fnLocals = map[string]bool{}
 			p.varTypes = map[string]string{}
 			p.paramShadow = map[string]bool{}
+			// fresh function: local store-name aliases start empty
+			p.fnLocalAliases = map[string]bool{}
+			p.fnLocalAliasOrder = nil
 			p.inFunc = true
 			for _, prm := range params {
 				p.fnParams[prm] = true
@@ -2869,6 +3030,8 @@ func (p *parser) parseTopLevel() []map[string]any {
 			p.fnParams, p.fnParamOrd, p.fnLocals, p.inFunc = saveParams, saveOrd, saveLocals, saveIn
 			p.paramShadow = saveShadow
 			p.varTypes = saveVarTypes
+			p.paramSlice = saveSlice
+			p.endFuncLocalScope()
 			p.fnNames[nm] = true
 			emitParams := params
 			for _, prm := range params {
@@ -3141,10 +3304,10 @@ func (p *parser) parseStmt() []map[string]any {
 		if p.atPunct(";") || p.atPunct("}") || p.tok().kind == tNL || p.tok().kind == tEOF {
 			p.skipNL()
 			// BARE return (always void — the subset has no named
-				// results): STOP the sub with no value echo. (An echo
-				// "" here leaked into enclosing captures, and the
-				// missing stop fell through — self-host
-				// skipReturnType ran skipType past `func f() {`.)
+			// results): STOP the sub with no value echo. (An echo
+			// "" here leaked into enclosing captures, and the
+			// missing stop fell through — self-host
+			// skipReturnType ran skipType past `func f() {`.)
 			// Return a VAR holding the node (NOT an inline literal):
 			// `return []map{…}` transpiles to echo-jsonObject (plain
 			// object → "[object Object]"), while a var echoes its
@@ -3783,21 +3946,29 @@ func (p *parser) parseVarSpec() []map[string]any {
 		if isSliceDecl {
 			if p.isAnyListElem(sliceElem) {
 				// LIST-element slice (`var out []tok`, `var out []any`,
-				// `var out []map[string]any`): elements ride a LIST id
-				// (shell arrays String-coerce object elements).
-				p.anyLists[n] = true
-				p.anyElem[n] = sliceElem
-				out = append(out, assignStmt(n,
+				// `var out []map[string]any`, `[]*expr`): elements ride a
+				// LIST id (shell arrays String-coerce object elements).
+				// A LOCAL gets a function-unique slot, like the plain-array
+				// branch below: `p.anyLists` is keyed by name, and
+				// `var args []*expr` appears in 6 different functions —
+				// sharing the name meant the last listNew wiped the
+				// earlier accumulator (parseArgs returned an empty arg
+				// list, derailing the whole parse).
+				lst := p.scopeLocalStoreName(n)
+				p.anyLists[lst] = true
+				p.anyElem[lst] = sliceElem
+				out = append(out, assignStmt(lst,
 					map[string]any{"type": "Call", "func": "listNew", "args": []any{}, "purity": "PureCpu"}))
 				continue
 			}
 			// a `var x []T` declaration initializes the ARRAY store (the
 			// appends/reads use the array store — a var-store "" would
 			// lose every appended item; the dogfood app's own
-			// `var out []map[string]any` in parseTopLevel)
-			out = append(out, assignStmt(n, map[string]any{
+			// `var out []map[string]any` in parseTopLevel). A LOCAL gets a
+			// function-unique slot (scopeLocalStoreName).
+			out = append(out, assignStmt(p.scopeLocalStoreName(n), map[string]any{
 				"type": "Call", "func": "setArray",
-				"args":   []any{strExpr(n), map[string]any{"type": "Array", "elements": []any{}}},
+				"args":   []any{strExpr(p.resolveVar(n)), map[string]any{"type": "Array", "elements": []any{}}},
 				"purity": "Emulable",
 			}))
 			continue
@@ -3833,12 +4004,30 @@ func (p *parser) parseVarSpec() []map[string]any {
 		}
 		if p.atPunct("[") && !p.byteSliceLitAhead() {
 			elems, typ := p.parseArrayLiteral()
-			p.arrays[names[0]] = arrayInfo{elems: elems, typ: typ}
+			// a LOCAL `x := []T{}` gets a function-unique store slot (see
+			// scopeLocalStoreName) so two functions declaring the same
+			// slice name do not share one shell array
+			stn := p.scopeLocalStoreName(names[0])
+			p.arrays[stn] = arrayInfo{elems: elems, typ: typ}
 			p.registerVar(names[0], "Array")
-			return []map[string]any{assignStmt(names[0],
+			// register the SCOPED slot: argToWord's spread gate and the
+			// `for i := range x` bound both consult
+			// varTypes[resolveVar(name)], and an untyped scoped slot made
+			// a plain shell array take the LIST paths — the splice then
+			// emitted listItems against an array store and read [] (the
+			// `fields = append(fields, names...)` layout collapse).
+			p.registerVar(stn, "Array")
+			p.varTypes[stn] = "Array"
+			if p.localModel == nil {
+				p.localModel = map[string]string{}
+			}
+			p.localModel[stn] = "array"
+			delete(p.anyLists, stn)
+			delete(p.anyElem, stn)
+			return []map[string]any{assignStmt(stn,
 				map[string]any{
 					"type": "Call", "func": "setArray",
-					"args":   []any{strExpr(names[0]), map[string]any{"type": "Array", "elements": elems}},
+					"args":   []any{strExpr(stn), map[string]any{"type": "Array", "elements": elems}},
 					"purity": "Emulable",
 				})}
 		}
@@ -4386,7 +4575,26 @@ func (p *parser) parseDottedStmt() []map[string]any {
 					compound := p.tok().text == "+="
 					p.pos++
 					p.skipNL()
-					rhsW = p.exprToWord(p.parseExpr())
+					rv := p.parseExpr()
+					rhsW = p.exprToWord(rv)
+					// A SLICE value written into a container must stay a
+					// slice. exprToWord reads an Array-typed var as
+					// getVar(name) — element 0 — but Go stores the whole
+					// slice, and the self-hosting contract's maps
+					// (structs/structFT/structRaw/structFields) hold
+					// map[string][]string. The scalar read made every
+					// struct layout come out as its FIRST FIELD NAME
+					// instead of the field list, so T{...} never resolved
+					// in the translated frontend.
+					if rv != nil && rv.kind == "var" &&
+						p.varTypes[p.resolveVar(rv.name)] == "Array" &&
+						p.anyListVar(rv.name) == "" {
+						rhsW = map[string]any{
+							"type": "Call", "func": "arrayItems",
+							"args":   []any{strExpr(p.resolveVar(rv.name))},
+							"purity": "PureCpu",
+						}
+					}
 					if compound {
 						// m.f[k] += v ≡ m.f[k] = m.f[k] + v — only a
 						// STRING-valued container concatenates faithfully
@@ -4943,6 +5151,16 @@ func (p *parser) arithNumCalls(e *expr) map[string]any {
 		// String() reads — the num_* call coerces the word to a number
 		return p.exprToWord(e)
 	case "add":
+		// parseAdd records the operator in e.op ("+" OR "-") — ignoring
+		// it lowered every subtraction as an addition. `p.toks[p.pos-1]`
+		// became `p.pos+1`, so parseTypeDecl read the token AFTER the type
+		// name: struct layouts registered under the wrong key ("{" instead
+		// of "tok") and every T{...} literal failed to resolve in the
+		// translated frontend.
+		if e.op == "-" {
+			return map[string]any{"type": "Call", "func": "num_sub",
+				"args": []any{p.arithNumCalls(e.lhs), p.arithNumCalls(e.rhs)}, "purity": "PureCpu"}
+		}
 		return map[string]any{"type": "Call", "func": "num_add",
 			"args": []any{p.arithNumCalls(e.lhs), p.arithNumCalls(e.rhs)}, "purity": "PureCpu"}
 	case "mul":
@@ -5480,8 +5698,8 @@ func (p *parser) parseMapLiteralBody(name string) []map[string]any {
 	p.maps[name] = true
 	p.registerVar(name, "Map")
 	// non-nil init: an EMPTY literal must marshal body as [],
-		// never null (the ingress rejects Block.body: not an array)
-		body := []map[string]any{}
+	// never null (the ingress rejects Block.body: not an array)
+	body := []map[string]any{}
 	empty := true
 	for {
 		p.skipNL()
@@ -5525,7 +5743,7 @@ func (p *parser) parseMapLiteralBody(name string) []map[string]any {
 }
 
 // emptyMapDecl: name was declared as an empty map (`m :=
- // map[K]V{}` emits an empty Block — no assocSet pairs, so p.maps
+// map[K]V{}` emits an empty Block — no assocSet pairs, so p.maps
 // misses it). The first element write creates the assoc array,
 // exactly like the pairs would have. Tracked explicitly (rather
 // than scanning emitted stmts) because decls reorder to the program
@@ -5638,9 +5856,13 @@ func (p *parser) parseAssignStmt() []map[string]any {
 		}
 	}
 	// a type-switch guard var is bound to the guarded value — writing to
-	// it would need a shadow (Refuse > guess; reads alias via resolveVar)
-	if _, ok := p.varAlias[targets[0]]; ok {
-		p.failf("cannot assign to type-switch guard %q (v2)", targets[0])
+	// it would need a shadow (Refuse > guess; reads alias via resolveVar).
+	// ONLY guard aliases: scopeLocalStoreName also uses varAlias for
+	// storage renaming, and those targets are ordinary assignable locals.
+	if _, isLocal := p.localAliases[targets[0]]; !isLocal && targets[0] != "" {
+		if _, ok := p.varAlias[targets[0]]; ok {
+			p.failf("cannot assign to type-switch guard %q (v2)", targets[0])
+		}
 	}
 	// indexed assign: a[1] = "X" → target var "a[1]" (the `arr[1]=X` shape);
 	// a computed key (`a[i] = x`, `toks[p.pos] = t`) renders the key as
@@ -5824,9 +6046,23 @@ func (p *parser) parseAssignStmt() []map[string]any {
 				"purity": "PureCpu",
 			})}
 		}
-		p.registerVar(targets[0], "Int")
-		return []map[string]any{assignStmt(targets[0],
-			arithWrap(arithBin(arithVar(targets[0]), arithOp, arithNum(1))))}
+		// The target must resolve through the SAME alias table the reads
+		// use. `targets` holds BARE parsed names, so a scoped local
+		// (`j := p.pos + 1` mints `j__396`) was incremented at the bare
+		// name while every read — including the enclosing `for j < len(...)`
+		// condition — resolved to the scoped slot. The loop variable then
+		// never advanced and the loop spun forever: the self-hosted
+		// frontend hung on `funcLitAhead`'s
+		//     for j < len(p.toks) && p.toks[j].kind == tNL { j++ }
+		// (the native binary handles the same function fine).
+		// scopeLocalStoreName is idempotent (an already-aliased name
+		// returns its alias) and returns the bare name outside a function,
+		// so the C-style `for ((i++; …))` ForInit lowering — which passes
+		// names this same table already resolved — is unaffected.
+		incName := p.scopeLocalStoreName(targets[0])
+		p.registerVar(incName, "Int")
+		return []map[string]any{assignStmt(incName,
+			arithWrap(arithBin(arithVar(incName), arithOp, arithNum(1))))}
 	}
 	op := ""
 	switch {
@@ -5877,18 +6113,47 @@ func (p *parser) parseAssignStmt() []map[string]any {
 			return []map[string]any{assignStmt(targets[0], strExpr(""))}
 		}
 		if p.isAnyListElem(makeElem) {
-			p.anyLists[targets[0]] = true
-			p.anyElem[targets[0]] = makeElem
-			return []map[string]any{assignStmt(targets[0],
+			// a LOCAL list gets a function-unique store slot: the
+			// any-list mark and the listNew assignment must agree with
+			// the reference the reads/range lowerings resolve to
+			// (`tgts := []dotTgt{…}` then `for i := range tgts` — a bare
+			// name here left the range unable to classify the var).
+			lst := p.scopeLocalStoreName(targets[0])
+			p.anyLists[lst] = true
+			p.anyElem[lst] = makeElem
+			if p.localModel == nil {
+				p.localModel = map[string]string{}
+			}
+			p.localModel[lst] = "list"
+			return []map[string]any{assignStmt(lst,
 				map[string]any{"type": "Call", "func": "listNew", "args": []any{}, "purity": "PureCpu"})}
 		}
 		// rebinding clears stale list marks (see parseVarDecl).
+		stnA := p.scopeLocalStoreName(targets[0])
+		delete(p.anyLists, stnA)
+		delete(p.anyElem, stnA)
+		if p.localModel == nil {
+			p.localModel = map[string]string{}
+		}
+		p.localModel[stnA] = "array"
+		// also clear the BARE name: the append lowering consults
+		// anyListVar(bare) at parse time, and a same-named any-list from
+		// an earlier function left it set — the declaration emitted
+		// setArray (a shell array) while every append emitted listPush
+		// (a list id), so the accumulator stayed empty.
 		delete(p.anyLists, targets[0])
 		delete(p.anyElem, targets[0])
 		p.registerVar(targets[0], "Array")
-		return []map[string]any{assignStmt(targets[0], map[string]any{
+		// register the SCOPED slot too: the append lowering consults
+		// varTypes[resolveVar(name)] to decide setArray vs listPush, and
+		// the bare-name registration above left the scoped slot untyped —
+		// so the model fallback missed and the append emitted listPush
+		// against a shell array.
+		p.registerVar(stnA, "Array")
+		p.varTypes[stnA] = "Array"
+		return []map[string]any{assignStmt(stnA, map[string]any{
 			"type": "Call", "func": "setArray",
-			"args":   []any{strExpr(targets[0]), map[string]any{"type": "Array", "elements": []any{}}},
+			"args":   []any{strExpr(stnA), map[string]any{"type": "Array", "elements": []any{}}},
 			"purity": "Emulable",
 		})}
 	}
@@ -5954,24 +6219,43 @@ func (p *parser) parseAssignStmt() []map[string]any {
 			saveI := i
 			elems, typ := p.parseArrayLiteral()
 			i = saveI
-			p.arrays[targets[i]] = arrayInfo{elems: elems, typ: typ}
+			// a LOCAL `x := []T{...}` gets a function-unique store slot
+			// (see scopeLocalStoreName); reads/writes follow via resolveVar
+			stn := p.scopeLocalStoreName(targets[i])
+			p.arrays[stn] = arrayInfo{elems: elems, typ: typ}
 			p.registerVar(targets[i], "Array")
+			// Register the SCOPED slot as well. argToWord's spread gate,
+			// the `for i := range x` bound and the append model check all
+			// consult varTypes[resolveVar(name)] — an untyped scoped slot
+			// made a plain shell array take the LIST paths, so
+			// `fields = append(fields, names...)` emitted
+			// listItems(getVar("names__N")) against the array store and
+			// spliced [] (every struct layout then registered as "").
+			p.registerVar(stn, "Array")
+			p.varTypes[stn] = "Array"
+			if p.localModel == nil {
+				p.localModel = map[string]string{}
+			}
+			p.localModel[stn] = "array"
 			// rebinding clears stale list marks (see parseVarDecl).
+			delete(p.anyLists, stn)
+			delete(p.anyElem, stn)
 			delete(p.anyLists, targets[i])
 			delete(p.anyElem, targets[i])
 			if p.isAnyListElem(litElem) {
 				// LIST-element slice (`[]tok{...}`, `[]any{...}`): elements
 				// ride a LIST id (shell arrays String-coerce objects).
-				p.anyLists[targets[i]] = true
-				p.anyElem[targets[i]] = litElem
-				pushes := []map[string]any{assignStmt(targets[i],
+				p.anyLists[stn] = true
+				p.anyElem[stn] = litElem
+				p.localModel[stn] = "list"
+				pushes := []map[string]any{assignStmt(stn,
 					map[string]any{"type": "Call", "func": "listNew", "args": []any{}, "purity": "PureCpu"})}
 				for _, el := range elems {
 					pushes = append(pushes, map[string]any{
 						"type": "Expr",
 						"expr": map[string]any{
 							"type": "Call", "func": "listPush",
-							"args":   []any{getVarExpr(targets[i]), el},
+							"args":   []any{getVarExpr(stn), el},
 							"purity": "PureCpu",
 						},
 					})
@@ -5986,11 +6270,11 @@ func (p *parser) parseAssignStmt() []map[string]any {
 				out = append(out, map[string]any{
 					"type": "Assign",
 					"targets": []any{map[string]any{
-						"var": targets[i], "sigil": nil, "indices": []any{},
+						"var": stn, "sigil": nil, "indices": []any{},
 					}},
 					"expr": map[string]any{
 						"type": "Call", "func": "setArray",
-						"args":   []any{strExpr(targets[i]), map[string]any{"type": "Array", "elements": elems}},
+						"args":   []any{strExpr(stn), map[string]any{"type": "Array", "elements": elems}},
 						"purity": "Emulable",
 					},
 				})
@@ -6802,8 +7086,8 @@ func (p *parser) parseAssignStmt() []map[string]any {
 						map[string]any{"type": "Int", "value": i},
 					},
 					"purity": "PureCpu",
-					},
-				})
+				},
+			})
 		}
 		if len(targets) > 1 {
 			return out
@@ -6818,6 +7102,18 @@ func (p *parser) parseAssignStmt() []map[string]any {
 		if name == "" {
 			return nil // f(args) bare call as RHS of `_ :=` — pure side effect
 		}
+		// `name` is the BARE parsed target; every READ of this variable in
+		// the surrounding function resolves through `resolveVar` to the
+		// function-unique alias. Assigning the bare name therefore wrote a
+		// slot nothing reads: parsePostfix's `e := p.parsePrimary()` — a
+		// CALL rhs, so it lands here rather than on the `:=` literal/local
+		// path — declared bare `e` while the loop's reads used `e__23`, so
+		// the final `return e` echoed an empty module-level local and
+		// parsePrimary's value was discarded (the translated frontend
+		// failed every assignment with `unsupported expression ""`).
+		// Resolving here keeps the type registration, the list marks and
+		// both capture shapes on one slot.
+		name = p.scopeLocalStoreName(name)
 		p.noteCallResultType(name, rhs.callee, rhs.args)
 		inner := execStmtTA(calleeName, words, "Spawn", rhs.typeArgs)
 		capture := map[string]any{
@@ -7062,7 +7358,26 @@ func (p *parser) parseAssignStmt() []map[string]any {
 		// `return` before the prelude made it dead code, so the temp
 		// refs read unset ("") at runtime (the dogfood app's own
 		// `funcStmts = append(funcStmts, map[string]any{…})`)
-		if ln := p.anyListVar(rhs.args[0].name); ln != "" {
+		// The declaration's chosen storage model wins over a stale
+		// same-named mark from another function (see localModel). NO
+		// `goto` here: the A1 has no goto node (it lowered to
+		// sh2.unsupported and killed the run).
+		// Model resolution, in order of authority:
+		//   1. localModel (what THIS scope's declaration chose),
+		//   2. a plain-Array varTypes entry — `names := []string{}`
+		//      registers Array, and a scalar-element slice is a SHELL
+		//      ARRAY, never a list id, so listPush would be wrong no
+		//      matter what a same-named var in another function did.
+		appName := rhs.args[0].name
+		declModel := p.localModel[p.resolveVar(appName)]
+		if declModel == "" {
+			declModel = p.localModel[appName]
+		}
+		if declModel == "" && p.varTypes[p.resolveVar(appName)] == "Array" &&
+			p.anyListVar(appName) == "" {
+			declModel = "array"
+		}
+		if ln := p.anyListVar(appName); ln != "" && declModel != "array" && declModel != "map" {
 			// ANY-LIST append (`out = append(out, tok{...})` — struct
 			// elements ride a list id): listPush each element. A SPREAD
 			// element (`stmts = append(stmts, sub...)` — the golib's own
@@ -7094,9 +7409,15 @@ func (p *parser) parseAssignStmt() []map[string]any {
 			}
 			return out
 		}
-		out := append(appendPre, assignStmt(rhs.args[0].name, map[string]any{
+		// the DESTINATION must resolve through varAlias: a scoped local
+		// (`var targets []string` -> `targets__32`) is DECLARED under the
+		// unique name, so appending to the bare name fills a different
+		// slot than the one declared — the array read back empty and
+		// `i >= len(targets)` fired on the first iteration.
+		appDst := p.resolveVar(rhs.args[0].name)
+		out := append(appendPre, assignStmt(appDst, map[string]any{
 			"type": "Call", "func": "setArrayAppend",
-			"args":   []any{strExpr(rhs.args[0].name), map[string]any{"type": "Array", "elements": elems}},
+			"args":   []any{strExpr(appDst), map[string]any{"type": "Array", "elements": elems}},
 			"purity": "Emulable",
 		}))
 		return out
@@ -7194,7 +7515,22 @@ func (p *parser) parseAssignStmt() []map[string]any {
 	if len(targets) == 2 && rhs.kind == "index" && !p.atPunct(",") {
 		w := p.exprToWord(rhs)
 		vName, okName := targets[0], targets[1]
-		p.registerVar(vName, "Str")
+		// A map[string][]string read (`layout, ok := p.structs[t.text]`):
+		// the value is a SLICE, so the target must register Array — else
+		// the argToWord slice protocol (arrayToList) never fires and the
+		// slice crosses a call boundary joined into a string
+		// (parseStructLit's listLen then reads 0, so every keyed T{...}
+		// field fails as "unknown field").
+		if sliceValuedMapRead(p, rhs) {
+			// DIRECT assignment, not registerVar: registerVar keeps the
+			// FIRST type seen (`if varTypes[name]=="" || =="Array"`), and
+			// `layout` is frequently pre-typed Str by an earlier
+			// registration, which silently ignored the Array mark.
+			p.registerVar(vName, "Str")
+			p.varTypes[vName] = "Array"
+		} else {
+			p.registerVar(vName, "Str")
+		}
 		p.registerVar(okName, "Bool")
 		out := []map[string]any{assignStmt(vName, w)}
 		if okName != "_" {
@@ -7390,17 +7726,27 @@ func (p *parser) parseAssignStmt() []map[string]any {
 	}
 	if op == "+=" {
 		// STRING concat only when the TARGET is a string (or the rhs
+		// This whole augment branch writes the target, so it must write the
+		// SAME slot the reads resolve to. `targets` holds the bare parsed
+		// name while resolveVar returns the function-unique alias, so a
+		// scoped local was augmented at the bare name and read at the
+		// scoped slot — lex's `i += len(op)` advanced a variable nothing
+		// read, the scan restarted at the same byte, and the self-hosted
+		// frontend produced `+` `+` for every multi-char operator instead
+		// of `++`/`:=` (which then mis-parsed as two statements and died in
+		// parseAssignStmt on "unsupported statement starting with =").
+		stn := p.scopeLocalStoreName(targets[0])
 		// carries object reads); pure-numeric stays arithmetic
 		tIsStr := p.varTypes[p.resolveVar(targets[0])] == "Str"
 		if tIsStr || p.hasObjectRead(rhs) || p.addHasString(rhs) {
-			cur := getVarExpr(targets[0])
+			cur := getVarExpr(stn)
 			cat := interpParts([]any{
 				map[string]any{"kind": "expr", "expr": cur},
 				map[string]any{"kind": "expr", "expr": w},
 			})
-			return []map[string]any{assignStmt(targets[0], cat)}
+			return []map[string]any{assignStmt(stn, cat)}
 		}
-		p.registerVar(targets[0], "Int")
+		p.registerVar(stn, "Int")
 		// i += len(op) — a string/array LENGTH in arithmetic: the Arith
 		// AST can't express `${#op}`, so lower to the arith-TEXT form
 		// (the runtime's evalArith expands ${#...} — the golib's
@@ -7412,14 +7758,14 @@ func (p *parser) parseAssignStmt() []map[string]any {
 			} else {
 				lenWord = "${#" + p.resolveVar(rhs.target.name) + "[@]}"
 			}
-			return []map[string]any{assignStmt(targets[0], map[string]any{
+			return []map[string]any{assignStmt(stn, map[string]any{
 				"type": "Call", "func": "arith",
-				"args":   []any{strExpr(targets[0] + " + " + lenWord)},
+				"args":   []any{strExpr(stn + " + " + lenWord)},
 				"purity": "PureCpu",
 			})}
 		}
-		return []map[string]any{assignStmt(targets[0],
-			arithWrap(arithBin(arithVar(targets[0]), "+", p.exprToArith(rhs))))}
+		return []map[string]any{assignStmt(stn,
+			arithWrap(arithBin(arithVar(stn), "+", p.exprToArith(rhs))))}
 	}
 	// inside a func: `name := lit` on a fresh var → local name=lit
 	if p.inFunc && op == ":=" && !p.fnParams[targets[0]] && !p.outer[targets[0]] && !p.fnLocals[targets[0]] {
@@ -7470,21 +7816,52 @@ func (p *parser) parseAssignStmt() []map[string]any {
 		// fnCall-status discard as the return echo); returned as a
 		// VAR (echo-ID) so the node resolves structurally.
 		if lv, ok := p.assignLiteral(rhs); ok {
+			// The declared name MUST be the SAME slot the reads resolve
+			// to. `targets` holds the BARE parsed name, while `resolveVar`
+			// returns the function-unique alias this `:=` is about to
+			// mint — so emitting `local j=0` against reads of `j__4`
+			// declared one variable and initialized another. The loop then
+			// never advanced (`for i < len(src) { … i++ }` in lex, and
+			// funcLitAhead's newline skip): six call sites in this file,
+			// and the self-hosted frontend spun forever on its own lexer.
+			// The local-decl path is the LAST writer of the alias, so
+			// scoping here also registers it for the reads below.
+			stn := p.scopeLocalStoreName(targets[0])
 			out := []map[string]any{}
 			out = append(out, map[string]any{
 				"type": "Expr",
 				"expr": map[string]any{
 					"type": "Call", "func": "exec",
-					"args":   []any{strExpr("local"), map[string]any{"type": "Array", "elements": []any{strExpr(targets[0] + "=" + lv)}}},
+					"args":   []any{strExpr("local"), map[string]any{"type": "Array", "elements": []any{strExpr(stn + "=" + lv)}}},
 					"purity": "Emulable",
 				},
 			})
 			return out
 		}
-		return []map[string]any{assignStmt(targets[0], w)}
+		if !p.inFunc {
+			if p.topLevelNames == nil {
+				p.topLevelNames = map[string]bool{}
+			}
+			p.topLevelNames[targets[0]] = true
+		}
+		return []map[string]any{assignStmt(p.scopeLocalStoreName(targets[0]), w)}
 	}
 	p.registerAssignType(targets[0], rhs, w)
-	return []map[string]any{assignStmt(targets[0], w)}
+	if !p.inFunc {
+		if p.topLevelNames == nil {
+			p.topLevelNames = map[string]bool{}
+		}
+		p.topLevelNames[targets[0]] = true
+	}
+	// A `:=` in a function body gets a function-unique STORE name. Every
+	// `x := p.parseExpr()` lowers to a bare file-level store slot, and this
+	// file has `arg := p.parseExpr()` in 8 different functions plus `e`,
+	// `out`, `w` and friends in dozens — so one function's assignment
+	// overwrote another's local and the reader saw whatever ran last
+	// (`arg` held the PARSER object in parsePrimary, so `arg.kind`,
+	// `arg.name` and every `arg`-derived read were garbage).
+	// Top-level decls keep their bare name (they are the globals).
+	return []map[string]any{assignStmt(p.scopeLocalStoreName(targets[0]), w)}
 }
 
 // registerAssignType — the target's type for an assign RHS: a byte read
@@ -7495,15 +7872,38 @@ func (p *parser) registerAssignType(name string, rhs *expr, w map[string]any) {
 	if rhs.kind == "index" && rhs.target != nil && rhs.target.kind == "var" &&
 		p.varTypes[p.resolveVar(rhs.target.name)] != "Array" {
 		p.registerVar(name, "Byte")
+	} else if rhs.kind == "index" && rhs.target != nil && rhs.target.kind == "var" &&
+		(rhs.target.name == "structs" || rhs.target.name == "structFT" ||
+			rhs.target.name == "structRaw" || rhs.target.name == "structFields") {
+		// The self-hosting contract's `map[string][]string` fields
+		// (p.structs/structFT/structRaw/structFields): the VALUE is a
+		// SLICE. `if layout, ok := p.structs[t.text]; ok` binds layout —
+		// without the Array registration the argToWord slice protocol
+		// (arrayToList) never fired, so the value crossed the call
+		// boundary as a joined string and parseStructLit's listLen read
+		// 0 — every keyed T{...} field then failed as "unknown field".
+		p.registerVar(name, "Array")
 	} else if rhs.kind == "structlit" {
 		p.registerVar(name, "Struct")
 		p.varStructTypes[name] = rhs.name
 	} else if rhs.kind == "index" && rhs.target != nil && rhs.target.kind == "member" {
 		if i := strings.LastIndex(rhs.target.name, "."); i > 0 {
 			base, field := rhs.target.name[:i], rhs.target.name[i+1:]
-			if elt := p.structFieldTypes[p.structTypeOf(base)][field]; elt != "" {
+			elt := p.structFieldTypes[p.structTypeOf(base)][field]
+			if elt != "" {
 				if _, ok := p.structFields[elt]; ok {
 					p.registerVar(name, "Struct")
+					return
+				}
+				// A `map[string][]string` field read (`layout, ok :=
+				// p.structs[t.text]`): the VALUE is a SLICE, so register
+				// the target Array — else the argToWord slice protocol
+				// (arrayToList) never fires, the value crosses the call
+				// boundary joined into a string, and parseStructLit's
+				// listLen reads 0 so every keyed T{...} field fails as
+				// "unknown field".
+				if strings.HasPrefix(elt, "[]") {
+					p.registerVar(name, "Array")
 					return
 				}
 			}
@@ -7527,6 +7927,32 @@ func (p *parser) registerAssignType(name string, rhs *expr, w map[string]any) {
 	} else {
 		p.registerVar(name, p.wordType(w))
 	}
+}
+
+// sliceValuedMapRead reports whether a comma-ok map read (`v, ok := m[k]`)
+// yields a SLICE value, i.e. `m` is one of the self-hosting contract's
+// map[string][]string fields or a []string-typed struct field.
+func sliceValuedMapRead(p *parser, rhs *expr) bool {
+	if rhs == nil || rhs.target == nil {
+		return false
+	}
+	if rhs.target.kind == "var" {
+		switch rhs.target.name {
+		case "structs", "structFT", "structRaw", "structFields", "fieldVals":
+			return true
+		}
+	}
+	if rhs.target.kind == "member" {
+		field := rhs.target.name
+		if i := strings.LastIndex(rhs.target.name, "."); i >= 0 {
+			field = rhs.target.name[i+1:]
+		}
+		switch field {
+		case "structs", "structFT", "structRaw", "structFields", "structFieldTypes":
+			return true
+		}
+	}
+	return false
 }
 
 // isAddStrOperand: whether an addition operand is provably a Go string
@@ -7624,8 +8050,8 @@ func (p *parser) parseMapLiteral(targets []string) []map[string]any {
 	p.maps[targets[0]] = true
 	p.registerVar(targets[0], "Map")
 	// non-nil init: an EMPTY literal must marshal body as [],
-		// never null (the ingress rejects Block.body: not an array)
-		body := []map[string]any{}
+	// never null (the ingress rejects Block.body: not an array)
+	body := []map[string]any{}
 	for {
 		p.skipNL()
 		if p.atPunct("}") {
@@ -8479,6 +8905,18 @@ func (p *parser) parseFor() []map[string]any {
 		switch {
 		case rv.kind == "var" && !p.maps[rv.name] && p.varTypes[p.resolveVar(rv.name)] == "Array":
 			lenExpr = joinCall(paramCall("slice", "#"+p.paramName(rv.name), "@", ""))
+		case rv.kind == "var" && p.anyListVar(rv.name) != "":
+			// ANY-LIST index-only range (`for i := range tgts` — a
+			// struct/any-element slice rides a LIST id): the bound is
+			// listLen(id). The value form had its own branch; without
+			// this one the index form fell through to the refusal, so a
+			// `[]dotTgt` loop could not be written at all.
+			ln := p.anyListVar(rv.name)
+			lenExpr = map[string]any{
+				"type": "Call", "func": "listLen",
+				"args":   []any{getVarExpr(ln)},
+				"purity": "PureCpu",
+			}
 		case rv.kind == "member":
 			if lw, tag := p.structFieldWord(rv.name); tag == "list" {
 				lenExpr = map[string]any{
@@ -9049,8 +9487,32 @@ func (p *parser) parseFor() []map[string]any {
 					"init": init, "cond": cond2, "step": step, "body": b2,
 				}}
 			}
-			if info, ok := p.arrays[rv.name]; ok {
+			// The RANGE BASE must be looked up under the SAME store name
+			// the declaration wrote. A local slice/map gets a
+			// function-unique slot (`multiOps` -> `multiOps__2`), so every
+			// `p.arrays[rv.name]` / `p.varTypes[rv.name]` / literal-word
+			// use of the BARE name missed the declaration: lex's
+			// `for _, op := range multiOps` then iterated an empty array,
+			// matched no operator, and `++`/`:=` fell through to single
+			// puncts (the translated frontend read Go's own source as
+			// `+` `+` and died in parseAssignStmt).
+			rnRange := p.resolveVar(rv.name)
+			if info, ok := p.arrays[rnRange]; ok && len(info.elems) > 0 {
 				iter, typ = info.elems, info.typ
+			} else if _, ok := p.arrays[rnRange]; ok && p.varTypes[rnRange] == "Array" {
+				// STATICALLY EMPTY but runtime-loaded (`names :=
+				// []string{}` then `names = append(names, …)` — the
+				// golib's field collection): the static elems list is
+				// EMPTY, so the old `info.elems` iter produced a For over
+				// `[]` and the body never ran — the accumulation silently
+				// stayed empty. Fall through to the runtime store read
+				// (the same param("slice", name, "@", "") contract the
+				// Array-typed branch below uses).
+				body := p.parseBlockStmts()
+				p.registerVar(v, "Str")
+				return p.rangeFor(idxVar, v, map[string]any{"type": "Array", "elements": []any{
+					paramCall("slice", rnRange, "@", ""),
+				}}, body)
 			} else if ln := p.anyListVar(rv.name); ln != "" {
 				// ANY-LIST var (`for _, t := range toks` — struct/any
 				// elements ride a list id): C-style ForInit over
@@ -9112,7 +9574,7 @@ func (p *parser) parseFor() []map[string]any {
 				body := p.parseBlockStmts()
 				p.registerVar(v, "Str")
 				return p.rangeFor(idxVar, v, map[string]any{"type": "Array", "elements": []any{
-					paramCall("slice", rv.name, "@", ""),
+					paramCall("slice", p.resolveVar(rv.name), "@", ""),
 				}}, body)
 			} else {
 				// UNKNOWN array name: a captured multi-line return —
@@ -9218,6 +9680,16 @@ func (p *parser) parseFor() []map[string]any {
 		p.pos++ // :=
 		p.skipNL()
 		rhs := p.parseExpr()
+		// The C-style header counter must live in the SAME slot its reads
+		// resolve to. `condToJSON(cond)` below resolves `i`/`k` through
+		// resolveVar to the function-unique alias, while the init and the
+		// post wrote the BARE name — so `for i := 0; i < len(raw); i++`
+		// initialised `i` against a condition reading `i__9`, the counter
+		// never advanced, and the loop spun forever. That is the spin
+		// behind the self-host `name := "world"` failure: decodeGoStr's
+		// own escape loop never terminated, so the 14 s capture cap
+		// tripped and parsePostfix returned "".
+		initName = p.scopeLocalStoreName(initName)
 		pre := []map[string]any{assignStmt(initName, p.exprToWord(rhs))}
 		p.registerVar(initName, "Int")
 		// FORCE the counter type: a C-style for header (`for k := p.pos-6;
@@ -9254,6 +9726,10 @@ func (p *parser) parseFor() []map[string]any {
 			} else {
 				p.expect(tPunct, "++")
 			}
+			// Same slot as the init and the condition (see initName above):
+			// the post-increment is what ADVANCES the counter, so writing
+			// the bare name here is exactly the spin.
+			postName = p.scopeLocalStoreName(postName)
 			post = []map[string]any{assignStmt(postName,
 				arithWrap(arithBin(arithVar(postName), postOp, arithNum(postDelta))))}
 		}
@@ -9679,6 +10155,99 @@ func (p *parser) resolveVar(name string) string {
 	return name
 }
 
+// scopeLocalStoreName gives a LOCAL slice/map declaration a
+// function-unique store name and aliases the Go name to it.
+//
+// Why: `var words []string` (and `x := []T{}`) lowers to
+// setArray("words", …) with every read lowering to the same bare name, so
+// the name IS the storage. Two functions declaring `words` therefore share
+// one array slot — and this file declares `words` in 17 different
+// functions, `out` in 11, `args` in 6. The later function's `setArray`
+// reset wipes the earlier one's items. Aliasing the declaration to a
+// unique name (`words__7`) isolates them; reads and writes follow via
+// resolveVar, and the alias is dropped when the function's scope ends.
+//
+// Top-level declarations keep their bare name: they are the program's
+// globals, and several are read deliberately across functions
+// (`__ptlOut`, the lexer tables).
+func (p *parser) scopeLocalStoreName(name string) string {
+	if !p.inFunc {
+		return name // top-level: the bare name IS the global slot
+	}
+	if now := p.resolveVar(name); now != name {
+		return now // already aliased in this scope
+	}
+	if p.fnParams[name] {
+		return name // a PARAM rides the positional protocol, never the store
+	}
+	// A name already bound at TOP LEVEL (`g := 0` then a closure writing
+	// `g = 1`) is a GLOBAL: scoping it inside the closure would give the
+	// write a private slot while every read outside still resolves to the
+	// global, so t42_global_mut silently lost the mutation.
+	if p.outer[name] && p.topLevelNames[name] {
+		return name
+	}
+	if p.localAliases == nil {
+		p.localAliases = map[string]string{}
+	}
+	if p.fnLocalAliases == nil {
+		p.fnLocalAliases = map[string]bool{}
+		p.fnLocalAliasOrder = nil
+	}
+	// a name declared in an ENCLOSING scope must stay visible to nested
+	// closures, so alias only the FIRST declaration in this function
+	if p.fnLocalAliases[name] {
+		return p.localAliases[name]
+	}
+	p.localSeq++
+	uniq := name + "__" + strconv.Itoa(p.localSeq)
+	p.varAlias[name] = uniq
+	p.localAliases[name] = uniq
+	p.fnLocalAliases[name] = true
+	p.fnLocalAliasOrder = append(p.fnLocalAliasOrder, name)
+	// The fresh slot MUST start unmarked. anyLists/anyElem/varTypes are
+	// keyed by NAME and persist across functions, so a same-named var from
+	// an earlier function left a stale "this is an any-list" mark that the
+	// new declaration's own classification disagrees with — the decl
+	// emitted setArray (a shell array) while every subsequent `append`
+	// emitted listPush (a list id), so the accumulator stayed empty and
+	// every struct layout registered as "". Clearing here makes the decl
+	// and the appends resolve to the same model.
+	delete(p.anyLists, uniq)
+	delete(p.anyElem, uniq)
+	delete(p.arrays, uniq)
+	if p.localModel != nil {
+		delete(p.localModel, uniq)
+	}
+	// A fresh scoped slot also invalidates the BARE-name marks: the
+	// append lowering consults anyListVar(bare) as well, and a
+	// same-named any-list from an earlier function left it set — the
+	// declaration emitted setArray (a shell array) while the appends
+	// emitted listPush (a list id), so the accumulator stayed empty.
+	delete(p.anyLists, name)
+	delete(p.anyElem, name)
+	if p.varTypes != nil {
+		delete(p.varTypes, uniq)
+	}
+	return uniq
+}
+
+// endFuncLocalScope drops the aliases minted for the function that just
+// finished parsing (called from the post-body restore sites). Driven by the
+// ORDERED name list rather than a `range` over the map: the frontend's own
+// range lowering refuses `for k := range <struct-field map>` (this file is
+// its own input), and a slice of names is the shape it does support.
+func (p *parser) endFuncLocalScope() {
+	names := p.fnLocalAliasOrder
+	p.fnLocalAliasOrder = p.fnLocalAliasOrder[:0]
+	for _, name := range names {
+		delete(p.varAlias, name)
+		delete(p.localAliases, name)
+	}
+	p.fnLocalAliases = map[string]bool{}
+	p.fnLocalAliasOrder = nil
+}
+
 func (p *parser) parseSwitchBody() []map[string]any {
 	out := []map[string]any{}
 	for {
@@ -9886,7 +10455,22 @@ func (p *parser) registerVar(name, typ string) {
 	if p.varTypes[name] == "" || p.varTypes[name] == "Array" {
 		p.varTypes[name] = typ
 	}
-	p.outer[name] = true
+	// `outer` means "bound at TOP LEVEL" (a global), and it is load-bearing
+	// in two places: scopeLocalStoreName keeps a global's bare name, and
+	// the `:=` scoping branch is SKIPPED for one. Marking EVERY registered
+	// name outer leaked a function-local into that state — the first
+	// registerVar("e", …) anywhere in the file (e.g. `e := p.parseOr()` in
+	// parseExpr, which registers through registerAssignType) set
+	// outer["e"], so every LATER function's `e := …` skipped the scoping
+	// branch and declared the BARE slot while its body's reads resolved to
+	// the scoped alias. In parsePostfix that split `e` in two: the
+	// declaration wrote bare `e`, the loop's reads read `e__N`, and the
+	// final `return e` echoed an empty module local — parsePrimary's value
+	// was discarded, so every assignment failed with
+	// `unsupported expression ""` on the self-host path.
+	if !p.inFunc {
+		p.outer[name] = true
+	}
 }
 
 func (p *parser) wordType(w map[string]any) string {
@@ -10250,6 +10834,28 @@ func (p *parser) argToWord(e *expr) map[string]any {
 		}
 		rn := p.resolveVar(e.name)
 		isSliceParam := p.paramSlice[e.name] || p.paramSlice[rn]
+		// A slice param whose ELEMENT TYPE is a plain scalar is a genuine
+		// shell ARRAY here — its word is arrayItems(name), NOT a list id.
+		// paramSlice is accumulated across declarations (a documented
+		// scope leak), so a same-named LOCAL (`names := []string{}`) in a
+		// later function inherits the mark; routing that through the
+		// list-id path spliced listItems(getVar("names")) — a plain array
+		// read as a list id — so parseTypeDecl's `fields = append(fields,
+		// names...)` appended NOTHING and every struct layout came out
+		// empty. Trust the CURRENT element typing first: an any-list var
+		// is a list id, a plain-Array var is a shell array.
+		// Trust the SCOPED slot's registration over the bare-name mark:
+		// the bare name is shared across functions, so a same-named
+		// any-list anywhere in the file left anyLists[bare] set and this
+		// splice kept choosing listItems against a shell array — the
+		// exact `fields = append(fields, names...)` shape that empties
+		// every struct layout. scopeLocalStoreName clears the bare marks
+		// on every scoped declaration, so a scoped name that is NOT in
+		// anyLists is a plain shell array.
+		scopedArray := p.varTypes[rn] == "Array" && !p.anyLists[rn] && p.localModel[rn] != "list"
+		if p.varTypes[rn] == "Array" && (p.anyListVar(e.name) == "" || scopedArray) {
+			isSliceParam = false
+		}
 		if e.kind != "var" ||
 			(p.varTypes[rn] != "Array" && p.anyListVar(e.name) == "" && !isSliceParam) {
 			p.failf("variadic spread needs an array-typed var (v2)")
@@ -10296,8 +10902,8 @@ func (p *parser) argToWord(e *expr) map[string]any {
 			return map[string]any{
 				"type": "Call", "func": "arrayToList",
 				"args":   []any{strExpr(rn)},
-					"purity": "PureCpu",
-				}
+				"purity": "PureCpu",
+			}
 		}
 		if e.name == p.variadicParam && p.variadicParam != "" {
 			// forwarding the current variadic (`g(parts)` — a shell
@@ -10305,9 +10911,9 @@ func (p *parser) argToWord(e *expr) map[string]any {
 			return map[string]any{
 				"type": "Call", "func": "arrayToList",
 				"args":   []any{strExpr(rn)},
-					"purity": "PureCpu",
-				}
+				"purity": "PureCpu",
 			}
+		}
 	}
 	return p.exprToWord(e)
 }
@@ -12265,16 +12871,16 @@ func (p *parser) condToJSON(c *expr) map[string]any {
 			}
 			orEmptyTrue := map[string]any{
 				"type": "BinOp", "op": "Or",
-				"lhs":  testCall("\"$" + tmp + "\"=\"\""),
-				"rhs":  testCall("\"$" + tmp + "\"=\"true\""),
+				"lhs": testCall("\"$" + tmp + "\"=\"\""),
+				"rhs": testCall("\"$" + tmp + "\"=\"true\""),
 			}
 			return map[string]any{
 				"type": "BinOp", "op": "And",
 				"lhs": assignC,
 				"rhs": map[string]any{
 					"type": "BinOp", "op": "And",
-					"lhs":  testCall(`"$?"=="0"`),
-					"rhs":  orEmptyTrue,
+					"lhs": testCall(`"$?"=="0"`),
+					"rhs": orEmptyTrue,
 				},
 			}
 		}
@@ -12313,9 +12919,9 @@ func (p *parser) condToJSON(c *expr) map[string]any {
 	// fully inline BinOp with no helper calls and no ok-flags. Placed
 	// BEFORE the strict-BinOp below because its `ok1 && ok2` check
 	// passes spuriously in JS (refusal echoes "false", which is
-		// truthy/non-empty), building degenerate BinOps with empty
-		// operands that poison output. simpleCmpWord nil-checks are
-		// immune (nil maps, not bool strings).
+	// truthy/non-empty), building degenerate BinOps with empty
+	// operands that poison output. simpleCmpWord nil-checks are
+	// immune (nil maps, not bool strings).
 	if c.kind == "binop" && (c.BOp == "==" || c.BOp == "!=") {
 		if lwS := p.simpleCmpWord(c.lhs); lwS != nil {
 			if rwS := p.simpleCmpWord(c.rhs); rwS != nil {
@@ -13497,6 +14103,16 @@ func (p *parser) prescanFuncNames() {
 			p.structs[p.toks[i+1].text] = []string{}
 			p.structFT[p.toks[i+1].text] = []string{}
 			p.structRaw[p.toks[i+1].text] = []string{}
+			// structFields too: it is the map the composite-literal
+			// lowering tests for KNOWN-ness (`if _, ok :=
+			// p.structFields[cname]; !ok`). Omitting it here made the
+			// pre-registration half-done: a struct declared LATER in
+			// the file was absent from structFields while present in
+			// the other three, so `T{...}` fell through to the
+			// unknown-type path, the brace was swallowed, and the
+			// parse derailed with an empty-callee call in
+			// parseAssignStmt ("unsupported call %q in word position").
+			p.structFields[p.toks[i+1].text] = []string{}
 		}
 	}
 	for i, t := range p.toks {
@@ -13548,24 +14164,22 @@ func (p *parser) prescanFuncNames() {
 			var retRaw string
 			for k < len(p.toks) && !(p.toks[k].kind == tPunct && p.toks[k].text == "{") && p.toks[k].kind != tNL && p.toks[k].kind != tEOF {
 				retRaw += p.toks[k].text
-				if p.toks[k].kind == tIdent {
-					base := p.toks[k].text
-					// a POINTER element (`[]*expr`) keeps its `*` so
-					// callFirstListElem returns "" (pointer elements ride
-					// shell arrays as arena-id strings, never the list-id
-					// path) — without it `[]*expr` is misread as a
-					// struct-slice of `expr`.
-					if k > 0 && p.toks[k-1].kind == tPunct && p.toks[k-1].text == "*" {
-						base = "*" + base
-					}
-					// record provisional per-position ret types (resolved
-					// against structs at use time) — forward-referenced
-					// `(T, bool)`/`*T` returns arm comma-ok Bool and the
-					// dotted-field paths BEFORE the decl parse commits
-					posIds = append(posIds, base)
-					p.prescanRet[name] = base
-				}
 				k++
+			}
+			// Per-POSITION type bases, via the same extractor the decl
+			// parse uses. Recording every ident here gave
+			// `(stmts []map[string]any, ok bool)` six entries
+			// (stmts/map/string/any/ok/bool) for two positions, so a
+			// forward call site read posIds[0] as the NAME `stmts` and
+			// typed the slice slot "Str" — the failure that surfaced as
+			// "variadic spread needs an array-typed var" in
+			// returnAppendList.
+			posIds = returnPosBases(p.toks, j, k)
+			if len(posIds) > 0 {
+				p.prescanRet[name] = posIds[len(posIds)-1]
+				if len(posIds) == 1 {
+					p.prescanRet[name] = posIds[0]
+				}
 			}
 			// a MAP return (`map[string]any`) — the prescan stores the
 			// FULL raw text so forward call sites bind the target as a
@@ -13573,10 +14187,21 @@ func (p *parser) prescanFuncNames() {
 			if strings.HasPrefix(retRaw, "map[") {
 				p.prescanRet[name] = retRaw
 			}
-			// a SLICE return (`[]any`) — keep the prefix so forward
-			// call sites route the result to an Array store var
-			if strings.HasPrefix(retRaw, "[]") && len(posIds) > 0 {
-				p.prescanRet[name] = "[]" + posIds[len(posIds)-1]
+			// a SLICE return — keep the prefix so forward call sites route
+			// the result to an Array store var. Go writes the slice-ness in
+			// three places: a bare `[]T`, a grouped `([]T, error)`, and a
+			// NAMED result `(stmts []T, ok bool)`. Only the bare form has
+			// the `[]` at the START of retRaw, so the grouped/named forms
+			// used to miss it — `sub, ok := p.spreadAppendPart(tmp, a)`
+			// then registered the slice slot "Str" and the caller's spread
+			// failed "variadic spread needs an array-typed var".
+			// A per-position `map` base is the grouped/named spelling of a
+			// slice whose element is a map or struct (callFirstListElem
+			// treats it as a list), so mark the prefix there too.
+			if !strings.HasPrefix(retRaw, "map[") && len(posIds) > 0 {
+				if strings.Contains(retRaw, "[]") || posIds[0] == "map" {
+					p.prescanRet[name] = "[]" + posIds[0]
+				}
 			}
 			if len(posIds) > 0 {
 				p.fnRetIdents[name] = posIds
@@ -13594,42 +14219,45 @@ func Shir(src string) ([]byte, error) {
 		return nil, err
 	}
 	p := &parser{
-		toks:        toks,
-		varTypes:    map[string]string{},
-		consts:      map[string]int{},
-		constStrs:   map[string]string{},
-		arrays:      map[string]arrayInfo{},
-		anyLists:    map[string]bool{},
-		anyElem:     map[string]string{},
-		maps:        map[string]bool{},
-		anyValMaps:  map[string]bool{},
-		emptyMaps:   map[string]bool{},
-		bufs:        map[string]string{},
-		cmds:        map[string][]*expr{},
-		stdinRdr:    map[string]bool{},
-		fnNames:     map[string]bool{},
-		outer:       map[string]bool{},
-		varAlias:    map[string]string{},
-		structs:     map[string][]string{},
-		structFT:    map[string][]string{},
-		structRaw:   map[string][]string{},
-		bufDyn:      map[string]bool{},
-		prescanRet:  map[string]string{},
-		pkgNames:    map[string]bool{},
-		importAlias: map[string]string{},
-		fnRetIdents: map[string][]string{},
-		boolFuncs:   map[string]bool{},
-		readDirVars: map[string]string{},
-		splitNVars:  make(map[string]splitNInfo),
-		cgoObjs:     map[string]bool{},
-		varStruct:   map[string]string{},
-		fnSig:       map[string][2]string{},
-		fnParams:    map[string]bool{},
-		fnParamOrd:  []string{},
-		fnLocals:    map[string]bool{},
-		paramTypes:  map[string]string{},
-		regexpVars:  map[string]string{},
-		paramSlice:  map[string]bool{},
+		toks:           toks,
+		varTypes:       map[string]string{},
+		consts:         map[string]int{},
+		constStrs:      map[string]string{},
+		arrays:         map[string]arrayInfo{},
+		anyLists:       map[string]bool{},
+		anyElem:        map[string]string{},
+		maps:           map[string]bool{},
+		anyValMaps:     map[string]bool{},
+		emptyMaps:      map[string]bool{},
+		bufs:           map[string]string{},
+		cmds:           map[string][]*expr{},
+		stdinRdr:       map[string]bool{},
+		fnNames:        map[string]bool{},
+		outer:          map[string]bool{},
+		varAlias:       map[string]string{},
+		localAliases:   map[string]string{},
+		topLevelNames:  map[string]bool{},
+		fnLocalAliases: map[string]bool{},
+		structs:        map[string][]string{},
+		structFT:       map[string][]string{},
+		structRaw:      map[string][]string{},
+		bufDyn:         map[string]bool{},
+		prescanRet:     map[string]string{},
+		pkgNames:       map[string]bool{},
+		importAlias:    map[string]string{},
+		fnRetIdents:    map[string][]string{},
+		boolFuncs:      map[string]bool{},
+		readDirVars:    map[string]string{},
+		splitNVars:     make(map[string]splitNInfo),
+		cgoObjs:        map[string]bool{},
+		varStruct:      map[string]string{},
+		fnSig:          map[string][2]string{},
+		fnParams:       map[string]bool{},
+		fnParamOrd:     []string{},
+		fnLocals:       map[string]bool{},
+		paramTypes:     map[string]string{},
+		regexpVars:     map[string]string{},
+		paramSlice:     map[string]bool{},
 		// the self-hosting contract's maps (positional composite
 		// literals, element types, receiver typing, runtime buffers)
 		structFields:     map[string][]string{},
