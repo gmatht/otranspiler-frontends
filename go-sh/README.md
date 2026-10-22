@@ -1,78 +1,54 @@
 # go-sh
 
-The Go port of the [shell-subset frontend](../py-sh/pysh.py), emitting the
-same **ShIR JSON (A1 contract)** that `debashc --shir` produces. Mirrors
-every pinned rule from `frontends/plan.md` (L2 word shaping, L3
-var_types, A2/A3 annotations, A4 purity).
+**Go source → shIR JSON (A1 contract).** A hand-rolled lexer + recursive-descent
+parser for the v2 Go subset described in the header of `go-sh.go`, lowering to
+the exact A1 node shapes the core frontend produces for the equivalent shell
+construct. The contract (`sh2perl/src/shir_json.rs`) is the source of truth.
 
-## Status
+This started as a line-by-line Go port of the Python shell frontend
+(`../py-sh/pysh.py`); the 2026-08-06 rewrite replaced that scanner/parser with
+a Go-source parser. Only the emitter rules (word shaping, var_types, purity)
+are still shared with `pysh`.
 
-**Scaffold — not yet compiled or run in this environment** (no `go`
-toolchain available). The code is a line-by-line port of `pysh.py` and is
-intended to be byte-identical to the core frontend on the v1 subset. When
-a Go toolchain is present:
+## Build and gate
 
 ```sh
 cd frontends/go-sh
-go build -o go-sh .
-./go-sh --shir testdata/t01_echo.sh --raw > /tmp/g.json
-debashc --shir testdata/t01_echo.sh --raw > /tmp/c.json
-diff /tmp/g.json /tmp/c.json   # should be empty (byte-identical)
+make build      # go build -o go-sh ./cmd/go-sh
+make test       # 1) A1 ingress acceptance  2) executed-stdout oracle
 ```
 
-The same byte-equality oracle (`frontends/equiv.py`) and full-pipe test
-(`frontends/test_pipe.py`) apply unchanged once the binary is built.
+`make test` has two halves, both over `testdata/*.go`:
 
-## Why hand-rolled, not ANTLR
+1. **Ingress acceptance** — every example must emit non-empty A1 JSON that the
+   core deserializer accepts (`otranspilerl-cli - --target estree`). Byte
+   equality with the core is not the signal here: the core consumes *shell*,
+   and this frontend consumes *Go*.
+2. **Executed stdout** (`harness/frontend-stdout.sh go`) — the Go source's
+   native output must match the output of the emitted A1 run through the
+   estree reference. This is the real semantic gate.
 
-The plan discussed an ANTLR-based Go frontend. The scaffold here is
-**hand-rolled** (lexer + parser + emitter, no parser generator) for three
-reasons:
-
-1. **No ANTLR toolchain in the scaffold environment** (and no `go` either).
-   The semantics are the hard part; a parser generator only helps with the
-   syntax.
-2. **Shell word expansion is context-sensitive**, and ANTLR's lex-then-parse
-   pipeline is a poor fit. The hand-rolled scanner does single-pass
-   segment analysis (matches `pysh.py`).
-3. **The emitter is a mechanical port of the proven `pysh` reference**, so
-   the grammar matters less than mirroring the pinned lowering rules.
-
-To port to ANTLR later: extract the scanner/parser into an ANTLR4
-grammar (`Bash.g4`), generate the Go parser, and re-attach the emitter
-(`internal/shir/` in this scaffold).
+The corpus is **Go source only**. A `.go` fixture that is not valid Go belongs
+to another frontend's corpus (`posix-sh-go` owns the shell examples); the
+triage table in `harness/triage.sh` declares this frontend's corpus as `go`,
+so a stray non-Go file in `testdata/` shows up as a phantom
+FAIL-FRONTEND-EMIT on every sweep.
 
 ## Layout
 
-- `go-sh.go` — single-file program: scanner, parser, emitter, var_types,
-  purity, CLI. Mirrors `pysh.py` 1:1.
-- `go.mod` — module declaration (no external deps).
-- `testdata/` — curated v1 examples (mirror of `frontends/tests/`).
+- `go-sh.go` — the frontend: scanner, parser, lowering/emitter. `package
+  golib`, so it doubles as a library.
+- `cmd/go-sh/main.go` — the CLI wrapper (`--shir FILE --raw`).
+- `testdata/` — the Go-source corpus (the gate's and triage's input).
+- `Makefile` — `build`, `test`, and the A1 oracle bootstrap.
 - `sync-builtins.sh` — regenerate the embedded `SYNC_BUILTINS` from
-  `sh2perl/data/sh2-builtins.json` (the A4 namespace; the JSON is the
-  source of truth — the sh2perl lib test `a4_sync_builtins_matches_rust`
-  asserts the two stay in sync).
-- `Makefile` — `make build`, `make test`, `make sync-builtins`.
-
-## Pinned rules (must match pysh + the core)
-
-- **Word shaping (L2):** unquoted `\X` → `X` (drop backslash, `\<newline>`
-  kept as newline); dq `\\`→`\`, `\$`→`$`, `\`+newline → line
-  continuation (dropped), other `\X` raw; `\"` inside *multiline* dq
-  refused.
-- **Type analysis (L3):** numeric lift = every source parses as i64 or
-  `getVar`-of-lifted; string lift = `Str` (not multiline) or any
-  `Interpolate` or `getVar`-of-lifted; env-prefix vars excluded.
-- **A3 purity:** `exec` = `Emulable` iff cmd ∈ `SYNC_BUILTINS` else
-  `Spawn`; `getVar` → `Emulable`.
-- **A1 contract:** `contract_version: 1` on Program; same node vocabulary
-  and key ordering as `shir_json.rs` (Go's `encoding/json` sorts map keys
-  alphabetically, matching serde_json's BTreeMap output).
+  `sh2perl/data/sh2-builtins.json` (the A4 namespace source of truth).
+- `FRONTEND.md` — the supported subset and every explicit refusal.
+- `DOGFOOD.md` — progress running the Go frontend over the Go codebase.
 
 ## Refuse > guess
 
-v1 refuses: pipe/redirect/`$(( `/`${`/backtick/positional/array/case/arith
-builtins (`let eval declare typeset local readonly export unset read shift
-source trap set exec test time .` `[[`)/compound keywords (`if while for
-case function ...`). The corpus gate grows the subset; every new
-construct enters by pinning the core's exact `--shir` shape first.
+A construct outside the subset refuses loudly with `unsupported …`; it is never
+mis-lowered. `FRONTEND.md` carries the current refuse list. The corpus gate
+grows the subset, and every new construct enters by pinning the core's exact
+`--shir` shape first.
