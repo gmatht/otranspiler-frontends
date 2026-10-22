@@ -44,6 +44,34 @@ while true; do
       git -C "$WORKSPACE" add $changes 2>/dev/null || true
       git -C "$WORKSPACE" commit -m "frontend py-sh-go: gate green" >> "$LOG" 2>&1 || true
     fi
+    # The frontends tree is a NESTED git repo (sh2perl/frontends, reached
+    # here through the workspace's `frontends` symlink): $WORKSPACE's status
+    # lists it only as the `sh2perl` gitlink, so the filter above can NEVER
+    # match this frontend's own paths. Measured 2026-10-23 — the py-sh-go
+    # Makefile GO/PATH fix, the main.go pyFloat purity and the SHIR_SKIP
+    # list were green in the tree and invisible to the commit step, i.e. one
+    # `git stash` from the build being red again (the same "fixes piled up
+    # uncommitted" class as the ${pwd} bug noted above). Commit them in
+    # their own repo: tracked modifications (the fix) plus NEW testdata
+    # examples (worker-coverage-step.sh's product). Untracked scratch
+    # (testdata/f, tools/*) is deliberately not swept in.
+    froot=$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null || true)
+    fpref=$(git -C "$PWD" rev-parse --show-prefix 2>/dev/null || true)
+    # fpref EMPTY means $PWD *is* the repo root: `git diff --name-only -- ""`
+    # would then select the WHOLE repo and sweep every other frontend's
+    # uncommitted work into this commit. Never commit without a non-empty
+    # frontend prefix.
+    if [ -n "$froot" ] && [ "$froot" != "$WORKSPACE" ] && [ -n "$fpref" ]; then
+      fmods=$(git -C "$froot" diff --name-only -- "$fpref" 2>/dev/null || true)
+      fnew=$(git -C "$froot" ls-files --others --exclude-standard -- "${fpref}testdata" 2>/dev/null \
+             | command grep -E "^${fpref}testdata/t[0-9]" || true)
+      fmods=$(printf '%s\n%s\n' "$fmods" "$fnew" | sed '/^$/d')
+      if [ -n "$fmods" ]; then
+        git -C "$froot" add -- $fmods >> "$LOG" 2>&1 || true
+        git -C "$froot" commit -m "frontend $(basename "$PWD"): gate green" >> "$LOG" 2>&1 || true
+        echo "[$(date +%FT%T)] py-sh-go: committed ${fmods//$'\n'/ } (nested frontends repo)" >> "$LOG"
+      fi
+    fi
     echo "[$(date +%FT%T)] py-sh-go: gate GREEN" >> "$LOG"
     bash "$WORKSPACE/frontends/coverage/worker-coverage-step.sh" py-sh-go "$LOG" >> "$LOG" 2>&1 || true
   else

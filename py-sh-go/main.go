@@ -2956,7 +2956,8 @@ func callPurity(func_ string, args []any) string {
 	switch func_ {
 	case "contains", "join", "brace", "idiv", "imod", "arith", "arithEval",
 		"trimCapture", "dirname", "basename", "not", "guard", "caseMatch",
-		"param", "callDirect", "sortedIntJoin", "sortedBigintJoin", "isqrt":
+		"param", "callDirect", "sortedIntJoin", "sortedBigintJoin", "isqrt",
+		"pyFloat":
 		return "PureCpu"
 	case "getVar", "setVar", "setLastExit", "assign", "test", "grepText",
 		"listVar", "setArray", "setArrayAppend", "arrayItems", "arrayKeys",

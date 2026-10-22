@@ -21,7 +21,13 @@
 
 ANTLR4 ?= antlr4
 CLI ?= $(abspath ../../../otranspilerl/target/debug/otranspilerl-cli)
-GO ?= /snap/go/current/bin/go
+# Go toolchain: prefer the snap install when present, else the system `go`
+# (apt golang-go -> /usr/bin/go). The hardcoded snap path wedged the whole
+# gate with `make: /snap/go/current/bin/go: No such file or directory`
+# (Error 127 at Makefile:75) on boxes where the snap is not installed, while
+# the frontend itself was healthy — same class as the stale-oracle fallback
+# below. `go` is on the minimal PATH too, so the cron/systemd worker sees it.
+GO ?= $(firstword $(wildcard /snap/go/current/bin/go) $(shell command -v go 2>/dev/null))
 
 .PHONY: all gen build test parse-test py2cy py2cy-test py2cy-test-all gmp-test worker clean
 
@@ -113,10 +119,24 @@ $(CLI): $(CORE_SRC)
 # Ingress-acceptance oracle: the emitted A1 shIR JSON must be accepted by
 # the core deserializer (`- --target estree`); then the executed-stdout gate
 # compares the transpiled run vs native python3.
+#
+# SHIR_SKIP — testdata fixtures that belong to the py2cy pipeline, not the
+# shIR one. They share testdata/ so the py2cy globs (t0*+t1*) see them, but
+# the A1 path cannot lower them and must not pretend to:
+#   * t103_pep695.py — PEP 695 (def/class type parameters, `type` aliases)
+#     and classes: the hand-rolled A1 parser supports neither; the
+#     generics/class grammar lives in the ANTLR front end (`--parse`).
+#   * t102_dual_guard.py — the entry-guarded dual arm: one body has to
+#     answer exactly in the int, bigint AND float domains per call value
+#     (2**100 must stay exact, 2.5 must stay a float). A single A1 body
+#     cannot select a domain per runtime value; that per-value dispatch is
+#     the py2cy transform this fixture pins.
+# Both are exercised by `make py2cy-test`.
+SHIR_SKIP := t102_dual_guard.py t103_pep695.py
 test: build $(CLI)
 	@for f in testdata/*.py; do \
 	  bn=$$(basename $$f); \
-	  case $$bn in t103_pep695.py) echo "SKIP $$bn (PEP 695: py2cy lowering fixture, not SHIR ingress)"; continue;; esac; \
+	  case " $(SHIR_SKIP) " in *" $$bn "*) echo "SKIP $$bn (py2cy-only fixture — not a shIR ingress case)"; continue;; esac; \
 	  ./py-sh-go --shir $$f --raw > /tmp/$$bn.mine 2>/dev/null || { echo "FAIL $$bn (frontend emit)"; exit 1; }; \
 	  # Ingress acceptance: the core consumes SHELL, not py source, so \
 	  # byte-equality vs otranspilerl-cli --shir is impossible. The progress signal \
@@ -163,7 +183,14 @@ test: build $(CLI)
 	  fi; \
 	done
 	@echo "--- executed-stdout comparison (native vs JS/ESTree) ---"
-	@bash "$(abspath ../../../harness/frontend-stdout.sh)" py ./py-sh-go testdata "$(CLI)" || exit 1
+	@# stdout phase over the SHIR fixtures only: symlink them into a temp
+	@# dir so frontend-stdout.sh's `$dir/*.py` glob skips SHIR_SKIP.
+	@tmpd=$$(mktemp -d); \
+	for f in testdata/*.py; do \
+	  bn=$$(basename "$$f"); \
+	  case " $(SHIR_SKIP) " in *" $$bn "*) ;; *) ln -s "$$(readlink -f "$$f")" "$$tmpd/$$bn";; esac; \
+	done; \
+	bash "$(abspath ../../../harness/frontend-stdout.sh)" py ./py-sh-go "$$tmpd" "$(CLI)"; rc=$$?; rm -rf "$$tmpd"; exit $$rc
 
 worker: test
 	@echo "py-sh-go worker gate: ingress acceptance + executed-stdout passed"
