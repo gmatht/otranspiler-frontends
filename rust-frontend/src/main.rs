@@ -36,10 +36,46 @@ use syn::spanned::Spanned;
 
 // ── errors ──────────────────────────────────────────────────────────
 
+/// Census mode (`--census`): a refusal PANICS instead of exiting, so the
+/// caller can catch it per function/item and keep reporting the rest.
+static CENSUS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static CENSUS_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn census_mode() -> bool {
+    CENSUS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn path_text(e: &syn::Expr) -> String {
+    match e {
+        syn::Expr::Path(p) => p
+            .path
+            .segments
+            .iter()
+            .map(|s| s.ident.to_string())
+            .collect::<Vec<_>>()
+            .join("::"),
+        other => format!("<{}>", expr_kind(other)),
+    }
+}
+
 fn refuse(msg: &str, span: proc_macro2::Span) -> ! {
     let loc = span.start();
-    eprintln!("unsupported Rust: {msg} (line {})", loc.line);
+    let text = format!("unsupported Rust: {msg} (line {})", loc.line);
+    if census_mode() {
+        std::panic::panic_any(text);
+    }
+    eprintln!("{text}");
     exit(1);
+}
+
+fn census_hit(unit: &str, name: &str, payload: Box<dyn std::any::Any + Send>) {
+    let msg = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_else(|| "refusal".to_string());
+    CENSUS_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    eprintln!("CENSUS\t{unit}\t{name}\t{msg}");
 }
 
 // ── A1 node constructors (byte-matching the core's --shir shapes) ───
@@ -141,6 +177,11 @@ enum Ty {
     /// a LIST-OBJECT id (strSplit / arrayToList): raw elements are read
     /// with listGet, length with listLen (dynamic, runtime-trusted)
     List,
+    /// HashMap/BTreeMap: a NAMED associative store (assocGet/assocSet),
+    /// keyed by the stringified key
+    Map(Box<Ty>, Box<Ty>),
+    /// HashSet/BTreeSet: an associative store whose keys are the elements
+    Set(Box<Ty>),
     /// a FUNCTION ITEM (`transforms::f`) — its store value is the
     /// REGISTERED lowered name; indirect calls dispatch by that name
     Fn(String),
@@ -187,8 +228,38 @@ fn ty_from_type(t: &syn::Type, cx: &Cx) -> Ty {
                 "str" | "String" | "Cow" => Ty::Str,
                 "bool" => Ty::Bool,
                 "AtomicBool" => Ty::AtomicBool,
-                "Vec" | "VecDeque" | "HashSet" | "BTreeSet" | "HashMap" | "BTreeMap"
-                | "Slice" => {
+                "HashMap" | "BTreeMap" => {
+                    let args: Vec<Ty> = match &seg.arguments {
+                        syn::PathArguments::AngleBracketed(a) => a
+                            .args
+                            .iter()
+                            .filter_map(|arg| match arg {
+                                syn::GenericArgument::Type(t) => Some(ty_from_type(t, cx)),
+                                _ => None,
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    Ty::Map(
+                        Box::new(args.first().cloned().unwrap_or(Ty::Unknown)),
+                        Box::new(args.get(1).cloned().unwrap_or(Ty::Unknown)),
+                    )
+                }
+                "HashSet" | "BTreeSet" => {
+                    let elem = match &seg.arguments {
+                        syn::PathArguments::AngleBracketed(a) => {
+                            a.args.iter().find_map(|arg| match arg {
+                                syn::GenericArgument::Type(t) => {
+                                    Some(Box::new(ty_from_type(t, cx)))
+                                }
+                                _ => None,
+                            })
+                        }
+                        _ => None,
+                    };
+                    Ty::Set(elem.unwrap_or(Box::new(Ty::Unknown)))
+                }
+                "Vec" | "VecDeque" | "Slice" => {
                     // Vec<T>: extract the element type when shape allows
                     let elem = match &seg.arguments {
                         syn::PathArguments::AngleBracketed(a) => {
@@ -581,6 +652,10 @@ fn main() {
                     file = Some(args[i].clone());
                 }
             }
+            "--census" => {
+                CENSUS.store(true, std::sync::atomic::Ordering::Relaxed);
+                std::panic::set_hook(Box::new(|_| {}));
+            }
             "--raw" => {} // accepted for CLI parity with the fleet; we always emit the same
             _ => {
                 eprintln!("usage: rust-frontend --shir <file.rs> [--raw]");
@@ -776,6 +851,7 @@ fn main() {
         }
     }
     let mut stmts: Vec<Value> = Vec::new();
+    let _items_census = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
     for item in &flat {
         match item {
             // `use` imports name things for the TYPE CHECKER only — they
@@ -843,6 +919,10 @@ fn main() {
             other => refuse("items other than `fn`/`use`/`const`/`static`", other.span()),
         }
     }
+    }));
+    if let Err(p) = _items_census {
+        census_hit("program", "items", p);
+    }
     // NOTE: no `main` is LEGAL for library-style sources (definitions
     // only) — the program body is then empty. The stdout oracle never
     // sees such a file (testdata examples are all runnable).
@@ -850,7 +930,11 @@ fn main() {
     // function definitions FIRST — runtime def-before-use order (the A1
     // Function statement lowers to a definition executed in stmt order).
     for src_fn in &fns {
-        all_stmts.push(match src_fn {
+        let (unit, label) = match src_fn {
+            FnSource::Free(f) => ("fn", f.sig.ident.to_string()),
+            FnSource::Method(name, _, _) => ("fn", name.clone()),
+        };
+        let lowered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match src_fn {
             FnSource::Free(f) => function_def(
                 f.sig.ident.to_string(),
                 &f.attrs,
@@ -862,9 +946,20 @@ fn main() {
             FnSource::Method(name, m, ty) => {
                 function_def(name.clone(), &m.attrs, &m.sig, &m.block, Some(ty), &cx)
             }
-        });
+        }));
+        match lowered {
+            Ok(v) => all_stmts.push(v),
+            Err(p) => census_hit(unit, &label, p),
+        }
     }
     all_stmts.append(&mut stmts);
+    if census_mode() {
+        eprintln!(
+            "CENSUS-SUMMARY\t{file}\t{}\tblocked units",
+            CENSUS_HITS.load(std::sync::atomic::Ordering::Relaxed)
+        );
+        exit(0);
+    }
 
     let prog = json!({
         "contract_version": 1,
@@ -966,6 +1061,22 @@ fn lower_local(local: &syn::Local, cx: &Cx, out: &mut Vec<Value>) -> Option<Valu
         // no-op in the store model, exactly like c-sh-go's dropped `int i;`.
         return None;
     };
+    // `let mut m = HashMap::new()` / `HashSet::from([..])` — a NAMED
+    // associative store; an explicit type annotation supplies K/V.
+    if let Some((mut ty, entries)) = map_ctor(&init.expr, cx) {
+        if let syn::Pat::Type(pt) = &local.pat {
+            let at = ty_from_type(&pt.ty, cx);
+            if matches!(at, Ty::Map(..) | Ty::Set(..)) {
+                ty = at;
+            }
+        }
+        out.push(assoc_empty_stmt(&name));
+        for (k, v) in entries {
+            out.push(assoc_set_stmt(&name, k, v));
+        }
+        cx.vars.borrow_mut().insert(name.clone(), ty);
+        return None;
+    }
     // `let ok = COLL.any(|e| COND)` / `.all(..)` — a bounded loop that
     // binds the boolean result (empty any=false, empty all=true).
     if let Some((all, src, cl)) = quantifier_parts(&init.expr, cx) {
@@ -1136,6 +1247,18 @@ fn infer_ty(e: &syn::Expr, cx: &Cx) -> Ty {
                 // identity-shaped reads keep the receiver's option-ness
                 "as_deref" | "unwrap_or_default" => rty,
                 "is_some" | "is_none" | "is_ok" | "is_err" => Ty::Bool,
+                "get" => match &rty {
+                    Ty::Map(_, v) => Ty::Opt(v.clone()),
+                    _ => Ty::Unknown,
+                },
+                "keys" => match &rty {
+                    Ty::Map(k, _) => Ty::Arr(Some(k.clone()), None),
+                    _ => Ty::Unknown,
+                },
+                "values" => match &rty {
+                    Ty::Map(_, v) => Ty::Arr(Some(v.clone()), None),
+                    _ => Ty::Unknown,
+                },
                 "split" => Ty::List,
                 "iter" | "iter_mut" => rty,
                 "any" | "all" => Ty::Bool,
@@ -1367,6 +1490,14 @@ fn lower_expr_stmt(e: &syn::Expr, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) ->
                 };
                 return Some(assign_stmt(&name, str_concat(get_var(&name), rhs)));
             }
+            // MAP/SET mutators are IMPURE: `insert`/`remove` must be
+            // EMITTED (value_expr yields the assocSet/assocDel call), not
+            // dropped as a discarded pure read.
+            if matches!(recv_ty, Ty::Map(..) | Ty::Set(..))
+                && matches!(m.method.to_string().as_str(), "insert" | "remove")
+            {
+                return Some(expr_stmt(value_expr(e, cx)));
+            }
             // everything else in statement position: only PURE methods
             // lower at all (the whitelist in value_expr), and a discarded
             // pure call is a no-op — drop it. Anything impure/unknown
@@ -1381,7 +1512,10 @@ fn lower_expr_stmt(e: &syn::Expr, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) ->
                 refuse("call target path", c.func.span());
             };
             let Some(target) = call_target(p, cx) else {
-                refuse("call to unknown function", c.func.span());
+                refuse(
+                    &format!("call to unknown function `{}`", path_text(c.func.as_ref())),
+                    c.func.span(),
+                );
             };
             Some(expr_stmt(fn_call_expr(&target, &c.args, "fnCall", cx)))
         }
@@ -1655,6 +1789,84 @@ fn for_stmt(fl: &syn::ExprForLoop, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) -
     // forbids mutating the array during iteration, so one length read is
     // exact. Elements read RAW (`arrayItems(v).at(i)`) so tuple/record
     // elements survive destructuring.
+    // MAP / SET iteration: keys come from assocKeys (a native array),
+    // values from assocGet per key. HashMap order is unspecified in
+    // Rust, so insertion order is a valid enumeration.
+    if let Some((vname, mode)) = map_iter_mode(&fl.expr, cx) {
+        let ks = fresh_tmp(cx, "mk");
+        out.push(store_stmt(
+            &ks,
+            assoc_call("assocKeys", vec![str_lit(&vname)]),
+        ));
+        let idx = fresh_tmp(cx, "i");
+        let lenv = fresh_tmp(cx, "l");
+        out.push(assign_stmt(&lenv, array_len_call(&ks)));
+        cx.vars.borrow_mut().insert(lenv.clone(), Ty::Int);
+        cx.vars.borrow_mut().insert(idx.clone(), Ty::Int);
+        let elem = raw_elem(&ks, json!({"type": "Var", "name": idx, "sigil": null}));
+        let mut body_all = Vec::new();
+        match (mode, fl.pat.as_ref()) {
+            ("keys" | "set", syn::Pat::Ident(pi)) if pi.subpat.is_none() => {
+                let name = pi.ident.to_string();
+                cx.vars.borrow_mut().insert(name.clone(), Ty::Str);
+                body_all.push(assign_stmt(&name, elem));
+            }
+            ("values", syn::Pat::Ident(pi)) if pi.subpat.is_none() => {
+                let name = pi.ident.to_string();
+                let k = fresh_tmp(cx, "k");
+                let vt = map_value_ty(&vname, cx);
+                cx.vars.borrow_mut().insert(k.clone(), Ty::Str);
+                cx.vars.borrow_mut().insert(name.clone(), vt.clone());
+                body_all.push(assign_stmt(&k, elem));
+                let read = assoc_call("assocGet", vec![str_lit(&vname), get_var(&k)]);
+                if is_composite_ty(&vt) {
+                    body_all.push(store_stmt(&name, read));
+                } else {
+                    body_all.push(assign_stmt(&name, read));
+                }
+            }
+            ("entries", syn::Pat::Tuple(t)) if t.elems.len() == 2 => {
+                let syn::Pat::Ident(ki) = &t.elems[0] else {
+                    refuse("map iteration key pattern", t.elems[0].span());
+                };
+                if ki.subpat.is_some() {
+                    refuse("map iteration key subpattern", ki.span());
+                }
+                let kname = ki.ident.to_string();
+                cx.vars.borrow_mut().insert(kname.clone(), Ty::Str);
+                body_all.push(assign_stmt(&kname, elem));
+                match &t.elems[1] {
+                    syn::Pat::Ident(vi) if vi.subpat.is_none() => {
+                        let vname2 = vi.ident.to_string();
+                        let vt = map_value_ty(&vname, cx);
+                        cx.vars.borrow_mut().insert(vname2.clone(), vt.clone());
+                        let read = assoc_call(
+                            "assocGet",
+                            vec![str_lit(&vname), get_var(&kname)],
+                        );
+                        if is_composite_ty(&vt) {
+                            body_all.push(store_stmt(&vname2, read));
+                        } else {
+                            body_all.push(assign_stmt(&vname2, read));
+                        }
+                    }
+                    syn::Pat::Wild(_) => {}
+                    other => refuse("map iteration value pattern", other.span()),
+                }
+            }
+            (_, pat) => refuse("map/set for-loop pattern", pat.span()),
+        }
+        lower_block(&fl.body, cx, in_fn, &mut body_all);
+        body_all.push(assign_stmt(
+            &idx,
+            arith_bin("+", arith_var(&idx), arith_num(1)),
+        ));
+        return json!({
+            "type": "While",
+            "cond": test_call(&format!("${idx} -lt ${lenv}")),
+            "body": body_all,
+        });
+    }
     let iter_arr: Option<&syn::Expr> = match &*fl.expr {
         syn::Expr::MethodCall(m)
             if (m.method == "iter" || m.method == "iter_mut") && m.args.is_empty() =>
@@ -2328,6 +2540,186 @@ fn set_array_stmt(name: &str, elements: Vec<Value>) -> Value {
         ],
         "func": "setVar", "purity": "Emulable", "type": "Call"
     }))
+}
+
+// ── maps and sets (named associative stores) ───────────────────────
+
+fn assoc_call(func: &str, args: Vec<Value>) -> Value {
+    json!({"type": "Call", "func": func, "purity": "Emulable", "args": args})
+}
+
+/// `declare -A`-equivalent: an EMPTY named associative store.
+fn assoc_empty_stmt(name: &str) -> Value {
+    expr_stmt(assoc_call(
+        "setArray",
+        vec![
+            str_lit(name),
+            json!({"type": "Array", "elements": []}),
+            json!({"type": "Bool", "value": true}),
+        ],
+    ))
+}
+
+fn assoc_set_stmt(name: &str, key: Value, val: Value) -> Value {
+    expr_stmt(assoc_call("assocSet", vec![str_lit(name), key, val]))
+}
+
+fn array_len_call(name: &str) -> Value {
+    json!({
+        "type": "Call", "func": "arrayLen", "purity": "PureCpu",
+        "args": [str_lit(name)]
+    })
+}
+
+/// The plain variable a method receiver reads (`m`, `&m`). Maps/sets are
+/// NAMED associative stores, so a field or nested receiver has no exact
+/// representation yet.
+fn recv_var_name(e: &syn::Expr) -> Option<String> {
+    match e {
+        syn::Expr::Path(p) => single_path(p).map(|i| i.to_string()),
+        syn::Expr::Reference(r) => recv_var_name(&r.expr),
+        syn::Expr::Paren(p) => recv_var_name(&p.expr),
+        _ => None,
+    }
+}
+
+fn array_elems_ref(e: &syn::Expr) -> Option<&syn::punctuated::Punctuated<syn::Expr, syn::Token![,]>> {
+    match e {
+        syn::Expr::Reference(r) => array_elems_ref(&r.expr),
+        syn::Expr::Array(a) => Some(&a.elems),
+        syn::Expr::Paren(p) => array_elems_ref(&p.expr),
+        _ => None,
+    }
+}
+
+/// `HashMap::new()`, `BTreeMap::new()`, `HashSet::new()`, `...::with_capacity(n)`,
+/// `HashMap::from([(k, v), ..])`, `HashSet::from([e, ..])` → the Ty plus
+/// the initial entries. `None` for any other expression.
+fn map_ctor(e: &syn::Expr, cx: &Cx) -> Option<(Ty, Vec<(Value, Value)>)> {
+    let (last, prev) = match e {
+        syn::Expr::Path(p) => {
+            let n = p.path.segments.len();
+            if n < 2 {
+                return None;
+            }
+            (
+                p.path.segments[n - 1].ident.to_string(),
+                p.path.segments[n - 2].ident.to_string(),
+            )
+        }
+        syn::Expr::Call(c) => {
+            let syn::Expr::Path(p) = &*c.func else {
+                return None;
+            };
+            let n = p.path.segments.len();
+            if n < 2 {
+                return None;
+            }
+            let last = p.path.segments[n - 1].ident.to_string();
+            let prev = p.path.segments[n - 2].ident.to_string();
+            let is_map = matches!(prev.as_str(), "HashMap" | "BTreeMap");
+            let is_set = matches!(prev.as_str(), "HashSet" | "BTreeSet");
+            if !is_map && !is_set {
+                return None;
+            }
+            if last == "new" || last == "with_capacity" {
+                return Some(if is_map {
+                    (
+                        Ty::Map(Box::new(Ty::Unknown), Box::new(Ty::Unknown)),
+                        Vec::new(),
+                    )
+                } else {
+                    (Ty::Set(Box::new(Ty::Unknown)), Vec::new())
+                });
+            }
+            if last != "from" {
+                return None;
+            }
+            let arr = array_elems_ref(c.args.first()?)?;
+            let mut out = Vec::new();
+            if is_set {
+                for el in arr {
+                    out.push((value_expr(el, cx), str_lit("1")));
+                }
+                return Some((Ty::Set(Box::new(Ty::Unknown)), out));
+            }
+            for el in arr {
+                let syn::Expr::Tuple(t) = el else {
+                    return None;
+                };
+                if t.elems.len() != 2 {
+                    return None;
+                }
+                out.push((value_expr(&t.elems[0], cx), value_expr(&t.elems[1], cx)));
+            }
+            return Some((
+                Ty::Map(Box::new(Ty::Unknown), Box::new(Ty::Unknown)),
+                out,
+            ));
+        }
+        _ => return None,
+    };
+    let is_map = matches!(prev.as_str(), "HashMap" | "BTreeMap");
+    let is_set = matches!(prev.as_str(), "HashSet" | "BTreeSet");
+    if !is_map && !is_set {
+        return None;
+    }
+    if last != "new" && last != "with_capacity" {
+        return None;
+    }
+    Some(if is_map {
+        (
+            Ty::Map(Box::new(Ty::Unknown), Box::new(Ty::Unknown)),
+            Vec::new(),
+        )
+    } else {
+        (Ty::Set(Box::new(Ty::Unknown)), Vec::new())
+    })
+}
+
+/// `for` over a map/set: the source variable and what each item is.
+/// Only NAMED map/set variables have an associative-store representation.
+fn map_value_ty(name: &str, cx: &Cx) -> Ty {
+    match cx.vars.borrow().get(name) {
+        Some(Ty::Map(_, v)) => (**v).clone(),
+        _ => Ty::Unknown,
+    }
+}
+
+/// Types whose store value is a composite (needs the raw setVar path).
+fn is_composite_ty(t: &Ty) -> bool {
+    matches!(
+        t,
+        Ty::Struct(_) | Ty::Tuple(_) | Ty::Arr(..) | Ty::Enum(_) | Ty::Map(..) | Ty::Set(_)
+    )
+}
+
+fn map_iter_mode(e: &syn::Expr, cx: &Cx) -> Option<(String, &'static str)> {
+    let base = match e {
+        syn::Expr::Reference(r) => &*r.expr,
+        e => e,
+    };
+    let (n, explicit) = match base {
+        syn::Expr::MethodCall(m) => {
+            let n = recv_var_name(&m.receiver)?;
+            let mode = match m.method.to_string().as_str() {
+                "iter" => None,
+                "keys" => Some("keys"),
+                "values" => Some("values"),
+                _ => return None,
+            };
+            (n, mode)
+        }
+        other => (recv_var_name(other)?, None),
+    };
+    let rt = cx.vars.borrow().get(&n).cloned()?;
+    match (rt, explicit) {
+        (Ty::Set(_), None) => Some((n, "set")),
+        (Ty::Set(_), Some(_)) => None,
+        (Ty::Map(..), Some(m)) => Some((n, m)),
+        (Ty::Map(..), None) => Some((n, "entries")),
+        _ => None,
+    }
 }
 
 /// If e is an ARRAY LITERAL (vec![..] or [..]), its elements — else None.
@@ -3624,6 +4016,13 @@ fn hoist_cond_calls(e: &syn::Expr, cx: &Cx, out: &mut Vec<Value>) -> syn::Expr {
                     syn::parse_str::<syn::Expr>("__sh2e == 0")
                         .unwrap_or_else(|_| refuse("temporary name", e.span()))
                 }
+                // MAP / SET: the associative store's key count.
+                (Ty::Map(..) | Ty::Set(..), Some(vname)) => {
+                    out.push(assign_stmt("__sh2e", array_len_call(&vname)));
+                    cx.vars.borrow_mut().insert("__sh2e".to_string(), Ty::Int);
+                    syn::parse_str::<syn::Expr>("__sh2e == 0")
+                        .unwrap_or_else(|_| refuse("temporary name", e.span()))
+                }
                 _ => refuse("is_empty on unproven receiver", m.method.span()),
             }
         }
@@ -3649,7 +4048,7 @@ fn hoist_cond_calls(e: &syn::Expr, cx: &Cx, out: &mut Vec<Value>) -> syn::Expr {
             // the temp carries the method's result type so a following
             // test_string sees a PROVEN bool (`contains`) etc.
             let ty = match m.method.to_string().as_str() {
-                "contains" | "starts_with" | "ends_with" => Ty::Bool,
+                "contains" | "contains_key" | "starts_with" | "ends_with" => Ty::Bool,
                 "len" => Ty::Int,
                 _ => infer_ty(e, cx),
             };
@@ -4278,6 +4677,16 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
             })
         }
         syn::Expr::Index(ix) => {
+            // `m[&k]` on a MAP reads the associative store.
+            if matches!(infer_ty(&ix.expr, cx), Ty::Map(..)) {
+                let Some(vname) = recv_var_name(&ix.expr) else {
+                    refuse("map index on a non-variable map", ix.expr.span());
+                };
+                return assoc_call(
+                    "assocGet",
+                    vec![str_lit(&vname), value_expr(&ix.index, cx)],
+                );
+            }
             // `v[i]` on a proven native-array variable: an A1 Index expr,
             // which the core renders as the trusted arrayIndex read
             // (getVar would give the scalar view).
@@ -4346,6 +4755,92 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
             // Vec methods, bool-returning predicates, indexing...
             let recv_ty = infer_ty(&m.receiver, cx);
             let rust_name = m.method.to_string();
+            // MAP / SET methods on a NAMED associative store. `insert`
+            // returns Option in Rust; it is lowered to the assocSet call
+            // (exact when used as a statement, which is how it appears).
+            if matches!(recv_ty, Ty::Map(..) | Ty::Set(..)) {
+                let Some(vname) = recv_var_name(&m.receiver) else {
+                    refuse("map/set method on a non-variable receiver", m.receiver.span());
+                };
+                let is_set = matches!(recv_ty, Ty::Set(..));
+                match rust_name.as_str() {
+                    "insert" if is_set => {
+                        if m.args.len() != 1 {
+                            refuse("set insert arity", m.span());
+                        }
+                        return assoc_call(
+                            "assocSet",
+                            vec![
+                                str_lit(&vname),
+                                value_expr(&m.args[0], cx),
+                                str_lit("1"),
+                            ],
+                        );
+                    }
+                    "insert" => {
+                        if m.args.len() != 2 {
+                            refuse("map insert arity", m.span());
+                        }
+                        return assoc_call(
+                            "assocSet",
+                            vec![
+                                str_lit(&vname),
+                                value_expr(&m.args[0], cx),
+                                value_expr(&m.args[1], cx),
+                            ],
+                        );
+                    }
+                    "get" if !is_set => {
+                        if m.args.len() != 1 {
+                            refuse("map get arity", m.span());
+                        }
+                        return assoc_call(
+                            "assocGet",
+                            vec![str_lit(&vname), value_expr(&m.args[0], cx)],
+                        );
+                    }
+                    "contains_key" if !is_set => {
+                        if m.args.len() != 1 {
+                            refuse("contains_key arity", m.span());
+                        }
+                        return assoc_call(
+                            "assocHas",
+                            vec![str_lit(&vname), value_expr(&m.args[0], cx)],
+                        );
+                    }
+                    "contains" if is_set => {
+                        if m.args.len() != 1 {
+                            refuse("set contains arity", m.span());
+                        }
+                        return assoc_call(
+                            "assocHas",
+                            vec![str_lit(&vname), value_expr(&m.args[0], cx)],
+                        );
+                    }
+                    "remove" => {
+                        if m.args.len() != 1 {
+                            refuse("map/set remove arity", m.span());
+                        }
+                        return assoc_call(
+                            "assocDel",
+                            vec![str_lit(&vname), value_expr(&m.args[0], cx)],
+                        );
+                    }
+                    "len" => return array_len_call(&vname),
+                    "is_empty" => refuse(
+                        "map/set is_empty in VALUE position (use it as a condition)",
+                        m.span(),
+                    ),
+                    "keys" | "values" | "iter" => refuse(
+                        "map/set iterator outside a for-loop",
+                        m.span(),
+                    ),
+                    _ => refuse(
+                        &format!("map/set method `{}`", rust_name),
+                        m.method.span(),
+                    ),
+                }
+            }
             // `s.split(SEP)` — the runtime strSplit returns a LIST id
             // (raw elements via listGet/listLen). The separator must be a
             // literal char/string: a dynamic separator would need the
@@ -4541,6 +5036,8 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                             Ty::AtomicBool => "",
                             Ty::Tuple(_) => "tuple ",
                             Ty::List => "list ",
+                            Ty::Map(..) => "map ",
+                            Ty::Set(..) => "set ",
                             Ty::Fn(_) => "",
                             Ty::Opt(_) => "option ",
                             Ty::Unknown => "",
@@ -4606,7 +5103,10 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                 return v;
             }
             let Some(target) = call_target(p, cx) else {
-                refuse("call to unknown function", c.func.span());
+                refuse(
+                    &format!("call to unknown function `{}`", path_text(c.func.as_ref())),
+                    c.func.span(),
+                );
             };
             fn_call_expr(&target, &c.args, "fnValue", cx)
         }
