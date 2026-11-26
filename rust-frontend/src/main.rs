@@ -768,12 +768,16 @@ fn main() {
     // ...then the lib.rs MODULE TREE with the same GATED splice: a module
     // joins only when it lowers cleanly alone, so a dirty module never
     // poisons the entry (its cross-calls simply refuse at the site).
-    let lib_path = base_dir.join("lib.rs");
+    // The crate root is found by WALKING UP: a leaf entry
+    // (`pipeline_native/capabilities/cut.rs`) has no lib.rs beside it, and
+    // using its own directory made the whole module tree invisible.
+    let crate_root = find_crate_src_root(&base_dir).unwrap_or_else(|| base_dir.clone());
+    let lib_path = crate_root.join("lib.rs");
     if !no_expand && lib_path.exists() && !visited.contains(&lib_path) {
         visited.insert(lib_path.clone());
         if let Ok(src_text) = std::fs::read_to_string(&lib_path) {
             if let Ok(f) = syn::parse_file(&src_text) {
-                roots.extend(expand_crate(&f.items, &base_dir, &mut visited));
+                roots.extend(expand_crate(&f.items, &crate_root, &mut visited));
             }
         }
     }
@@ -786,9 +790,9 @@ fn main() {
         collect_mod_files(&ast.items, &base_dir, &mut mods);
         // The lib.rs MODULE TREE is the crate's real structure for a leaf
         // entry (go_backend.rs has no `mod` of its own).
-        if let Ok(text) = std::fs::read_to_string(base_dir.join("lib.rs")) {
+        if let Ok(text) = std::fs::read_to_string(crate_root.join("lib.rs")) {
             if let Ok(f) = syn::parse_file(&text) {
-                collect_mod_files(&f.items, &base_dir, &mut mods);
+                collect_mod_files(&f.items, &crate_root, &mut mods);
             }
         }
         if std::env::var("RUST_FRONTEND_DEMAND_DEBUG").is_ok() {
@@ -1029,7 +1033,14 @@ fn main() {
                 }));
                 match res {
                     Ok(v) => demand_defs.push(v),
-                    Err(_) => {
+                    Err(e) => {
+                        if std::env::var("RUST_FRONTEND_DEMAND_DEBUG").is_ok() {
+                            let msg = e
+                                .downcast_ref::<String>()
+                                .cloned()
+                                .unwrap_or_else(|| "<panic>".to_string());
+                            eprintln!("DEMAND dropped {name}: {msg}");
+                        }
                         cx.fns.retain(|n| *n != name);
                         cx.fn_rets.remove(&name);
                     }
@@ -1211,7 +1222,7 @@ fn lower_block(block: &syn::Block, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) {
 
 fn lower_stmt(stmt: &syn::Stmt, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) -> Option<Value> {
     match stmt {
-        syn::Stmt::Local(local) => lower_local(local, cx, out),
+        syn::Stmt::Local(local) => lower_local(local, cx, in_fn, out),
         syn::Stmt::Expr(e, _semi) => lower_expr_stmt(e, cx, in_fn, out),
         syn::Stmt::Item(item) => refuse("nested item declarations", item.span()),
         syn::Stmt::Macro(m) => Some(lower_print_macro(&m.mac, cx)),
@@ -1226,13 +1237,33 @@ fn let_pattern_stmt(
     pat: &syn::Pat,
     init: &syn::LocalInit,
     cx: &Cx,
+    in_fn: bool,
     out: &mut Vec<Value>,
 ) -> Option<Value> {
+    // `let (a, b) = f()?;` — the `?` propagates BEFORE the destructure.
+    let (init_expr, try_prop) = match &*init.expr {
+        syn::Expr::Try(t) => (&*t.expr, true),
+        e => (e, false),
+    };
     let temp = fresh_tmp(cx, "l");
-    out.push(store_stmt(&temp, value_expr(&init.expr, cx)));
+    out.push(store_stmt(&temp, value_expr(init_expr, cx)));
     // The temp's shape drives slice-pattern element reads (array vs list).
     let temp_ty = infer_ty(&init.expr, cx);
     cx.vars.borrow_mut().insert(temp.clone(), temp_ty);
+    if try_prop {
+        let prop = if in_fn {
+            json!({"type": "Return", "value": str_lit("")})
+        } else {
+            json!({"type": "Exit", "value": null})
+        };
+        out.push(json!({
+            "cond": test_call(&format!("\"${temp}\" = \"\"")),
+            "then": [prop],
+            "elsifs": [],
+            "else": [],
+            "type": "If",
+        }));
+    }
     let mut pre = Vec::new();
     let mut binds = Vec::new();
     let cond = destructure(&temp, pat, cx, &mut pre, &mut binds);
@@ -1262,7 +1293,107 @@ fn let_pattern_stmt(
     }
 }
 
-fn lower_local(local: &syn::Local, cx: &Cx, out: &mut Vec<Value>) -> Option<Value> {
+/// Does `e` contain a `?` anywhere BELOW its root? (A root `?` keeps the
+/// existing dedicated lowering.)
+fn has_nested_try(e: &syn::Expr) -> bool {
+    fn walk(e: &syn::Expr) -> bool {
+        match e {
+            syn::Expr::Try(_) => true,
+            syn::Expr::MethodCall(m) => walk(&m.receiver) || m.args.iter().any(walk),
+            syn::Expr::Call(c) => c.args.iter().any(walk),
+            syn::Expr::Field(x) => walk(&x.base),
+            syn::Expr::Index(x) => walk(&x.expr) || walk(&x.index),
+            syn::Expr::Binary(x) => walk(&x.left) || walk(&x.right),
+            syn::Expr::Unary(x) => walk(&x.expr),
+            syn::Expr::Paren(x) => walk(&x.expr),
+            syn::Expr::Reference(x) => walk(&x.expr),
+            syn::Expr::Cast(x) => walk(&x.expr),
+            syn::Expr::Tuple(t) => t.elems.iter().any(walk),
+            _ => false,
+        }
+    }
+    match e {
+        syn::Expr::Try(t) => walk(&t.expr),
+        other => walk(other),
+    }
+}
+
+/// Rewrite `e` so every `?` becomes `tmp = <inner>; if tmp is empty
+/// {propagate}; ` and the value of the whole expression is the temp.
+fn hoist_tries(e: &syn::Expr, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) -> syn::Expr {
+    let tmp_path = |name: &str| {
+        syn::parse_str::<syn::Expr>(name).unwrap_or_else(|_| refuse("temporary name", e.span()))
+    };
+    match e {
+        syn::Expr::Try(t) => {
+            let inner = hoist_tries(&t.expr, cx, in_fn, out);
+            let tmp = fresh_tmp(cx, "q");
+            let inner_ty = infer_ty(&inner, cx);
+            out.push(store_stmt(&tmp, value_expr(&inner, cx)));
+            // the temp IS the unwrapped value: its type drives the outer
+            // method dispatch (`prog.strip_prefix('{')?.strip_suffix('}')`)
+            cx.vars.borrow_mut().insert(tmp.clone(), inner_ty);
+            let prop = if in_fn {
+                json!({"type": "Return", "value": str_lit("")})
+            } else {
+                json!({"type": "Exit", "value": null})
+            };
+            out.push(json!({
+                "cond": test_call(&format!("\"${tmp}\" = \"\"")),
+                "then": [prop],
+                "elsifs": [],
+                "else": [],
+                "type": "If",
+            }));
+            tmp_path(&tmp)
+        }
+        syn::Expr::MethodCall(m) => {
+            let mut m2 = m.clone();
+            m2.receiver = Box::new(hoist_tries(&m.receiver, cx, in_fn, out));
+            for a in m2.args.iter_mut() {
+                *a = hoist_tries(a, cx, in_fn, out);
+            }
+            syn::Expr::MethodCall(m2)
+        }
+        syn::Expr::Call(c) => {
+            let mut c2 = c.clone();
+            for a in c2.args.iter_mut() {
+                *a = hoist_tries(a, cx, in_fn, out);
+            }
+            syn::Expr::Call(c2)
+        }
+        syn::Expr::Field(f) => {
+            let mut f2 = f.clone();
+            f2.base = Box::new(hoist_tries(&f.base, cx, in_fn, out));
+            syn::Expr::Field(f2)
+        }
+        syn::Expr::Index(ix) => {
+            let mut ix2 = ix.clone();
+            ix2.expr = Box::new(hoist_tries(&ix.expr, cx, in_fn, out));
+            ix2.index = Box::new(hoist_tries(&ix.index, cx, in_fn, out));
+            syn::Expr::Index(ix2)
+        }
+        syn::Expr::Binary(b) => {
+            let mut b2 = b.clone();
+            b2.left = Box::new(hoist_tries(&b.left, cx, in_fn, out));
+            b2.right = Box::new(hoist_tries(&b.right, cx, in_fn, out));
+            syn::Expr::Binary(b2)
+        }
+        syn::Expr::Paren(p) => {
+            let mut p2 = p.clone();
+            p2.expr = Box::new(hoist_tries(&p.expr, cx, in_fn, out));
+            syn::Expr::Paren(p2)
+        }
+        other => other.clone(),
+    }
+}
+
+fn lower_local(
+    local: &syn::Local,
+    cx: &Cx,
+    in_fn: bool,
+    out: &mut Vec<Value>,
+) -> Option<Value> {
     // `let x: i64 = ...` parses as Pat::Type wrapping Pat::Ident — the
     // annotation is type-checker information, erased here (the store is
     // dynamically typed).
@@ -1273,7 +1404,7 @@ fn lower_local(local: &syn::Local, cx: &Cx, out: &mut Vec<Value>) -> Option<Valu
     if let Some(init) = &local.init {
         let plain_ident = matches!(pat, syn::Pat::Ident(pi) if pi.subpat.is_none() && pi.ident != "None");
         if init.diverge.is_some() || !plain_ident {
-            return let_pattern_stmt(pat, init, cx, out);
+            return let_pattern_stmt(pat, init, cx, in_fn, out);
         }
     }
     let syn::Pat::Ident(pi) = pat else {
@@ -1322,6 +1453,16 @@ fn lower_local(local: &syn::Local, cx: &Cx, out: &mut Vec<Value>) -> Option<Valu
             "iterator chain (only SRC.iter()[.map(closure-or-fn)].collect())",
             init.expr.span(),
         );
+    }
+    // NESTED `?` inside a larger expression (`a()?.b()?`): hoist EVERY
+    // `?` into its own temp + early return, then evaluate the rewritten
+    // expression. This is the same propagation the outermost form uses,
+    // just applied at the point each `?` occurs.
+    if matches!(&*init.expr, syn::Expr::Try(_)) && has_nested_try(&init.expr) {
+        let hoisted = hoist_tries(&init.expr, cx, in_fn, out);
+        let ty = infer_ty(&init.expr, cx);
+        cx.vars.borrow_mut().insert(name.clone(), ty);
+        return Some(assign_stmt(&name, value_expr(&hoisted, cx)));
     }
     // `let x = expr?;` — Option propagation under None≡"": an EMPTY
     // value returns "" from the enclosing fn (propagation); otherwise x
@@ -1396,6 +1537,8 @@ fn infer_ty(e: &syn::Expr, cx: &Cx) -> Ty {
             syn::Lit::Int(_) => Ty::Int,
             syn::Lit::Str(_) => Ty::Str,
             syn::Lit::Bool(_) => Ty::Bool,
+            // a char is a one-character string in the store
+            syn::Lit::Char(_) => Ty::Str,
             _ => Ty::Unknown,
         },
         syn::Expr::Macro(m) => {
@@ -1500,7 +1643,7 @@ fn infer_ty(e: &syn::Expr, cx: &Cx) -> Ty {
                 // string-to-string methods keep the Str type (a proven
                 // receiver makes the result proven too)
                 "trim" | "trim_start" | "trim_end" | "to_lowercase" | "to_uppercase"
-                | "to_string" | "strip_prefix" | "strip_suffix" | "as_str"
+                | "to_string" | "strip_prefix" | "strip_suffix" | "as_str" | "replace"
                     if matches!(rty, Ty::Str) =>
                 {
                     Ty::Str
@@ -3744,6 +3887,41 @@ fn arm_cond_neg(temp: &str, pat: &syn::Pat, cx: &Cx) -> Option<String> {
                 )),
                 _ => None,
             },
+            // `!matches!(x, Enum::Variant { .. })` — the TAG inequality
+            // (same wildcard-only sub-pattern rule as the positive form).
+            syn::Pat::Struct(ps) => {
+                if !ps
+                    .fields
+                    .iter()
+                    .all(|f| matches!(&*f.pat, syn::Pat::Wild(_) | syn::Pat::Ident(_)))
+                {
+                    return None;
+                }
+                enum_variant_of_path(&ps.path, cx)
+                    .map(|(en, vn)| format!("\"${temp}\" != \"{en}::{vn}\""))
+            }
+            syn::Pat::TupleStruct(ts) => {
+                if !ts.elems.iter().all(|p| {
+                    matches!(p, syn::Pat::Wild(_))
+                        || matches!(p, syn::Pat::Ident(pi) if pi.subpat.is_none())
+                }) {
+                    return None;
+                }
+                let last = ts
+                    .path
+                    .segments
+                    .last()
+                    .map(|s| s.ident.to_string())
+                    .unwrap_or_default();
+                if ts.path.segments.len() == 1 && last == "Some" {
+                    return Some(format!("\"${temp}\" = \"\""));
+                }
+                if ts.path.segments.len() == 1 && last == "None" {
+                    return Some(format!("\"${temp}\" != \"\""));
+                }
+                enum_variant_of_path(&ts.path, cx)
+                    .map(|(en, vn)| format!("\"${temp}\" != \"{en}::{vn}\""))
+            }
             _ => None,
         }
     }
@@ -3789,6 +3967,43 @@ fn arm_cond(temp: &str, pat: &syn::Pat, cx: &Cx) -> Option<String> {
                 )),
                 _ => None,
             },
+            // `matches!(x, Enum::Variant { .. })` / `Variant(_)`: the TAG
+            // test. Only patterns whose sub-patterns are wildcards or
+            // plain bindings are accepted (a payload constraint would need
+            // the full destructure, not just the tag).
+            syn::Pat::Struct(ps) => {
+                if !ps
+                    .fields
+                    .iter()
+                    .all(|f| matches!(&*f.pat, syn::Pat::Wild(_) | syn::Pat::Ident(_)))
+                {
+                    return None;
+                }
+                enum_variant_of_path(&ps.path, cx)
+                    .map(|(en, vn)| format!("${temp} = \"{en}::{vn}\""))
+            }
+            syn::Pat::TupleStruct(ts) => {
+                if !ts.elems.iter().all(|p| {
+                    matches!(p, syn::Pat::Wild(_))
+                        || matches!(p, syn::Pat::Ident(pi) if pi.subpat.is_none())
+                }) {
+                    return None;
+                }
+                let last = ts
+                    .path
+                    .segments
+                    .last()
+                    .map(|s| s.ident.to_string())
+                    .unwrap_or_default();
+                if ts.path.segments.len() == 1 && last == "Some" {
+                    return Some(format!("\"${temp}\" != \"\""));
+                }
+                if ts.path.segments.len() == 1 && last == "None" {
+                    return Some(format!("\"${temp}\" = \"\""));
+                }
+                enum_variant_of_path(&ts.path, cx)
+                    .map(|(en, vn)| format!("${temp} = \"{en}::{vn}\""))
+            }
             _ => None,
         }
     }
@@ -5528,10 +5743,13 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
             // scalar param("len") fold that miscounted an array value).
             // Result::ok() / Option::as_ref() / String::as_str() — the
             // store has one absent marker (`""`) for both Result and
-            // Option, so these conversions are the value itself.
+            // Option, so these conversions are the value itself. The same
+            // holds for `to_string`: Display of every store type IS its
+            // stored text (a record has no Display in Rust, so it cannot
+            // appear here).
             if matches!(
                 rust_name.as_str(),
-                "ok" | "as_str" | "as_deref" | "as_ref" | "as_slice"
+                "ok" | "as_str" | "as_deref" | "as_ref" | "as_slice" | "to_string"
             ) && m.args.is_empty()
             {
                 return value_expr(&m.receiver, cx);
@@ -5755,6 +5973,10 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                 (Ty::Str, "trim") => "trim",
                 (Ty::Str, "trim_start") => "trimStart",
                 (Ty::Str, "trim_end") => "trimEnd",
+                // Rust's `replace` replaces EVERY non-overlapping match;
+                // JS `replaceAll` with a STRING pattern is literal and
+                // global — the same operation (no regex interpretation).
+                (Ty::Str, "replace") => "replaceAll",
                 (Ty::Str, "to_lowercase") => "toLowerCase",
                 (Ty::Str, "to_uppercase") => "toUpperCase",
                 // strings are immutable JS values — to_string is identity
