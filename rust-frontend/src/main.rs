@@ -507,6 +507,10 @@ struct Cx {
     statics: std::cell::RefCell<HashMap<String, Ty>>,
     /// global assignments (consts/statics), in source order
     globals: Vec<Value>,
+    /// statements a VALUE lowering had to emit (an if-value's A1 If, a
+    /// hoisted pure read). Drained by `lower_block` just BEFORE the
+    /// statement that consumes the temp, so the order is the source order.
+    pending: std::cell::RefCell<Vec<Value>>,
     /// every name the program can put in the STORE: `let`/param/pattern
     /// bindings plus const/static globals. An env read lowers to
     /// getVar(name), whose runtime lookup prefers the store over
@@ -1314,7 +1318,14 @@ fn main() {
 
 fn lower_block(block: &syn::Block, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) {
     for stmt in &block.stmts {
-        if let Some(v) = lower_stmt(stmt, cx, in_fn, out) {
+        // statements a VALUE lowering hoisted (an if-value, a pure-read
+        // snapshot) land in `pending`; they must run BEFORE the statement
+        // that reads their temp.
+        cx.pending.borrow_mut().clear();
+        let v = lower_stmt(stmt, cx, in_fn, out);
+        let mut pend: Vec<Value> = cx.pending.borrow_mut().drain(..).collect();
+        out.append(&mut pend);
+        if let Some(v) = v {
             out.push(v);
         }
     }
@@ -1542,6 +1553,67 @@ fn lower_local(
     }
     // if-as-value: bind the target in EVERY branch (exact — rustc
     // guarantees all paths produce the value)
+    // A chain COLLECTED INTO A MAP: `let m: BTreeMap<K,V> = SRC.iter()
+    // .enumerate().map(|(i, n)| (K, V)).collect();`. Each element inserts
+    // one pair, so the fill order does not matter (a map has no order of
+    // its own). The source may be ANY array-valued expression — a field
+    // array is copied ONCE into a temp exactly like array iteration — and
+    // the bound is the runtime-trusted arrayLen, so an unproven-length
+    // source is fine here (unlike the ordered accumulator below).
+    let decl_map = match &local.pat {
+        syn::Pat::Type(pt) => matches!(ty_from_type(&pt.ty, cx), Ty::Map(..)),
+        _ => false,
+    };
+    if decl_map && as_method_call(&init.expr, "collect").is_some() {
+        if let Some((src, iname, vname, key, val)) = map_collect_parts(&init.expr, cx) {
+            let t = fresh_tmp(cx, "a");
+            match src {
+                // a plain array variable: copy its ELEMENTS (a getVar read
+                // would arrive as one joined string — see array_items_call)
+                syn::Expr::Path(p) if p.qself.is_none() && single_path(p).is_some() => {
+                    let n = single_path(p).unwrap().to_string();
+                    out.push(store_stmt(&t, array_items_call(&n)));
+                }
+                other => out.push(store_stmt(&t, value_expr(other, cx))),
+            }
+            cx.vars
+                .borrow_mut()
+                .insert(t.clone(), Ty::Arr(None, None));
+            let idxv = fresh_tmp(cx, "i");
+            let lenv = fresh_tmp(cx, "l");
+            out.push(assign_stmt(&lenv, array_len_call(&t)));
+            cx.vars.borrow_mut().insert(lenv.clone(), Ty::Int);
+            cx.vars.borrow_mut().insert(idxv.clone(), Ty::Int);
+            let elem_ty = match infer_ty(src, cx) {
+                Ty::Arr(Some(e), _) => *e,
+                _ => Ty::Str,
+            };
+            let mut body = Vec::new();
+            cx.vars.borrow_mut().insert(iname.clone(), Ty::Int);
+            body.push(assign_stmt(&iname, get_var(&idxv)));
+            cx.vars.borrow_mut().insert(vname.clone(), elem_ty);
+            body.push(assign_stmt(
+                &vname,
+                raw_elem(&t, json!({"type": "Var", "name": idxv, "sigil": null})),
+            ));
+            body.push(assoc_set_stmt(&name, value_expr(key, cx), value_expr(val, cx)));
+            body.push(assign_stmt(
+                &idxv,
+                arith_bin("+", arith_var(&idxv), arith_num(1)),
+            ));
+            out.push(assoc_empty_stmt(&name));
+            cx.vars.borrow_mut().insert(
+                name.clone(),
+                Ty::Map(Box::new(Ty::Str), Box::new(Ty::Int)),
+            );
+            out.push(json!({
+                "type": "While",
+                "cond": test_call(&format!("${idxv} -lt ${lenv}")),
+                "body": body,
+            }));
+            return None;
+        }
+    }
     // iterator chains (`SRC.iter().map(F).collect()`) desugar to
     // accumulator + index loop + setArrayAppend
     if as_method_call(&init.expr, "collect").is_some() {
@@ -1706,6 +1778,19 @@ fn infer_ty(e: &syn::Expr, cx: &Cx) -> Ty {
                 if is_env_var_path(p2) && env_var_lit(&c.args).is_some() {
                     return Ty::Opt(Box::new(Ty::Str));
                 }
+                // `String::new()` / `String::with_capacity(n)` / `String::from(x)`
+                // — the store value is a string in every case.
+                if p2.qself.is_none()
+                    && p2.path.leading_colon.is_none()
+                    && p2.path.segments.len() == 2
+                    && p2.path.segments[0].ident == "String"
+                    && matches!(
+                        p2.path.segments[1].ident.to_string().as_str(),
+                        "new" | "with_capacity" | "from"
+                    )
+                {
+                    return Ty::Str;
+                }
                 if let Some(id) = single_path(p2) {
                     // Some(v) constructor -> Opt(type of v), under the
                     // None≡"" convention (the option methods then collapse
@@ -1750,11 +1835,24 @@ fn infer_ty(e: &syn::Expr, cx: &Cx) -> Ty {
                 }
                 "iter" | "iter_mut" => rty,
                 "any" | "all" => Ty::Bool,
+                // Rust's char/str predicates and the membership family
+                "is_ascii_alphanumeric" | "is_ascii_digit" | "is_ascii"
+                | "is_ascii_whitespace" | "is_alphanumeric" | "is_empty"
+                | "contains" | "contains_key" | "starts_with" | "ends_with" => Ty::Bool,
                 "unwrap_or" => match m.args.first() {
                     Some(a) => infer_ty(a, cx),
                     None => Ty::Unknown,
                 },
-                "clone" => rty,
+                // Option shape-preserving reads
+                "copied" | "cloned" | "as_ref" | "as_deref" | "ok" | "clone" => rty,
+                "unwrap" | "expect" => match rty {
+                    Ty::Opt(t) => *t,
+                    _ => Ty::Unknown,
+                },
+                // `s.chars()` / `s.lines()` are string sequences; their
+                // `next()` is the Option of one element (a one-char string).
+                "chars" | "lines" => Ty::List,
+                "next" => Ty::Opt(Box::new(Ty::Str)),
                 _ => Ty::Unknown,
             }
         }
@@ -1960,6 +2058,19 @@ fn lower_expr_stmt(e: &syn::Expr, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) ->
                 };
                 let name = id.to_string();
                 if method == "push" {
+                    // String::push(c) appends exactly ONE char (rustc types
+                    // the argument as `char`), so the value-level concat is
+                    // the same string — no measurement, no ambiguity.
+                    if matches!(recv_ty, Ty::Str) {
+                        if m.args.len() != 1 {
+                            refuse("push expects exactly one argument", m.span());
+                        }
+                        let rhs = match &m.args[0] {
+                            syn::Expr::Reference(r) => value_expr(&r.expr, cx),
+                            other => value_expr(other, cx),
+                        };
+                        return Some(assign_stmt(&name, str_concat(get_var(&name), rhs)));
+                    }
                     if !matches!(recv_ty, Ty::Arr(..)) {
                         refuse(
                             "`push` on an unproven (non-array) receiver",
@@ -1970,13 +2081,30 @@ fn lower_expr_stmt(e: &syn::Expr, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) ->
                         refuse("push expects exactly one argument", m.span());
                     }
                     let v = &m.args[0];
-                    return Some(expr_stmt(json!({
+                    let vv = value_expr(v, cx);
+                    // A Vec of SCALARS also keeps a parallel ASSOC SET, so
+                    // `contains` can answer membership exactly (an ordered
+                    // array alone cannot). Only pushes into a Vec that
+                    // `contains` may later consult need the shadow.
+                    let shadow = matches!(recv_ty, Ty::Arr(Some(ref e), _) if matches!(**e, Ty::Str | Ty::Int));
+                    let mut stmts = vec![expr_stmt(json!({
                         "args": [
                             str_lit(&name),
-                            json!({"elements": vec![value_expr(v, cx)], "type": "Array"}),
+                            json!({"elements": vec![vv.clone()], "type": "Array"}),
                         ],
                         "func": "setArrayAppend", "purity": "Emulable", "type": "Call"
-                    })));
+                    }))];
+                    if shadow {
+                        stmts.push(assoc_set_stmt(
+                            &format!("{name}__set"),
+                            vv,
+                            str_lit("1"),
+                        ));
+                    }
+                    if stmts.len() == 1 {
+                        return Some(stmts.pop().unwrap_or(serde_json::Value::Null));
+                    }
+                    return Some(json!({"type": "Block", "body": stmts}));
                 }
                 // String::push_str(&p) — Rust appends; the store value is a
                 // string, so `s = s + p` is the same value. Rust's
@@ -2056,6 +2184,17 @@ fn plain_assign(a: &syn::ExprAssign, cx: &Cx, out: &mut Vec<Value>) -> Value {
     let Some(name) = single_path(p) else {
         refuse("assignment target path", p.span());
     };
+    // A Vec that carries the `contains` shadow set (`<v>__set`, filled at
+    // every push) cannot be REBOUND: the set would keep the old elements
+    // and `contains` would silently answer wrong. Refuse rather than let a
+    // stale set lie.
+    if matches!(infer_ty(&a.left, cx), Ty::Arr(Some(ref e), _) if matches!(**e, Ty::Str | Ty::Int))
+    {
+        refuse(
+            "assignment to a Vec that carries the contains shadow set",
+            a.left.span(),
+        );
+    }
     // `ok = COLL.any(|e| COND)` / `.all(..)`
     if let Some((all, src, cl)) = quantifier_parts(&a.right, cx) {
         let r = quantifier_stmts(all, src, cl, cx, out);
@@ -2285,6 +2424,47 @@ fn for_stmt(fl: &syn::ExprForLoop, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) -
     if fl.label.is_some() {
         refuse("labeled for", fl.span());
     }
+    // STRING iteration: `for c in s.chars()` / `for line in s.lines()`.
+    // The runtime already carries the two ops with Rust's exact semantics:
+    // strChars yields Unicode SCALAR VALUES (a non-BMP char is ONE element,
+    // where split("") would give two UTF-16 halves) and strLines is Rust's
+    // `lines()` (\r\n stripped, a final newline adds no empty line). Both
+    // return a native array, adopted through setArray's Array.isArray
+    // splice (setVar would nest it as ONE element). The iterator borrows the
+    // source immutably, so the temp snapshot cannot change under the loop:
+    // reading the length once is exact.
+    if let syn::Expr::MethodCall(m) = &*fl.expr {
+        let fname = match m.method.to_string().as_str() {
+            "chars" => Some("strChars"),
+            "lines" => Some("strLines"),
+            _ => None,
+        };
+        if let Some(fname) = fname {
+            if m.args.is_empty() && matches!(infer_ty(&m.receiver, cx), Ty::Str) {
+                let tmp = fresh_tmp(cx, "s");
+                out.push(expr_stmt(json!({
+                    "type": "Call", "func": "setArray", "purity": "Emulable",
+                    "args": [
+                        str_lit(&tmp),
+                        json!({"type": "Array", "elements": [json!({
+                            "type": "Call", "func": fname, "purity": "PureCpu",
+                            "args": [value_expr(&m.receiver, cx)],
+                        })]}),
+                    ],
+                })));
+                cx.vars
+                    .borrow_mut()
+                    .insert(tmp.clone(), Ty::Arr(Some(Box::new(Ty::Str)), None));
+                let mut fl2 = fl.clone();
+                fl2.label = None;
+                fl2.expr = Box::new(
+                    syn::parse_str::<syn::Expr>(&tmp)
+                        .unwrap_or_else(|_| refuse("temporary name", fl.span())),
+                );
+                return for_stmt(&fl2, cx, in_fn, out);
+            }
+        }
+    }
     // ARRAY iteration: `for PAT in v` / `&v` / `v.iter()` — an index
     // while-loop over the trusted runtime length. Rust's borrow checker
     // forbids mutating the array during iteration, so one length read is
@@ -2368,7 +2548,22 @@ fn for_stmt(fl: &syn::ExprForLoop, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) -
             "body": body_all,
         });
     }
-    let iter_arr: Option<&syn::Expr> = match &*fl.expr {
+    // `.iter().enumerate()`: the loop index IS the position (the walk visits
+    // elements in order), so `for (i, x) in v.iter().enumerate()` binds i to
+    // the counter and x to the element.
+    let mut enumerate_iter = false;
+    let mut iter_root: &syn::Expr = &fl.expr;
+    if let syn::Expr::MethodCall(m) = iter_root {
+        if m.method == "enumerate" && m.args.is_empty() {
+            if let syn::Expr::MethodCall(m2) = &*m.receiver {
+                if (m2.method == "iter" || m2.method == "iter_mut") && m2.args.is_empty() {
+                    enumerate_iter = true;
+                    iter_root = &m2.receiver;
+                }
+            }
+        }
+    }
+    let iter_arr: Option<&syn::Expr> = match iter_root {
         syn::Expr::MethodCall(m)
             if (m.method == "iter" || m.method == "iter_mut") && m.args.is_empty() =>
         {
@@ -2446,6 +2641,35 @@ fn for_stmt(fl: &syn::ExprForLoop, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) -
                     body_all.push(store_stmt(&name, elem));
                 } else {
                     body_all.push(assign_stmt(&name, elem));
+                }
+            }
+            // `for (i, x) in v.iter().enumerate()` — the pair is never
+            // materialized: i is the loop counter, x the element.
+            syn::Pat::Tuple(t) if enumerate_iter && t.elems.len() == 2 => {
+                let syn::Pat::Ident(ii) = &t.elems[0] else {
+                    refuse("enumerate loop index pattern", t.elems[0].span());
+                };
+                if ii.subpat.is_some() {
+                    refuse("enumerate loop index subpattern", ii.span());
+                }
+                let iname = ii.ident.to_string();
+                cx.vars.borrow_mut().insert(iname.clone(), Ty::Int);
+                body_all.push(assign_stmt(&iname, get_var(&idx)));
+                match &t.elems[1] {
+                    syn::Pat::Ident(vi) if vi.subpat.is_none() => {
+                        let vname2 = vi.ident.to_string();
+                        cx.vars.borrow_mut().insert(vname2.clone(), elem_ty.clone());
+                        if matches!(
+                            elem_ty,
+                            Ty::Struct(_) | Ty::Tuple(_) | Ty::Arr(..) | Ty::Enum(_)
+                        ) {
+                            body_all.push(store_stmt(&vname2, elem));
+                        } else {
+                            body_all.push(assign_stmt(&vname2, elem));
+                        }
+                    }
+                    syn::Pat::Wild(_) => {}
+                    other => refuse("enumerate loop element pattern", other.span()),
                 }
             }
             pat => {
@@ -3182,11 +3406,49 @@ fn assoc_set_stmt(name: &str, key: Value, val: Value) -> Value {
     expr_stmt(assoc_call("assocSet", vec![str_lit(name), key, val]))
 }
 
+/// A COPY of a named array's elements (`sh2.arrayItems(name)`). Use this —
+/// never `getVar(name)` — when the value must STAY an array: the emitter
+/// inlines a store read as `sh2.vars.x ?? ""`, and the runtime stringifies
+/// that on the way in, so a nested getVar would arrive as one joined string.
+fn array_items_call(name: &str) -> Value {
+    json!({
+        "type": "Call", "func": "arrayItems", "purity": "PureCpu",
+        "args": [str_lit(name)]
+    })
+}
+
 fn array_len_call(name: &str) -> Value {
     json!({
         "type": "Call", "func": "arrayLen", "purity": "PureCpu",
         "args": [str_lit(name)]
     })
+}
+
+/// A receiver with NO side effect: a literal, a store read, a field/index
+/// read, or a PURE method chain over those (store reads like
+/// `map.get(k).copied()`). Evaluating one twice — a marker test and the
+/// value branch — is the same read twice, so the result is identical.
+fn pure_receiver(e: &syn::Expr) -> bool {
+    match e {
+        syn::Expr::Lit(_) => true,
+        syn::Expr::Path(p) => p.qself.is_none() && single_path(p).is_some(),
+        syn::Expr::Field(f) => pure_receiver(&f.base),
+        syn::Expr::Index(ix) => pure_receiver(&ix.expr) && pure_receiver(&ix.index),
+        syn::Expr::Paren(p) => pure_receiver(&p.expr),
+        syn::Expr::Reference(r) => pure_receiver(&r.expr),
+        syn::Expr::Cast(c) => pure_receiver(&c.expr),
+        syn::Expr::Try(t) => pure_receiver(&t.expr),
+        syn::Expr::Unary(u) => matches!(u.op, syn::UnOp::Deref(_)) && pure_receiver(&u.expr),
+        syn::Expr::MethodCall(m) => {
+            matches!(
+                m.method.to_string().as_str(),
+                "get" | "copied" | "cloned" | "as_ref" | "as_deref" | "as_str"
+                    | "to_string" | "ok" | "first" | "last"
+            ) && pure_receiver(&m.receiver)
+                && m.args.iter().all(pure_receiver)
+        }
+        _ => false,
+    }
 }
 
 /// The plain variable a method receiver reads (`m`, `&m`). Maps/sets are
@@ -3400,6 +3662,69 @@ enum Step<'a> {
     Enumerate,
     /// `.rev()` — reverse visitation order
     Rev,
+}
+
+/// `SRC.iter().enumerate().map(|(i, n)| (K, V)).collect()` -> its parts:
+/// the source expression, the two closure binding names (position and
+/// element) and the KEY / VALUE expressions. Nothing else matches.
+fn map_collect_parts<'a>(
+    e: &'a syn::Expr,
+    cx: &Cx,
+) -> Option<(&'a syn::Expr, String, String, &'a syn::Expr, &'a syn::Expr)> {
+    let collect = as_method_call(e, "collect")?;
+    if !collect.args.is_empty() {
+        return None;
+    }
+    let map = as_method_call(&collect.receiver, "map")?;
+    if map.args.len() != 1 {
+        return None;
+    }
+    let syn::Expr::Closure(cl) = &map.args[0] else {
+        return None;
+    };
+    if cl.inputs.len() != 1 {
+        return None;
+    }
+    let Some(syn::Pat::Tuple(pt)) = cl.inputs.first() else {
+        return None;
+    };
+    if pt.elems.len() != 2 {
+        return None;
+    }
+    let (syn::Pat::Ident(ii), syn::Pat::Ident(nn)) = (&pt.elems[0], &pt.elems[1]) else {
+        return None;
+    };
+    if ii.subpat.is_some() || nn.subpat.is_some() {
+        return None;
+    }
+    let syn::Expr::Tuple(tu) = &*cl.body else {
+        return None;
+    };
+    if tu.elems.len() != 2 {
+        return None;
+    }
+    let en = as_method_call(&map.receiver, "enumerate")?;
+    if !en.args.is_empty() {
+        return None;
+    }
+    let src: &syn::Expr = match &*en.receiver {
+        syn::Expr::MethodCall(m)
+            if (m.method == "iter" || m.method == "iter_mut") && m.args.is_empty() =>
+        {
+            &m.receiver
+        }
+        other => other,
+    };
+    if !matches!(infer_ty(src, cx), Ty::Arr(..) | Ty::List) {
+        return None;
+    }
+    Some((
+        src,
+        ii.ident.to_string(),
+        nn.ident.to_string(),
+        &tu.elems[0],
+        &tu.elems[1],
+    ))
 }
 
 fn as_method_call<'a>(e: &'a syn::Expr, name: &str) -> Option<&'a syn::ExprMethodCall> {
@@ -4931,6 +5256,21 @@ fn hoist_cond_calls(e: &syn::Expr, cx: &Cx, out: &mut Vec<Value>) -> syn::Expr {
 /// each branch lowers its statements then binds/returns the branch value.
 /// else-if chains recurse (nested If in the else position). A missing
 /// else refuses (rustc rejects it too — never reached for valid code).
+/// A conditional VALUE as a STATEMENT `If` (the A1 `Ternary` node is
+/// Perl-only IR — the ESTree renderer rejects it). One branch runs, exactly
+/// like Rust's `if`; the arms are pure values, so the order is Rust's own.
+fn cond_value(hint: &str, cond: String, then_v: Value, else_v: Value, cx: &Cx) -> Value {
+    let r = fresh_tmp(cx, hint);
+    cx.pending.borrow_mut().push(json!({
+        "cond": test_call(&cond),
+        "then": [assign_stmt(&r, then_v)],
+        "elsifs": [],
+        "else": [assign_stmt(&r, else_v)],
+        "type": "If",
+    }));
+    get_var(&r)
+}
+
 fn if_value_node(
     ie: &syn::ExprIf,
     target: BranchTarget,
@@ -4984,7 +5324,11 @@ fn if_value_node(
         out.push(store_stmt(&tmp, value_expr(&l.expr, cx)));
         iflet_cond(&tmp, &l.pat, cx, out)
     } else {
-        test_call(&test_string(&ie.cond, cx))
+        // the condition may need a hoist (`self.items.is_empty()`, a method
+        // call) before the test grammar can read it — the same pre-pass the
+        // statement form runs. An if evaluates its condition ONCE.
+        let hoisted = hoist_cond_calls(&ie.cond, cx, out);
+        test_call(&test_string(&hoisted, cx))
     };
     let mut then = Vec::new();
     push_branch(&ie.then_branch, target, cx, in_fn, &mut then);
@@ -5957,7 +6301,20 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
             };
             if matches!(recv_ty, Ty::Opt(_)) {
                 match rust_name.as_str() {
-                    "as_deref" | "unwrap_or_default" => {
+                    // `unwrap()` is the same value read as the family
+                    // above: Some(v) -> v. The None branch PANICS in Rust
+                    // (no defined stdout), so the store's absent marker
+                    // ("") never has to model an output.
+                    "as_deref" | "unwrap_or_default" | "unwrap" => {
+                        if !m.args.is_empty() {
+                            refuse("option method with arguments", m.span());
+                        }
+                        return value_expr(&m.receiver, cx);
+                    }
+                    // `Option<&T>::copied()` is the Option<T> of the same
+                    // value: the store has no reference layer, so the read
+                    // is the value.
+                    "copied" | "cloned" => {
                         if !m.args.is_empty() {
                             refuse("option method with arguments", m.span());
                         }
@@ -5970,12 +6327,13 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                         // would be evaluated twice).
                         if m.args.len() == 1 {
                             if let Some(n) = recv_var_name(&m.receiver) {
-                                return json!({
-                                    "type": "Ternary",
-                                    "cond": test_call(&format!("\"${n}\" != \"\"")),
-                                    "then": get_var(&n),
-                                    "else": value_expr(&m.args[0], cx),
-                                });
+                                return cond_value(
+                                    "u",
+                                    format!("\"${n}\" != \"\""),
+                                    get_var(&n),
+                                    value_expr(&m.args[0], cx),
+                                    cx,
+                                );
                             }
                         }
                         let empty_default = m.args.first().map(|a| match a {
@@ -5984,6 +6342,25 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                         }).unwrap_or(false);
                         if empty_default {
                             return value_expr(&m.receiver, cx);
+                        }
+                        // A compound but PURE receiver (a store read like
+                        // `map.get(k).copied()`) carries no side effect, so
+                        // evaluating it in the test and in the value branch
+                        // is observationally the receiver read twice — the
+                        // same value. Anything else keeps the refusal.
+                        if pure_receiver(&m.receiver) {
+                            let t = fresh_tmp(cx, "o");
+                            let ty = infer_ty(&m.receiver, cx);
+                            cx.vars.borrow_mut().insert(t.clone(), ty);
+                            let v = value_expr(&m.receiver, cx);
+                            cx.pending.borrow_mut().push(assign_stmt(&t, v));
+                            return cond_value(
+                                "u",
+                                format!("\"${t}\" != \"\""),
+                                get_var(&t),
+                                value_expr(&m.args[0], cx),
+                                cx,
+                            );
                         }
                         refuse(
                             "unwrap_or with a non-empty default (branching not representable in value position)",
@@ -6071,6 +6448,122 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                         },
                         "else": str_lit("")
                     });
+                }
+            }
+            // `s.chars()` / `s.lines()` in VALUE position: the runtime ops
+            // return a native array of Unicode SCALARS / Rust's exact lines.
+            if matches!(recv_ty, Ty::Str)
+                && m.args.is_empty()
+                && matches!(rust_name.as_str(), "chars" | "lines")
+            {
+                let f = if rust_name == "chars" { "strChars" } else { "strLines" };
+                return json!({
+                    "type": "Call", "func": f, "purity": "PureCpu",
+                    "args": [value_expr(&m.receiver, cx)],
+                });
+            }
+            // `.next()` of a FRESH char/line iterator is its FIRST element
+            // (or the absent marker for an empty sequence — Rust's None). A
+            // cursor over a STORED iterator is a stateful, different shape
+            // and does not match. The op is pure, so the empty test and the
+            // element read are the same array twice.
+            if rust_name == "next" && m.args.is_empty() {
+                if let syn::Expr::MethodCall(rm) = &*m.receiver {
+                    if (rm.method == "chars" || rm.method == "lines")
+                        && rm.args.is_empty()
+                        && matches!(infer_ty(&rm.receiver, cx), Ty::Str)
+                    {
+                        let f = if rm.method == "chars" { "strChars" } else { "strLines" };
+                        // snapshot the sequence ONCE, then its length, then
+                        // read element 0 only when it exists (None -> "").
+                        let t = fresh_tmp(cx, "s");
+                        let arr = json!({
+                            "type": "Call", "func": f, "purity": "PureCpu",
+                            "args": [value_expr(&rm.receiver, cx)],
+                        });
+                        cx.pending.borrow_mut().push(store_stmt(&t, arr));
+                        cx.vars.borrow_mut().insert(
+                            t.clone(),
+                            Ty::Arr(Some(Box::new(Ty::Str)), None),
+                        );
+                        let n = fresh_tmp(cx, "n");
+                        cx.pending.borrow_mut().push(assign_stmt(&n, array_len_call(&t)));
+                        cx.vars.borrow_mut().insert(n.clone(), Ty::Int);
+                        return cond_value(
+                            "c",
+                            format!("${n} -gt 0"),
+                            raw_elem(&t, str_lit("0")),
+                            str_lit(""),
+                            cx,
+                        );
+                    }
+                }
+            }
+            // `is_ascii_alphanumeric` / `is_ascii_digit` on a CHAR: Rust's
+            // str:: predicates are char-only, so the receiver is ONE char,
+            // and an anchored bash bracket glob over the same ASCII set is
+            // the identical predicate (the runtime matcher is an anchored
+            // regex class; both sets contain both cases, and `[0-9]` has no
+            // case at all, so nocasematch cannot change the answer).
+            if matches!(recv_ty, Ty::Str)
+                && m.args.is_empty()
+                && matches!(
+                    rust_name.as_str(),
+                    "is_ascii_alphanumeric" | "is_ascii_digit"
+                )
+            {
+                let pat = if rust_name == "is_ascii_digit" {
+                    "[0-9]"
+                } else {
+                    "[0-9A-Za-z]"
+                };
+                // the A1 call carries (value, pattern); the emitter swaps
+                // to the runtime's globMatch(pattern, value).
+                return json!({
+                    "type": "Call", "func": "globMatch", "purity": "PureCpu",
+                    "args": [value_expr(&m.receiver, cx), str_lit(pat)],
+                });
+            }
+            // `v.contains(&x)` on a Vec of SCALARS: the ordered array cannot
+            // answer membership, but every `push` also maintained a parallel
+            // ASSOC SET (`<v>__set`), so membership is a key lookup. Exact
+            // because push is the ONLY mutation path this frontend admits on
+            // a Vec (remove/pop/retain/sort/extend refuse, element writes
+            // need a plain-variable target) and a whole-variable
+            // REASSIGNMENT of a shadowed Vec refuses in plain_assign — a
+            // stale set would answer wrong, so it is never produced.
+            if let Ty::Arr(Some(ref elem), _) = recv_ty {
+                if rust_name == "contains"
+                    && m.args.len() == 1
+                    && matches!(**elem, Ty::Str | Ty::Int)
+                {
+                    if let Some(n) = recv_var_name(&m.receiver) {
+                        let needle = match &m.args[0] {
+                            syn::Expr::Reference(r) => value_expr(&r.expr, cx),
+                            other => value_expr(other, cx),
+                        };
+                        // key PRESENT in the shadow set <=> the value is an
+                        // element. The lookup answers in the store's TEXT
+                        // vocabulary ("false" is a real string, not a falsy
+                        // JS boolean that prints as ""), so the result folds
+                        // into "true"/"false" through an exact test.
+                        let g = fresh_tmp(cx, "h");
+                        cx.pending.borrow_mut().push(assign_stmt(
+                            &g,
+                            assoc_call(
+                                "assocGet",
+                                vec![str_lit(&format!("{n}__set")), needle],
+                            ),
+                        ));
+                        cx.vars.borrow_mut().insert(g.clone(), Ty::Str);
+                        return cond_value(
+                            "k",
+                            format!("\"${g}\" != \"\""),
+                            str_lit("true"),
+                            str_lit("false"),
+                            cx,
+                        );
+                    }
                 }
             }
             let js_name_raw = match (&recv_ty, rust_name.as_str()) {
@@ -6212,6 +6705,20 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                 );
             };
             fn_call_expr(&target, &c.args, "fnValue", cx)
+        }
+        // `if c { A } else { B }` as a VALUE: the branches are STATEMENTS, so
+        // the whole if lowers into the pending buffer (drained before the
+        // statement that consumes the temp) and the value IS that temp. Rust
+        // evaluates exactly one branch and the A1 If does the same.
+        syn::Expr::If(ie) => {
+            let t = fresh_tmp(cx, "f");
+            let ty = branch_ty(ie, cx);
+            cx.vars.borrow_mut().insert(t.clone(), ty);
+            let mut buf: Vec<Value> = Vec::new();
+            let node = if_value_node(ie, BranchTarget::Var(&t), cx, false, &mut buf);
+            buf.push(node);
+            cx.pending.borrow_mut().extend(buf);
+            get_var(&t)
         }
         // `as` between integer types is a compile-time FACT when the operand
         // is a constant: Rust yields the same value whenever it fits the
@@ -6675,6 +7182,9 @@ fn operand(e: &syn::Expr, cx: &Cx, str_eq: bool) -> String {
                 format!("\"{}\"", if lb.value() { "true" } else { "false" })
             }
             syn::Lit::Str(ls) if str_eq => format!("\"{}\"", ls.value()),
+            // a CHAR is a one-character string in the store (the same value
+            // `"{}"` prints), so character equality is string equality.
+            syn::Lit::Char(lc) if str_eq => format!("\"{}\"", lc.value()),
             other => refuse("literal in condition operand", other.span()),
         },
         other => refuse(

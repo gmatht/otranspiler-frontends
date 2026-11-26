@@ -596,6 +596,75 @@ still `lazy_static!`, and the three `go/perl/zig_backend` files still stop at
 Pinned by t82 (executed stdout vs native rustc) and the refusal boundary
 pins t83 (wrapping constant) / t84 (non-constant).
 
+## v0.29 additions — the first COMPLETELY lowered backend file
+
+The dogfood mission's first concrete win: **`src/vulkan_backend.rs` (334
+lines) now lowers END TO END** — zero refusals, A1 accepted by the core,
+ESTree rendered, JS evaluated. It is the first `src/*_backend.rs` file to
+reach LOWERED. It was chosen by *measured frontier*, not by size: after
+v0.28 the 13 `*_backend.rs` files stood at `c_backend.rs` 145,
+`cuda_backend.rs` 8, `vulkan_backend.rs` 3 — the smallest path to a
+finished file.
+
+Classes lowered on the way, each exact:
+
+- **Code-point iteration** — `for c in s.chars()` and `for line in
+  s.lines()` materialise `strChars`/`strLines` into a temp array (the
+  runtime carries Rust's semantics: Unicode SCALAR values, and `lines()`
+  with `\r\n` stripped and no trailing empty line) and run the ordinary
+  index loop over it.
+- **`.chars()` / `.lines()` in VALUE position** — the same ops; `.next()`
+  snapshots the sequence once, reads its length, and yields element 0 or
+  the absent marker `""`.
+- **`String::push(char)`** — a concat: rustc types the argument as `char`,
+  so it is exactly one store element.
+- **`is_ascii_alphanumeric` / `is_ascii_digit` on a char** — an anchored
+  ASCII class (`globMatch`). The receiver is ONE char, both sets contain
+  both cases and `[0-9]` has no case, so the answer is Rust's for every
+  input. NOTE the A1 call order is `(value, pattern)`; the runtime
+  signature is `globMatch(pattern, value)` and the emitter swaps.
+- **`Vec<scalar>::contains`** — the ordered array cannot answer
+  membership, so every `push` also maintains a parallel ASSOC SET
+  (`<v>__set`) and membership is a key lookup folded into the store's
+  text `"true"`/`"false"`. Exact because `push` is the only Vec mutation
+  this frontend admits and a whole-variable REASSIGNMENT of such a Vec
+  REFUSES (t89) rather than leaving a stale set.
+- **`iter().enumerate().map(|(i, n)| (K, V)).collect()` into a map** —
+  snapshot the source's elements, then one `assocSet` per element.
+- **`for (i, x) in v.iter().enumerate()`** — the tuple pattern binds the
+  loop index and the element.
+- **`Option::copied`/`cloned`/`unwrap`** — identities (the store has no
+  reference layer; a `None` `unwrap` panics in Rust, so there is no
+  defined stdout to model). **`unwrap_or(d)`** is a conditional over the
+  receiver: a variable, or a PURE store read hoisted once into a temp;
+  anything with a side effect keeps its own refusal (t90).
+- **`if` in VALUE position** (a `let` initializer, a `format!` argument) —
+  a branch body is a STATEMENT LIST, so it lowers to a statement `If`
+  writing a temp, emitted through a new pending-statement buffer that
+  `lower_block` drains immediately BEFORE the statement that reads the
+  temp (source order preserved; exactly one branch runs, as in Rust).
+
+Three exactness bugs found by the pins, all fixed or documented:
+
+1. The A1 **`Ternary` node is Perl-only IR** — the ESTree renderer panics
+   on it. Value-level conditionals are therefore statement `If`s.
+2. The emitter inlines a store read as `sh2.vars.x ?? ""`, which STRINGS
+   an array: materialising an array variable must go through
+   `arrayItems(x)` (a copy), never `getVar(x)`, or a 3-element source
+   arrives as `"aa,b,cc"` and a loop runs once.
+3. **`BTreeMap` iteration order is not modelled**: the store's assoc
+   arrays iterate in INSERTION order, rustc iterates a `BTreeMap` in KEY
+   order. Range-for over a map is exact for an insertion-ordered map
+   (`HashMap`-style use) but not for a `BTreeMap`. This is a pre-existing
+   runtime/representation limit, documented here instead of tuned away:
+   no pin iterates a `BTreeMap`, and `vulkan_backend.rs` only *builds* one
+   (`ext_idx`) — it never iterates it.
+
+Scoreboard: **LOWERED 17 → 18 / 254**; `src/vulkan_backend.rs` moves from
+3 first-blockers to 0. The frontend-stdout gate is **61/81 match, 0 FAIL,
+20 SKIP** (was 57/75). Pinned by t85–t88 (executed stdout vs native
+`rustc`) and the refusal boundary pins t89/t90.
+
 ## Gate
 
 `make test` = refusal pins + ingress acceptance (`debashc
