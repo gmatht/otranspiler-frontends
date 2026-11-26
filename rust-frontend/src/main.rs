@@ -40,9 +40,32 @@ use syn::spanned::Spanned;
 /// caller can catch it per function/item and keep reporting the rest.
 static CENSUS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static CENSUS_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// While a DEMAND-PULLED function is lowered, a refusal must unwind to
+/// the caller (which drops the function) instead of exiting.
+static CATCHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn census_mode() -> bool {
     CENSUS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn catching_mode() -> bool {
+    CATCHING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Lower a DEMAND-PULLED function with refusals turning into a catch: a
+/// body that refuses is dropped (its name leaves the call set), so the
+/// pull can never make a file worse than it was without the pull.
+fn caught<F>(f: F) -> Result<Value, Box<dyn std::any::Any + Send>>
+where
+    F: FnOnce() -> Value + std::panic::UnwindSafe,
+{
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    CATCHING.store(true, std::sync::atomic::Ordering::Relaxed);
+    let r = std::panic::catch_unwind(f);
+    CATCHING.store(false, std::sync::atomic::Ordering::Relaxed);
+    std::panic::set_hook(prev);
+    r
 }
 
 fn path_text(e: &syn::Expr) -> String {
@@ -61,7 +84,7 @@ fn path_text(e: &syn::Expr) -> String {
 fn refuse(msg: &str, span: proc_macro2::Span) -> ! {
     let loc = span.start();
     let text = format!("unsupported Rust: {msg} (line {})", loc.line);
-    if census_mode() {
+    if census_mode() || catching_mode() {
         std::panic::panic_any(text);
     }
     eprintln!("{text}");
@@ -410,14 +433,17 @@ fn expand_crate(
                 let Some(path) = cands.iter().find(|p| p.exists()) else {
                     continue; // unresolved module: any USE refuses at its site
                 };
-                if !visited.insert(path.clone()) {
-                    continue;
-                }
                 // Splice ONLY modules that lower cleanly ON THEIR OWN: a
                 // module whose own body refuses would poison the entry
                 // (its deep gaps are not this file's semantics).
                 // Self-exactness: the check IS this same binary.
                 if !lowers_clean(path) {
+                    continue;
+                }
+                // Mark SPLICED only after the check: the demand pass must
+                // still see gated-out (dirty) modules to pull the few
+                // functions the entry actually calls from them.
+                if !visited.insert(path.clone()) {
                     continue;
                 }
                 if let Ok(src_text) = std::fs::read_to_string(path) {
@@ -710,6 +736,11 @@ fn main() {
     let no_expand = std::env::var("RUST_FRONTEND_NO_EXPAND").is_ok();
     let mut visited: HashSet<PathBuf> = HashSet::new();
     visited.insert(std::fs::canonicalize(&file).unwrap_or_else(|_| PathBuf::from(&file)));
+    // Functions pulled out of gated-out modules (demand pass). They are
+    // lowered SEPARATELY and only registered when their body succeeds:
+    // a pulled function that refuses must degrade to the old
+    // "call to unknown function" refusal, never fail the whole file.
+    let mut demand_extra: Vec<syn::Item> = Vec::new();
     // Entry file + its mod tree first...
     let mut roots: Vec<syn::Item> = if no_expand {
         ast.items.clone()
@@ -726,6 +757,102 @@ fn main() {
             if let Ok(f) = syn::parse_file(&src_text) {
                 roots.extend(expand_crate(&f.items, &base_dir, &mut visited));
             }
+        }
+    }
+    // DEMAND-DRIVEN SPLICE: a module that does not lower cleanly is
+    // excluded wholesale, so one dirty function poisons every clean
+    // function beside it. Pull only the functions (and impl methods) the
+    // entry actually CALLS out of those modules, transitively.
+    if !no_expand {
+        let mut mods: Vec<PathBuf> = Vec::new();
+        collect_mod_files(&ast.items, &base_dir, &mut mods);
+        // The lib.rs MODULE TREE is the crate's real structure for a leaf
+        // entry (go_backend.rs has no `mod` of its own).
+        if let Ok(text) = std::fs::read_to_string(base_dir.join("lib.rs")) {
+            if let Ok(f) = syn::parse_file(&text) {
+                collect_mod_files(&f.items, &base_dir, &mut mods);
+            }
+        }
+        if std::env::var("RUST_FRONTEND_DEMAND_DEBUG").is_ok() {
+            eprintln!("DEMAND mods: {mods:?}");
+        }
+        let mut dirty: Vec<syn::File> = Vec::new();
+        for f in &mods {
+            let canon = std::fs::canonicalize(f).unwrap_or_else(|_| f.clone());
+            // `visited` already distinguishes SPLICED (clean) modules
+            // from gated-out ones; re-running lowers_clean here would
+            // re-lower every dirty module (minutes per file).
+            if visited.contains(&canon) || visited.contains(f) {
+                continue;
+            }
+            if let Ok(text) = std::fs::read_to_string(f) {
+                if let Ok(ast) = syn::parse_file(&text) {
+                    dirty.push(ast);
+                }
+            }
+        }
+        if !dirty.is_empty() {
+            let mut defined = defined_names(&roots);
+            let mut needed = HashSet::new();
+            collect_calls_in_items(&roots, &mut needed);
+            let mut extra: Vec<syn::Item> = Vec::new();
+            for _round in 0..12 {
+                let missing: HashSet<String> =
+                    needed.difference(&defined).cloned().collect();
+                if std::env::var("RUST_FRONTEND_DEMAND_DEBUG").is_ok() {
+                    eprintln!("DEMAND round: needed={needed:?} missing={missing:?} extra={}", extra.len());
+                }
+                if missing.is_empty() || extra.len() > 400 {
+                    break;
+                }
+                let mut progress = false;
+                for ast in &dirty {
+                    for item in &ast.items {
+                        match item {
+                            syn::Item::Fn(f)
+                                if missing.contains(&f.sig.ident.to_string()) =>
+                            {
+                                defined.insert(f.sig.ident.to_string());
+                                extra.push(item.clone());
+                                progress = true;
+                            }
+                            syn::Item::Impl(i) => {
+                                let Some(t) = type_ident(&i.self_ty) else {
+                                    continue;
+                                };
+                                let keep: Vec<syn::ImplItem> = i
+                                    .items
+                                    .iter()
+                                    .filter(|ii| match ii {
+                                        syn::ImplItem::Fn(m) => missing
+                                            .contains(&format!("{}_{}", t, m.sig.ident)),
+                                        _ => false,
+                                    })
+                                    .cloned()
+                                    .collect();
+                                if keep.is_empty() {
+                                    continue;
+                                }
+                                for ii in &keep {
+                                    if let syn::ImplItem::Fn(m) = ii {
+                                        defined.insert(format!("{}_{}", t, m.sig.ident));
+                                    }
+                                }
+                                let mut ci = i.clone();
+                                ci.items = keep;
+                                extra.push(syn::Item::Impl(ci));
+                                progress = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if !progress {
+                    break;
+                }
+                collect_calls_in_items(&extra, &mut needed);
+            }
+            demand_extra = extra;
         }
     }
     // Flatten inline `mod` blocks into one item list — namespace nesting
@@ -850,6 +977,73 @@ fn main() {
             _ => {}
         }
     }
+    // DEMAND-PULLED definitions: register + lower BEFORE the entry so
+    // its calls resolve. A body that refuses is REMOVED from the call
+    // set (the call site then refuses, exactly as before the pull).
+    let mut demand_defs: Vec<Value> = Vec::new();
+    for item in demand_extra.iter().rev() {
+        match item {
+            syn::Item::Fn(f) if f.sig.ident != "main" => {
+                let name = f.sig.ident.to_string();
+                if !cx.fns.contains(&name) {
+                    cx.fns.push(name.clone());
+                    cx.fn_rets
+                        .insert(name.clone(), ret_ty(&f.sig.output, &cx));
+                }
+                let res = caught(std::panic::AssertUnwindSafe(|| {
+                    function_def(
+                        name.clone(),
+                        &f.attrs,
+                        &f.sig,
+                        &f.block,
+                        None,
+                        &cx,
+                    )
+                }));
+                match res {
+                    Ok(v) => demand_defs.push(v),
+                    Err(_) => {
+                        cx.fns.retain(|n| *n != name);
+                        cx.fn_rets.remove(&name);
+                    }
+                }
+            }
+            syn::Item::Impl(i) => {
+                let Some(t) = type_ident(&i.self_ty) else {
+                    continue;
+                };
+                for ii in &i.items {
+                    let syn::ImplItem::Fn(m) = ii else {
+                        continue;
+                    };
+                    let name = format!("{}_{}", t, m.sig.ident);
+                    if !cx.fns.contains(&name) {
+                        cx.fns.push(name.clone());
+                        cx.fn_rets
+                            .insert(name.clone(), ret_ty(&m.sig.output, &cx));
+                    }
+                    let res = caught(std::panic::AssertUnwindSafe(|| {
+                        function_def(
+                            name.clone(),
+                            &m.attrs,
+                            &m.sig,
+                            &m.block,
+                            Some(&t),
+                            &cx,
+                        )
+                    }));
+                    match res {
+                        Ok(v) => demand_defs.push(v),
+                        Err(_) => {
+                            cx.fns.retain(|n| *n != name);
+                            cx.fn_rets.remove(&name);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
     let mut stmts: Vec<Value> = Vec::new();
     let _items_census = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
     for item in &flat {
@@ -927,6 +1121,7 @@ fn main() {
     // only) — the program body is then empty. The stdout oracle never
     // sees such a file (testdata examples are all runnable).
     let mut all_stmts = std::mem::take(&mut cx.globals);
+    all_stmts.extend(demand_defs);
     // function definitions FIRST — runtime def-before-use order (the A1
     // Function statement lowers to a definition executed in stmt order).
     for src_fn in &fns {
@@ -2081,6 +2276,123 @@ enum FnSource<'a> {
 /// modules (`mod x;`) contribute nothing — their contents live in other
 /// files this single-file lowering never sees; any cross-file USE refuses
 /// at its own site.
+/// Every CALL target name an item list mentions: the last path segment
+/// (unqualified free fn) and, for `mod::fn`, the mangled
+/// `mod_fn` spelling. Method calls are not resolvable by name alone.
+fn collect_calls_in_items(items: &[syn::Item], out: &mut HashSet<String>) {
+    use syn::visit::Visit;
+    struct C<'a>(&'a mut HashSet<String>);
+    impl<'ast> Visit<'ast> for C<'_> {
+        fn visit_expr_call(&mut self, c: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(p) = &*c.func {
+                let segs: Vec<String> = p
+                    .path
+                    .segments
+                    .iter()
+                    .map(|s| s.ident.to_string())
+                    .collect();
+                // std/core/alloc paths are library calls, never crate
+                // functions; treating their last segment as a name could
+                // splice an unrelated same-named item.
+                if matches!(segs.first().map(|s| s.as_str()), Some("std" | "core" | "alloc"))
+                {
+                    syn::visit::visit_expr_call(self, c);
+                    return;
+                }
+                if let Some(last) = segs.last() {
+                    self.0.insert(last.clone());
+                    if segs.len() >= 2 {
+                        self.0
+                            .insert(format!("{}_{}", segs[segs.len() - 2], last));
+                    }
+                }
+            }
+            syn::visit::visit_expr_call(self, c);
+        }
+    }
+    let mut c = C(out);
+    for it in items {
+        c.visit_item(it);
+    }
+}
+
+/// Free fn names and mangled impl-method names defined by an item list.
+fn defined_names(items: &[syn::Item]) -> HashSet<String> {
+    fn walk(items: &[syn::Item], out: &mut HashSet<String>) {
+        for it in items {
+            match it {
+                syn::Item::Fn(f) => {
+                    out.insert(f.sig.ident.to_string());
+                }
+                syn::Item::Impl(i) => {
+                    if let Some(t) = type_ident(&i.self_ty) {
+                        for ii in &i.items {
+                            if let syn::ImplItem::Fn(m) = ii {
+                                out.insert(format!("{}_{}", t, m.sig.ident));
+                            }
+                        }
+                    }
+                }
+                syn::Item::Mod(m) => {
+                    if let Some((_, inner)) = &m.content {
+                        walk(inner, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = HashSet::new();
+    walk(items, &mut out);
+    out
+}
+
+/// Files named by `mod x;` declarations reachable from `items` (not the
+/// whole crate: the demand pass must stay proportional to the entry).
+fn collect_mod_files(items: &[syn::Item], base: &Path, out: &mut Vec<PathBuf>) {
+    for it in items {
+        let syn::Item::Mod(m) = it else {
+            continue;
+        };
+        if let Some((_, inner)) = &m.content {
+            collect_mod_files(inner, base, out);
+            continue;
+        }
+        // `#[path = "..."]` wins over the name-derived candidates.
+        let path_attr = m.attrs.iter().find_map(|a| {
+            if !a.path().is_ident("path") {
+                return None;
+            }
+            let syn::Meta::NameValue(nv) = &a.meta else {
+                return None;
+            };
+            let syn::Expr::Lit(l) = &nv.value else {
+                return None;
+            };
+            let syn::Lit::Str(s) = &l.lit else {
+                return None;
+            };
+            Some(base.join(s.value()))
+        });
+        let cands = [
+            path_attr.unwrap_or_else(|| base.join(format!("{}.rs", m.ident))),
+            base.join(m.ident.to_string()).join("mod.rs"),
+        ];
+        let Some(path) = cands.iter().find(|p| p.exists()) else {
+            continue;
+        };
+        if out.contains(path) {
+            continue;
+        }
+        out.push(path.clone());
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if let Ok(f) = syn::parse_file(&text) {
+                collect_mod_files(&f.items, path.parent().unwrap_or(base), out);
+            }
+        }
+    }
+}
+
 fn flatten_items<'a>(items: &'a [syn::Item], out: &mut Vec<&'a syn::Item>) {
     for item in items {
         // a `#[cfg(test)]`-gated inline mod contributes NOTHING to a
