@@ -60,7 +60,14 @@ where
     F: FnOnce() -> Value + std::panic::UnwindSafe,
 {
     let prev = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
+    std::panic::set_hook(Box::new(|info| {
+        if std::env::var("RUST_FRONTEND_PANIC_DEBUG").is_ok() {
+            eprintln!(
+                "PANIC: {info}\n{}",
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+    }));
     CATCHING.store(true, std::sync::atomic::Ordering::Relaxed);
     let r = std::panic::catch_unwind(f);
     CATCHING.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -605,7 +612,11 @@ fn register_struct(s: &syn::ItemStruct, cx: &mut Cx) {
 /// gated splice skips dirty modules entirely, so `NativeCtx`/`IrStmt`
 /// variants were invisible and their patterns refused).
 fn find_crate_src_root(start: &Path) -> Option<PathBuf> {
-    let mut d = start.to_path_buf();
+    // CANONICALIZE first: the harness passes RELATIVE entry paths, and
+    // popping a relative path reaches "" (whose `join("lib.rs")` finds
+    // the CWD's lib.rs but `read_dir("")` fails) — the declaration index
+    // silently saw zero files and every cross-module enum pattern refused.
+    let mut d = std::fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
     loop {
         if d.join("lib.rs").is_file() || d.join("main.rs").is_file() {
             return Some(d);
@@ -680,7 +691,14 @@ fn main() {
             }
             "--census" => {
                 CENSUS.store(true, std::sync::atomic::Ordering::Relaxed);
-                std::panic::set_hook(Box::new(|_| {}));
+                std::panic::set_hook(Box::new(|info| {
+        if std::env::var("RUST_FRONTEND_PANIC_DEBUG").is_ok() {
+            eprintln!(
+                "PANIC: {info}\n{}",
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+    }));
             }
             "--raw" => {} // accepted for CLI parity with the fleet; we always emit the same
             _ => {
@@ -888,6 +906,15 @@ fn main() {
     // patterns resolvable when the module closure is gated out.
     if let Some(root) = find_crate_src_root(&base_dir) {
         index_declarations(&root, &mut cx);
+    }
+    if std::env::var("RUST_FRONTEND_DEBUG_TYPES").is_ok() {
+        eprintln!("TYPES enums: {:?}", cx.enums);
+        eprintln!("TYPES ambiguous: {:?}", cx.ambiguous);
+        if let Some(v) = cx.variants.get("NativeCtx") {
+            eprintln!("TYPES NativeCtx variants: {:?}", v.keys().collect::<Vec<_>>());
+        } else {
+            eprintln!("TYPES NativeCtx MISSING");
+        }
     }
     // Program-wide store-binding names (see Cx::bindings).
     {
@@ -1203,6 +1230,9 @@ fn let_pattern_stmt(
 ) -> Option<Value> {
     let temp = fresh_tmp(cx, "l");
     out.push(store_stmt(&temp, value_expr(&init.expr, cx)));
+    // The temp's shape drives slice-pattern element reads (array vs list).
+    let temp_ty = infer_ty(&init.expr, cx);
+    cx.vars.borrow_mut().insert(temp.clone(), temp_ty);
     let mut pre = Vec::new();
     let mut binds = Vec::new();
     let cond = destructure(&temp, pat, cx, &mut pre, &mut binds);
@@ -1323,6 +1353,10 @@ fn lower_local(local: &syn::Local, cx: &Cx, out: &mut Vec<Value>) -> Option<Valu
         return Some(set_array_stmt(&name, elements));
     }
     if let syn::Expr::Match(m) = &*init.expr {
+        // The bound name exists after the match (all arms assign or
+        // return): register it so later `format!("{name}")` captures and
+        // typed reads see it. The arm result type is not tracked.
+        cx.vars.borrow_mut().insert(name.clone(), Ty::Unknown);
         return Some(match_value_node(m, BranchTarget::Var(&name), cx, false, out));
     }
     if let syn::Expr::If(ie) = &*init.expr {
@@ -1332,7 +1366,15 @@ fn lower_local(local: &syn::Local, cx: &Cx, out: &mut Vec<Value>) -> Option<Valu
         return Some(v);
     }
     // NOTE: infer BEFORE taking the write guard (infer_ty reads vars).
-    let init_ty = infer_ty(&init.expr, cx);
+    // An EXPLICIT annotation (`let names: Vec<String> = Vec::new()`) is a
+    // type-checker fact and beats the shape of the initializer.
+    let mut init_ty = infer_ty(&init.expr, cx);
+    if let syn::Pat::Type(pt) = &local.pat {
+        let dt = ty_from_type(&pt.ty, cx);
+        if !matches!(dt, Ty::Unknown) {
+            init_ty = dt;
+        }
+    }
     // arithmetic over field reads: hoist the pure reads into temps
     if arith_contains_field(&init.expr) {
         let mut ctr = cx.tmp.borrow_mut();
@@ -1455,6 +1497,14 @@ fn infer_ty(e: &syn::Expr, cx: &Cx) -> Ty {
                     _ => Ty::Unknown,
                 },
                 "split" => Ty::List,
+                // string-to-string methods keep the Str type (a proven
+                // receiver makes the result proven too)
+                "trim" | "trim_start" | "trim_end" | "to_lowercase" | "to_uppercase"
+                | "to_string" | "strip_prefix" | "strip_suffix" | "as_str"
+                    if matches!(rty, Ty::Str) =>
+                {
+                    Ty::Str
+                }
                 "iter" | "iter_mut" => rty,
                 "any" | "all" => Ty::Bool,
                 "unwrap_or" => match m.args.first() {
@@ -1471,13 +1521,19 @@ fn infer_ty(e: &syn::Expr, cx: &Cx) -> Ty {
             )),
             Some(tu.elems.len() as u64),
         ),
-        // `v[i]` on a proven array reads the element type
+        // `expr?` propagates the absent case; the VALUE has the inner type.
+        syn::Expr::Try(t) => infer_ty(&t.expr, cx),
+
+        // `v[i]` on a PROVEN array carries the element type; a strSplit
+        // list's elements are strings.
         syn::Expr::Index(ix) => match infer_ty(&ix.expr, cx) {
             Ty::Arr(Some(t), _) => *t,
+            Ty::List => Ty::Str,
             _ => Ty::Unknown,
         },
 
         // `.N` on a proven Arr(tuple) reads an element of the elem type
+
         syn::Expr::Field(f)
             if matches!(&f.member, syn::Member::Unnamed(_))
                 && matches!(infer_ty(&f.base, cx), Ty::Arr(..)) =>
@@ -3660,6 +3716,49 @@ fn unit_variant_pat(p: &syn::Pat, cx: &Cx) -> Option<String> {
 /// scrutinee, or-patterns join with `-o`. Literal patterns are exact
 /// (`$t = "str"` for strings/bools, `$t -eq N` for integers); a bare
 /// `None` is the Option layer's absent marker under None≡"".
+/// The EXACT NEGATION of `arm_cond`: unit variants, literals and or-
+/// patterns invert to `!=` (or-chains invert to and-chains); `_` is
+/// always false. Used for `!matches!(..)` conditions.
+fn arm_cond_neg(temp: &str, pat: &syn::Pat, cx: &Cx) -> Option<String> {
+    fn one_neg(temp: &str, p: &syn::Pat, cx: &Cx) -> Option<String> {
+        if let Some(tag) = unit_variant_pat(p, cx) {
+            return Some(format!("\"${temp}\" != \"{tag}\""));
+        }
+        match p {
+            syn::Pat::Wild(_) => Some("0 -eq 1".into()),
+            syn::Pat::Ident(pi) if pi.ident == "None" && pi.subpat.is_none() => {
+                Some(format!("\"${temp}\" != \"\""))
+            }
+            syn::Pat::Lit(l) => match &l.lit {
+                syn::Lit::Int(li) => Some(format!("${temp} -ne {}", int_text(li))),
+                syn::Lit::Str(ls) => {
+                    let s = ls.value();
+                    if s.contains('"') || s.contains('\\') {
+                        return None;
+                    }
+                    Some(format!("\"${temp}\" != \"{s}\""))
+                }
+                syn::Lit::Bool(lb) => Some(format!(
+                    "\"${temp}\" != \"{}\"",
+                    if lb.value() { "true" } else { "false" }
+                )),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    match pat {
+        syn::Pat::Or(o) => {
+            let mut parts = Vec::new();
+            for p2 in &o.cases {
+                parts.push(one_neg(temp, p2, cx)?);
+            }
+            Some(parts.join(" -a "))
+        }
+        other => one_neg(temp, other, cx),
+    }
+}
+
 fn arm_cond(temp: &str, pat: &syn::Pat, cx: &Cx) -> Option<String> {
     fn one(temp: &str, p: &syn::Pat, cx: &Cx) -> Option<String> {
         if let Some(tag) = unit_variant_pat(p, cx) {
@@ -3713,7 +3812,7 @@ fn fresh_tmp(cx: &Cx, prefix: &str) -> String {
 
 /// `E::V` where E is a registered enum carrying variant V.
 fn enum_variant_of_path(path: &syn::Path, cx: &Cx) -> Option<(String, String)> {
-    if path.leading_colon.is_some() || path.segments.len() != 2 {
+    if path.leading_colon.is_some() || path.segments.len() < 2 {
         return None;
     }
     if path
@@ -3723,8 +3822,12 @@ fn enum_variant_of_path(path: &syn::Path, cx: &Cx) -> Option<(String, String)> {
     {
         return None;
     }
-    let en = path.segments[0].ident.to_string();
-    let vn = path.segments[1].ident.to_string();
+    // A QUALIFIED variant path (`crate::ir::IrExpr::Call`) names the same
+    // variant as the short `IrExpr::Call`; the last two segments are the
+    // enum and variant. Module paths carry no runtime name.
+    let n = path.segments.len();
+    let en = path.segments[n - 2].ident.to_string();
+    let vn = path.segments[n - 1].ident.to_string();
     if cx.ambiguous.contains(&en) {
         return None;
     }
@@ -3841,6 +3944,41 @@ fn destructure(
             pi.subpat
                 .as_ref()
                 .and_then(|(_, p)| destructure(temp, p, cx, pre, binds))
+        }
+        // FIXED-LENGTH slice/array pattern (`let [a, b] = ..`): the length
+        // test plus one destructure per element. A rest (`[a, ..]`) needs
+        // variable-length binding and keeps refusing.
+        syn::Pat::Slice(sl) => {
+            if sl.elems.iter().any(|p| matches!(p, syn::Pat::Rest(_))) {
+                refuse("slice pattern with a rest (fixed length only)", sl.span());
+            }
+            let n = sl.elems.len();
+            let is_list = matches!(cx.vars.borrow().get(temp), Some(Ty::List));
+            let l = fresh_tmp(cx, "sl");
+            pre.push(assign_stmt(
+                &l,
+                if is_list {
+                    json!({"type": "Call", "func": "listLen", "purity": "PureCpu", "args": [get_var(temp)]})
+                } else {
+                    array_len_call(temp)
+                },
+            ));
+            cx.vars.borrow_mut().insert(l.clone(), Ty::Int);
+            let mut cond = format!("${l} -eq {n}");
+            for (i, p) in sl.elems.iter().enumerate() {
+                let et = fresh_tmp(cx, "se");
+                let key = json!({"type": "Arith", "ast": {"type": "Num", "value": i as i64}});
+                let elem = if is_list {
+                    json!({"type": "Call", "func": "listGet", "purity": "PureCpu", "args": [get_var(temp), key]})
+                } else {
+                    raw_elem(temp, key)
+                };
+                pre.push(store_stmt(&et, elem));
+                if let Some(c) = destructure(&et, p, cx, pre, binds) {
+                    cond.push_str(&format!(" -a {c}"));
+                }
+            }
+            Some(cond)
         }
         syn::Pat::Lit(_) | syn::Pat::Path(_) | syn::Pat::Or(_) => arm_cond(temp, pat, cx),
         syn::Pat::Paren(p) => destructure(temp, &p.pat, cx, pre, binds),
@@ -4016,9 +4154,6 @@ fn match_value_node(
     in_fn: bool,
     out: &mut Vec<Value>,
 ) -> Value {
-    if !m.arms.iter().all(|a| a.guard.is_none()) {
-        refuse("match guard", m.span());
-    }
     // scrutinee hoist — any expression, read once (exact: Rust moves/
     // borrows the scrutinee once too)
     let n = cx.tmp.borrow_mut();
@@ -4060,23 +4195,58 @@ fn match_value_node(
                 c
             }
         };
+        // The arm's bindings (if any) precede the body: a guard reads them.
+        let binds_len = then.len();
         match &*arm.body {
             syn::Expr::Block(blk) => {
                 push_branch_block(&blk.block, target, cx, in_fn, &mut then)
             }
             body_e => match target {
                 BranchTarget::Var(name) => {
-                    then.push(assign_stmt(name, value_expr(body_e, cx)))
+                    // `let x = match .. { _ => return None }`: the arm
+                    // RETURNS; the assignment never runs on that path.
+                    if let syn::Expr::Return(r) = body_e {
+                        let v = match &r.expr {
+                            Some(e) => value_expr(e, cx),
+                            None => serde_json::Value::Null,
+                        };
+                        then.push(json!({"type": "Return", "value": v}));
+                    } else {
+                        then.push(assign_stmt(name, value_expr(body_e, cx)));
+                    }
                 }
-                BranchTarget::Ret => then.push(
-                    json!({"type": "Return", "value": value_expr(body_e, cx)}),
-                ),
+                BranchTarget::Ret => {
+                    // `PAT => return None` in a value match: the arm's own
+                    // return IS the tail (never wrap it in a second Return).
+                    if let syn::Expr::Return(r) = body_e {
+                        let v = match &r.expr {
+                            Some(e) => value_expr(e, cx),
+                            None => serde_json::Value::Null,
+                        };
+                        then.push(json!({"type": "Return", "value": v}));
+                    } else {
+                        then.push(json!({"type": "Return", "value": value_expr(body_e, cx)}));
+                    }
+                }
                 BranchTarget::Unit => {
                     if let Some(v) = lower_expr_stmt(body_e, cx, in_fn, &mut then) {
                         then.push(v);
                     }
                 }
             },
+        }
+        // `PAT if GUARD => body`: the pattern's bindings are in scope, so the
+        // guard becomes a nested If whose FALSE branch is the remaining
+        // arms (the same arms the pattern's own failure branch runs).
+        if let Some(g) = &arm.guard {
+            let body: Vec<Value> = then.split_off(binds_len);
+            then.push(json!({
+                "cond": test_call(&test_string(&g.1, cx)),
+                "then": body,
+                "elsifs": [],
+                "else": else_.clone(),
+                "type": "If",
+            }));
         }
         else_ = match cond_s {
             Some(cond_s) => vec![json!({
@@ -4337,6 +4507,52 @@ fn hoist_cond_calls(e: &syn::Expr, cx: &Cx, out: &mut Vec<Value>) -> syn::Expr {
                 }
                 _ => refuse("is_empty on unproven receiver", m.method.span()),
             }
+        }
+        // `matches!(EXPR, PAT)` with a COMPOUND subject: evaluate the
+        // subject ONCE into a temp, then test the pattern on that temp.
+        // Exact for If (the condition evaluates once); While conditions
+        // never hoist, so they keep refusing.
+        syn::Expr::Macro(m)
+            if m.mac
+                .path
+                .segments
+                .last()
+                .map(|s| s.ident == "matches")
+                .unwrap_or(false) =>
+        {
+            let (subj, pat, guard) = parse_matches_args(m.mac.tokens.clone(), m.span());
+            // `matches!` is an IF-LET in disguise: destructure the subject
+            // once, bind the pattern's names, then test the optional guard
+            // against those bindings. Exact for If (evaluated once).
+            let t = fresh_tmp(cx, "m");
+            out.push(store_stmt(&t, value_expr(&subj, cx)));
+            let r = fresh_tmp(cx, "mr");
+            out.push(store_stmt(&r, str_lit("false")));
+            let mut pre = Vec::new();
+            let mut binds = Vec::new();
+            let c = destructure(&t, &pat, cx, &mut pre, &mut binds);
+            let mut then = pre;
+            then.extend(binds);
+            match guard {
+                Some(g) => then.push(json!({
+                    "cond": test_call(&test_string(&g, cx)),
+                    "then": [store_stmt(&r, str_lit("true"))],
+                    "elsifs": [],
+                    "else": [],
+                    "type": "If",
+                })),
+                None => then.push(store_stmt(&r, str_lit("true"))),
+            }
+            out.push(json!({
+                "cond": test_call(c.as_deref().unwrap_or("1 -eq 1")),
+                "then": then,
+                "elsifs": [],
+                "else": [],
+                "type": "If",
+            }));
+            cx.vars.borrow_mut().insert(r.clone(), Ty::Bool);
+            syn::parse_str::<syn::Expr>(&r)
+                .unwrap_or_else(|_| refuse("temporary name", e.span()))
         }
         // An INDEX or FIELD read in a condition (`v[i] == "x"`,
         // `self.kind == "A::B"`): the test grammar reads only $vars, so
@@ -4641,6 +4857,89 @@ impl syn::parse::Parse for FmtArgs {
     }
 }
 
+fn format_value(mac: &syn::Macro, cx: &Cx) -> Value {
+    let fmt_args: FmtArgs = syn::parse2(mac.tokens.clone())
+        .unwrap_or_else(|e| refuse(&format!("`format!` arguments: {e}"), mac.span()));
+    let fmt = fmt_args.fmt.value();
+    let mut parts: Vec<Value> = Vec::new();
+    let mut lit = String::new();
+    let mut ph = 0usize;
+    let mut it = fmt.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            '{' => {
+                if it.peek() == Some(&'{') {
+                    it.next();
+                    lit.push('{');
+                    continue;
+                }
+                let mut spec = String::new();
+                let mut closed = false;
+                for c2 in it.by_ref() {
+                    if c2 == '}' {
+                        closed = true;
+                        break;
+                    }
+                    spec.push(c2);
+                }
+                if !closed {
+                    refuse("unbalanced `{` in format!", fmt_args.fmt.span());
+                }
+                if !lit.is_empty() {
+                    parts.push(json!({"kind": "lit", "text": std::mem::take(&mut lit)}));
+                }
+                let positional = spec.is_empty() || spec == ":?";
+                if positional {
+                    let a = fmt_args.args.get(ph).unwrap_or_else(|| {
+                        refuse(
+                            "fewer format! arguments than placeholders",
+                            fmt_args.fmt.span(),
+                        )
+                    });
+                    ph += 1;
+                    if spec == ":?" && !matches!(infer_ty(a, cx), Ty::Int | Ty::Unknown) {
+                        refuse(
+                            "{:?} on a non-proven-integer in format! (Debug != Display)",
+                            fmt_args.fmt.span(),
+                        );
+                    }
+                    parts.push(json!({"kind": "expr", "expr": value_expr(a, cx)}));
+                } else if !spec.contains(':') && spec.chars().all(|c| c.is_alphanumeric() || c == '_')
+                {
+                    if !cx.vars.borrow().contains_key(&spec) {
+                        refuse("format! named argument (only local captures)", fmt_args.fmt.span());
+                    }
+                    parts.push(json!({"kind": "expr", "expr": get_var(&spec)}));
+                } else {
+                    refuse(
+                        "format! spec (only {}, {:?} on ints, and {name} captures)",
+                        fmt_args.fmt.span(),
+                    );
+                }
+            }
+            '}' => {
+                if it.peek() == Some(&'}') {
+                    it.next();
+                    lit.push('}');
+                } else {
+                    refuse("unbalanced `}` in format!", fmt_args.fmt.span());
+                }
+            }
+            other => lit.push(other),
+        }
+    }
+    if ph != fmt_args.args.len() {
+        refuse("format! argument count mismatch", fmt_args.fmt.span());
+    }
+    if !lit.is_empty() {
+        parts.push(json!({"kind": "lit", "text": lit}));
+    }
+    if parts.is_empty() {
+        return str_lit("");
+    }
+    json!({"type": "Interpolate", "parts": parts})
+}
+
 fn lower_print_macro(mac: &syn::Macro, cx: &Cx) -> Value {
     let newline = if mac.path.segments.len() == 1 && mac.path.leading_colon.is_none() {
         match mac.path.segments[0].ident.to_string().as_str() {
@@ -4809,7 +5108,9 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
             // to a JS boolean (native `true`/`false`), which prints exactly
             // like Rust's `{}` formatting for bools.
             syn::Lit::Bool(lb) => json!({"type": "Bool", "value": lb.value()}),
-            other => refuse("literal type (only integers, strings, bools)", other.span()),
+            // a char is a ONE-CHARACTER string in the store
+            syn::Lit::Char(lc) => str_lit(&lc.value().to_string()),
+            other => refuse("literal type (only integers, strings, chars, bools)", other.span()),
         },
         syn::Expr::Path(p) => {
             // `Color::Red` — a UNIT-variant value lowers to its qualified
@@ -4922,6 +5223,13 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                     )
                 });
                 return test_call(&cond_s);
+            }
+            // `format!("..")` in VALUE position is a string built from
+            // literal segments and argument values (the Interpolate node
+            // `$a$b` lowers to). Exact for `{}`, `{:?}` on proven ints and
+            // `{name}` captures of locals; width/alignment specs refuse.
+            if name == "format" {
+                return format_value(&m.mac, cx);
             }
             if name != "vec" {
                 refuse(&format!("macro `{name}!` in value position"), m.span());
@@ -5218,6 +5526,49 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
             // Vec::len() on a PROVEN native-array variable: the trusted
             // runtime length (arrayLen reads `this.arrays`, unlike the
             // scalar param("len") fold that miscounted an array value).
+            // Result::ok() / Option::as_ref() / String::as_str() — the
+            // store has one absent marker (`""`) for both Result and
+            // Option, so these conversions are the value itself.
+            if matches!(
+                rust_name.as_str(),
+                "ok" | "as_str" | "as_deref" | "as_ref" | "as_slice"
+            ) && m.args.is_empty()
+            {
+                return value_expr(&m.receiver, cx);
+            }
+            // `v.get(i)` — Some(element) or the absent marker; arrayIndex
+            // is exactly `(arr[i] !== undefined ? arr[i] : "")`.
+            if rust_name == "get" && m.args.len() == 1 && matches!(recv_ty, Ty::Arr(..)) {
+                let key = value_expr(&m.args[0], cx);
+                if let Some(name) = recv_var_name(&m.receiver) {
+                    return json!({
+                        "type": "Call", "func": "arrayIndex", "purity": "PureCpu",
+                        "args": [str_lit(&name), key]
+                    });
+                }
+                return json!({
+                    "type": "ElementRead",
+                    "coll": value_expr(&m.receiver, cx),
+                    "key": key,
+                });
+            }
+            // `v.first()` — the first element or the absent marker.
+            if rust_name == "first" && m.args.is_empty() {
+                if matches!(recv_ty, Ty::Arr(..)) {
+                    let zero = json!({"type": "Arith", "ast": {"type": "Num", "value": 0}});
+                    if let Some(name) = recv_var_name(&m.receiver) {
+                        return json!({
+                            "type": "Call", "func": "arrayIndex", "purity": "PureCpu",
+                            "args": [str_lit(&name), zero]
+                        });
+                    }
+                    return json!({
+                        "type": "ElementRead",
+                        "coll": value_expr(&m.receiver, cx),
+                        "key": zero,
+                    });
+                }
+            }
             if rust_name == "len" && m.args.is_empty() {
                 if matches!(recv_ty, Ty::Arr(..)) {
                     if let syn::Expr::Path(p) = &*m.receiver {
@@ -5228,7 +5579,13 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                             });
                         }
                     }
-                    refuse("len on a non-variable array", m.method.span());
+                    // A FIELD array / slice expression: `.length` on the
+                    // raw native array is the same trusted length.
+                    return json!({
+                        "type": "FieldRead",
+                        "object": value_expr(&m.receiver, cx),
+                        "name": "length",
+                    });
                 }
                 refuse("len on a non-array receiver", m.method.span());
             }
@@ -5282,8 +5639,20 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                         return value_expr(&m.receiver, cx);
                     }
                     "unwrap_or" | "unwrap_or_else" => {
-                        // exact ONLY for the empty-string default (the
-                        // convention's absent marker)
+                        // Option/Result is value-or-"" in the store, so
+                        // `x.unwrap_or(d)` is `x != "" ? x : d`. Exact only
+                        // with a VARIABLE receiver (a compound receiver
+                        // would be evaluated twice).
+                        if m.args.len() == 1 {
+                            if let Some(n) = recv_var_name(&m.receiver) {
+                                return json!({
+                                    "type": "Ternary",
+                                    "cond": test_call(&format!("\"${n}\" != \"\"")),
+                                    "then": get_var(&n),
+                                    "else": value_expr(&m.args[0], cx),
+                                });
+                            }
+                        }
                         let empty_default = m.args.first().map(|a| match a {
                             syn::Expr::Lit(l) => matches!(&l.lit, syn::Lit::Str(s) if s.value().is_empty()),
                             _ => false,
@@ -5314,6 +5683,66 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                         return opt_present(&m.receiver, false, cx);
                     }
                     _ => {}
+                }
+            }
+            // `s.strip_prefix(p)` / `s.strip_suffix(p)` — Option<&str>:
+            // the stripped value or the absent marker. Exact by anchoring
+            // the test and slicing; the receiver/prefix are PURE reads, so
+            // reading them twice is observationally identical.
+            if matches!(rust_name.as_str(), "strip_prefix" | "strip_suffix")
+                && m.args.len() == 1
+                && matches!(recv_ty, Ty::Str)
+            {
+                // PURE reads (no side effects) so evaluating twice — once in
+                // the test, once in the slice — is observational identity.
+                fn pure_read(e: &syn::Expr) -> bool {
+                    match e {
+                        syn::Expr::Lit(_) => true,
+                        syn::Expr::Path(p) if p.qself.is_none() => single_path(p).is_some(),
+                        syn::Expr::Field(f) => matches!(&f.member, syn::Member::Named(_)),
+                        syn::Expr::Try(t) => pure_read(&t.expr),
+                        syn::Expr::Paren(p) => pure_read(&p.expr),
+                        syn::Expr::MethodCall(m) => {
+                            matches!(
+                                m.method.to_string().as_str(),
+                                "trim"
+                                    | "trim_start"
+                                    | "trim_end"
+                                    | "to_string"
+                                    | "as_str"
+                                    | "to_lowercase"
+                                    | "to_uppercase"
+                                    | "strip_prefix"
+                                    | "strip_suffix"
+                            ) && pure_read(&m.receiver)
+                                && m.args.iter().all(pure_read)
+                        }
+                        _ => false,
+                    }
+                }
+                if pure_read(&m.receiver) && pure_read(&m.args[0]) {
+                    let s = value_expr(&m.receiver, cx);
+                    let p = value_expr(&m.args[0], cx);
+                    let plen = json!({"type": "MethodCall", "object": p.clone(), "method": "length", "args": []});
+                    let slen = json!({"type": "MethodCall", "object": s.clone(), "method": "length", "args": []});
+                    let zero = json!({"type": "Arith", "ast": {"type": "Num", "value": 0}});
+                    if rust_name == "strip_prefix" {
+                        return json!({
+                            "type": "Ternary",
+                            "cond": {"type": "MethodCall", "object": s.clone(), "method": "startsWith", "args": [p]},
+                            "then": {"type": "MethodCall", "object": s, "method": "slice", "args": [plen]},
+                            "else": str_lit("")
+                        });
+                    }
+                    return json!({
+                        "type": "Ternary",
+                        "cond": {"type": "MethodCall", "object": s.clone(), "method": "endsWith", "args": [p]},
+                        "then": {
+                            "type": "MethodCall", "object": s, "method": "substring",
+                            "args": [zero, json!({"type": "BinOp", "lhs": slen, "op": "-", "rhs": plen})]
+                        },
+                        "else": str_lit("")
+                    });
                 }
             }
             let js_name_raw = match (&recv_ty, rust_name.as_str()) {
@@ -5381,6 +5810,23 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
             if is_env_var_path(p) {
                 return env_var_value(p, &c.args, cx);
             }
+            // `Ok(x)` is x under the value-or-"" Result model; `Err(e)` is
+            // the absent marker (the payload still evaluates for effects).
+            if p.path.segments.len() == 1 && c.args.len() == 1 {
+                match p.path.segments[0].ident.to_string().as_str() {
+                    "Ok" => return value_expr(&c.args[0], cx),
+                    "Err" => {
+                        return json!({
+                            "type": "Arrow",
+                            "stmts": [
+                                expr_stmt(value_expr(&c.args[0], cx)),
+                                json!({"type": "Return", "value": str_lit("")})
+                            ]
+                        });
+                    }
+                    _ => {}
+                }
+            }
             if let Some((en, vn)) = enum_variant_of_path(&p.path, cx) {
                 let shape = cx
                     .variants
@@ -5409,6 +5855,19 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                         return json!({"type": "Object", "properties": props});
                     }
                     _ => refuse("enum variant construction form", c.func.span()),
+                }
+            }
+            // `Box::new(x)` is an ALLOCATOR wrapper: the store has no box
+            // layer, so the value is x itself (`Box::from(x)` likewise).
+            if p.path.segments.len() >= 2 {
+                let n = p.path.segments.len();
+                let ty = p.path.segments[n - 2].ident.to_string();
+                let f = p.path.segments[n - 1].ident.to_string();
+                if (ty == "Box" || ty == "Rc" || ty == "Arc")
+                    && (f == "new" || f == "from")
+                    && c.args.len() == 1
+                {
+                    return value_expr(&c.args[0], cx);
                 }
             }
             if let Some(v) = std_ctor_value(p, &c.args, cx) {
@@ -5537,9 +5996,8 @@ fn arith_from_unary(u: &syn::ExprUnary, cx: &Cx) -> Value {
 /// Integer literal -> its DECIMAL text (hex/bin/octal and `_` separators
 /// normalized, suffixes refused). The store is decimal-string-typed.
 fn int_text(li: &syn::LitInt) -> String {
-    if !li.suffix().is_empty() {
-        refuse("integer literal suffix", li.span());
-    }
+    // `1i64` / `0u8` / `3usize` carry their TYPE, not their value: the
+    // store is decimal-text typed, so the suffix is dropped.
     let v: i64 = li
         .base10_parse()
         .unwrap_or_else(|_| refuse("integer literal (out of i64 range)", li.span()));
@@ -5577,23 +6035,60 @@ fn int_literal(e: &syn::Expr, cx: &Cx) -> i64 {
 /// subject must be a PLAIN VARIABLE (the test grammar reads `$var`; a
 /// compound subject would be re-evaluated — not exact), and the pattern
 /// the same unit-variant/or/`_` set the match lowering accepts.
+struct MatchesArgs(syn::Expr, syn::Pat, Option<syn::Expr>);
+impl syn::parse::Parse for MatchesArgs {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        let e: syn::Expr = input.parse()?;
+        input.parse::<syn::Token![,]>()?;
+        // or-patterns (`A | B`) are Pat::Or, not parse_single
+        let p: syn::Pat = syn::Pat::parse_multi_with_leading_vert(input)?;
+        // optional match guard: `PAT if COND`
+        let g = if input.peek(syn::Token![if]) {
+            input.parse::<syn::Token![if]>()?;
+            Some(input.parse::<syn::Expr>()?)
+        } else {
+            None
+        };
+        Ok(MatchesArgs(e, p, g))
+    }
+}
+
+fn parse_matches_args(
+    tokens: proc_macro2::TokenStream,
+    span: proc_macro2::Span,
+) -> (syn::Expr, syn::Pat, Option<syn::Expr>) {
+    let MatchesArgs(subj, pat, guard) = syn::parse2(tokens)
+        .unwrap_or_else(|e| refuse(&format!("`matches!` argument form: {e}"), span));
+    (subj, pat, guard)
+}
+
+fn matches_cond_neg(
+    tokens: proc_macro2::TokenStream,
+    span: proc_macro2::Span,
+    cx: &Cx,
+) -> Option<String> {
+    let (subj, pat, guard) = parse_matches_args(tokens, span);
+    if guard.is_some() {
+        return None;
+    }
+    let Some(sv) = (match &subj {
+        syn::Expr::Path(p) if p.qself.is_none() => single_path(p).map(|i| i.to_string()),
+        _ => None,
+    }) else {
+        refuse("`matches!` on a compound subject in negated position", span);
+    };
+    arm_cond_neg(&sv, &pat, cx)
+}
+
 fn matches_cond(
     tokens: proc_macro2::TokenStream,
     span: proc_macro2::Span,
     cx: &Cx,
 ) -> Option<String> {
-    struct MatchesArgs(syn::Expr, syn::Pat);
-    impl syn::parse::Parse for MatchesArgs {
-        fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
-            let e: syn::Expr = input.parse()?;
-            input.parse::<syn::Token![,]>()?;
-            // or-patterns (`A | B`) are Pat::Or, not parse_single
-            let p: syn::Pat = syn::Pat::parse_multi_with_leading_vert(input)?;
-            Ok(MatchesArgs(e, p))
-        }
+    let (subj, pat, guard) = parse_matches_args(tokens, span);
+    if guard.is_some() {
+        return None;
     }
-    let MatchesArgs(subj, pat) = syn::parse2(tokens)
-        .unwrap_or_else(|e| refuse(&format!("`matches!` argument form: {e}"), span));
     let Some(sv) = (match &subj {
         syn::Expr::Path(p) if p.qself.is_none() => single_path(p).map(|i| i.to_string()),
         _ => None,
@@ -5752,6 +6247,18 @@ fn test_string_neg(e: &syn::Expr, cx: &Cx) -> String {
                 return format!("${name} != \"true\"");
             }
             refuse("negated condition path (type not proven)", p.span())
+        }
+        // `!matches!(x, PAT)` — the exact inverse of matches_cond.
+        syn::Expr::Macro(m)
+            if m.mac
+                .path
+                .segments
+                .last()
+                .map(|s| s.ident == "matches")
+                .unwrap_or(false) =>
+        {
+            matches_cond_neg(m.mac.tokens.clone(), m.span(), cx)
+                .unwrap_or_else(|| refuse("negated `matches!` pattern", m.span()))
         }
         other => refuse("negated condition expression", other.span()),
     }
