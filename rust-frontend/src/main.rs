@@ -529,8 +529,108 @@ fn const_int(e: &syn::Expr, cx: &Cx) -> Option<i64> {
         },
         syn::Expr::Paren(p) => const_int(&p.expr, cx),
         syn::Expr::Path(p) => single_path(p).and_then(|id| cx.ints.get(&id.to_string()).copied()),
+        // an exact constant cast stays a compile-time integer
+        syn::Expr::Cast(c) => {
+            let v = const_int(&c.expr, cx)?;
+            let (bits, signed) = int_ty_bits(&c.ty)?;
+            if int_cast_range_ok(v as i128, bits, signed) {
+                Some(v)
+            } else {
+                None
+            }
+        }
         _ => None,
     }
+}
+
+/// A primitive integer type used as an `as` cast TARGET -> (bits, signed).
+/// Anything else (float, pointer, path type) has no exact store value.
+fn int_ty_bits(t: &syn::Type) -> Option<(u32, bool)> {
+    let syn::Type::Path(tp) = t else { return None };
+    if tp.qself.is_some() || tp.path.leading_colon.is_some() || tp.path.segments.len() != 1 {
+        return None;
+    }
+    let seg = &tp.path.segments[0];
+    if !matches!(seg.arguments, syn::PathArguments::None) {
+        return None;
+    }
+    match seg.ident.to_string().as_str() {
+        "i8" => Some((8, true)),
+        "i16" => Some((16, true)),
+        "i32" => Some((32, true)),
+        "i64" => Some((64, true)),
+        "i128" => Some((128, true)),
+        "isize" => Some((64, true)),
+        "u8" => Some((8, false)),
+        "u16" => Some((16, false)),
+        "u32" => Some((32, false)),
+        "u64" => Some((64, false)),
+        "u128" => Some((128, false)),
+        "usize" => Some((64, false)),
+        _ => None,
+    }
+}
+
+/// Does `v` survive `as` into the given integer type UNCHANGED? Rust's
+/// integer `as` wraps (two's-complement truncation) outside the range,
+/// and a wrapped value is not what the decimal store says — so only an
+/// in-range cast is an identity, and everything else must refuse.
+fn int_cast_range_ok(v: i128, bits: u32, signed: bool) -> bool {
+    if bits >= 128 {
+        return if signed { true } else { v >= 0 };
+    }
+    if signed {
+        let max = (1i128 << (bits - 1)) - 1;
+        let min = -(1i128 << (bits - 1));
+        v >= min && v <= max
+    } else {
+        let max = (1i128 << bits) - 1;
+        v >= 0 && v <= max
+    }
+}
+
+/// Const-evaluate an integer expression to i128 (literal / -literal /
+/// paren / already-tabled path / exact constant cast).
+fn const_int_i128(e: &syn::Expr, cx: &Cx) -> Option<i128> {
+    match e {
+        syn::Expr::Lit(l) => match &l.lit {
+            syn::Lit::Int(li) => li.base10_parse().ok(),
+            _ => None,
+        },
+        syn::Expr::Unary(u) => match u.op {
+            syn::UnOp::Neg(_) => Some(-const_int_i128(&u.expr, cx)?),
+            _ => None,
+        },
+        syn::Expr::Paren(p) => const_int_i128(&p.expr, cx),
+        syn::Expr::Path(p) => single_path(p)
+            .and_then(|id| cx.ints.get(&id.to_string()).map(|v| *v as i128))
+            .or_else(|| int_assoc_const_path(p).and_then(|t| t.parse::<i128>().ok())),
+        syn::Expr::Cast(c) => {
+            let v = const_int_i128(&c.expr, cx)?;
+            let (bits, signed) = int_ty_bits(&c.ty)?;
+            if int_cast_range_ok(v, bits, signed) {
+                Some(v)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// A CONSTANT operand for an `as` cast: its EXACT decimal text, plus the
+/// i128 value when it fits (a u128-range associated constant does not).
+fn const_int_cast_operand(e: &syn::Expr, cx: &Cx) -> Option<(String, Option<i128>)> {
+    if let Some(v) = const_int_i128(e, cx) {
+        return Some((v.to_string(), Some(v)));
+    }
+    if let syn::Expr::Path(p) = e {
+        if let Some(t) = int_assoc_const_path(p) {
+            let v = t.parse::<i128>().ok();
+            return Some((t, v));
+        }
+    }
+    None
 }
 
 /// The payload shape of one enum variant — a type-checker fact, so
@@ -1666,6 +1766,13 @@ fn infer_ty(e: &syn::Expr, cx: &Cx) -> Ty {
         ),
         // `expr?` propagates the absent case; the VALUE has the inner type.
         syn::Expr::Try(t) => infer_ty(&t.expr, cx),
+
+        // a cast to an integer type is an integer (a float/pointer cast is
+        // not something the store types)
+        syn::Expr::Cast(c) => match int_ty_bits(&c.ty) {
+            Some(_) => Ty::Int,
+            None => Ty::Unknown,
+        },
 
         // `v[i]` on a PROVEN array carries the element type; a strSplit
         // list's elements are strings.
@@ -3791,7 +3898,7 @@ fn push_branch_block(
 /// (`i128::MAX`, `usize::MIN`, …) -> its EXACT decimal text. The store is
 /// string-typed, so the full i128/u128 range survives verbatim; only
 /// arithmetic uses would need i64 and refuse there.
-fn int_assoc_const(p: &syn::ExprPath) -> Option<String> {
+fn int_assoc_const_path(p: &syn::ExprPath) -> Option<String> {
     if p.qself.is_some() || p.path.leading_colon.is_some() || p.path.segments.len() != 2 {
         return None;
     }
@@ -5361,7 +5468,7 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
             // are compile-time integers. The store is a decimal string, so
             // the EXACT value is emitted (i128/u128 exceed i64; any later
             // arithmetic use refuses at its own site rather than wrap).
-            if let Some(v) = int_assoc_const(p) {
+            if let Some(v) = int_assoc_const_path(p) {
                 return str_lit(&v);
             }
             let Some(name) = single_path(p) else {
@@ -6105,6 +6212,39 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                 );
             };
             fn_call_expr(&target, &c.args, "fnValue", cx)
+        }
+        // `as` between integer types is a compile-time FACT when the operand
+        // is a constant: Rust yields the same value whenever it fits the
+        // target's range, so the exact text IS the constant. Everything else
+        // refuses — a runtime value can wrap (a u64 wrap is unrepresentable
+        // in the decimal store) and a float/pointer cast has no store value.
+        syn::Expr::Cast(c) => {
+            let Some((text, val)) = const_int_cast_operand(&c.expr, cx) else {
+                refuse(
+                    "cast (`as`) of a non-constant expression (only compile-time integer values are exact)",
+                    c.span(),
+                )
+            };
+            let Some((bits, signed)) = int_ty_bits(&c.ty) else {
+                refuse(
+                    "cast (`as`) to a non-integer type (no exact JS equivalent yet)",
+                    c.ty.span(),
+                )
+            };
+            let ok = match val {
+                Some(v) => int_cast_range_ok(v, bits, signed),
+                // the only constant never seen as i128 is a u128-range
+                // associated constant (`u128::MAX`): verbatim ONLY into an
+                // unsigned 128-bit target.
+                None => !signed && bits >= 128,
+            };
+            if !ok {
+                refuse(
+                    "cast (`as`) that would wrap (value outside the target type's range)",
+                    c.span(),
+                );
+            }
+            str_lit(&text)
         }
         other => refuse(
             &format!("expression kind `{}`", expr_kind(other)),

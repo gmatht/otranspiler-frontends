@@ -548,6 +548,54 @@ position, `is_ok`/`is_err`) and t74 (Option presence predicates), with the
 refusal boundaries t73 (computed env name) and t75 (env name shadowed by a
 program binding).
 
+## v0.28 additions — exact compile-time integer `as` casts
+
+`as` was the *named* expression refusal, and its biggest site class is a
+compile-time fact, not a semantics wall: when the operand is a CONSTANT and
+the value fits the target type's range, Rust's integer `as` yields the same
+value, so the store's exact decimal text IS the answer. The first blocker of
+`src/c_backend.rs` (the flagship backend) was `const VER_M: i128 =
+i64::MAX as i128;` — pure constant folding.
+
+Lowered (all exact, no guessing):
+
+- **A constant cast to an integer type** — the operand may be an integer
+  literal (i128-parsed, so u64/u128 literals survive), a parser-level
+  negative, a paren, a tabled `const`, a primitive assoc const
+  (`u8::MAX`), or another constant cast. The value is range-checked
+  against the target type's own range and, when it fits, emitted verbatim.
+  Nesting composes left to right (`(u8::MAX as u16) as i64`).
+- `const_int`/`const_int_i128` fold the same casts, so `const A: i128 =
+  i64::MAX as i128;` lands in the int-const table and later constant uses
+  (conditions, other casts) see the value.
+- `infer_ty` types a cast to an integer type as `Int` (a float/pointer
+  cast types as Unknown instead of pretending).
+
+Refused loudly (t83/t84):
+
+- a cast of a **non-constant** expression — a runtime value can wrap, and a
+  wrapped u64 has no decimal-store representation, so a guessed truncation
+  would be silently wrong;
+- a constant cast that would **wrap** (`300 as u8`), named as such;
+- a cast to a non-integer type (float/pointer), its own message.
+
+One runtime note for future pins: the A1 carries the exact decimal text even
+above 2^53, but the ESTree executor parses a numeric-looking value as a JS
+number, so PRINTING `i64::MAX` through the JS path loses digits (caught by
+the stdout oracle on the first draft of t82). The pin therefore stays inside
+the double-exact range; the cast lowering itself is exact either way.
+
+**Scoreboard movement (the histogram is the metric).** The first-blocker
+class `expression kind `cast (`as`)`` is gone from the histogram; the
+whole-file count stays 17/254, as the v0.20 note predicts. Frontiers moved:
+`src/c_backend.rs` 7120 → 145 (`condition operand`), `src/cuda_backend.rs`
+and `src/vulkan_backend.rs` still `.chars()` iteration, `fish/sh/zsh/rust_backend`
+still `lazy_static!`, and the three `go/perl/zig_backend` files still stop at
+`fallback_builtin_to_exec`, whose body needs `&mut`.
+
+Pinned by t82 (executed stdout vs native rustc) and the refusal boundary
+pins t83 (wrapping constant) / t84 (non-constant).
+
 ## Gate
 
 `make test` = refusal pins + ingress acceptance (`debashc
