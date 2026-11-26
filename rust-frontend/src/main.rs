@@ -951,9 +951,15 @@ fn lower_expr_stmt(e: &syn::Expr, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) ->
             use syn::BinOp::*;
             if matches!(
                 b.op,
-                AddAssign(_) | SubAssign(_) | MulAssign(_) | DivAssign(_) | RemAssign(_)
+                AddAssign(_)
+                    | SubAssign(_)
+                    | MulAssign(_)
+                    | DivAssign(_)
+                    | RemAssign(_)
+                    | BitOrAssign(_)
+                    | BitAndAssign(_)
             ) {
-                Some(compound_assign(b, cx))
+                Some(compound_assign(b, cx, out))
             } else {
                 refuse("binary-operator statement (only compound assigns)", b.op.span())
             }
@@ -1151,7 +1157,7 @@ fn plain_assign(a: &syn::ExprAssign, cx: &Cx, out: &mut Vec<Value>) -> Value {
     assign_stmt(&name.to_string(), value_expr(&a.right, cx))
 }
 
-fn compound_assign(b: &syn::ExprBinary, cx: &Cx) -> Value {
+fn compound_assign(b: &syn::ExprBinary, cx: &Cx, out: &mut Vec<Value>) -> Value {
     let syn::Expr::Path(p) = &*b.left else {
         refuse("assignment target (only plain variables are supported)", b.left.span());
     };
@@ -1160,6 +1166,36 @@ fn compound_assign(b: &syn::ExprBinary, cx: &Cx) -> Value {
     };
     let name = name.to_string();
     use syn::BinOp::*;
+    // `|=` / `&=` on a PROVEN boolean are Rust's logical OR / AND
+    // (`BitOr`/`BitAnd` on bool). They are NOT short-circuiting, so the
+    // RHS always evaluates exactly once — hoisting it into a temp is the
+    // exact evaluation order. A bitwise lowering would be silently wrong:
+    // the store holds the strings "true"/"false", which `|` coerces to
+    // NaN → 0. Any non-bool receiver refuses (REFUSE > GUESS).
+    if matches!(b.op, BitOrAssign(_) | BitAndAssign(_)) {
+        let lhs_ty = cx
+            .vars
+            .borrow()
+            .get(&name)
+            .cloned()
+            .or_else(|| cx.statics.borrow().get(&name).cloned())
+            .unwrap_or(Ty::Unknown);
+        if !matches!(lhs_ty, Ty::Bool | Ty::AtomicBool) {
+            refuse(
+                "bitwise compound assignment on a non-boolean receiver",
+                b.op.span(),
+            );
+        }
+        let mut ctr = cx.tmp.borrow_mut();
+        *ctr += 1;
+        let temp = format!("__sh2b{}", ctr);
+        drop(ctr);
+        out.push(assign_stmt(&temp, value_expr(&b.right, cx)));
+        cx.vars.borrow_mut().insert(temp.clone(), Ty::Bool);
+        let op = if matches!(b.op, BitOrAssign(_)) { "-o" } else { "-a" };
+        let cond = format!("${name} = \"true\" {op} ${temp} = \"true\"");
+        return assign_stmt(&name, test_call(&cond));
+    }
     let op = match b.op {
         AddAssign(_) => "+",
         SubAssign(_) => "-",
@@ -1448,11 +1484,24 @@ fn flatten_items<'a>(items: &'a [syn::Item], out: &mut Vec<&'a syn::Item>) {
 
 /// The plain identifier of a non-generic path type (`Point`), or None
 /// (`Vec<T>`, `&T`, qualified paths — none name a lowerable impl target).
+///
+/// LIFETIME-ONLY arguments erase (`TestParser<'a, 'r>`, `PyChild<'_>`,
+/// `Walker<'a>`): lifetimes have no runtime representation, exactly like
+/// the v0.14 function-level lifetime erasure. Type/const generics still
+/// refuse — they can change a method's runtime shape.
 fn type_ident(ty: &syn::Type) -> Option<String> {
     if let syn::Type::Path(tp) = ty {
-        if tp.qself.is_none() {
+        if tp.qself.is_none() && tp.path.leading_colon.is_none() {
             if let Some(seg) = tp.path.segments.last() {
-                if seg.arguments.is_none() && tp.path.leading_colon.is_none() {
+                let lifetimes_only = match &seg.arguments {
+                    syn::PathArguments::None => true,
+                    syn::PathArguments::AngleBracketed(a) => a
+                        .args
+                        .iter()
+                        .all(|arg| matches!(arg, syn::GenericArgument::Lifetime(_))),
+                    syn::PathArguments::Parenthesized(_) => false,
+                };
+                if lifetimes_only {
                     return Some(seg.ident.to_string());
                 }
             }
@@ -2325,6 +2374,52 @@ fn push_branch_block(
     }
 }
 
+/// A primitive integer type's associated `MAX`/`MIN` constant
+/// (`i128::MAX`, `usize::MIN`, …) -> its EXACT decimal text. The store is
+/// string-typed, so the full i128/u128 range survives verbatim; only
+/// arithmetic uses would need i64 and refuse there.
+fn int_assoc_const(p: &syn::ExprPath) -> Option<String> {
+    if p.qself.is_some() || p.path.leading_colon.is_some() || p.path.segments.len() != 2 {
+        return None;
+    }
+    let ty = p.path.segments[0].ident.to_string();
+    let name = p.path.segments[1].ident.to_string();
+    let (bits, signed) = match ty.as_str() {
+        "i8" => (8u32, true),
+        "i16" => (16, true),
+        "i32" => (32, true),
+        "i64" => (64, true),
+        "i128" => (128, true),
+        "isize" => (64, true),
+        "u8" => (8, false),
+        "u16" => (16, false),
+        "u32" => (32, false),
+        "u64" => (64, false),
+        "u128" => (128, false),
+        "usize" => (64, false),
+        _ => return None,
+    };
+    match name.as_str() {
+        "MAX" => {
+            if signed {
+                Some(((1i128 << (bits - 1)) - 1).to_string())
+            } else if bits == 128 {
+                Some(u128::MAX.to_string())
+            } else {
+                Some(((1u128 << bits) - 1).to_string())
+            }
+        }
+        "MIN" => {
+            if signed {
+                Some((-(1i128 << (bits - 1))).to_string())
+            } else {
+                Some("0".to_string())
+            }
+        }
+        _ => None,
+    }
+}
+
 /// A UNIT-variant pattern (`Color::Red`) -> its qualified tag string;
 /// None for anything else (payload variants, literals, bindings).
 fn unit_variant_pat(p: &syn::Pat, cx: &Cx) -> Option<String> {
@@ -2345,10 +2440,41 @@ fn unit_variant_pat(p: &syn::Pat, cx: &Cx) -> Option<String> {
 }
 
 /// A match arm's test condition: string equality on the hoisted
-/// scrutinee, or-patterns join with `-o`.
+/// scrutinee, or-patterns join with `-o`. Literal patterns are exact
+/// (`$t = "str"` for strings/bools, `$t -eq N` for integers); a bare
+/// `None` is the Option layer's absent marker under None≡"".
 fn arm_cond(temp: &str, pat: &syn::Pat, cx: &Cx) -> Option<String> {
     fn one(temp: &str, p: &syn::Pat, cx: &Cx) -> Option<String> {
-        unit_variant_pat(p, cx).map(|tag| format!("${temp} = \"{tag}\""))
+        if let Some(tag) = unit_variant_pat(p, cx) {
+            return Some(format!("${temp} = \"{tag}\""));
+        }
+        match p {
+            // `None` parses as a BINDING ident in pattern position (syn
+            // has no variant knowledge); it is the absent marker, not a
+            // fresh binding. Same convention as `if let None`.
+            syn::Pat::Ident(pi) if pi.ident == "None" && pi.subpat.is_none() => {
+                Some(format!("\"${temp}\" = \"\""))
+            }
+            syn::Pat::Lit(l) => match &l.lit {
+                syn::Lit::Int(li) => Some(format!("${temp} -eq {}", int_text(li))),
+                syn::Lit::Str(ls) => {
+                    let s = ls.value();
+                    // the test grammar is shell-shaped: a quote or
+                    // backslash inside the literal would need the same
+                    // escaping bash applies — refuse rather than guess.
+                    if s.contains('"') || s.contains('\\') {
+                        return None;
+                    }
+                    Some(format!("\"${temp}\" = \"{s}\""))
+                }
+                syn::Lit::Bool(lb) => Some(format!(
+                    "\"${temp}\" = \"{}\"",
+                    if lb.value() { "true" } else { "false" }
+                )),
+                _ => None,
+            },
+            _ => None,
+        }
     }
     match pat {
         syn::Pat::Or(o) => {
@@ -2384,14 +2510,37 @@ fn match_value_node(
     drop(n);
     out.push(assign_stmt(&temp, value_expr(&m.expr, cx)));
     let mut else_: Vec<Value> = Vec::new();
-    for arm in m.arms.iter().rev() {
-        let Some(cond_s) = arm_cond(&temp, &arm.pat, cx) else {
-            refuse(
-                "match pattern (only unit variants, or-patterns of them, and `_`)",
-                arm.pat.span(),
-            );
-        };
+    let last_ix = m.arms.len().saturating_sub(1);
+    for (ix, arm) in m.arms.iter().enumerate().rev() {
         let mut then = Vec::new();
+        // Irrefutable arms (`_` and a plain binding) are the FALL-THROUGH.
+        // rustc only permits them last (later arms would be unreachable);
+        // any other position refuses rather than silently dropping code.
+        let cond_s = match &arm.pat {
+            syn::Pat::Wild(_) => {
+                if ix != last_ix {
+                    refuse("`_` match arm before later arms", arm.pat.span());
+                }
+                None
+            }
+            syn::Pat::Ident(pi) if pi.subpat.is_none() && pi.ident != "None" => {
+                if ix != last_ix {
+                    refuse("binding match arm before later arms", arm.pat.span());
+                }
+                // `other => body` binds the scrutinee value to `other`
+                // (the hoisted temp is read once, so the snapshot is exact).
+                then.push(assign_stmt(&pi.ident.to_string(), get_var(&temp)));
+                let bind_ty = infer_ty(&m.expr, cx);
+                cx.vars.borrow_mut().insert(pi.ident.to_string(), bind_ty);
+                None
+            }
+            pat => Some(arm_cond(&temp, pat, cx).unwrap_or_else(|| {
+                refuse(
+                    "match pattern (only unit variants, literals, bindings, or-patterns, and `_`)",
+                    pat.span(),
+                )
+            })),
+        };
         match &*arm.body {
             syn::Expr::Block(blk) => {
                 push_branch_block(&blk.block, target, cx, in_fn, &mut then)
@@ -2410,13 +2559,25 @@ fn match_value_node(
                 }
             },
         }
-        else_ = vec![json!({
-            "cond": test_call(&cond_s),
-            "then": then,
-            "elsifs": [],
-            "else": else_,
-            "type": "If",
-        })];
+        else_ = match cond_s {
+            Some(cond_s) => vec![json!({
+                "cond": test_call(&cond_s),
+                "then": then,
+                "elsifs": [],
+                "else": else_,
+                "type": "If",
+            })],
+            // irrefutable arm: the body IS the remaining else. The
+            // always-true guard keeps the one-node shape the caller
+            // expects (and is exact — no value is inspected).
+            None => vec![json!({
+                "cond": test_call("1 -eq 1"),
+                "then": then,
+                "elsifs": [],
+                "else": [],
+                "type": "If",
+            })],
+        };
     }
     else_.remove(0)
 }
@@ -2941,6 +3102,13 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                 if cx.fns.iter().any(|f| *f == last) {
                     return str_lit(&last);
                 }
+            }
+            // `i64::MAX` / `u128::MIN` … — primitive associated constants
+            // are compile-time integers. The store is a decimal string, so
+            // the EXACT value is emitted (i128/u128 exceed i64; any later
+            // arithmetic use refuses at its own site rather than wrap).
+            if let Some(v) = int_assoc_const(p) {
+                return str_lit(&v);
             }
             let Some(name) = single_path(p) else {
                 refuse("path expression", p.span());

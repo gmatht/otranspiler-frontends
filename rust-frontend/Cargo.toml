@@ -1,6 +1,8 @@
 # rust-frontend — Rust source -> A1 shIR JSON (the sh2perl frontend contract).
 # syn-based (stable crates.io parser, no nightly/rustc-dev), offline build
 # against the workspace's cached registry.
+[workspace]
+
 [package]
 name = "rust-frontend"
 version = "0.1.0"

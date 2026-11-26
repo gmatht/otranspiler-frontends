@@ -452,6 +452,53 @@ against native `rustc` by `harness/frontend-stdout.sh`):
 Refused loudly (new pins t64/t65): `if let Some(<non-name>)`
 (destructuring), and `matches!` on a compound subject.
 
+## v0.21 additions — the backend dogfood frontier
+
+Four subset holes that stopped the DOGFOODING walk early, all exact lowerings
+(no guessing):
+
+- **`|=` / `&=` on a PROVEN bool** are Rust's logical OR / AND
+  (`BitOr`/`BitAnd` on bool), and they are NOT short-circuiting — the RHS
+  always evaluates once, so hoisting it into a temp is the exact order.
+  The result is the usual value-position `test` (a native JS boolean). A
+  bitwise lowering would be silently wrong (the store's `"true"`/`"false"`
+  coerce to NaN → 0 through JS `|`), and a NON-bool receiver refuses:
+  i64 bitwise semantics are not the JS 32-bit `|`/`&` and the store is
+  string-typed (REFUSE > GUESS). This was the first blocker for **24**
+  `src/transforms/*.rs` files (`changed |= recurse(s);`) — the backend
+  lowering pipeline itself.
+- **Lifetime-only generic impl targets erase** (`impl<'a, 'r> T<'a, 'r>`,
+  `impl Trait for T<'_>`, `impl<'a> Walker<'a>`), exactly like the v0.14
+  function-level lifetime erasure: a lifetime has no runtime
+  representation. Type/const generics still refuse. This unblocked the
+  first hole in `rust_backend.rs` and `python_backend.rs`.
+- **Match literal / binding / `_` arms.** Integer literals lower to
+  `$t -eq N`; string and bool literals to quoted test equality; `A | B`
+  joins with `-o`; bare `None` tests the None≡"" marker; a plain binding
+  arm (`other => …`) binds the hoisted scrutinee and is the
+  irrefutable fall-through, as is `_` (both only in last position —
+  rustc's unreachable-arm rule). The always-true guard `1 -eq 1` keeps
+  the one-node shape for an irrefutable-only match. Payload/struct
+  patterns still refuse (record storage).
+- **Primitive associated constants** (`i128::MAX`, `u64::MAX`, `u8::MIN`, …)
+  fold to their EXACT decimal text. The store is decimal-string-typed, so
+  the positive i128/u128 range survives verbatim; an arithmetic use beyond
+  i64 refuses at its own site. (The ESTree executor still parses a
+  numeric-looking A1 `Str`, so the pin stays on positive out-of-i64
+  values; the frontend's A1 carries the exact string either way.)
+
+**Scoreboard movement (the histogram is the metric, not the pass count).**
+The first-blocker classes removed: `binary-operator statement` 24 → 0,
+`impl of generic/qualified type` 8 → 0, `path expression` 2 → 0. As the
+v0.20 note predicts, the whole-file count does not move (each refused file
+carries 10–49 blockers); the frontier does — e.g. `rust_backend.rs` now
+stops at an item-level macro, `python_backend.rs` at `.lines()` iteration,
+and the transforms files at `&mut` borrows / payload matches.
+
+Pinned by t16 (promoted from its old refusal pin), t66–t69 (executed-stdout
+vs native rustc), and t70/t71 (the refusal boundaries: non-bool bitwise
+compound assign, payload match patterns).
+
 ## Gate
 
 `make test` = refusal pins + ingress acceptance (`debashc
