@@ -5918,6 +5918,9 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                         syn::Expr::Lit(_) => true,
                         syn::Expr::Path(p) if p.qself.is_none() => single_path(p).is_some(),
                         syn::Expr::Field(f) => matches!(&f.member, syn::Member::Named(_)),
+                        // `p.words[0]` — an element read of a field array is
+                        // pure too (no side effects, same value twice).
+                        syn::Expr::Index(ix) => pure_read(&ix.expr) && pure_read(&ix.index),
                         syn::Expr::Try(t) => pure_read(&t.expr),
                         syn::Expr::Paren(p) => pure_read(&p.expr),
                         syn::Expr::MethodCall(m) => {
