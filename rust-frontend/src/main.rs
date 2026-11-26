@@ -379,6 +379,12 @@ struct Cx {
     statics: std::cell::RefCell<HashMap<String, Ty>>,
     /// global assignments (consts/statics), in source order
     globals: Vec<Value>,
+    /// every name the program can put in the STORE: `let`/param/pattern
+    /// bindings plus const/static globals. An env read lowers to
+    /// getVar(name), whose runtime lookup prefers the store over
+    /// process.env, so it is exact only when this set does not contain
+    /// the env name (checked at the read site).
+    bindings: HashSet<String>,
 }
 
 /// Const-evaluate an expression to i64 if possible (literal / -literal /
@@ -488,6 +494,53 @@ fn main() {
     // qualified paths resolve only for `Type::method` call targets).
     let mut flat: Vec<&syn::Item> = Vec::new();
     flatten_items(&roots, &mut flat);
+    // EXPANDED-TREE type registry: the pre-pass above sees only the entry
+    // file's top level, but the module closure contributes structs/enums
+    // too (`BraceExpansion` lives beside mir.rs). Declared field types
+    // are type-checker facts, so registering them is exact — it is what
+    // lets `expansion.prefix.as_deref()` prove Option<String>.
+    for item in &flat {
+        match item {
+            syn::Item::Struct(s) => {
+                let fields: Vec<(String, Ty)> = s
+                    .fields
+                    .iter()
+                    .filter_map(|f| match &f.ident {
+                        Some(id) => Some((id.to_string(), ty_from_type(&f.ty, &cx))),
+                        None => None,
+                    })
+                    .collect();
+                cx.structs.borrow_mut().insert(s.ident.to_string(), fields);
+            }
+            syn::Item::Enum(e) if !cx.enums.iter().any(|x| *x == e.ident.to_string()) => {
+                cx.enums.push(e.ident.to_string());
+            }
+            _ => {}
+        }
+    }
+    // Program-wide store-binding names (see Cx::bindings).
+    {
+        use syn::visit::Visit as _;
+        struct Collect<'a>(&'a mut HashSet<String>);
+        impl<'ast> syn::visit::Visit<'ast> for Collect<'_> {
+            fn visit_pat_ident(&mut self, p: &'ast syn::PatIdent) {
+                self.0.insert(p.ident.to_string());
+                syn::visit::visit_pat_ident(self, p);
+            }
+            fn visit_item_const(&mut self, c: &'ast syn::ItemConst) {
+                self.0.insert(c.ident.to_string());
+                syn::visit::visit_item_const(self, c);
+            }
+            fn visit_item_static(&mut self, s: &'ast syn::ItemStatic) {
+                self.0.insert(s.ident.to_string());
+                syn::visit::visit_item_static(self, s);
+            }
+        }
+        let mut collect = Collect(&mut cx.bindings);
+        for item in &flat {
+            collect.visit_item(item);
+        }
+    }
 
     // pre-pass: collect consts/statics (globals + int-const table) so any
     // later lowering step can const-fold against them.
@@ -830,6 +883,9 @@ fn infer_ty(e: &syn::Expr, cx: &Cx) -> Ty {
         // REGISTERED-fn calls carry their declared return Ty
         syn::Expr::Call(c) => {
             if let syn::Expr::Path(p2) = &*c.func {
+                if is_env_var_path(p2) && env_var_lit(&c.args).is_some() {
+                    return Ty::Opt(Box::new(Ty::Str));
+                }
                 if let Some(id) = single_path(p2) {
                     // Some(v) constructor -> Opt(type of v), under the
                     // None≡"" convention (the option methods then collapse
@@ -850,6 +906,7 @@ fn infer_ty(e: &syn::Expr, cx: &Cx) -> Ty {
             match m.method.to_string().as_str() {
                 // identity-shaped reads keep the receiver's option-ness
                 "as_deref" | "unwrap_or_default" => rty,
+                "is_some" | "is_none" | "is_ok" | "is_err" => Ty::Bool,
                 "unwrap_or" => match m.args.first() {
                     Some(a) => infer_ty(a, cx),
                     None => Ty::Unknown,
@@ -1536,6 +1593,106 @@ fn first_semantic_attr<'a>(attrs: &'a [syn::Attribute]) -> Option<&'a syn::Attri
 /// Std constructor calls with EXACT store-native values:
 /// `String::from(x)` is x itself; `String::new()` is ""; `Vec::new()` /
 /// map/set constructors are the empty array. Anything else -> None.
+/// A plain shell/store identifier: getVar parses `#name` as a length and
+/// `name[...]` as a subscript, so anything else is not a readable name.
+fn valid_env_name(n: &str) -> bool {
+    let mut cs = n.chars();
+    match cs.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// True for `std::env::var` / `std::env::var_os` (also `env::var` after
+/// `use std::env;`). Only the two-argument-free, literal-name reads are
+/// accepted at the call site.
+fn is_env_var_path(p: &syn::ExprPath) -> bool {
+    if p.qself.is_some() || p.path.leading_colon.is_some() {
+        return false;
+    }
+    let segs: Vec<&syn::PathSegment> = p.path.segments.iter().collect();
+    if segs.iter().any(|s| !s.arguments.is_none()) {
+        return false;
+    }
+    let Some(last) = segs.last() else {
+        return false;
+    };
+    if last.ident != "var" && last.ident != "var_os" {
+        return false;
+    }
+    if segs.len() == 2 {
+        return segs[0].ident == "env";
+    }
+    segs.len() >= 3
+        && segs[segs.len() - 2].ident == "env"
+        && segs[segs.len() - 3].ident == "std"
+}
+
+fn env_var_lit<'a>(
+    args: &'a syn::punctuated::Punctuated<syn::Expr, syn::Token![,]>,
+) -> Option<&'a syn::LitStr> {
+    if args.len() != 1 {
+        return None;
+    }
+    match args.first()? {
+        syn::Expr::Lit(l) => match &l.lit {
+            syn::Lit::Str(s) => Some(s),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `std::env::var("NAME")` -> `getVar("NAME")`.
+///
+/// The runtime's getVar falls back to `process.env[name]` for names the
+/// program never assigned, so the value is the environment's. var/var_os
+/// differ only for non-UTF-8 values, which the string store cannot hold;
+/// Option vs Result is collapsed by the store's None≡"" convention. The
+/// two exactness preconditions are enforced here: a PLAIN identifier name
+/// (getVar interprets `#`/`[...]`), and no same-named program binding
+/// (getVar would read the store first).
+fn env_var_value(
+    p: &syn::ExprPath,
+    args: &syn::punctuated::Punctuated<syn::Expr, syn::Token![,]>,
+    cx: &Cx,
+) -> Value {
+    if args.len() != 1 {
+        refuse("env var read expects exactly one name", p.span());
+    }
+    let Some(syn::Expr::Lit(l)) = args.first() else {
+        refuse("env var name must be a string literal", args.span());
+    };
+    let syn::Lit::Str(ls) = &l.lit else {
+        refuse("env var name must be a string literal", l.span());
+    };
+    let name = ls.value();
+    if !valid_env_name(&name) {
+        refuse("env var name is not a plain shell identifier", ls.span());
+    }
+    if cx.bindings.contains(&name) {
+        refuse(
+            &format!("env var `{name}` is shadowed by a program binding"),
+            ls.span(),
+        );
+    }
+    get_var(&name)
+}
+
+/// `Some(v)`/`Ok(v)` <=> the store value is not ""; `None`/`Err` <=> it is.
+/// A1 BinOp compares exactly like the test grammar's string equality, and
+/// the store is string-typed, so this is the same marker test as
+/// `if let Some(x)`.
+fn opt_present(recv: &syn::Expr, present: bool, cx: &Cx) -> Value {
+    json!({
+        "type": "BinOp",
+        "op": if present { "Ne" } else { "Eq" },
+        "lhs": value_expr(recv, cx),
+        "rhs": str_lit(""),
+    })
+}
+
 fn std_ctor_value(
     p: &syn::ExprPath,
     args: &syn::punctuated::Punctuated<syn::Expr, syn::Token![,]>,
@@ -3344,7 +3501,6 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                 call_args.extend(m.args.iter().cloned());
                 return fn_call_expr_values(&target, call_args, "fnValue", cx);
             }
-            eprintln!("DBG4 recv_ty={:?} method={}", recv_ty, rust_name);
             // OPTION methods: under the None≡"" store convention,
             // as_deref / unwrap_or("") / unwrap_or_default are ALL the
             // plain variable read (Some(v) -> v, None -> ""). Exact when
@@ -3382,6 +3538,23 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                             "unwrap_or with a non-empty default (branching not representable in value position)",
                             m.method.span(),
                         );
+                    }
+                    // PRESENCE predicates are the absent-marker test:
+                    // Some(v)/Ok(v) <=> the store value is not "". Exact
+                    // for the string-typed store under the documented
+                    // Some("") == None convention (same convention as
+                    // `if let Some(x)`, which tests the same marker).
+                    "is_some" | "is_ok" => {
+                        if !m.args.is_empty() {
+                            refuse("option predicate with arguments", m.span());
+                        }
+                        return opt_present(&m.receiver, true, cx);
+                    }
+                    "is_none" | "is_err" => {
+                        if !m.args.is_empty() {
+                            refuse("option predicate with arguments", m.span());
+                        }
+                        return opt_present(&m.receiver, false, cx);
                     }
                     _ => {}
                 }
@@ -3445,6 +3618,9 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
             let Some(syn::Expr::Path(p)) = Some(c.func.as_ref()) else {
                 refuse("call target path", c.func.span());
             };
+            if is_env_var_path(p) {
+                return env_var_value(p, &c.args, cx);
+            }
             if let Some(v) = std_ctor_value(p, &c.args, cx) {
                 return v;
             }

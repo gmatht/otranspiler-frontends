@@ -499,6 +499,55 @@ Pinned by t16 (promoted from its old refusal pin), t66–t69 (executed-stdout
 vs native rustc), and t70/t71 (the refusal boundaries: non-bool bitwise
 compound assign, payload match patterns).
 
+## v0.22 additions — environment reads and Option presence
+
+`.lines()` and `&mut` are the obvious next examples, but neither is exactly
+representable in the store yet: a split/line array has a RUNTIME length (the
+A1 array reads need a proven length; `param("len")` is the scalar view), and
+`&mut` writes through an alias a value store cannot express. The highest-value
+EXACT class actually on the frontier is the environment read that gates the
+transform pipeline: `env::var`/`env::var_os` appears **195** times in the
+tree, and the first-blocker class was "method on receiver" mostly from
+`.unwrap_or_default()` / `.is_ok()` / `.is_some()` on those reads.
+
+- `std::env::var("NAME")` / `env::var_os("NAME")` lower to
+  `getVar("NAME")`, whose runtime lookup falls back to `process.env`. The
+  Result/Option shape is `Ty::Opt(Str)`; `unwrap_or_default`,
+  `unwrap_or("")` and `as_deref` (already supported) collapse to the read.
+- `is_some`/`is_ok` are `getVar(..) != ""`; `is_none`/`is_err` are
+  `== ""` (an A1 `BinOp`, the same marker test as `if let Some(x)`).
+- Exactness preconditions are ENFORCED, not assumed: the name must be a
+  string LITERAL, a plain store identifier (getVar parses `#`/`[...]`), and
+  no program binding anywhere may share the name (getVar reads the store
+  before the environment). `var` vs `var_os` differ only for non-UTF-8
+  values, which the string store cannot hold. Presence uses the documented
+  None ≡ "" convention: a set-but-empty env var reads as absent, exactly
+  as `Some("")` already does (t73/t75 pin the two refusals).
+
+**Scoreboard, one frozen source for both binaries (hash `422a3436f88b0ceb`,
+254 files):**
+
+```
+LOWERED                14 / 254   (unchanged)
+method on receiver     22 -> 19
+call to unknown        67 -> 68
+compound subject        1 -> 2
+macro invocation        0 -> 1
+```
+
+The pass count is unchanged because each refused file still carries several
+blockers — the first-blocker histogram is the frontier metric. Seven files
+moved past their first blocker: the four `transforms/*_lift` /
+`text_ops_planner` A/B gates now stop at `.split(',').any(..)` (a DYNAMIC
+split, i.e. the array-length core request), `perl_generator_fixed` at
+`eprintln!`, `echo_return` at a cross-module call, and `str_chop_cursor` at
+`matches!` on a compound subject.
+
+Pinned by t72 (executed stdout: set/unset reads in value and condition
+position, `is_ok`/`is_err`) and t74 (Option presence predicates), with the
+refusal boundaries t73 (computed env name) and t75 (env name shadowed by a
+program binding).
+
 ## Gate
 
 `make test` = refusal pins + ingress acceptance (`debashc
