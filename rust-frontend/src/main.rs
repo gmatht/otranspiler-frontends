@@ -6593,12 +6593,13 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                             Ty::Str => "string ",
                             Ty::Bool => "bool ",
                             Ty::Arr(..) => "array ",
-                            Ty::Struct(ref n) => {
-                                unreachable!("struct receivers dispatched above: {}", n)
-                            }
-                            Ty::Enum(ref n) => {
-                                unreachable!("enum receivers are not method targets: {}", n)
-                            }
+                            // Struct/enum receivers normally dispatch to a
+                            // native shape earlier; one that reaches here has
+                            // NO proven lowering, so it REFUSES like every
+                            // other unmapped receiver — never a panic (a
+                            // hoisted if-condition can legitimately reach it).
+                            Ty::Struct(_) => "struct ",
+                            Ty::Enum(_) => "enum ",
                             Ty::AtomicBool => "",
                             Ty::Tuple(_) => "tuple ",
                             Ty::List => "list ",

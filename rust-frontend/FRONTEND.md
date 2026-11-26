@@ -660,6 +660,13 @@ Three exactness bugs found by the pins, all fixed or documented:
    no pin iterates a `BTreeMap`, and `vulkan_backend.rs` only *builds* one
    (`ext_idx`) — it never iterates it.
 
+One robustness fix this surfaced: the method-dispatch table's struct/enum
+receiver arms were `unreachable!`. A hoisted `if` condition can legitimately
+reach them, and `src/c_backend.rs` then PANICKED instead of refusing; both
+arms are now honest refusals ("method ... on enum receiver"), so every corpus
+file still REFUSEs loudly rather than crashing (checked: zero `internal
+error`/`panicked` lines across the 254-file run).
+
 Scoreboard: **LOWERED 17 → 18 / 254**; `src/vulkan_backend.rs` moves from
 3 first-blockers to 0. The frontend-stdout gate is **61/81 match, 0 FAIL,
 20 SKIP** (was 57/75). Pinned by t85–t88 (executed stdout vs native
