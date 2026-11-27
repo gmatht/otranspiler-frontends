@@ -2057,11 +2057,15 @@ fn lower_local(
         // The bound name exists after the match (all arms assign or
         // return): register it so later `format!("{name}")` captures and
         // typed reads see it. The arm result type is not tracked.
+        //
+        // `in_fn` is passed THROUGH: an arm of a value-position match is
+        // still the function's body, so `return None;` inside an arm is the
+        // function's early exit (carrying a value), not a top-level `return`.
         cx.vars.borrow_mut().insert(name.clone(), Ty::Unknown);
-        return Some(match_value_node(m, BranchTarget::Var(&name), cx, false, out));
+        return Some(match_value_node(m, BranchTarget::Var(&name), cx, in_fn, out));
     }
     if let syn::Expr::If(ie) = &*init.expr {
-        let v = if_value_node(ie, BranchTarget::Var(&name), cx, false, out);
+        let v = if_value_node(ie, BranchTarget::Var(&name), cx, in_fn, out);
         let ty = branch_ty(ie, cx);
         cx.vars.borrow_mut().insert(name.clone(), ty);
         return Some(v);
@@ -8903,6 +8907,24 @@ fn operand(e: &syn::Expr, cx: &Cx, str_eq: bool) -> String {
                 return format!("${s}");
             }
             format!("${name}")
+        }
+        // A LENGTH READ as a comparison operand (`v.len() > 1`): hoisted into
+        // a temp so the test grammar can read a $variable. Exact only for
+        // what the store counts exactly — an ARRAY's element count. A
+        // STRING's `.len()` stays refused: Rust counts bytes, the store's
+        // text is UTF-16 code units (the v0.35 `as_bytes` wall). The temp is
+        // queued on `cx.pending`, which `lower_block`/`lower_fn_stmt` flush
+        // BEFORE the statement that reads it.
+        syn::Expr::MethodCall(m)
+            if m.method == "len"
+                && m.args.is_empty()
+                && matches!(infer_ty(&m.receiver, cx), Ty::Arr(..)) =>
+        {
+            let t = fresh_tmp(cx, "cl");
+            let v = value_expr(e, cx);
+            cx.pending.borrow_mut().push(assign_stmt(&t, v));
+            cx.vars.borrow_mut().insert(t.clone(), Ty::Int);
+            format!("${t}")
         }
         syn::Expr::Lit(l) => match &l.lit {
             syn::Lit::Int(li) => int_text(li),

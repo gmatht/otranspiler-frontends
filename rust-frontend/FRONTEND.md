@@ -1489,6 +1489,70 @@ Gate: **82/114 -> 83/115 match, 0 FAIL, 32 SKIP**. Census over the 14
 in those files iterates a `BTreeMap`, so no unit completes; the change is a
 correctness fix for programs that do, not a census mover.
 
+## v0.38 — two lowering gaps closed; `cat.rs` flips
+
+The dogfood census's closest files each had ONE blocked unit. Two of those
+units were refused for reasons that were not modelling walls at all:
+
+### 1. `return V;` inside a value-position `match`/`if` initializer
+
+`let path = match w { Pat(s) => { if guarded(s) { return None; } v } .. }` —
+the shape `src/pipeline_native/capabilities/cat.rs::cat_file` uses — refused
+with `` `return` with a value ``. The cause was a dropped flag, not a
+semantic gap: `lower_local` lowered the match/if arms of a `let` initializer
+with `in_fn = false`, so an arm's `return` looked like a top-level one. An
+arm of a value-position match is still the function's body, and Rust's
+nested-item rules make a `return` there the function's early exit carrying a
+value. `in_fn` is now threaded through `match_value_node`/`if_value_node` at
+that site, and the A1 `Return` statement inside the arm renders as the
+native JS `return` (the same node a plain early return already used).
+
+That closed `cat.rs` — the unit was its only blocker — so the file now
+LOWERS end to end.
+
+### 2. An array `.len()` as a comparison operand
+
+`fn body_needs_newlines(stmts: &[IrStmt]) -> bool { stmts.len() > 1 }`
+(`fish_backend.rs`) refused with "condition operand (variable or integer
+literal only)": the test grammar reads `$variables` and integer literals, and
+a call was not one. The count is now HOISTED into a temp (`__sh2clN`) queued
+on `cx.pending`, which `lower_block`/`lower_fn_stmt` flush BEFORE the
+statement that reads it, so `$__sh2clN -gt 1` is the exact test. The arm is
+deliberately narrow: only `.len()` on a receiver typed `Ty::Arr` — the store
+counts array elements exactly. A STRING `.len()` stays refused (Rust counts
+UTF-8 bytes, the store's text is UTF-16 code units — the v0.35 `as_bytes`
+wall), and so does every other `&self`-shaped call.
+
+`fish_backend.rs` 158 -> 157 blocked units.
+
+### Proven by execution
+
+`t125_early_return_arm` (extended this turn) covers both shapes and matches
+native `rustc` byte for byte:
+
+```
+path 'a.txt'|path none|path none|small:3|big|nonpositive|false false true|two:2|none:0|
+```
+
+— the match-arm early return and the if/else-let early return (`classify`),
+plus `needs_separator` (the `stmts.len() > 1` body) and `if two.len() > 1` /
+`if none.len() > 1` in statement position, which also exercises the hoist
+ORDER (the temp must be computed before the `if` that reads it).
+
+### Measured
+
+Gate: **83/115 -> 84/116 match, 0 FAIL, 32 SKIP**. Census over the 14
+`src/*_backend.rs`: **1793 -> 1792** (`fish_backend.rs` 158 -> 157). Whole
+tree dogfood: **LOWERED 18/254 -> 19/254**, the flip being
+`pipeline_native/capabilities/cat.rs`; EXIT=0, no `internal error` and no
+`panicked` line. `DOGFOOD_BLOCKERS.tsv` is regenerated from this tree (235
+still-coded files).
+
+Unchanged by design: `HashMap`/`HashSet` iteration keeps the store's
+insertion order (Rust promises none), and the `BTreeMap`/`BTreeSet`
+key-order lowering with its `U+0000..U+FFFF` exactness boundary is
+untouched.
+
 ## Gate
 
 `make test` = refusal pins + ingress acceptance (`debashc
