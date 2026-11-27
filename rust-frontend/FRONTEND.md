@@ -753,7 +753,7 @@ patterns, executed stdout vs native `rustc`) and t92 (documented
 that is not `cfg(test)` still refuses — it selects code for a build
 configuration we cannot know).
 
-### Known inexactness found while pinning t91 (documented, not fixed)
+### Known inexactness found while pinning t91 (CLOSED in v0.31 below)
 
 A **struct or enum value does not survive a free-function parameter
 boundary**: `fn get(p: &P) -> i64 { p.x }` + `get(&P{x:5})` prints `0`
@@ -765,9 +765,79 @@ only record payloads are stringified. This is PRE-EXISTING and orthogonal
 to lowering: it does not change a single refusal, but it means LOWERED is
 not a fidelity claim for a file whose functions pass structs/enums (e.g.
 `vulkan_backend.rs` calls `arith(&st.value, &ext_idx)`), which is why no
-pin in this suite passes a record across a call. Making positional reads
-non-stringifying is core-emitter work (a separate tranche), so it is
-recorded here rather than guessed around.
+pin in this suite passes a record across a call. **v0.31 closes this** from
+the frontend side (the parameter-prologue fix below); the reproducer there
+is now a pin.
+
+## v0.31 additions — record arguments cross the call boundary
+
+LOWERED is now a fidelity claim for a file that passes structs/enums
+between functions. The reproducer from v0.30 prints rustc's answer:
+
+```rust
+struct P { x: i64 }
+fn get(p: &P) -> i64 { p.x }
+fn main() { let p = P { x: 5 }; println!("{}", get(&p)); }   // 5 (was 0)
+```
+
+Cause: the parameter prologue emitted `param := getVar("1")`, and a
+literal-digit `getVar` is a **text-mode** read — the core inlines it as
+`String(sh2.positional[0] ?? "")`. That `String()` is right for every shell
+value and destroys a record (the callee received `"[object Object]"`).
+
+Fix (frontend only, no core change): a **record-typed** parameter
+(`Ty::Struct`, `Ty::Enum`, and `Ty::Opt` of either) is bound through
+`record_param_bind`, which hands `getVar` the index as an *arithmetic*
+value instead of a literal string. That keeps the call generic —
+`sh2.getVar(1)` — and the runtime answers it with the positional **exactly
+as the caller passed it**: the same text every primitive gets (argv entries
+are text anyway) and the object itself for a record. Every other parameter
+keeps today's text read byte for byte: primitives, arrays, maps,
+`Option<scalar>`, shared references to primitives and `&self` method
+receivers (`self` is still bound by the receiver branch's own read, so
+method dispatch is untouched). `Option<record>` moves too — its `None` is
+the store's empty value, where a text read and a value read agree — because
+leaving it behind would have kept the same silent wrongness for half the
+record shapes.
+
+Shapes covered, each its own pin and each executed stdout-exact against
+native `rustc`:
+
+| pin | shape | rustc stdout |
+|---|---|---|
+| t94 | struct arg by `&` | `12` |
+| t95 | enum arg by `&` (payload variants) | `9`, `20` |
+| t96 | struct field reads through the param (loop bound + condition) | `3 2 1`, `y=2` |
+| t97 | enum MATCHED through the param (payload + unit) | `move 2 3`, `quit`, `peek 9 8` |
+| t98 | two record args in one call | `309`, `102` |
+| t99 | record param passed onward (three hops) | `42` |
+| t100 | `Option<record>` param (`Some` + `None`) | `5`, `0` |
+
+One record-passing shape genuinely stays unsupported and keeps a refusal
+pin: **`&mut` record** (t101 — `fn bump(p: &mut P)`, refused as `` `&mut`
+borrow (mutation through a borrow is not representable) ``), for the same
+reason `&mut` scalars refuse: the value store has no reference layer.
+Tuple structs are unaffected either way (their constructors refuse before
+any argument crosses a call).
+
+Measured, baseline binary built from `f54a335` vs this tree:
+
+- record reproducer: `0` (struct) / `undefined` (enum) → **`5`** / payload exact;
+- frontend-stdout gate: **63/84 match, 0 FAIL, 21 SKIP** → **70/92 match, 0 FAIL, 22 SKIP**
+  (the 7 new matches are t94–t100; the extra SKIP is the t101 refusal pin);
+- `--census` over the 14 `src/*_backend.rs`: **1830 → 1830** blocked units,
+  every file byte-identical in count (`c_backend.rs` 608, `cuda_backend.rs` 5,
+  `vulkan_backend.rs` 0, …) — no unit changed status, so nothing that used to
+  lower "thanks to" the stringified read now refuses;
+- whole-tree dogfood: **LOWERED 18/254**, and the LOWERED *set* is identical
+  file-for-file; `vulkan_backend.rs` still `rc=0`, zero `internal error` /
+  `panicked` lines. Note `vulkan_backend.rs` is exactly the case that
+  improves: it calls `arith(&st.value, &ext_idx)` with a record payload.
+
+The `&mut` wall that keeps `cuda_backend.rs` at 5 blocked units is unchanged
+(see v0.30): `*tmp += 1`, `*qlab += 1` and `&mut` arguments have no exact
+form in the value store, so `join`/`is_power_of_two` still stay refusals
+rather than half-classes.
 
 ## Gate
 

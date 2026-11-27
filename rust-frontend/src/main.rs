@@ -174,6 +174,39 @@ fn arith_var(name: &str) -> Value {
     json!({"name": name, "type": "Var"})
 }
 
+/// `getVar("i")` — the TEXT store read. Right for every shell value, and
+/// WRONG for a record: the core's text-mode read inlines a positional as
+/// `String(sh2.positional[i-1] ?? "")`, so a struct/enum payload arrives
+/// as "[object Object]" and every field read answers from that string.
+///
+/// Handing `getVar` the index as an ARITHMETIC value instead keeps it a
+/// generic `sh2.getVar(<n>)` call, which the runtime answers with the
+/// positional EXACTLY as the caller passed it: the same text every
+/// primitive gets (argv entries are text) and the object itself for a
+/// record. Only RECORD-typed parameters use this; primitives, arrays and
+/// `&self` receivers keep the text read they take today.
+fn record_param_bind(name: &str, pos: usize) -> Value {
+    assign_stmt(
+        name,
+        json!({
+            "args": [json!({"ast": arith_num(pos as i64), "type": "Arith"})],
+            "func": "getVar", "purity": "Emulable", "type": "Call"
+        }),
+    )
+}
+
+/// A parameter whose value can be a tagged OBJECT (struct/enum payload)
+/// rather than a store string. `Option<record>` counts: its `None` is the
+/// store's empty value (a text read and a value read agree there) while a
+/// `Some(payload)` carries the object.
+fn is_record_ty(t: &Ty) -> bool {
+    match t {
+        Ty::Struct(_) | Ty::Enum(_) => true,
+        Ty::Opt(inner) => is_record_ty(inner),
+        _ => false,
+    }
+}
+
 fn arith_bin(op: &str, lhs: Value, rhs: Value) -> Value {
     json!({"ast": json!({"lhs": lhs, "op": op, "rhs": rhs, "type": "Bin"}), "type": "Arith"})
 }
@@ -5559,9 +5592,15 @@ fn function_def(
             refuse("duplicate parameter name", pi.ident.span());
         }
         seen.push(pname.clone());
-        cx.vars.borrow_mut().insert(pname.clone(), ty_from_type(&pt.ty, cx));
-        // positional binding: param i <- getVar("i+1")
-        body.push(assign_stmt(&pname, get_var(&(i + 1).to_string())));
+        let pty = ty_from_type(&pt.ty, cx);
+        // positional binding: param i <- getVar("i+1"), read as a VALUE for
+        // a record parameter (`record_param_bind`) and as text otherwise.
+        body.push(if is_record_ty(&pty) {
+            record_param_bind(&pname, i + 1)
+        } else {
+            assign_stmt(&pname, get_var(&(i + 1).to_string()))
+        });
+        cx.vars.borrow_mut().insert(pname.clone(), pty);
     }
     // Body statements; a SEMI-LESS tail expression RETURNS ITS VALUE when
     // the signature declares a return type (Rust tail-expression return).
