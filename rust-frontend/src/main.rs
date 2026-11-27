@@ -691,6 +691,11 @@ struct Cx {
     tuple_structs: HashMap<String, Vec<Ty>>,
     /// registered fn name -> declared return Ty (chain desugar typing)
     fn_rets: HashMap<String, Ty>,
+    /// registered fn name -> parameter names, positionally. A `&mut`
+    /// argument is exact only when its variable's name is the callee's
+    /// parameter name (the store keys a location by name), so the call site
+    /// needs the callee's spelling to decide — never to guess.
+    fn_params: HashMap<String, Vec<String>>,
     /// CONST array items with fully-literal STRING contents
     /// (`const BUILTINS: &[&str] = &["a", ..]`) — membership tests
     /// lower to exact OR-equality chains over these literals
@@ -1432,6 +1437,8 @@ fn main() {
                 cx.fns.push(f.sig.ident.to_string());
                 cx.fn_rets
                     .insert(f.sig.ident.to_string(), ret_ty(&f.sig.output, &cx));
+                cx.fn_params
+                    .insert(f.sig.ident.to_string(), param_names(&f.sig));
                 fns.push(FnSource::Free(f));
             }
             syn::Item::Impl(i) => {
@@ -1449,6 +1456,7 @@ fn main() {
                         let mangled = format!("{}_{}", ty, m.sig.ident);
                         cx.fns.push(mangled.clone());
                         cx.fn_rets.insert(mangled.clone(), ret_ty(&m.sig.output, &cx));
+                        cx.fn_params.insert(mangled.clone(), param_names(&m.sig));
                         fns.push(FnSource::Method(mangled, m, ty.clone()));
                     }
                     // non-fn impl items (consts/types) are declaration-only
@@ -1494,6 +1502,7 @@ fn main() {
         for (n, f) in &nested {
             cx.fns.push(n.clone());
             cx.fn_rets.insert(n.clone(), ret_ty(&f.sig.output, &cx));
+            cx.fn_params.insert(n.clone(), param_names(&f.sig));
         }
         *cx.fn_scopes.borrow_mut() = scopes;
     }
@@ -2804,6 +2813,26 @@ fn plain_assign(a: &syn::ExprAssign, cx: &Cx, out: &mut Vec<Value>) -> Value {
         };
         return index_set_stmt(&name.to_string(), key, value_expr(&a.right, cx));
     }
+    // `*p = v` — a write through a `&mut` parameter (references erase to the
+    // slot, v0.40), so the pointee IS the variable: `p = v`. cuda_backend's
+    // `*tmp += 1` / `*qlab += 1` are the shapes that need this.
+    if let syn::Expr::Unary(u) = &*a.left {
+        if matches!(u.op, syn::UnOp::Deref(_)) {
+            if let syn::Expr::Path(p) = &*u.expr {
+                if let Some(name) = single_path(p) {
+                    let name = name.to_string();
+                    let ty = infer_ty(&u.expr, cx);
+                    if !is_scalar_store_ty(&ty) {
+                        refuse(
+                            "write through a `&mut` collection reference (collections live in the store by name, not as values)",
+                            a.left.span(),
+                        );
+                    }
+                    return assign_stmt(&name, value_expr(&a.right, cx));
+                }
+            }
+        }
+    }
     let syn::Expr::Path(p) = &*a.left else {
         refuse("assignment target (only plain variables are supported)", a.left.span());
     };
@@ -2912,6 +2941,38 @@ fn compound_assign(b: &syn::ExprBinary, cx: &Cx, out: &mut Vec<Value>) -> Value 
                 };
                 let nv = arith_bin(op, arith_var(&sname), arith_expr(&b.right, cx));
                 return assign_stmt(&sname, nv);
+            }
+        }
+    }
+    // `*p += e` — compound write through a `&mut` parameter: the pointee is
+    // the slot, so `p += e` (v0.40).
+    if let syn::Expr::Unary(u) = &*b.left {
+        if matches!(u.op, syn::UnOp::Deref(_)) {
+            if let syn::Expr::Path(p) = &*u.expr {
+                if let Some(name) = single_path(p) {
+                    let name = name.to_string();
+                    let ty = infer_ty(&u.expr, cx);
+                    if !is_scalar_store_ty(&ty) {
+                        refuse(
+                            "write through a `&mut` collection reference (collections live in the store by name, not as values)",
+                            b.left.span(),
+                        );
+                    }
+                    use syn::BinOp::*;
+                    let op = match b.op {
+                        AddAssign(_) => "+",
+                        SubAssign(_) => "-",
+                        MulAssign(_) => "*",
+                        DivAssign(_) => "/",
+                        RemAssign(_) => "%",
+                        _ => refuse(
+                            "compound assignment operator through a `&mut` reference",
+                            b.op.span(),
+                        ),
+                    };
+                    let nv = arith_bin(op, arith_var(&name), arith_expr(&b.right, cx));
+                    return assign_stmt(&name, nv);
+                }
             }
         }
     }
@@ -4057,10 +4118,77 @@ where
     json!({
         "args": [
             str_lit(name),
-            json!({"elements": args.into_iter().map(|a| value_expr(&a, cx)).collect::<Vec<_>>(), "type": "Array"}),
+            json!({"elements": args.into_iter().enumerate().map(|(i, a)| call_arg_expr(&a, i, name, cx)).collect::<Vec<_>>(), "type": "Array"}),
         ],
         "func": func, "purity": "Emulable", "type": "Call"
     })
+}
+
+/// Parameter names, positionally, for the `&mut`-argument rule below. A
+/// receiver keeps its positional slot so a method's `self` lines up with
+/// argument 0.
+fn param_names(sig: &syn::Signature) -> Vec<String> {
+    sig.inputs
+        .iter()
+        .map(|a| match a {
+            syn::FnArg::Receiver(_) => "self".to_string(),
+            syn::FnArg::Typed(pt) => match &*pt.pat {
+                syn::Pat::Ident(pi) => pi.ident.to_string(),
+                _ => String::new(),
+            },
+        })
+        .collect()
+}
+
+/// A CALL ARGUMENT. Shared borrows already erase to the value; a `&mut x`
+/// argument needs the v0.40 exactness rule:
+///
+/// The store keys ONE flat location per NAME — scalars in `vars`, arrays in
+/// the native-array registry, sets/maps in their assoc stores — and
+/// references are erased (`&mut T` and `T` are the same `Ty`), so inside the
+/// callee `*p` reads and `*p = v` writes the location named `p`, and
+/// `p.push`/`p.insert` write the array/set registered under `p`.
+///
+/// That IS the caller's variable exactly when the argument's name is the
+/// parameter's name: one name, one location, the same one the caller reads
+/// after the call returns. Records alias too (JS objects, passed as the
+/// object by `record_param_bind`), but a name-keyed value does NOT: passing
+/// the value under a new name creates a second location, so the writes
+/// vanish (measured: `&mut lines` bound as `out` pushed into a fresh array
+/// and the caller still read 0 elements). A different name therefore
+/// REFUSES rather than silently dropping the mutation.
+fn call_arg_expr(a: &syn::Expr, idx: usize, callee: &str, cx: &Cx) -> Value {
+    let syn::Expr::Reference(r) = a else {
+        return value_expr(a, cx);
+    };
+    if r.mutability.is_none() {
+        return value_expr(a, cx);
+    }
+    let Some(name) = (match &*r.expr {
+        syn::Expr::Path(p) => single_path(p).map(|s| s.to_string()),
+        _ => None,
+    }) else {
+        refuse(
+            "`&mut` of a non-variable (the store has no location for a field/element reference)",
+            r.expr.span(),
+        );
+    };
+    let same_name = cx
+        .fn_params
+        .get(callee)
+        .and_then(|ps| ps.get(idx))
+        .map(|p| *p == name)
+        .unwrap_or(false);
+    if !same_name {
+        refuse(
+            &format!(
+                "`&mut` argument to `{callee}` under a different name than the parameter \
+                 (the store keys a location by name, so the write would be lost)"
+            ),
+            a.span(),
+        );
+    }
+    value_expr(&r.expr, cx)
 }
 
 /// Does e contain a field read inside its ARITHMETIC spine? Field reads

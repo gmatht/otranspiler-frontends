@@ -1673,6 +1673,64 @@ The narrowest of these (`words == ["-L"]`, slice equality against an array
 literal) would need a deep-equality RUNTIME MEMBER; none exists, so the tsv
 records it as the top wall rather than inventing one.
 
+## v0.40 — writes through a `&mut` parameter (name-slot references)
+
+A `&mut` argument names a LOCATION, and this store keys exactly one
+location per NAME: scalars in `vars`, arrays in the native-array registry,
+sets/maps in their assoc stores. References stay erased (`&mut u32` and
+`u32` are the same `Ty`), which makes the lowering one rule, not a new
+value form:
+
+- inside the callee `*p` **is** the slot `p`. Reads already lowered that
+  way; `*p = v` and `*p += e` now write it (`p = v`, `p = v + e`), and a
+  write through a `&mut COLLECTION` (`*v = Vec::new()`) still refuses,
+  because a collection has no value form to rebind;
+- at the call site `&mut x` is accepted **only when the callee's parameter
+  at that position is spelled `x`**. Then the callee's slot IS the caller's
+  location, so the caller reads the mutation back: `*t += 1` in a parameter
+  named `t` bumps the caller's `t`, and `lines.push(..)` in a parameter
+  named `lines` appends to the caller's array.
+
+Why the name rule instead of "just pass the object": measured, not assumed.
+Binding `&mut lines` into a parameter named `out` and pushing there printed
+**0** elements in the caller — arrays are name-keyed in this store, so a
+second name is a second location. A different name therefore REFUSES rather
+than silently dropping the write; making it exact needs a real reference
+layer or call-site copy-out, neither of which exists yet.
+
+Shapes covered (executed stdout-exact against native `rustc`) and the new
+refusals, each its own pin:
+
+| pin | shape | result |
+|---|---|---|
+| t127 | `&mut u32` writes (`*t += 1`, `*t = *t + 10`) + `&mut Vec<String>` push | `2 12 x` |
+| t128 | `` `&mut` argument to `bump` under a different name `` | refuse |
+| t129 | `` `&mut` of a non-variable `` (`&mut p.x`) | refuse |
+| t130 | `` write through a `&mut` collection reference `` (`*v = Vec::new()`) | refuse |
+
+Measured: gate **85/117 -> 86/121 match, 0 FAIL, 35 SKIP** (one new match,
+three new refusal pins); census over the 14 `src/*_backend.rs`:
+**1783 -> 1766** (`c_backend.rs` 593 -> 585, `lint_backend.rs` 15 -> 11,
+`cuda_backend.rs` 5 -> 3, `fish_backend.rs` 157 -> 156,
+`java_backend.rs` 64 -> 63, `python_backend.rs` 138 -> 137 — the deref
+writes are exact in the same shape everywhere, not just here). Whole-tree
+dogfood: **EXIT=0, no `internal error`, no `panicked`**, LOWERED
+**19/254** (unchanged set — no file's LAST refusal was a scalar `&mut`).
+
+### cuda_backend.rs: 5 blocked units -> 3
+
+`arith` and `seq_stmt` now lower (they were exactly the `*tmp += 1` /
+`*qlab += 1` units). The file does not flip yet, and the three walls left
+are not `&mut` writes:
+
+- `shir_to_cu_reduce` — `&mut vlines` into a parameter named `out`
+  (line 672): a different name, i.e. the copy-out case above;
+- `shir_to_cu_compute` — `.join(", ")` on a `Vec<String>` (line 339): there
+  is no join member, so this needs a composed loop, not an invented member;
+- `divmod` — `(*d as u64).is_power_of_two()` (line 250): exact without
+  bitwise ops (halve while even, then `== 1`), but it is a loop in value
+  position.
+
 ## Gate
 
 `make test` = refusal pins + ingress acceptance (`debashc
