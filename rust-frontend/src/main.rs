@@ -550,6 +550,11 @@ struct Cx {
     /// process.env, so it is exact only when this set does not contain
     /// the env name (checked at the read site).
     bindings: HashSet<String>,
+    /// the enclosing impl's type while one of its methods lowers —
+    /// `Self::m` resolves against it (`Self::rank` -> `Width_rank`).
+    /// None at module level and inside free fns, where `Self` is not a
+    /// legal path in Rust either.
+    self_ty: std::cell::RefCell<Option<String>>,
 }
 
 /// Const-evaluate an expression to i64 if possible (literal / -literal /
@@ -1354,6 +1359,10 @@ fn main() {
                 if f.sig.asyncness.is_some() || f.sig.unsafety.is_some() || f.sig.constness.is_some() {
                     refuse("non-plain `fn main` (async/unsafe/const)", f.sig.ident.span());
                 }
+                // `Self` is not a legal path in a free fn: drop the impl
+                // type the last method_def left behind, so an invalid
+                // source can never resolve a `Self::` call here.
+                *cx.self_ty.borrow_mut() = None;
                 cx.vars.borrow_mut().clear();
                 lower_block(&f.block, &cx, false, &mut stmts);
             }
@@ -1895,6 +1904,20 @@ fn infer_ty(e: &syn::Expr, cx: &Cx) -> Ty {
                     )
                 {
                     return Ty::Str;
+                }
+                // `Self::m(..)` inside an impl block returns the
+                // enclosing type's registered method's declared Ty
+                if p2.qself.is_none()
+                    && p2.path.leading_colon.is_none()
+                    && p2.path.segments.len() == 2
+                    && p2.path.segments[0].ident == "Self"
+                {
+                    if let Some(t) = cx.self_ty.borrow().as_deref() {
+                        let mangled = format!("{}_{}", t, p2.path.segments[1].ident);
+                        if let Some(rt) = cx.fn_rets.get(&mangled) {
+                            return rt.clone();
+                        }
+                    }
                 }
                 if let Some(id) = single_path(p2) {
                     // Some(v) constructor -> Opt(type of v), under the
@@ -3341,6 +3364,17 @@ fn call_target(p: &syn::ExprPath, cx: &Cx) -> Option<String> {
             .or_else(|| cx.statics.borrow().get(&n).cloned());
         if let Some(Ty::Fn(reg)) = vt {
             return Some(reg);
+        }
+    }
+    // `Self::m` inside an impl block names the enclosing type's
+    // associated fn — the same item the explicit `Type::m` form names,
+    // so it resolves to the identical mangled registration.
+    if segs.len() == 2 && segs[0].ident == "Self" && segs[1].arguments.is_none() {
+        if let Some(t) = cx.self_ty.borrow().as_deref() {
+            let mangled = format!("{}_{}", t, segs[1].ident);
+            if known(&mangled) {
+                return Some(mangled);
+            }
         }
     }
     // exactly-2 segments: the `Type::method` mangling wins first
@@ -5532,6 +5566,8 @@ fn function_def(
     if let Some(a) = first_semantic_attr(attrs) {
         refuse("semantic attribute on a function", a.span());
     }
+    // the enclosing impl type for `Self::m` resolution (None in a free fn)
+    *cx.self_ty.borrow_mut() = self_ty.map(|s| s.to_string());
     // LIFETIME generics erase unconditionally — they are borrow-checker
     // metadata with zero runtime meaning (`fn f<'a>(x: &'a T)` IS
     // `fn f(x: &T)` at runtime). Type/const generics refuse.
@@ -6436,6 +6472,11 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                 // inherent method dispatch: `obj.m(args)` ->
                 // fnValue("Type_m", [obj, args...]) — the mangled def's
                 // first positional IS the receiver object (its `self`).
+                // NOTE: an ENUM receiver stays refused below: a by-value
+                // enum method would bind `self` into the shared store
+                // (FRONTEND.md "KNOWN LIMITATION: params share the global
+                // store"), and every method call inside the callee would
+                // then clobber the caller's `self` — not exact.
                 let target = format!("{}_{}", ty_name, rust_name);
                 if !cx.fns.iter().any(|f| *f == target) {
                     refuse(&format!("no method `{}` on struct `{}`", rust_name, ty_name),

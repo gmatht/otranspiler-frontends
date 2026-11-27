@@ -839,6 +839,56 @@ The `&mut` wall that keeps `cuda_backend.rs` at 5 blocked units is unchanged
 form in the value store, so `join`/`is_power_of_two` still stay refusals
 rather than half-classes.
 
+## v0.32 additions — `Self::m` associated-function calls
+
+Inside an `impl` block, `Self::helper(..)` names exactly the item
+`Type::helper` names: the impl's own associated fn, registered under the
+mangled `Type_helper`. The resolver only knew the explicit spelling, so it
+looked up `Self_helper`, which no impl ever registers — every
+associated-function helper call was an `unknown function` refusal.
+`c_backend.rs` spells `Self::` on 511 lines, `python_backend.rs` on 274,
+`rust_backend.rs` on 234.
+
+This is name resolution, not a new lowering path. `call_target` resolves
+`Self::m` against the enclosing impl's type (`Cx::self_ty`, set by
+`function_def` and cleared for free fns), and `infer_ty` gives a
+`Self::m(..)` call the registered def's declared return Ty. The emitted
+call is byte-identical to the `Type::m` spelling; no runtime shape
+changes.
+
+| pin | shape | native stdout |
+|---|---|---|
+| t102 | `Self::helper` from a `&self` method, bound to a `let` | `43` |
+| t103 | `Self::helper` in TAIL position, String result | `336` |
+| t104 | `Self::helper` from a receiver-less associated fn, two args + field args | `14`, `3` |
+
+Refusal pins:
+
+- t105 — `Self::missing(..)` with no registered `Type_m` stays
+  `call to unknown function`: resolution never guesses a target.
+- t106 — an **enum value receiver** (`w.rank()` where `w: Width`) stays
+  refused. Enum method dispatch would bind `self` into the shared store,
+  and the limitation documented in v0.8 (a callee's parameter names
+  clobber the caller's variables) makes a method that calls another
+  method silently wrong: the reproducer
+  `Width::U8.widen(Width::U64)` printed `u64 u8` against rustc's
+  `u64 u64`. Until per-function locals land, enum receivers stay out;
+  struct receivers keep exactly the path they took before.
+
+Measured against `ae27361`:
+
+- frontend-stdout gate: **70/92 match, 0 FAIL, 22 SKIP** -> **73/97 match,
+  0 FAIL, 24 SKIP** (t102-t104 match, t105/t106 are the new refusal pins);
+- `--census` over the 14 `src/*_backend.rs`: **1830 -> 1815** blocked
+  units — `c_backend.rs` 608 -> 602, `rust_backend.rs` 358 -> 352,
+  `python_backend.rs` 140 -> 139, `go_backend.rs` 125 -> 124,
+  `zig_backend.rs` 63 -> 62, every other file unchanged (no `Self::`
+  refusal is left in the corpus);
+- whole-tree dogfood: **LOWERED 18/254**, first-blocker histogram
+  unchanged (the backends' first blockers are other classes: enum
+  receiver, `&mut`, item macros), zero `internal error` / `panicked`
+  lines, `vulkan_backend.rs` still `rc=0`.
+
 ## Gate
 
 `make test` = refusal pins + ingress acceptance (`debashc
