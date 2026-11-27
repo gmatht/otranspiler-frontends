@@ -1179,6 +1179,106 @@ side effects inside a combinator chain — the argument-eagerness rule is
 enforced structurally (arguments lower before the branch) rather than
 measured.
 
+## v0.35 additions — the process argument vector as a value
+
+The seven files closest to a full lowering (`bin/{c,java,perl,python,sh}_backend`,
+`bin/sh2glsl`, `bin/shir_to_c`) all stopped at `env::args().collect()`: the IR
+had no expression that names the process argument vector, so a program could
+not read its own argv and no pin could exercise one.
+
+### The node (core, `src/shir_nodes/argv.node`)
+
+`Argv` is a fieldless IR expression: the process argument vector as ONE
+array value, element 0 = the program name as invoked (`sh2.argv0`), then the
+arguments in OS order (`sh2.positional`). The ESTree renderer emits
+`[sh2.argv0].concat(sh2.positional)` — a FRESH array, so a later write to
+the caller's binding cannot reach the runtime's positional store (a shell
+`shift`/`set --` rebinds `sh2.positional` and must not be able to rewrite a
+Rust program's snapshot). The value is immutable input: argv is fixed
+before `main`, so reading it twice in one run yields the same elements —
+there is no aliasing or lifetime question to model.
+
+### The frontend lowering
+
+`std::env::args()` / `env::args()` is typed `Vec<String>`'s element type
+(`Ty::Arr(Str)`) and lowered to `Argv`; `collect()` on it binds that value
+directly (identity, no loop, no copy step), so `len`, indexing and
+iteration over the result are the ordinary array operations. `first`/`last`
+answer `Option<&elem>` — the element, or the absent marker when the array
+is empty, with the length read ONCE and the index guarded so neither end
+can be overrun. `str::is_empty()` is exact for every encoding (a string is
+empty iff its stored text is `""`), and a map/set `is_empty()` now answers
+in VALUE position too (its length is the same runtime count).
+
+### Proven by execution
+
+`t117_argv` — collects argv, prints its length, iterates it and counts:
+with **no** arguments the gate sees `1 true 1` on both sides; with
+identical arguments fed to both sides
+(`estree-runner.mjs … --name <binary> --args a b` vs `<binary> a b`) both
+print `3 true a b 3`, so argument CONTENT flows through the A1→ESTree→JS
+path in OS order. The gate pin deliberately prints nothing that includes
+argv[0], because a compiled binary's path and the runner's `--name` are
+different strings by construction; that is a property of the harness, not
+of the lowering.
+
+`t118_edge_accessors` — `first`/`last` on a non-empty and an empty vector
+plus `is_empty` on `""` and on a non-empty `String`: `a bb none none true false`.
+
+### Kept refused, with the cause
+
+- **`as_bytes()` stays refused** (pin `t119`). It is the largest remaining
+  string cluster, and it is not a typing problem: a Rust `&str` is a BYTE
+  view while the store's text is a JS string of UTF-16 code units, so
+  `bytes[i]` and `bytes.len()` differ from the code-unit read for every
+  non-ASCII input — exactly the inputs the corpus has (latin-1 fixtures
+  included). The byte view needs an IR representation of its own.
+- `env::args_os()` (OS strings, no text model), `env::args().nth(K)` and
+  a `.skip(K)` chain in a `for` loop stay refused for now: `nth`/`skip`
+  consume the iterator in Rust, and the store's array is a snapshot — the
+  consuming forms need an explicit cursor, not a silent reuse.
+- Everything refused in v0.34 stays refused for the reasons written there
+  (Result error payloads, `ok_or`/`ok_or_else`, fn-item predicates,
+  `strip_prefix`/`strip_suffix` values).
+
+### Measured
+
+Gate: **78/107 -> 80/110 match, 0 FAIL, 30 SKIP** (`t119_as_bytes_refuse`
+is the new refusal pin; `t117`/`t118` execute and match native `rustc`
+byte for byte).
+
+`--census` over the 14 `src/*_backend.rs`: **1795 -> 1793** blocked units
+(`c_backend.rs` 599 -> 598, `zig_backend.rs` 62 -> 61); the JS path
+`shir.rs` **759 -> 758** and `estree.rs` **92 -> 92** (unchanged, see
+below). The two lost units are files whose whole function turned green
+from the empties/edges family; the near-flip files' first blockers moved
+on (`eprintln!` in five of them, `nth`/`skip`/`expect` in the rest) but
+their next blocker is a `debashl` crate call (`Parser::new`,
+`std::fs::read`, `crate::shir::ast_to_ir`) that no frontend can lower, so
+their unit count is 1 either way.
+
+`estree.rs` did not move this turn, and the reason is measured rather than
+assumed: every short unit in it has a SECOND blocker behind the argv/
+iterator one — `ast_to_estree`/`ast_to_estree_json` (5 lines each) call
+`crate::shir::ast_to_ir`, the `matches!`-with-guard family
+(`is_ident_expr`, `is_sh2_call`, `is_last_exit_member`) needs a payload
+FIELD read that the enum model does not carry (a variant with a payload is
+not stored as a tag string), and `is_positional_name` is the
+`strip_prefix` value refused in v0.34.
+
+Whole-tree dogfood (`harness/rust-dogfood.sh`, 254 files): **LOWERED
+18/254 — unchanged, and no file flipped this turn**, `EXIT=0`, no
+`internal error` and no `panicked` line. The measured reason, not a
+guess: lowering a file needs EVERY function in it to lower, and each of
+the near-flip files has exactly one refusing function (`main`) whose
+remaining blockers are, in order after argv: `eprintln!` (c/fish-go
+style drivers), `.nth(1)`/`.skip(1)`/`.expect(..)`, and then a `debashl`
+crate call — `Parser::new(..)`, `std::fs::read(..)`,
+`crate::shir::ast_to_ir(..)` — which the frontend cannot resolve at all,
+so those units stay at 1 whether argv lowers or not. What DID move is the
+first blocker on every one of them (from `env::args().collect()` to the
+next honest wall), which is the frontier the next class should attack.
+
 ## Gate
 
 `make test` = refusal pins + ingress acceptance (`debashc

@@ -1960,6 +1960,23 @@ fn lower_local(
             return None;
         }
     }
+    // `std::env::args().collect()` — the source IS the runtime's argument
+    // vector, so the binding is that value: a FRESH array (argv[0] then the
+    // positionals), not a copy of the live positional store.
+    if let Some(m) = as_method_call(&init.expr, "collect") {
+        if m.args.is_empty() {
+            if let syn::Expr::Call(c) = &*m.receiver {
+                if is_argv_call(c) {
+                    cx.vars.borrow_mut().insert(
+                        name.clone(),
+                        Ty::Arr(Some(Box::new(Ty::Str)), None),
+                    );
+                    let v = value_expr(&m.receiver, cx);
+                    return Some(store_stmt(&name, v));
+                }
+            }
+        }
+    }
     // iterator chains (`SRC.iter().map(F).collect()`) desugar to
     // accumulator + index loop + setArrayAppend
     if as_method_call(&init.expr, "collect").is_some() {
@@ -2124,6 +2141,10 @@ fn infer_ty(e: &syn::Expr, cx: &Cx) -> Ty {
                 if is_env_var_path(p2) && env_var_lit(&c.args).is_some() {
                     return Ty::Opt(Box::new(Ty::Str));
                 }
+                // the process argument VECTOR is an array of strings
+                if is_argv_call(c) {
+                    return Ty::Arr(Some(Box::new(Ty::Str)), None);
+                }
                 // `String::new()` / `String::with_capacity(n)` / `String::from(x)`
                 // — the store value is a string in every case.
                 if p2.qself.is_none()
@@ -2260,6 +2281,13 @@ fn infer_ty(e: &syn::Expr, cx: &Cx) -> Ty {
                 "copied" | "cloned" | "as_ref" | "ok" | "clone" => rty,
                 "unwrap" | "expect" => match rty {
                     Ty::Opt(t) => *t,
+                    _ => Ty::Unknown,
+                },
+                // `v.first()` / `v.last()` answer Option<&elem> — the
+                // element or the absent marker
+                "first" | "last" if m.args.is_empty() => match &rty {
+                    Ty::Arr(Some(t), _) => Ty::Opt(Box::new((**t).clone())),
+                    Ty::List => Ty::Opt(Box::new(Ty::Str)),
                     _ => Ty::Unknown,
                 },
                 // `s.chars()` / `s.lines()` are string sequences; their
@@ -2655,6 +2683,20 @@ fn plain_assign(a: &syn::ExprAssign, cx: &Cx, out: &mut Vec<Value>) -> Value {
         let r = quantifier_stmts(all, src, cl, cx, out);
         cx.vars.borrow_mut().insert(name.to_string(), Ty::Bool);
         return store_stmt(&name.to_string(), get_var(&r));
+    }
+    // `dst = std::env::args().collect()` — the argument vector as a value
+    if let Some(m) = as_method_call(&a.right, "collect") {
+        if m.args.is_empty() {
+            if let syn::Expr::Call(c) = &*m.receiver {
+                if is_argv_call(c) {
+                    cx.vars
+                        .borrow_mut()
+                        .insert(name.to_string(), Ty::Arr(Some(Box::new(Ty::Str)), None));
+                    let v = value_expr(&m.receiver, cx);
+                    return store_stmt(&name.to_string(), v);
+                }
+            }
+        }
     }
     // iterator chains in assignment position
     if as_method_call(&a.right, "collect").is_some() {
@@ -3542,6 +3584,23 @@ fn valid_env_name(n: &str) -> bool {
 /// True for `std::env::var` / `std::env::var_os` (also `env::var` after
 /// `use std::env;`). Only the two-argument-free, literal-name reads are
 /// accepted at the call site.
+/// `env::args()` / `std::env::args()` — the process argument vector. The
+/// A1 `Argv` node names it as one array value (argv[0] = program name as
+/// invoked, then the arguments in OS order).
+fn is_argv_call(c: &syn::ExprCall) -> bool {
+    if !c.args.is_empty() {
+        return false;
+    }
+    let syn::Expr::Path(p) = &*c.func else {
+        return false;
+    };
+    if p.qself.is_some() || p.path.leading_colon.is_some() {
+        return false;
+    }
+    let segs: Vec<String> = p.path.segments.iter().map(|s| s.ident.to_string()).collect();
+    matches!(segs.join("::").as_str(), "env::args" | "std::env::args")
+}
+
 fn is_env_var_path(p: &syn::ExprPath) -> bool {
     if p.qself.is_some() || p.path.leading_colon.is_some() {
         return false;
@@ -7379,10 +7438,20 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                         );
                     }
                     "len" => return array_len_call(&vname),
-                    "is_empty" => refuse(
-                        "map/set is_empty in VALUE position (use it as a condition)",
-                        m.span(),
-                    ),
+                    "is_empty" => {
+                        let g = fresh_tmp(cx, "n");
+                        cx.pending
+                            .borrow_mut()
+                            .push(assign_stmt(&g, array_len_call(&vname)));
+                        cx.vars.borrow_mut().insert(g.clone(), Ty::Int);
+                        return cond_value(
+                            "c",
+                            format!("${g} -eq 0"),
+                            str_lit("true"),
+                            str_lit("false"),
+                            cx,
+                        );
+                    }
                     "keys" | "values" | "iter" => refuse(
                         "map/set iterator outside a for-loop",
                         m.span(),
@@ -7503,6 +7572,64 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                         "key": zero,
                     });
                 }
+            }
+            // `v.last()` — mirrors `first`: the last element when the
+            // array is non-empty, the absent marker when it is empty (the
+            // length is read ONCE and the read is guarded, so no index can
+            // run past either end).
+            if rust_name == "last" && m.args.is_empty() {
+                if matches!(recv_ty, Ty::Arr(..)) {
+                    let n = fresh_tmp(cx, "ln");
+                    let len_v = match recv_var_name(&m.receiver) {
+                        Some(name) => array_len_call(&name),
+                        None => json!({
+                            "type": "Call", "func": "arrayLen", "purity": "PureCpu",
+                            "args": [value_expr(&m.receiver, cx)]
+                        }),
+                    };
+                    cx.pending.borrow_mut().push(assign_stmt(&n, len_v));
+                    cx.vars.borrow_mut().insert(n.clone(), Ty::Int);
+                    let idx = fresh_tmp(cx, "li");
+                    cx.pending.borrow_mut().push(assign_stmt(
+                        &idx,
+                        arith_bin("-", arith_var(&n), arith_num(1)),
+                    ));
+                    cx.vars.borrow_mut().insert(idx.clone(), Ty::Int);
+                    let elem = match recv_var_name(&m.receiver) {
+                        Some(name) => json!({
+                            "type": "Call", "func": "arrayIndex", "purity": "PureCpu",
+                            "args": [str_lit(&name), get_var(&idx)]
+                        }),
+                        None => json!({
+                            "type": "ElementRead",
+                            "coll": value_expr(&m.receiver, cx),
+                            "key": get_var(&idx),
+                        }),
+                    };
+                    return branch_value(
+                        "lv",
+                        format!("${n} -gt 0"),
+                        || elem,
+                        || str_lit(""),
+                        cx,
+                    );
+                }
+            }
+            // `s.is_empty()` — exact for every encoding: a string is empty
+            // iff it carries no bytes, which is iff its stored text is "".
+            if rust_name == "is_empty" && m.args.is_empty() && matches!(recv_ty, Ty::Str) {
+                let t = fresh_tmp(cx, "se");
+                let sv = value_expr(&m.receiver, cx);
+                cx.pending.borrow_mut().push(store_stmt(&t, sv));
+                let r = cond_value(
+                    "ie",
+                    format!("\"${t}\" = \"\""),
+                    str_lit("true"),
+                    str_lit("false"),
+                    cx,
+                );
+                cx.vars.borrow_mut().insert(t, Ty::Str);
+                return r;
             }
             if rust_name == "len" && m.args.is_empty() {
                 if matches!(recv_ty, Ty::Arr(..)) {
@@ -8035,6 +8162,13 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
             };
             if is_env_var_path(p) {
                 return env_var_value(p, &c.args, cx);
+            }
+            // `env::args()` — the runtime already owns the vector
+            // (`sh2.argv0` + `sh2.positional`); the node snapshots it into
+            // a FRESH array, so a later write to the binding cannot reach
+            // the positional store.
+            if is_argv_call(c) {
+                return json!({"type": "Argv", "purity": "PureCpu"});
             }
             // `Ok(x)` is x under the value-or-"" Result model; `Err(e)` is
             // the absent marker (the payload still evaluates for effects).
