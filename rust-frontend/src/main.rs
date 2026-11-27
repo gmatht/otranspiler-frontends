@@ -2403,6 +2403,24 @@ fn infer_ty(e: &syn::Expr, cx: &Cx) -> Ty {
                 }
                 "iter" | "iter_mut" => rty,
                 "any" | "all" => Ty::Bool,
+                // v0.43: the result types of the methods v0.41/v0.42 taught
+                // the LOWERING. They are the methods' genuine Rust types
+                // (`is_power_of_two`/`trailing_zeros` on unsigned ints),
+                // which is what the hoisted-condition temp must carry: the
+                // earlier omission made it Ty::Unknown, so a condition built
+                // from `A && x.is_power_of_two()` refused in `test_string`'s
+                // bare-Var branch even though the lowering was exact.
+                "is_power_of_two" => Ty::Bool,
+                "trailing_zeros" => Ty::Int,
+                // `Vec<String>::join` answers the joined string (the lowering
+                // only accepts that element type, so any other receiver stays
+                // Unknown rather than being guessed)
+                "join" => match &rty {
+                    Ty::Arr(Some(t), _) if matches!(**t, Ty::Str) => Ty::Str,
+                    _ => Ty::Unknown,
+                },
+                // `iter().position(..)` is Option<usize>
+                "position" => Ty::Opt(Box::new(Ty::Int)),
                 // Rust's char/str predicates and the membership family
                 "is_ascii_alphanumeric" | "is_ascii_digit" | "is_ascii"
                 | "is_ascii_whitespace" | "is_alphanumeric" | "is_empty"
@@ -7005,6 +7023,13 @@ fn hoist_cond_calls(e: &syn::Expr, cx: &Cx, out: &mut Vec<Value>) -> syn::Expr {
         }
         syn::Expr::MethodCall(m) => {
             let v = value_expr(e, cx);
+            // The value may have queued its own statements (the loop-based
+            // lowerings: `is_power_of_two`, `join`, `position`): they must
+            // run BEFORE the temp is read, exactly as the static-guard and
+            // matches arms above do — otherwise the temp is assigned from a
+            // value whose statements were never emitted.
+            let mut p: Vec<Value> = cx.pending.borrow_mut().drain(..).collect();
+            out.append(&mut p);
             let mut ctr = cx.tmp.borrow_mut();
             *ctr += 1;
             let temp = format!("__sh2c{}", ctr);
@@ -8719,7 +8744,16 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                 },
                 _ => recv_ty,
             };
-            if matches!(recv_ty, Ty::Opt(_)) {
+            // `X.iter().position(..).unwrap_or(D)` is FUSED (v0.42): its
+            // Option never exists in the store, so the plain Option-method
+            // reads below must not claim it — `position` is Option<usize>
+            // (v0.43 made infer_ty say so, which is what would otherwise
+            // route this into the absent-marker read).
+            let fused_position = matches!(
+                &*m.receiver,
+                syn::Expr::MethodCall(p) if p.method == "position"
+            );
+            if matches!(recv_ty, Ty::Opt(_)) && !(fused_position && rust_name == "unwrap_or") {
                 match rust_name.as_str() {
                     // `unwrap()` is the same value read as the family
                     // above: Some(v) -> v. The None branch PANICS in Rust

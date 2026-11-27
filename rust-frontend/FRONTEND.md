@@ -1827,6 +1827,42 @@ integer literal only)"), iterating a PARAMETER's collections
 length unproven"), and a bool-typed condition the frontend cannot prove
 ("boolean variable as a condition (type not proven)").
 
+## v0.43 — a hoisted `&&` operand carries its genuine type
+
+`infer_ty` now knows the real result types of the methods v0.41/v0.42 taught
+the lowering: `is_power_of_two` -> Bool, `trailing_zeros` -> Int, `position`
+-> Option<Int>, and `join` -> Str only for a `Vec<String>` receiver (any
+other receiver stays Unknown rather than being guessed). These are the
+methods' own Rust types, not a list chosen to satisfy the test grammar.
+
+That was the whole of cuda's `divmod` refusal: the `&&` operand
+`(*d as u64).is_power_of_two()` is hoisted into `__sh2cN` and tested as a
+bare Var, and because `infer_ty` answered Unknown the temp was registered
+Unknown, so `test_string` refused "boolean variable as a condition (type not
+proven)". The temp now carries Bool.
+
+Two consequences had to be handled, both exactness, not convenience:
+
+* the fused `position(..).unwrap_or(D)` lowering (v0.42) must not be
+  swallowed by the plain Option reads now that `position` truthfully answers
+  Option<Int> — a `position` receiver falls through to the fused scan.
+* the generic MethodCall hoist arm queued the value's statements in
+  `cx.pending` and never emitted them, so the hoisted temp was assigned from
+  a value whose loop never ran (`t140` printed 0 where rustc prints 5). It
+  now drains `pending` into the prologue like the static-guard and `matches!`
+  arms already did.
+
+Pin: t140 (`if n > 0 && n.is_power_of_two()` in a `while` loop over a
+`Vec<u32>`), node == rustc `5` byte-identical; it refused before this pass and
+printed 0 with the type registered but the statements dropped.
+
+Measured with the shipped binary: gate **92/130 -> 93/131 match, 0 FAIL,
+38 SKIP**; cuda blocked units **3 -> 3** (`divmod` line 250's boolean wall is
+gone, the function now refuses on `trailing_zeros` at **line 255**); dogfood
+`EXIT=0`, no `internal error`, no `panicked`, **LOWERED 19/254** — still not
+cuda, whose remaining walls are `trailing_zeros` (255), the field-operand
+condition (356) and param-collection iteration (716).
+
 ## Gate
 
 `make test` = refusal pins + ingress acceptance (`debashc
