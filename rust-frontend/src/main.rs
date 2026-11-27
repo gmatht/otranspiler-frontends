@@ -292,6 +292,28 @@ fn ty_from_type(t: &syn::Type, cx: &Cx) -> Ty {
                 };
                 return Ty::Opt(elem.unwrap_or(Box::new(Ty::Unknown)));
             }
+            // Result<T, E> -> Opt(T): under the SAME convention Ok(v) IS v
+            // and Err IS the absent marker (the convention `?` and `ok()`
+            // already assume). The ERROR payload is not representable, so
+            // every accessor that observes it (`.err()`, `unwrap_err`,
+            // `Err(e)` patterns, Debug formatting) refuses at its own site.
+            // A UNIT Ok type stays Unknown: `Ok(())` and `Err(..)` would
+            // both be "", so no value could tell success from failure --
+            // nothing claims it.
+            if id == "Result" {
+                let ok = match &seg.arguments {
+                    syn::PathArguments::AngleBracketed(a) => a.args.iter().find_map(|arg| match arg {
+                        syn::GenericArgument::Type(t) => Some(t),
+                        _ => None,
+                    }),
+                    _ => None,
+                };
+                let Some(ok) = ok else { return Ty::Unknown };
+                if matches!(ok, syn::Type::Tuple(t) if t.elems.is_empty()) {
+                    return Ty::Unknown;
+                }
+                return Ty::Opt(Box::new(ty_from_type(ok, cx)));
+            }
             // interior-mutability wrappers are erased: JS is single-
             // threaded, so a Mutex/RwLock/Cell static IS a plain global.
             // The wrapper's inner type is what the store carries.
@@ -1631,6 +1653,20 @@ fn lower_block(block: &syn::Block, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) {
     }
 }
 
+/// Lower ONE statement of a function body and drain what its value
+/// lowering hoisted into `pending` first (a branch, a pure-read
+/// snapshot): those run BEFORE the statement that reads their temp,
+/// exactly as `lower_block` arranges for main/loops.
+fn lower_fn_stmt(stmt: &syn::Stmt, cx: &Cx, body: &mut Vec<Value>) {
+    cx.pending.borrow_mut().clear();
+    let v = lower_stmt(stmt, cx, true, body);
+    let mut pend: Vec<Value> = cx.pending.borrow_mut().drain(..).collect();
+    body.append(&mut pend);
+    if let Some(v) = v {
+        body.push(v);
+    }
+}
+
 fn lower_stmt(stmt: &syn::Stmt, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) -> Option<Value> {
     match stmt {
         syn::Stmt::Local(local) => lower_local(local, cx, in_fn, out),
@@ -2161,7 +2197,7 @@ fn infer_ty(e: &syn::Expr, cx: &Cx) -> Ty {
             }
             match m.method.to_string().as_str() {
                 // identity-shaped reads keep the receiver's option-ness
-                "as_deref" | "unwrap_or_default" => rty,
+                "as_deref" => rty,
                 "is_some" | "is_none" | "is_ok" | "is_err" => Ty::Bool,
                 "get" => match &rty {
                     Ty::Map(_, v) => Ty::Opt(v.clone()),
@@ -2194,8 +2230,34 @@ fn infer_ty(e: &syn::Expr, cx: &Cx) -> Ty {
                     Some(a) => infer_ty(a, cx),
                     None => Ty::Unknown,
                 },
+                // combinators answer the CLOSURE BODY's shape; the
+                // Option-returning ones wrap it
+                "map" | "map_or" | "and_then" | "or_else" | "unwrap_or_else" => {
+                    let (aget, a) = match (rty.clone(), m.args.last()) {
+                        (Ty::Opt(inner), Some(a)) => (*inner, a),
+                        (_, Some(a)) => (Ty::Unknown, a),
+                        (_, None) => return Ty::Unknown,
+                    };
+                    let body_ty = match a {
+                        syn::Expr::Closure(cl) => closure_ret_ty(cl, aget, cx),
+                        other => infer_ty(other, cx),
+                    };
+                    match m.method.to_string().as_str() {
+                        "map" => Ty::Opt(Box::new(body_ty)),
+                        "and_then" | "or_else" => match body_ty {
+                            Ty::Opt(_) => body_ty,
+                            t => Ty::Opt(Box::new(t)),
+                        },
+                        _ => body_ty,
+                    }
+                }
+                "is_some_and" | "is_ok_and" => Ty::Bool,
+                "flatten" => match rty {
+                    Ty::Opt(inner) => *inner,
+                    _ => Ty::Unknown,
+                },
                 // Option shape-preserving reads
-                "copied" | "cloned" | "as_ref" | "as_deref" | "ok" | "clone" => rty,
+                "copied" | "cloned" | "as_ref" | "ok" | "clone" => rty,
                 "unwrap" | "expect" => match rty {
                     Ty::Opt(t) => *t,
                     _ => Ty::Unknown,
@@ -6120,6 +6182,240 @@ fn hoist_cond_calls(e: &syn::Expr, cx: &Cx, out: &mut Vec<Value>) -> syn::Expr {
 /// A conditional VALUE as a STATEMENT `If` (the A1 `Ternary` node is
 /// Perl-only IR — the ESTree renderer rejects it). One branch runs, exactly
 /// like Rust's `if`; the arms are pure values, so the order is Rust's own.
+// ── Option/Result combinators (the absent-marker algebra) ───────────
+//
+// The store's Option model is value-or-absent(""): Some(v)/Ok(v) IS v and
+// None/Err IS "". Every combinator below is that algebra with RUST's own
+// evaluation order:
+//   unwrap_or(d), map_or(d, f)   evaluate d EAGERLY (it is an argument),
+//                                then run f only when present;
+//   unwrap_or_else(f)            runs f only when absent;
+//   map, and_then, is_some_and   run the closure only when present.
+// A combinator closure is INLINED with its parameter renamed to a fresh
+// store temp, so the binding can neither capture nor clobber an outer
+// variable of the same name (the store has ONE namespace; Rust gives a
+// closure its own).
+
+/// A store temp holding `e`, with its proven Ty (evaluated ONCE).
+fn recv_tmp(e: &syn::Expr, cx: &Cx) -> (String, Ty) {
+    let t = fresh_tmp(cx, "o");
+    let ty = infer_ty(e, cx);
+    cx.vars.borrow_mut().insert(t.clone(), ty.clone());
+    let v = value_expr(e, cx);
+    cx.pending.borrow_mut().push(store_stmt(&t, v));
+    (t, ty)
+}
+
+/// `if COND { then } else { else }` as a VALUE. Each branch keeps its OWN
+/// hoisted statements: Rust runs a combinator closure only on the branch
+/// that takes it, so hoisting them in front of the If would run a side
+/// effect the native program never runs.
+fn branch_value(
+    hint: &str,
+    cond: String,
+    then_f: impl FnOnce() -> Value,
+    else_f: impl FnOnce() -> Value,
+    cx: &Cx,
+) -> Value {
+    let base = cx.pending.borrow().len();
+    let r = fresh_tmp(cx, hint);
+    let tv = then_f();
+    let mut then_stmts: Vec<Value> = cx.pending.borrow_mut().split_off(base);
+    then_stmts.push(store_stmt(&r, tv));
+    let ev = else_f();
+    let mut else_stmts: Vec<Value> = cx.pending.borrow_mut().split_off(base);
+    else_stmts.push(store_stmt(&r, ev));
+    cx.pending.borrow_mut().push(json!({
+        "cond": test_call(&cond),
+        "then": then_stmts,
+        "elsifs": [],
+        "else": else_stmts,
+        "type": "If",
+    }));
+    get_var(&r)
+}
+
+/// `|..| BODY` / `|x| BODY` only — and only with a single trailing
+/// expression, because a statement body can carry `return`/`break` that
+/// would bind to the CALLER's function, not to the closure.
+fn closure_body(cl: &syn::ExprClosure) -> syn::Expr {
+    match &*cl.body {
+        syn::Expr::Block(b) => {
+            let mut only: Option<&syn::Expr> = None;
+            for st in &b.block.stmts {
+                match st {
+                    syn::Stmt::Expr(e, None) => {
+                        if only.is_some() {
+                            refuse("combinator closure with several statements", b.span());
+                        }
+                        only = Some(e);
+                    }
+                    other => refuse("combinator closure with a statement body", other.span()),
+                }
+            }
+            match only {
+                Some(e) => e.clone(),
+                None => refuse("empty combinator closure body", b.span()),
+            }
+        }
+        e => e.clone(),
+    }
+}
+
+/// Rename every single-segment use of a closure parameter.
+struct RenameIdent {
+    from: String,
+    to: String,
+}
+
+impl syn::visit_mut::VisitMut for RenameIdent {
+    fn visit_expr_mut(&mut self, e: &mut syn::Expr) {
+        if let syn::Expr::Path(pth) = e {
+            if pth.qself.is_none() && pth.path.segments.len() == 1 {
+                let seg = &mut pth.path.segments[0];
+                if seg.ident == self.from && seg.arguments.is_none() {
+                    seg.ident = syn::Ident::new(&self.to, seg.ident.span());
+                }
+            }
+        }
+        syn::visit_mut::visit_expr_mut(self, e);
+    }
+}
+
+fn pat_binds(p: &syn::Pat, name: &str) -> bool {
+    match p {
+        syn::Pat::Ident(pi) => pi.ident == name,
+        syn::Pat::Tuple(t) => t.elems.iter().any(|e| pat_binds(e, name)),
+        syn::Pat::TupleStruct(ts) => ts.elems.iter().any(|e| pat_binds(e, name)),
+        syn::Pat::Struct(st) => st.fields.iter().any(|f| pat_binds(&f.pat, name)),
+        syn::Pat::Reference(r) => pat_binds(&r.pat, name),
+        syn::Pat::Type(t) => pat_binds(&t.pat, name),
+        syn::Pat::Or(o) => o.cases.iter().any(|c| pat_binds(c, name)),
+        syn::Pat::Slice(sl) => sl.elems.iter().any(|e| pat_binds(e, name)),
+        _ => false,
+    }
+}
+
+/// Does the body introduce a NEW binding of `name` (a `let`, a nested
+/// closure parameter)? Then the rename would capture it — refuse instead
+/// of silently renaming the inner binding's uses.
+struct Rebinds<'a> {
+    name: &'a str,
+    hit: bool,
+}
+
+impl<'a> syn::visit::Visit<'a> for Rebinds<'a> {
+    fn visit_local(&mut self, l: &'a syn::Local) {
+        if pat_binds(&l.pat, self.name) {
+            self.hit = true;
+        }
+        syn::visit::visit_local(self, l);
+    }
+    fn visit_expr_closure(&mut self, c: &'a syn::ExprClosure) {
+        if c.inputs.iter().any(|i| pat_binds(i, self.name)) {
+            self.hit = true;
+        }
+        syn::visit::visit_expr_closure(self, c);
+    }
+    fn visit_item_fn(&mut self, _f: &'a syn::ItemFn) {
+        self.hit = true;
+    }
+}
+
+fn rebinds(body: &syn::Expr, name: &str) -> bool {
+    let mut r = Rebinds { name, hit: false };
+    syn::visit::Visit::visit_expr(&mut r, body);
+    r.hit
+}
+
+/// Any `?` in the body? In Rust that returns from the CLOSURE, so inlining
+/// it would return from the caller — a different program.
+struct HasTry {
+    hit: bool,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for HasTry {
+    fn visit_expr_try(&mut self, t: &'ast syn::ExprTry) {
+        self.hit = true;
+        syn::visit::visit_expr_try(self, t);
+    }
+}
+
+fn closure_has_try(body: &syn::Expr) -> bool {
+    let mut h = HasTry { hit: false };
+    syn::visit::Visit::visit_expr(&mut h, body);
+    h.hit
+}
+
+fn as_closure(e: &syn::Expr) -> &syn::ExprClosure {
+    match e {
+        syn::Expr::Closure(c) => c,
+        other => refuse(
+            "combinator argument (only a closure is representable)",
+            other.span(),
+        ),
+    }
+}
+
+/// Inline a combinator closure: bind its parameter to a FRESH store temp
+/// and return (temp, renamed body). `move`/async closures, patterns,
+/// bodies that rebind the parameter and bodies using `?` refuse.
+fn inline_closure(cl: &syn::ExprClosure, arg_ty: Ty, cx: &Cx) -> (String, syn::Expr) {
+    use syn::visit_mut::VisitMut as _;
+    if cl.asyncness.is_some() || cl.movability.is_some() || cl.capture.is_some() {
+        refuse(
+            "`move`/async combinator closure (capture semantics differ from an inlined body)",
+            cl.span(),
+        );
+    }
+    let mut body = closure_body(cl);
+    if closure_has_try(&body) {
+        refuse(
+            "`?` inside a combinator closure (it returns from the CLOSURE, not the caller)",
+            body.span(),
+        );
+    }
+    let name = fresh_tmp(cx, "c");
+    match cl.inputs.len() {
+        0 => (name, body),
+        1 => {
+            let syn::Pat::Ident(pi) = &cl.inputs[0] else {
+                refuse(
+                    "closure parameter pattern (only a plain name is representable)",
+                    cl.inputs[0].span(),
+                );
+            };
+            if pi.by_ref.is_some() || pi.subpat.is_some() {
+                refuse("closure parameter pattern", pi.span());
+            }
+            let pname = pi.ident.to_string();
+            if rebinds(&body, &pname) {
+                refuse(
+                    "combinator closure that rebinds its own parameter",
+                    body.span(),
+                );
+            }
+            RenameIdent {
+                from: pname,
+                to: name.clone(),
+            }
+            .visit_expr_mut(&mut body);
+            cx.vars.borrow_mut().insert(name.clone(), arg_ty);
+            (name, body)
+        }
+        _ => refuse(
+            "combinator closure with two parameters",
+            cl.inputs[1].span(),
+        ),
+    }
+}
+
+/// The closure body's Ty, with the parameter bound (used by `infer_ty`).
+fn closure_ret_ty(cl: &syn::ExprClosure, arg_ty: Ty, cx: &Cx) -> Ty {
+    let (_, body) = inline_closure(cl, arg_ty, cx);
+    infer_ty(&body, cx)
+}
+
 fn cond_value(hint: &str, cond: String, then_v: Value, else_v: Value, cx: &Cx) -> Value {
     let r = fresh_tmp(cx, hint);
     cx.pending.borrow_mut().push(json!({
@@ -6343,9 +6639,7 @@ fn function_def(
                         }
                         continue;
                     }
-                    if let Some(v) = lower_stmt(stmt, cx, true, &mut body) {
-                        body.push(v);
-                    }
+                    lower_fn_stmt(stmt, cx, &mut body);
                     continue;
                 }
                 if returns_value {
@@ -6366,15 +6660,13 @@ fn function_def(
                     let mut tp: Vec<Value> = cx.pending.borrow_mut().drain(..).collect();
                     body.append(&mut tp);
                     body.push(json!({"type": "Return", "value": tv}));
-                } else if let Some(v) = lower_stmt(stmt, cx, true, &mut body) {
-                    body.push(v);
+                } else {
+                    lower_fn_stmt(stmt, cx, &mut body);
                 }
                 continue;
             }
         }
-        if let Some(v) = lower_stmt(stmt, cx, true, &mut body) {
-            body.push(v);
-        }
+        lower_fn_stmt(stmt, cx, &mut body);
     }
     json!({"body": body, "name": name, "type": "Function"})
 }
@@ -6940,6 +7232,18 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                     m.span(),
                 );
             }
+            // `SRC.iter().any(|e| COND)` / `.all(..)` in VALUE position:
+            // the bounded loop's setup + iterations hoist into `pending`
+            // (evaluated once, in source order, before the statement that
+            // reads the result)
+            if let Some((all, src, cl)) = quantifier_parts(e, cx) {
+                let mut pre: Vec<Value> = Vec::new();
+                let r = quantifier_stmts(all, src, cl, cx, &mut pre);
+                for st in pre {
+                    cx.pending.borrow_mut().push(st);
+                }
+                return get_var(&r);
+            }
             // a method ON a static guard is the static's OWN operation
             // (insert answers "was absent", remove the previous value)
             if let Some((sname, inner)) = static_guard(&m.receiver, cx) {
@@ -7272,7 +7576,7 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                     // above: Some(v) -> v. The None branch PANICS in Rust
                     // (no defined stdout), so the store's absent marker
                     // ("") never has to model an output.
-                    "as_deref" | "unwrap_or_default" | "unwrap" => {
+                    "as_deref" | "unwrap" => {
                         if !m.args.is_empty() {
                             refuse("option method with arguments", m.span());
                         }
@@ -7287,52 +7591,179 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                         }
                         return value_expr(&m.receiver, cx);
                     }
-                    "unwrap_or" | "unwrap_or_else" => {
-                        // Option/Result is value-or-"" in the store, so
-                        // `x.unwrap_or(d)` is `x != "" ? x : d`. Exact only
-                        // with a VARIABLE receiver (a compound receiver
-                        // would be evaluated twice).
-                        if m.args.len() == 1 {
-                            if let Some(n) = recv_var_name(&m.receiver) {
-                                return cond_value(
-                                    "u",
-                                    format!("\"${n}\" != \"\""),
-                                    get_var(&n),
-                                    value_expr(&m.args[0], cx),
-                                    cx,
-                                );
-                            }
-                        }
-                        let empty_default = m.args.first().map(|a| match a {
-                            syn::Expr::Lit(l) => matches!(&l.lit, syn::Lit::Str(s) if s.value().is_empty()),
-                            _ => false,
-                        }).unwrap_or(false);
-                        if empty_default {
-                            return value_expr(&m.receiver, cx);
-                        }
-                        // A compound but PURE receiver (a store read like
-                        // `map.get(k).copied()`) carries no side effect, so
-                        // evaluating it in the test and in the value branch
-                        // is observationally the receiver read twice — the
-                        // same value. Anything else keeps the refusal.
-                        if pure_receiver(&m.receiver) {
-                            let t = fresh_tmp(cx, "o");
-                            let ty = infer_ty(&m.receiver, cx);
-                            cx.vars.borrow_mut().insert(t.clone(), ty);
-                            let v = value_expr(&m.receiver, cx);
-                            cx.pending.borrow_mut().push(assign_stmt(&t, v));
-                            return cond_value(
-                                "u",
-                                format!("\"${t}\" != \"\""),
-                                get_var(&t),
-                                value_expr(&m.args[0], cx),
-                                cx,
+                    // `x.unwrap_or(d)` — d is an ARGUMENT, so Rust
+                    // evaluates it eagerly, present or not. The receiver
+                    // evaluates ONCE into a temp; the choice is a branch.
+                    "unwrap_or" if m.args.len() == 1 => {
+                        let (t, _) = recv_tmp(&m.receiver, cx);
+                        let d = fresh_tmp(cx, "d");
+                        let dv = value_expr(&m.args[0], cx);
+                        cx.pending.borrow_mut().push(store_stmt(&d, dv));
+                        return branch_value(
+                            "u",
+                            format!("\"${t}\" != \"\""),
+                            || get_var(&t),
+                            || get_var(&d),
+                            cx,
+                        );
+                    }
+                    // `x.unwrap_or_else(|| d)` — the closure runs ONLY when
+                    // absent, so its statements stay in the else branch
+                    "unwrap_or_else" if m.args.len() == 1 => {
+                        let cl = as_closure(&m.args[0]);
+                        // On a RESULT this closure receives the ERROR
+                        // payload (on an Option it takes no argument):
+                        // that value is not in the store model, so it
+                        // refuses rather than dropping it.
+                        if !cl.inputs.is_empty() {
+                            refuse(
+                                "unwrap_or_else closure with a parameter (a Result's ERROR payload is not representable)",
+                                cl.span(),
                             );
                         }
-                        refuse(
-                            "unwrap_or with a non-empty default (branching not representable in value position)",
-                            m.method.span(),
+                        let (t, _) = recv_tmp(&m.receiver, cx);
+                        let (_, body) = inline_closure(cl, Ty::Unknown, cx);
+                        return branch_value(
+                            "u",
+                            format!("\"${t}\" != \"\""),
+                            || get_var(&t),
+                            || value_expr(&body, cx),
+                            cx,
                         );
+                    }
+                    // `x.unwrap_or_default()` — the TYPE's zero value (an
+                    // `Option<i64>` is 0, not the absent marker)
+                    "unwrap_or_default" if m.args.is_empty() => {
+                        let Ty::Opt(inner) = &recv_ty else {
+                            refuse("unwrap_or_default on a non-Option", m.span());
+                        };
+                        let z = static_zero(inner);
+                        let (t, _) = recv_tmp(&m.receiver, cx);
+                        return branch_value(
+                            "u",
+                            format!("\"${t}\" != \"\""),
+                            || get_var(&t),
+                            || z,
+                            cx,
+                        );
+                    }
+                    // `x.map(f)` — only the present branch runs f
+                    "map" if m.args.len() == 1 => {
+                        let (t, rty) = recv_tmp(&m.receiver, cx);
+                        let Ty::Opt(inner) = rty else {
+                            refuse("map on a non-Option receiver", m.span());
+                        };
+                        let cl = as_closure(&m.args[0]);
+                        let (p, body) = inline_closure(cl, (*inner).clone(), cx);
+                        return branch_value(
+                            "m",
+                            format!("\"${t}\" != \"\""),
+                            || {
+                                cx.pending.borrow_mut().push(store_stmt(&p, get_var(&t)));
+                                value_expr(&body, cx)
+                            },
+                            || str_lit(""),
+                            cx,
+                        );
+                    }
+                    // `x.and_then(f)` — f answers an Option, so its absent
+                    // marker propagates unchanged
+                    "and_then" if m.args.len() == 1 => {
+                        let (t, rty) = recv_tmp(&m.receiver, cx);
+                        let Ty::Opt(inner) = rty else {
+                            refuse("and_then on a non-Option receiver", m.span());
+                        };
+                        let cl = as_closure(&m.args[0]);
+                        let (p, body) = inline_closure(cl, (*inner).clone(), cx);
+                        return branch_value(
+                            "m",
+                            format!("\"${t}\" != \"\""),
+                            || {
+                                cx.pending.borrow_mut().push(store_stmt(&p, get_var(&t)));
+                                value_expr(&body, cx)
+                            },
+                            || str_lit(""),
+                            cx,
+                        );
+                    }
+                    // `x.or_else(|| alt)` — lazy: the closure is the ABSENT
+                    // branch, and it answers an Option
+                    "or_else" if m.args.len() == 1 => {
+                        let (t, _) = recv_tmp(&m.receiver, cx);
+                        let cl = as_closure(&m.args[0]);
+                        let (_, body) = inline_closure(cl, Ty::Unknown, cx);
+                        return branch_value(
+                            "u",
+                            format!("\"${t}\" != \"\""),
+                            || get_var(&t),
+                            || value_expr(&body, cx),
+                            cx,
+                        );
+                    }
+                    // `x.map_or(d, f)` — d eagerly (an argument), then f
+                    // only when present: exactly `map(f).unwrap_or(d)`
+                    "map_or" if m.args.len() == 2 => {
+                        let (t, rty) = recv_tmp(&m.receiver, cx);
+                        let Ty::Opt(inner) = rty else {
+                            refuse("map_or on a non-Option receiver", m.span());
+                        };
+                        let d = fresh_tmp(cx, "d");
+                        let dv = value_expr(&m.args[0], cx);
+                        cx.pending.borrow_mut().push(store_stmt(&d, dv));
+                        let cl = as_closure(&m.args[1]);
+                        let (p, body) = inline_closure(cl, (*inner).clone(), cx);
+                        return branch_value(
+                            "m",
+                            format!("\"${t}\" != \"\""),
+                            || {
+                                cx.pending.borrow_mut().push(store_stmt(&p, get_var(&t)));
+                                value_expr(&body, cx)
+                            },
+                            || get_var(&d),
+                            cx,
+                        );
+                    }
+                    // `x.is_some_and(f)` — present AND f(v): the predicate
+                    // evaluates only in the present branch
+                    "is_some_and" | "is_ok_and" if m.args.len() == 1 => {
+                        let (t, rty) = recv_tmp(&m.receiver, cx);
+                        let Ty::Opt(inner) = rty else {
+                            refuse("is_some_and on a non-Option receiver", m.span());
+                        };
+                        let cl = as_closure(&m.args[0]);
+                        let (p, body) = inline_closure(cl, (*inner).clone(), cx);
+                        return branch_value(
+                            "p",
+                            format!("\"${t}\" != \"\""),
+                            || {
+                                cx.pending.borrow_mut().push(store_stmt(&p, get_var(&t)));
+                                let mut pre: Vec<Value> = Vec::new();
+                                let ce = hoist_cond_calls(&body, cx, &mut pre);
+                                for st in pre {
+                                    cx.pending.borrow_mut().push(st);
+                                }
+                                cond_value(
+                                    "b",
+                                    test_string(&ce, cx),
+                                    str_lit("true"),
+                                    str_lit("false"),
+                                    cx,
+                                )
+                            },
+                            || str_lit("false"),
+                            cx,
+                        );
+                    }
+                    // `x.flatten()` — Option<Option<T>> collapses to the
+                    // inner absent marker (identity under the convention)
+                    "flatten" if m.args.is_empty() => {
+                        let Ty::Opt(inner) = &recv_ty else {
+                            refuse("flatten on a non-Option receiver", m.span());
+                        };
+                        if !matches!(**inner, Ty::Opt(_)) {
+                            refuse("flatten on a non-nested Option", m.span());
+                        }
+                        return value_expr(&m.receiver, cx);
                     }
                     // PRESENCE predicates are the absent-marker test:
                     // Some(v)/Ok(v) <=> the store value is not "". Exact
@@ -7611,13 +8042,13 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                 match p.path.segments[0].ident.to_string().as_str() {
                     "Ok" => return value_expr(&c.args[0], cx),
                     "Err" => {
-                        return json!({
-                            "type": "Arrow",
-                            "stmts": [
-                                expr_stmt(value_expr(&c.args[0], cx)),
-                                json!({"type": "Return", "value": str_lit("")})
-                            ]
-                        });
+                        // the payload is an ARGUMENT: it evaluates EAGERLY
+                        // (for its effects), and the value is the absent
+                        // marker. (It used to be wrapped in a thunk, which
+                        // deferred a side effect Rust performs at once.)
+                        let ev = value_expr(&c.args[0], cx);
+                        cx.pending.borrow_mut().push(expr_stmt(ev));
+                        return str_lit("");
                     }
                     _ => {}
                 }

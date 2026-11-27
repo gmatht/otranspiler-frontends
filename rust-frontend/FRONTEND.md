@@ -1024,6 +1024,161 @@ atomics, `Mutex` scalars and `thread_local!` `Cell`. A candidate pin that
 re-locks a `Mutex` while the guard is alive deadlocks native rustc and
 was removed for that reason, not because the lowering failed.
 
+## v0.34 additions — the Option/Result combinator algebra
+
+The JS path stopped at `unwrap_or` (shir.rs line 45, whole-program) and the
+census showed the whole combinator surface as the largest cluster behind
+it: `unwrap_or` 32, `map_or` 17, `map` 15, `and_then` 21, `or_else` 3,
+`unwrap_or_else` 3, `ok_or` 4 across the tree. They are lowered as ONE
+value algebra, not a text substitution.
+
+### The value model (unchanged, now used everywhere)
+
+`Some(v)` / `Ok(v)` **IS** `v`; `None` / `Err(_)` **IS** the absent marker
+`""`. So a combinator is a *branch on presence*, and presence is the
+store test `"$x" != ""`.
+
+### Evaluation order (the part that must not be guessed)
+
+Rust's combinators differ in WHEN the argument runs, and the lowering
+follows each one:
+
+| form | argument timing | lowering |
+|---|---|---|
+| `unwrap_or(d)` | eager (it is an argument) | `d` hoists BEFORE the branch |
+| `map_or(d, f)` | `d` eager, `f` only when present | `d` hoists, `f` in the then-branch |
+| `unwrap_or_else(f)` | lazy, only when absent | `f` in the ELSE branch |
+| `or_else(f)` | lazy, only when absent | `f` in the ELSE branch |
+| `map(f)` / `and_then(f)` / `is_some_and(f)` / `ok_or(e)` | only when present | `f` in the then-branch |
+| `unwrap_or_default()` | the TYPE's zero (0 for `Option<i64>`) | a constant |
+
+`branch_value` is the helper: it records the pending length before each
+branch, hoists the branch's own statements into that branch, and returns
+the temp both branches store. An argument that would run eagerly is
+lowered BEFORE `branch_value` is entered, so a side effect in `d` happens
+whether or not the value is present — as in Rust.
+
+Closures are INLINED with their parameter renamed to a fresh store temp
+(`RenameIdent` over syn's `visit_mut`), so a closure body can never
+capture or clobber an outer binding of the same name. A `move`/`async`
+closure, a pattern parameter, a body that rebinds its parameter, and a
+body containing `?` all stay refused (the parameter would become a
+different variable, or the `?` would bind to the caller's function).
+
+`Result<T, E>` maps onto the same model as `Ty::Opt(T)` (Ok ≡ Some,
+Err ≡ absent) — the convention `?`/`ok()` already assumed. A unit-ish
+`Ok(())` stays `Ty::Unknown`: both `Ok(())` and `Err(..)` are `""`, which
+is exactly what the store can express.
+
+### `any`/`all` in VALUE position
+
+`.iter().any(P)` / `.all(P)` used to lower only as a `let` initializer or
+an `if` condition; in a match-arm body or a call argument they refused
+(`method `any` on array receiver`). They now lower through the same
+bounded loop, hoisting its setup + iterations into `pending` when the
+result is read by the enclosing statement. Refusals kept inside the
+class: a function POINTER as the predicate (`any(Self::f)` — a fn item is
+not a closure in this IR — pin `t116`), a tuple-pattern parameter, and a
+parameter that shadows a store binding.
+
+### Two bugs this exposed (both fixed)
+
+- **A function body dropped its hoisted statements.** `lower_block`
+  drains `pending` before each statement, but the function-body loop
+  called `lower_stmt` directly — so `let a = opt.unwrap_or(d)` inside a
+  fn WITH parameters assigned `a` from a temp that was never set (it read
+  `null`). The gate caught it (t57). `lower_fn_stmt` now performs the same
+  drain for function bodies.
+- **`unwrap_or_default()` returned the absent marker** instead of the
+  type's zero, so `Option<i64>` printed `""` where Rust prints `0`.
+
+### Kept refused, with the cause
+
+- **A `Result`'s ERROR payload is not representable** (pin `t114`).
+  `unwrap_or_else(|e| ..)`, `.err()`, `unwrap_err`, `map_err`, `ok_or_else`
+  with a payload consumer, and `Err(e)` patterns all observe the error
+  value; the store carries Err as the absent marker and nothing else, so
+  they refuse rather than silently dropping the payload. `is_ok_and`,
+  `unwrap_or`, `map`, `and_then`, `flatten` and `ok()` (which DISCARD the
+  error) do lower. `ok_or(e)` is refused too (pin `t115`): it answers a
+  `Result` whose error payload has no place in the store, and evaluating
+  `e` for its side effects and then dropping it is only sound while
+  nothing observes it — which the frontend cannot see.
+- **`strip_prefix`/`strip_suffix` values stay refused** (pin
+  `t113_strip_affix_refuse`). The affix lowering is a conditional
+  EXPRESSION and the ESTree renderer has no conditional expression (only
+  branch statements); it also reads the affix length through a `length`
+  METHOD call, which JS renders as `p.length()` (a property there). Even
+  fixed, Rust's strip is BYTE-based while JS slicing counts UTF-16 code
+  units, so a length-based slice is a DIFFERENT string for non-ASCII
+  input — a silent mistranslation, not a lowering. Typing the result
+  `Option<&str>` (which is what it is) was implemented, measured, and
+  reverted: it turned a clean refusal into IR the JS renderer cannot
+  render.
+- Combinator chains whose closure body is a statement block, that rebind
+  the closure parameter, or that contain `?`, and iterator laziness in
+  `.map(..).collect()` pipelines, refuse as before.
+
+### Measured
+
+Gate (`harness/frontend-stdout.sh rust`, native `rustc` vs
+A1->ESTree->JS), pins `t111`/`t112` executing byte for byte:
+
+| pin | shape | native stdout |
+|---|---|---|
+| t111 | every combinator on `Option` and `Result`, present and absent, incl. `map_or`, `and_then`, `or_else`, `unwrap_or_else`, `unwrap_or_default`, `is_some_and`, `is_ok_and`, `flatten` | `5 9 7 1 10 0 6 0 true false true false -1 8 5 0 5 42 4 -2 hi` |
+| t112 | `any`/`all` in value position (call argument), strings and ints, empty collections | `true false true true false true` |
+
+`t113_strip_affix_refuse`, `t114_option_err_payload_refuse`,
+`t115_ok_or_refuse` and `t116_fn_ptr_quantifier_refuse` are the refusal
+pins (measured: `ok_or` and a fn-item predicate both refuse, `flatten`
+lowers and matches `rustc` on `4 -2`). Gate: **76/101 -> 78/107 match, 0 FAIL, 29 SKIP**.
+
+`--census` over the 14 `src/*_backend.rs`: **1801 -> 1795** blocked units
+(`c_backend.rs` 602 -> 599, `fish_backend.rs` 159 -> 158,
+`glsl_backend.rs` 90 -> 89, `python_backend.rs` 139 -> 138; the other ten
+unchanged). The cluster shrank much further than the total, because many
+of these units now die on the NEXT wall instead of the combinator one:
+combinator-shaped refusals 110 -> 97 across the 14 files, `any`/`all`
+refusals 27 -> 11.
+
+The JS path itself (this is the target): `shir.rs` **802 -> 759**, first
+whole-program blocker `unwrap_or` (line 45) -> `trim_start_matches`
+(line 185); its combinator-shaped refusals **102 -> 42** (shir.rs +
+estree.rs) and `any`/`all` refusals 36 -> 22. `estree.rs` **93 -> 92**
+(the iterator-length class still leads). There is no `js_backend.rs`
+anywhere in the corpus — the JS path IS `shir.rs`, `estree.rs`,
+`render_ext_estree/mod.rs` and `shir_json*.rs` / `bin/shir_render.rs`;
+`render_ext_estree/mod.rs` stays at 2 (`include!` of generated code).
+
+Whole-tree dogfood (`harness/rust-dogfood.sh`, 254 files): **LOWERED
+18/254, EXIT=0**, no `internal error` and no `panicked` line — unchanged
+from v0.33, and here is exactly why, measured rather than assumed:
+
+- Tree-wide, no file's FIRST blocker is a combinator any more except two,
+  and both are refused BY RULE, not by omission: `bc.rs` stops at
+  `ok_or_else(|| format!(..))` — a LAZY payload constructor, refused with
+  `ok_or` because the closure's value is the error payload (pin `t115`);
+  `grep.rs` stops at `grep_boolean(call).map(NativeEmit::Cond)` — a
+  FN ITEM as the closure argument (pin `t116`). All other combinator
+  refusals in the tree are below some earlier blocker in the same
+  function.
+- The seven files closest to a flip (`bin/{c,java,perl,python,sh}_backend`,
+  `bin/sh2glsl`, `bin/shir_to_c`, one unit each) all stop at
+  `env::args().collect()`. The JS runner models process arguments
+  (`--name`/`--args` set `$0`/`$1..`), but there is no A1 op that reads
+  them as an ARRAY, so `collect()` on `std::env::args()` has nothing to
+  lower to. Refused rather than synthesised: a wrong argv array would
+  silently change every driver's behaviour.
+
+What is *not* proven by execution: `map_or`'s eager-default rule and the
+lazy `or_else` branch are proven by the pins' stdout (an eager default
+with a side effect is covered by `t90_unwrap_or_impure_refuse`, which
+keeps the *impure* default refused), but no pin observes the ORDER of two
+side effects inside a combinator chain — the argument-eagerness rule is
+enforced structurally (arguments lower before the branch) rather than
+measured.
+
 ## Gate
 
 `make test` = refusal pins + ingress acceptance (`debashc
