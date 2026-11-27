@@ -1279,6 +1279,157 @@ so those units stay at 1 whether argv lowers or not. What DID move is the
 first blocker on every one of them (from `env::args().collect()` to the
 next honest wall), which is the frontier the next class should attack.
 
+## v0.36 additions — stderr as a typed output channel
+
+`stderr` had no representation in the IR at all: the shell frontends reach it
+through `>&2` and the runtime's diagnostics, but a batch frontend's program
+could not write there, so the five drivers whose first blocker was
+`eprintln!` had no honest path forward.
+
+### The node (core, `src/shir_nodes/err_line.node`)
+
+`ErrLine { value }` is an IR expression whose value is a formatted string; the
+ESTree renderer emits `sh2.warn(value)` — the namespace member the shell path
+already uses for `>&2`, which writes `String(v ?? "") + "\n"` to stderr and
+leaves stdout untouched. Rendered code may only call whitelisted `sh2.<name>`
+members, so a raw `process.stderr.write` was not an option: the channel has to
+go through the namespace. The operand is built by the SAME formatter as a
+stdout print (`format_value`: literal segments, `{}`, `{name}` captures, with
+width/precision specs refused), so a diagnostic line cannot silently use a
+different rendering than the print next to it. The trailing newline is part of
+the node's contract, not the caller's string.
+
+### The frontend lowering
+
+`eprintln!` lowers to `ErrLine(<formatted value>)`. `eprint!` stays refused
+(pin `t122`): it is the same channel WITHOUT the newline, the only stderr
+member always appends one, and adding a newline the source does not emit would
+be a behaviour change, not a lowering. `io::stderr().write_all(..)` and
+`write!(io::stderr(), ..)` stay refused (pin `t123`): the first writes BYTES
+(a byte view the store does not have) and both return a `Result` the program
+may inspect. `stderr().lock()` stays refused with the same byte/Result reason.
+`{:?}` on a non-proven integer stays refused (Debug is a different renderer),
+identically on both channels.
+
+`std::process::exit(N)` also landed in this pass (it is the next blocker in
+four of the five drivers): the A1 `Exit` statement is exactly this call
+(`process.exit(Number(N))`), the status is its only observable, and value
+position cannot occur because the call's type is `!`. `nth(K)` on the
+argument snapshot builds on v0.35: a CONSTANT `K` is a guarded index over a
+fresh array (length read once, element only when `K < len`, absent marker
+otherwise) — there is no iterator position to consume. A non-constant `K`,
+and any consuming `skip(K)` chain bound to a variable, stay refused: those
+need an explicit cursor, which is a different model, not a silent index.
+
+### Proven by execution, both streams
+
+`t120_stderr` interleaves `println!` and `eprintln!` (a literal, an
+interpolated `String`, and a final line). Native `rustc` and the JS run agree
+BYTE FOR BYTE on both streams: stdout `start|ok|`, stderr
+`usage: dump_ast <script.sh>|reading file.sh|done|`.
+
+`t121_argv_nth_exit` is the full channel test: `args().nth(1)` with a
+`match`, `eprintln!` and `exit(2)` on the missing path, `println!` on the
+present one. With NO argument both sides print nothing on stdout, write
+`usage: need a name\n` to stderr and exit **2**. With one argument
+(`estree-runner.mjs … --args alpha` vs `<binary> alpha`) both print
+`name: alpha` on stdout, nothing on stderr, and exit **0**. The exit status is
+compared as well as the two streams, so "it printed the usage line" is not
+mistaken for "it took the failure path".
+
+This turn also fixed an ORDERING bug the new pins exposed: a `match`
+scrutinee whose value needs hoisted temps (a guarded index, a branch value)
+had its binding statement emitted BEFORE the temps it reads, so
+`match args().nth(1) { .. }` matched on the temp's initializer instead of the
+element. `match_value_node` now evaluates the scrutinee first, flushes its
+hoisted statements, and only then emits the binding — the general rule for
+every caller of `value_expr`.
+
+### Measured
+
+Gate: **80/110 -> 82/114 match, 0 FAIL, 32 SKIP** (`t120`/`t121` execute and
+match native `rustc` on stdout AND stderr with identical argv; `t122`/`t123`
+are the new refusal pins).
+
+`--census` over the 14 `src/*_backend.rs`: **1793 -> 1793, unchanged**, and
+this is measured rather than assumed: no unit in those files first-blocks on
+`eprintln!`/`eprint!`/`process::exit`/`nth`/`skip`, so the new capabilities
+complete no unit there. The units that DO first-block on `is_empty` are all
+`match`-payload bindings (`ArithAst::Var(n)`) whose next refusal is
+`n.chars().all(..)` — an enum payload field read the model does not carry —
+so lowering their `is_empty` would move the blocker without completing them.
+JS path: `shir.rs` **758 -> 758** and `estree.rs` **92 -> 92** (unchanged);
+`render_ext_estree/mod.rs` 2. Quoted proof lines and the reason are in the
+report; the per-file first-blocker table is reproducible with
+`for f in $(find /tmp/src-base/src -name '*.rs'); do ./target/release/rust-frontend --shir "$f"; done`.
+
+Whole-tree dogfood (`harness/rust-dogfood.sh`, 254 files): **LOWERED 18/254,
+EXIT=0**, no `internal error` and no `panicked` line. What moved is the
+frontier: five drivers' first blocker went from `eprintln!` to
+`std::process::exit` — which this turn lowered — and their next walls are
+`.nth(1)` (now lowered for a constant), `.skip(1)` (cursor model, refused),
+`.expect(..)`, the `debashl` crate calls (`Parser::new(..)`,
+`std::fs::read(..)`, `crate::shir::ast_to_ir(..)`), so their unit count is 1
+either way and no file can flip.
+
+### The per-file structural proof (whole tree, 254 files)
+
+`DOGFOOD_BLOCKERS.tsv` records, for every one of the **236 still-coded**
+files, the refusing source LINE and the first blocker verbatim (regenerate
+with `find /tmp/src-base/src -name '*.rs' | xargs -P8 -n1 <run
+'rust-frontend --shir F'>`). Its measurement, not its assertion:
+
+- **57 of the 236** first-block on a callee that does not exist in this
+  frontend, i.e. a `::`-qualified path with no symbol table behind it:
+  - `render_ext_expr/handlers/*.rs:7` — **23 files**, each stopping on
+    `super::all_nodes::<node>` (the generated handler modules call a module
+    this frontend never resolves);
+  - `render_ext_estree/handlers/*.rs:7..12` — **10 files**, stopping on
+    `crate::shir::expr_to_estree_pub` (`address_of`, `affix_strip`,
+    `clone_deep`, `cutset_trim`, `deref`, `element_read`, `regexp_find`,
+    `spread`, `type_assert`, plus `cgo_call.rs:10 crate::estree::str_lit`);
+  - the four backend drivers and `zig_backend.rs:180`
+    (`crate::transforms::builtin::fallback_builtin_to_exec`), the five
+    `pipeline_native/capabilities/*.rs:22..49` (`crate::ir::exec_word_args`,
+    `crate::ir::ir_expr_to_perl`), and the one-off crate calls:
+    `lexer.rs:431 Token::lexer`, `lint_backend.rs:39` and
+    `shir_passes/mod.rs:122 PassContext::default`,
+    `transforms/planner.rs:45 Capabilities::default`,
+    `shir_nodes/enc.rs:12 Value::Array`, `shared_utils.rs:23 fs::read`,
+    `shir_passes/strip.rs:79 std::mem::take`,
+    `shir_passes/interval.rs:59` and
+    `shir_passes/list_profile/census.rs:105 crate::shir::analyze_var_ranges`,
+    `transforms/arith_identity.rs:101 crate::shir::source_lang`,
+    `transforms/echo_return.rs:76 crate::shir_passes::scc::build_call_graph_stmts`,
+    `transforms/test_lowering.rs:83 crate::shir::walk_lastexit_liveness`.
+- **3 files** stop on a bare call to a function defined in the same file
+  (`ir_expr_to_perl` x2, `census`), which a local symbol table would resolve.
+- **176 files** stop on a language feature, not a callee; the top classes
+  are `method `X` on receiver` (20), `&mut` borrow (14), `assignment
+  target` (10), `nested item declarations` (10), `condition
+  expression`/`negated condition expression` (9+9), `binary operator in
+  arithmetic` (9), `condition operand` (8).
+
+A file flips only when EVERY function in it lowers, so a crate-callee file
+cannot flip from any frontend-side typing work: the symbol is simply not
+there. That is the measured reason LOWERED is 18/254 and not a claim that
+"stderr did not help".
+
+The JS path is measured the same way, with the census lines quoted verbatim
+(columns are TAB separated):
+
+```
+CENSUS	fn	lang_has_exit_status	unsupported Rust: method `trim_start_matches` on string receiver (no proven JS-equivalent yet) (line 185)
+CENSUS	fn	set_source_lang	unsupported Rust: method `with` on interior-mutable receiver (no proven JS-equivalent yet) (line 201)
+CENSUS	fn	ast_to_estree	unsupported Rust: iterator source length unproven (param-len arrays core request) (line 315)
+```
+
+So `shir.rs` stays at 758 and `estree.rs` at 92 because their first units
+refuse on a FEATURE (`trim_start_matches`, an interior-mutable `.with(..)`, a
+`Vec::with_capacity(n)` length the length model does not track) and the next
+wall is `crate::shir::ast_to_ir` — none of it stderr-shaped, so none of it
+moved.
+
 ## Gate
 
 `make test` = refusal pins + ingress acceptance (`debashc

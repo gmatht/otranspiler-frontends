@@ -2422,6 +2422,21 @@ fn lower_expr_stmt(e: &syn::Expr, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) ->
                 refuse("binary-operator statement (only compound assigns)", b.op.span())
             }
         }
+        // `std::process::exit(N)` — end the process with status N. A1's Exit
+        // statement IS this (`process.exit(Number(N))`), the same node a
+        // top-level `return;` lowers to; the status is the only observable, so
+        // there is no value to model. (Value position cannot occur: the call's
+        // type is `!`, so it never supplies a `let` initializer.)
+        syn::Expr::Call(c) if is_exit_call(c) => {
+            let status = c
+                .args
+                .first()
+                .unwrap_or_else(|| refuse("`std::process::exit` without a status", c.span()));
+            if c.args.len() > 1 {
+                refuse("`std::process::exit` with extra arguments", c.span());
+            }
+            Some(json!({"type": "Exit", "value": value_expr(status, cx)}))
+        }
         syn::Expr::If(ie) => Some(if_stmt(ie, cx, in_fn, out)),
         syn::Expr::While(w) => Some(while_stmt(w, cx, in_fn)),
         syn::Expr::ForLoop(fl) => Some(for_stmt(fl, cx, in_fn, out)),
@@ -3599,6 +3614,19 @@ fn is_argv_call(c: &syn::ExprCall) -> bool {
     }
     let segs: Vec<String> = p.path.segments.iter().map(|s| s.ident.to_string()).collect();
     matches!(segs.join("::").as_str(), "env::args" | "std::env::args")
+}
+
+/// `std::process::exit(..)` / `process::exit(..)` — the terminating call whose
+/// only observable is the process status.
+fn is_exit_call(c: &syn::ExprCall) -> bool {
+    let syn::Expr::Path(p) = &*c.func else {
+        return false;
+    };
+    if p.qself.is_some() || p.path.leading_colon.is_some() {
+        return false;
+    }
+    let segs: Vec<String> = p.path.segments.iter().map(|s| s.ident.to_string()).collect();
+    matches!(segs.join("::").as_str(), "process::exit" | "std::process::exit")
 }
 
 fn is_env_var_path(p: &syn::ExprPath) -> bool {
@@ -5772,7 +5800,15 @@ fn match_value_node(
     let n = cx.tmp.borrow_mut();
     let temp = format!("__sh2m{n}");
     drop(n);
-    out.push(store_stmt(&temp, value_expr(&m.expr, cx)));
+    // ORDER: the scrutinee's value can need hoisted temps (a guarded index, a
+    // branch value). `value_expr` QUEUES those on `cx.pending`, so they must be
+    // flushed BEFORE the statement that consumes their result — otherwise the
+    // binding reads the temp before the temp is computed (argv `nth(1)` in a
+    // match scrutinee was exactly that bug).
+    let scrut = value_expr(&m.expr, cx);
+    let hoisted: Vec<Value> = cx.pending.borrow_mut().drain(..).collect();
+    out.extend(hoisted);
+    out.push(store_stmt(&temp, scrut));
     let mut else_: Vec<Value> = Vec::new();
     let last_ix = m.arms.len().saturating_sub(1);
     for (ix, arm) in m.arms.iter().enumerate().rev() {
@@ -6834,15 +6870,34 @@ fn format_value(mac: &syn::Macro, cx: &Cx) -> Value {
 }
 
 fn lower_print_macro(mac: &syn::Macro, cx: &Cx) -> Value {
-    let newline = if mac.path.segments.len() == 1 && mac.path.leading_colon.is_none() {
-        match mac.path.segments[0].ident.to_string().as_str() {
-            "println" => true,
-            "print" => false,
-            other => refuse(&format!("macro invocation `{other}!`"), mac.path.span()),
-        }
-    } else {
-        refuse("qualified macro path", mac.path.span());
-    };
+    let (newline, to_stderr) =
+        if mac.path.segments.len() == 1 && mac.path.leading_colon.is_none() {
+            match mac.path.segments[0].ident.to_string().as_str() {
+                "println" => (true, false),
+                "print" => (false, false),
+                "eprintln" => (true, true),
+                // `eprint!` is the same channel WITHOUT the trailing newline,
+                // and the runtime's only stderr member (`sh2.warn`) always
+                // appends one; a raw `process.stderr.write` would break the
+                // rule that rendered callees are whitelisted `sh2.<name>`
+                // members. Refused rather than given a newline it does not
+                // emit.
+                "eprint" => refuse(
+                    "`eprint!` (stderr with NO trailing newline: the runtime's `sh2.warn` always appends one)",
+                    mac.path.span(),
+                ),
+                other => refuse(&format!("macro invocation `{other}!`"), mac.path.span()),
+            }
+        } else {
+            refuse("qualified macro path", mac.path.span());
+        };
+    // stderr is a SEPARATE typed channel: the operand is the same formatted
+    // value a stdout print would build, and `ErrLine` renders to the
+    // runtime's `sh2.warn` (one line on stderr, stdout untouched).
+    if to_stderr {
+        let v = format_value(mac, cx);
+        return expr_stmt(json!({"type": "ErrLine", "value": v}));
+    }
     let fmt_args: FmtArgs = syn::parse2(mac.tokens.clone())
         .unwrap_or_else(|e| refuse(&format!("macro arguments: {e}"), mac.span()));
     let fmt = fmt_args.fmt.value();
@@ -7579,14 +7634,21 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
             // run past either end).
             if rust_name == "last" && m.args.is_empty() {
                 if matches!(recv_ty, Ty::Arr(..)) {
-                    let n = fresh_tmp(cx, "ln");
-                    let len_v = match recv_var_name(&m.receiver) {
-                        Some(name) => array_len_call(&name),
-                        None => json!({
-                            "type": "Call", "func": "arrayLen", "purity": "PureCpu",
-                            "args": [value_expr(&m.receiver, cx)]
-                        }),
+                    let rname = match recv_var_name(&m.receiver) {
+                        Some(name) => name,
+                        None => {
+                            let t = fresh_tmp(cx, "av");
+                            let v = value_expr(&m.receiver, cx);
+                            cx.pending.borrow_mut().push(assign_stmt(&t, v));
+                            cx.vars.borrow_mut().insert(
+                                t.clone(),
+                                Ty::Arr(Some(Box::new(Ty::Str)), None),
+                            );
+                            t
+                        }
                     };
+                    let n = fresh_tmp(cx, "ln");
+                    let len_v = array_len_call(&rname);
                     cx.pending.borrow_mut().push(assign_stmt(&n, len_v));
                     cx.vars.borrow_mut().insert(n.clone(), Ty::Int);
                     let idx = fresh_tmp(cx, "li");
@@ -7595,17 +7657,10 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                         arith_bin("-", arith_var(&n), arith_num(1)),
                     ));
                     cx.vars.borrow_mut().insert(idx.clone(), Ty::Int);
-                    let elem = match recv_var_name(&m.receiver) {
-                        Some(name) => json!({
-                            "type": "Call", "func": "arrayIndex", "purity": "PureCpu",
-                            "args": [str_lit(&name), get_var(&idx)]
-                        }),
-                        None => json!({
-                            "type": "ElementRead",
-                            "coll": value_expr(&m.receiver, cx),
-                            "key": get_var(&idx),
-                        }),
-                    };
+                    let elem = json!({
+                        "type": "Call", "func": "arrayIndex", "purity": "PureCpu",
+                        "args": [str_lit(&rname), get_var(&idx)]
+                    });
                     return branch_value(
                         "lv",
                         format!("${n} -gt 0"),
@@ -7613,6 +7668,56 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                         || str_lit(""),
                         cx,
                     );
+                }
+            }
+            // `it.nth(K)` — on the process-argument snapshot, the only
+            // Arr-typed "iterator" this frontend produces (a Vec has no
+            // `.nth`, so a compiling program that reaches here is indexing the
+            // immutable argument vector). A CONSTANT K is a guarded index: the
+            // length is read once and the element read only when `K < len`,
+            // with the absent marker otherwise — no iterator position exists
+            // to consume, because the snapshot is a fresh array.
+            if rust_name == "nth" && m.args.len() == 1 && matches!(recv_ty, Ty::Arr(..)) {
+                match &m.args[0] {
+                    lit @ syn::Expr::Lit(syn::ExprLit {
+                        lit: syn::Lit::Int(_), ..
+                    }) => {
+                        let k = int_literal(lit, cx);
+                        // arrayLen/arrayIndex read the store's ARRAY REGISTRY by
+                        // name, not a value, so a snapshot expression is bound to
+                        // a temp first (assigning an array value registers it,
+                        // which is what makes `let args = env::args(); args.len()`
+                        // work).
+                        let name = match recv_var_name(&m.receiver) {
+                            Some(name) => name,
+                            None => {
+                                let t = fresh_tmp(cx, "av");
+                                let v = value_expr(&m.receiver, cx);
+                                cx.pending.borrow_mut().push(assign_stmt(&t, v));
+                                cx.vars.borrow_mut().insert(t.clone(), Ty::Arr(Some(Box::new(Ty::Str)), None));
+                                t
+                            }
+                        };
+                        let n = fresh_tmp(cx, "nn");
+                        let len_v = array_len_call(&name);
+                        cx.pending.borrow_mut().push(assign_stmt(&n, len_v));
+                        cx.vars.borrow_mut().insert(n.clone(), Ty::Int);
+                        let elem = json!({
+                            "type": "Call", "func": "arrayIndex", "purity": "PureCpu",
+                            "args": [str_lit(&name), str_lit(&k.to_string())]
+                        });
+                        return branch_value(
+                            "nth",
+                            format!("${n} -gt {k}"),
+                            || elem,
+                            || str_lit(""),
+                            cx,
+                        );
+                    }
+                    other => refuse(
+                        "`nth(K)` with a non-constant K (only a literal index has a proven guard)",
+                        other.span(),
+                    ),
                 }
             }
             // `s.is_empty()` — exact for every encoding: a string is empty
