@@ -1689,7 +1689,8 @@ value form:
   at that position is spelled `x`**. Then the callee's slot IS the caller's
   location, so the caller reads the mutation back: `*t += 1` in a parameter
   named `t` bumps the caller's `t`, and `lines.push(..)` in a parameter
-  named `lines` appends to the caller's array.
+  named `lines` appends to the caller's array. (v0.41 lifts the same-name
+  restriction with an explicit copy-in/copy-out at the call site.)
 
 Why the name rule instead of "just pass the object": measured, not assumed.
 Binding `&mut lines` into a parameter named `out` and pushing there printed
@@ -1730,6 +1731,68 @@ are not `&mut` writes:
 - `divmod` — `(*d as u64).is_power_of_two()` (line 250): exact without
   bitwise ops (halve while even, then `== 1`), but it is a loop in value
   position.
+
+## v0.41 — join, power-of-two, and `&mut` readback (copy-in/copy-out)
+
+Three shapes the dogfood still refused, each made exact rather than
+approximated.
+
+**`Vec<String>::join(sep)`** is loop-composed, because the store has no join
+member and none was invented: an accumulator string plus `arrayLen` /
+`arrayItems(name).at(i)`, the separator emitted only BETWEEN elements, each
+element contributing its stored text. That is byte-identical to Rust's
+`join` for the only element types it accepts (`String`/`&str`).
+
+**`n.is_power_of_two()`** (unsigned integers — Rust has no signed version)
+is exact without bitwise ops, which the store lacks: halve while even, then
+test `== 1`. `0` never enters the loop and answers false; every value the
+store can hold keeps its own answer, including powers of two above 2^53
+(halving is exact on doubles).
+
+**A `&mut` argument bound under a DIFFERENT name** now reads its mutation
+back, by copy-in/copy-out at the call site:
+
+1. the `&mut` parameter is **not bound from its positional** any more (the
+   prologue skips it), because binding would clobber the caller's location
+   with the argument's text;
+2. the caller writes the callee's slot before the call (`p := x`, or
+   `p := arrayItems(x)` for a `Vec`, plus a rebuilt `<p>__set` so the
+   callee's `contains` sees the copied-in elements);
+3. the call runs;
+4. the slot is copied back (`x := p`, or `x := arrayItems(p)` plus a
+   rebuilt `<x>__set`). rustc's borrow rules make `&mut` non-aliasing, so
+   the caller observing the final state at return IS the borrow's
+   observable semantics.
+
+The readback statements are emitted only where the call is the statement's
+whole value (a `let` initializer or a statement-position call), so they
+cannot reorder anything. Everything else REFUSES: a `&mut` argument in a
+larger expression, a bare reborrow into a parameter spelled differently, a
+`&mut` set/map under another name (its store is keyed by name), and a
+readback call returning a collection.
+
+Pins (each executed through frontend -> `--target estree` -> node against
+native `rustc`):
+
+| pin | shape | rustc stdout |
+|---|---|---|
+| t128 | `bump(&mut n)` — differing name, scalar readback | `2` |
+| t131 | `join`, empty/single/several, `""` and multi-char separators | `[] [a] [a-b-c] xy x :: y` |
+| t132 | `is_power_of_two` on 0,1,2,3,4,6,8,64,1024,2^40,2^40+1 | `… false true true false true false true true true true false` |
+| t133 | `&mut Vec` push through `out`, CALLER reads the pushed elements | `2 2 x` then `y` |
+| t134 | `&mut` argument inside a larger expression | refuse |
+| t135 | reborrow into a differently-spelled parameter | refuse |
+| t136 | `&mut` set under another name | refuse |
+
+Measured: gate **86/121 -> 90/127 match, 0 FAIL, 37 SKIP**; census over the
+14 `src/*_backend.rs`: **1766 -> 1763** (`go_backend.rs` 124 -> 121);
+whole-tree dogfood: **EXIT=0, no `internal error`, no `panicked`**, LOWERED
+**19/254** — `cuda_backend.rs` does NOT flip yet, and its remaining three
+walls are none of the shapes above: `(*d as u64)` (a cast of a variable),
+`arrays.iter().position(..).unwrap_or(0)` (iterator chain + `unwrap_or`),
+and `for .. in &spec.seq_prelude` / `used.iter()` (iterating a parameter's
+collection whose length is unproven). `join`, `is_power_of_two` and the
+differing-name `&mut` call sites in `cuda_backend.rs` now LOWER.
 
 ## Gate
 

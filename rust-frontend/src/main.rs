@@ -696,6 +696,16 @@ struct Cx {
     /// parameter name (the store keys a location by name), so the call site
     /// needs the callee's spelling to decide — never to guess.
     fn_params: HashMap<String, Vec<String>>,
+    /// registered fn name -> is each parameter a `&mut` borrow? A `&mut`
+    /// parameter is NOT bound from its positional (v0.41): the caller writes
+    /// the location itself (copy-in) and reads it back (copy-out), so the
+    /// callee's slot must not be clobbered by an argument read.
+    fn_param_mut: HashMap<String, Vec<bool>>,
+    /// set while a call site is emitting `&mut` READBACK statements for
+    /// arguments bound under a different name than the parameter (v0.41).
+    /// Off everywhere else, so the same shape refuses instead of dropping
+    /// the writes.
+    mut_rw: std::cell::RefCell<bool>,
     /// CONST array items with fully-literal STRING contents
     /// (`const BUILTINS: &[&str] = &["a", ..]`) — membership tests
     /// lower to exact OR-equality chains over these literals
@@ -1439,6 +1449,8 @@ fn main() {
                     .insert(f.sig.ident.to_string(), ret_ty(&f.sig.output, &cx));
                 cx.fn_params
                     .insert(f.sig.ident.to_string(), param_names(&f.sig));
+                cx.fn_param_mut
+                    .insert(f.sig.ident.to_string(), param_muts(&f.sig));
                 fns.push(FnSource::Free(f));
             }
             syn::Item::Impl(i) => {
@@ -1457,6 +1469,7 @@ fn main() {
                         cx.fns.push(mangled.clone());
                         cx.fn_rets.insert(mangled.clone(), ret_ty(&m.sig.output, &cx));
                         cx.fn_params.insert(mangled.clone(), param_names(&m.sig));
+                        cx.fn_param_mut.insert(mangled.clone(), param_muts(&m.sig));
                         fns.push(FnSource::Method(mangled, m, ty.clone()));
                     }
                     // non-fn impl items (consts/types) are declaration-only
@@ -1503,6 +1516,7 @@ fn main() {
             cx.fns.push(n.clone());
             cx.fn_rets.insert(n.clone(), ret_ty(&f.sig.output, &cx));
             cx.fn_params.insert(n.clone(), param_names(&f.sig));
+            cx.fn_param_mut.insert(n.clone(), param_muts(&f.sig));
         }
         *cx.fn_scopes.borrow_mut() = scopes;
     }
@@ -2197,6 +2211,15 @@ fn lower_local(
         return Some(assign_stmt(&name, arith_value(ast)));
     }
     cx.vars.borrow_mut().insert(name.clone(), init_ty);
+    // A `let` whose initializer is a call with `&mut` arguments bound under
+    // other names: the call and its readback are the whole statement, so the
+    // order is Rust's (bind a temp, then the copies).
+    {
+        let (done, v) = call_mut_readback(&init.expr, Some(&name), cx, out, false);
+        if done {
+            return v;
+        }
+    }
     Some(assign_stmt(&name, value_expr(&init.expr, cx)))
 }
 
@@ -2765,6 +2788,11 @@ fn lower_expr_stmt(e: &syn::Expr, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) ->
                     c.func.span(),
                 );
             };
+            // A statement call with `&mut` arguments bound under other names
+            // emits its own copy-in/call/copy-out sequence here.
+            if call_mut_readback(e, None, cx, out, true).0 {
+                return None;
+            }
             Some(expr_stmt(fn_call_expr(&target, &c.args, "fnCall", cx)))
         }
         syn::Expr::Path(p) => {
@@ -4127,6 +4155,19 @@ where
 /// Parameter names, positionally, for the `&mut`-argument rule below. A
 /// receiver keeps its positional slot so a method's `self` lines up with
 /// argument 0.
+/// Is each parameter declared `&mut`? (Syntactic: `&mut T`.)
+fn param_muts(sig: &syn::Signature) -> Vec<bool> {
+    sig.inputs
+        .iter()
+        .map(|a| match a {
+            syn::FnArg::Receiver(_) => false,
+            syn::FnArg::Typed(pt) => {
+                matches!(&*pt.ty, syn::Type::Reference(r) if r.mutability.is_some())
+            }
+        })
+        .collect()
+}
+
 fn param_names(sig: &syn::Signature) -> Vec<String> {
     sig.inputs
         .iter()
@@ -4159,6 +4200,35 @@ fn param_names(sig: &syn::Signature) -> Vec<String> {
 /// REFUSES rather than silently dropping the mutation.
 fn call_arg_expr(a: &syn::Expr, idx: usize, callee: &str, cx: &Cx) -> Value {
     let syn::Expr::Reference(r) = a else {
+        // A bare path handed to a `&mut` parameter is a REBORROW: exact only
+        // when the names match (then the caller's slot IS the callee's).
+        if let syn::Expr::Path(p) = a {
+            if let Some(n) = single_path(p) {
+                let pmut = cx
+                    .fn_param_mut
+                    .get(callee)
+                    .and_then(|m| m.get(idx))
+                    .copied()
+                    .unwrap_or(false);
+                if pmut {
+                    let same = cx
+                        .fn_params
+                        .get(callee)
+                        .and_then(|ps| ps.get(idx))
+                        .map(|p| *p == n.to_string())
+                        .unwrap_or(false);
+                    if !same {
+                        refuse(
+                            &format!(
+                                "reborrow into `{callee}`'s parameter bound under a different \
+                                 name (only an explicit `&mut x` argument gets a readback)"
+                            ),
+                            a.span(),
+                        );
+                    }
+                }
+            }
+        }
         return value_expr(a, cx);
     };
     if r.mutability.is_none() {
@@ -4173,6 +4243,7 @@ fn call_arg_expr(a: &syn::Expr, idx: usize, callee: &str, cx: &Cx) -> Value {
             r.expr.span(),
         );
     };
+    let pointee = infer_ty(&r.expr, cx);
     let same_name = cx
         .fn_params
         .get(callee)
@@ -4180,13 +4251,33 @@ fn call_arg_expr(a: &syn::Expr, idx: usize, callee: &str, cx: &Cx) -> Value {
         .map(|p| *p == name)
         .unwrap_or(false);
     if !same_name {
-        refuse(
-            &format!(
-                "`&mut` argument to `{callee}` under a different name than the parameter \
-                 (the store keys a location by name, so the write would be lost)"
+        // A different name is a DIFFERENT location. It becomes exact only
+        // through the readback statements `call_mut_readback` emits around
+        // the call (v0.41), which exist for a whole `let` initializer or a
+        // statement-position call — anywhere else the write would be lost,
+        // so it REFUSES rather than lowering.
+        if !*cx.mut_rw.borrow() {
+            refuse(
+                &format!(
+                    "`&mut` argument to `{callee}` bound under a different name where the \
+                     readback cannot be emitted (only a whole `let` initializer or a \
+                     statement-position call)"
+                ),
+                a.span(),
+            );
+        }
+        // The POSITIONAL is unused for a `&mut` parameter (the prologue does
+        // not bind it): the call site writes the callee's slot itself, so the
+        // argument slot only has to keep the positional numbering aligned.
+        match pointee {
+            Ty::Int | Ty::Str | Ty::Bool => return str_lit(""),
+            _ if arr_of_scalar(&pointee) => return str_lit(""),
+            _ => refuse(
+                "`&mut` argument of a collection type bound under a different name \
+                 (only scalars and Vec<scalar> have an exact readback)",
+                a.span(),
             ),
-            a.span(),
-        );
+        }
     }
     value_expr(&r.expr, cx)
 }
@@ -4504,6 +4595,17 @@ fn static_init_stmt(name: &str, ty: &Ty, init: Option<&syn::Expr>, cx: &Cx) -> V
 /// Types whose value the scalar store can carry (a guard read is the read).
 fn is_scalar_store_ty(t: &Ty) -> bool {
     matches!(t, Ty::Int | Ty::Str | Ty::Bool | Ty::AtomicBool | Ty::Opt(_))
+}
+
+/// `Vec<String>` (the only element type Rust's `join` accepts).
+fn arr_of_str(t: &Ty) -> bool {
+    matches!(t, Ty::Arr(e, _) if matches!(e.as_deref(), Some(Ty::Str)))
+}
+
+/// `Vec<scalar>` — the element types the array copy-in/copy-out channel
+/// carries exactly (elements stay their own values; no objects to alias).
+fn arr_of_scalar(t: &Ty) -> bool {
+    matches!(t, Ty::Arr(e, _) if matches!(e.as_deref(), Some(Ty::Int | Ty::Str | Ty::Bool)))
 }
 
 /// The static behind a guard expression: `NAME.lock().unwrap()`,
@@ -5880,6 +5982,221 @@ fn raw_elem(name: &str, key: Value) -> Value {
     })
 }
 
+/// A plain `Var` value node (a store read by name).
+fn var_node(name: &str) -> Value {
+    json!({"type": "Var", "name": name, "sigil": null})
+}
+
+/// Statements that rebuild the Vec `contains` shadow set (`<v>__set`, an
+/// assoc store keyed by VARIABLE NAME) from a copied array's elements:
+/// `for i in 0..arrayLen(arr) { assocSet(set, arr[i], "1") }`. Keying by
+/// name is why a Vec that crosses a call boundary under a new name needs
+/// this: the callee's pushes fill `<param>__set`, never the caller's set.
+fn shadow_fill_stmts(cx: &Cx, set_name: &str, arr_name: &str) -> Vec<Value> {
+    let i = fresh_tmp(cx, "sfi");
+    let n = fresh_tmp(cx, "sfn");
+    let body = vec![
+        assoc_set_stmt(set_name, raw_elem(arr_name, var_node(&i)), str_lit("1")),
+        assign_stmt(&i, arith_bin("+", arith_var(&i), arith_num(1))),
+    ];
+    vec![
+        assign_stmt(&n, array_len_call(arr_name)),
+        assign_stmt(&i, str_lit("0")),
+        json!({
+            "type": "While",
+            "cond": test_call(&format!("${i} -lt ${n}")),
+            "body": body,
+        }),
+    ]
+}
+
+/// `arr.join(sep)` for a `Vec<String>`, loop-composed (v0.41). The store has
+/// no join member and none is invented: the accumulator is built with the
+/// Interpolate concat, the separator goes BETWEEN elements, and each element
+/// contributes its stored (raw) text — which is exactly Rust's `join` for the
+/// only element type it accepts (`String`/`&str`, via `Borrow<str>`).
+fn join_value(cx: &Cx, arr: &str, sep: Value) -> Value {
+    let n = fresh_tmp(cx, "jn");
+    let i = fresh_tmp(cx, "ji");
+    let acc = fresh_tmp(cx, "js");
+    // Temps are written with `assign_stmt` (the emitter's JS binding), never
+    // `store_stmt`: a `setVar` write lands in `sh2.vars` while the generated
+    // reads use the hoisted binding, and the two would diverge.
+    let mut stmts = vec![
+        assign_stmt(&n, array_len_call(arr)),
+        assign_stmt(&i, str_lit("0")),
+        assign_stmt(&acc, str_lit("")),
+    ];
+    let body = vec![
+        json!({
+            "type": "If",
+            "cond": test_call(&format!("${i} -gt 0")),
+            "then": [assign_stmt(&acc, str_concat(get_var(&acc), sep))],
+            "elsifs": [],
+            "else": [],
+        }),
+        assign_stmt(&acc, str_concat(get_var(&acc), raw_elem(arr, var_node(&i)))),
+        assign_stmt(&i, arith_bin("+", arith_var(&i), arith_num(1))),
+    ];
+    stmts.push(json!({
+        "type": "While",
+        "cond": test_call(&format!("${i} -lt ${n}")),
+        "body": body,
+    }));
+    for s in stmts {
+        cx.pending.borrow_mut().push(s);
+    }
+    var_node(&acc)
+}
+
+/// `n.is_power_of_two()` (v0.41) — exact without bitwise ops, which the
+/// store does not have: a positive integer is a power of two iff halving it
+/// while it is even lands on exactly 1. `0` never enters the loop and stays
+/// false, and so does every negative value (Rust's own answer). Exact for
+/// every width: the store's numbers are IEEE doubles, so the integers it can
+/// hold are |n| < 2^53, and powers of two above that halve exactly as well.
+fn pow2_value(cx: &Cx, recv: &syn::Expr) -> Value {
+    let v = fresh_tmp(cx, "pt");
+    let m = fresh_tmp(cx, "pm");
+    let r = fresh_tmp(cx, "pr");
+    let mut stmts = vec![
+        assign_stmt(&v, value_expr(recv, cx)),
+        assign_stmt(&r, str_lit("false")),
+    ];
+    let then = vec![
+        assign_stmt(&m, arith_bin("%", arith_var(&v), arith_num(2))),
+        json!({
+            "type": "While",
+            "cond": test_call(&format!("${m} -eq 0")),
+            "body": [
+                assign_stmt(&v, arith_bin("/", arith_var(&v), arith_num(2))),
+                assign_stmt(&m, arith_bin("%", arith_var(&v), arith_num(2))),
+            ],
+        }),
+        json!({
+            "type": "If",
+            "cond": test_call(&format!("${v} -eq 1")),
+            "then": [assign_stmt(&r, str_lit("true"))],
+            "elsifs": [],
+            "else": [],
+        }),
+    ];
+    stmts.push(json!({
+        "type": "If",
+        "cond": test_call(&format!("${v} -gt 0")),
+        "then": then,
+        "elsifs": [],
+        "else": [],
+    }));
+    for s in stmts {
+        cx.pending.borrow_mut().push(s);
+    }
+    var_node(&r)
+}
+
+/// `&mut` READBACK for a call whose arguments are bound under DIFFERENT
+/// names than the callee's parameters (v0.41). The store keys a location by
+/// name, so the callee's `p` and the caller's `x` are two locations:
+///
+///   * copy-in — a `Vec` argument is passed as `arrayItems(x)` (the elements,
+///     which the callee's prologue registers under `p`), and `<p>__set` is
+///     rebuilt from those elements so the callee's `contains` sees them;
+///   * the call;
+///   * copy-out — `x := p` for a scalar, `x := arrayItems(p)` plus a rebuilt
+///     `<x>__set` for a Vec. rustc's borrow rules make `&mut` non-aliasing,
+///     so the caller observing the final state at return IS the borrow's
+///     observable semantics.
+///
+/// Only a whole `let` initializer or a statement-position call qualifies
+/// (`bind`/`stmt`), where the call is the statement's own value: the
+/// statements cannot reorder anything, so the order is Rust's. Returns
+/// `(handled, binding statement)`.
+fn call_mut_readback(
+    e: &syn::Expr,
+    bind: Option<&str>,
+    cx: &Cx,
+    out: &mut Vec<Value>,
+    stmt: bool,
+) -> (bool, Option<Value>) {
+    let syn::Expr::Call(c) = e else {
+        return (false, None);
+    };
+    let syn::Expr::Path(p) = &*c.func else {
+        return (false, None);
+    };
+    let Some(callee) = single_path(p).map(|s| s.to_string()) else {
+        return (false, None);
+    };
+    let Some(params) = cx.fn_params.get(&callee).cloned() else {
+        return (false, None);
+    };
+    let mut rw: Vec<(String, String, Ty)> = Vec::new();
+    for (i, a) in c.args.iter().enumerate() {
+        let syn::Expr::Reference(r) = a else { continue };
+        if r.mutability.is_none() {
+            continue;
+        }
+        let syn::Expr::Path(ap) = &*r.expr else { continue };
+        let Some(an) = single_path(ap).map(|s| s.to_string()) else {
+            continue;
+        };
+        let Some(pn) = params.get(i).cloned() else { continue };
+        if pn == an {
+            continue; // the same name IS the same location: nothing to copy
+        }
+        rw.push((an, pn, infer_ty(&r.expr, cx)));
+    }
+    if rw.is_empty() {
+        return (false, None);
+    }
+    // COPY-IN: write the callee's slot from the caller's location. A `&mut`
+    // parameter is not bound from its positional at all, so this is the only
+    // write that puts the caller's value where the callee reads it.
+    for (an, pn, ty) in &rw {
+        if matches!(ty, Ty::Arr(..)) {
+            out.push(assign_stmt(pn, array_items_call(an)));
+            for s in shadow_fill_stmts(cx, &format!("{pn}__set"), an) {
+                out.push(s);
+            }
+        } else {
+            out.push(assign_stmt(pn, get_var(an)));
+        }
+    }
+    if !stmt {
+        // The hoisted result rides the JS binding (`assign_stmt`); a call
+        // returning a collection would need the array channel, so it refuses.
+        if matches!(
+            cx.fn_rets.get(&callee),
+            Some(Ty::Arr(..)) | Some(Ty::Struct(_)) | Some(Ty::Enum(_)) | Some(Ty::Set(..)) | Some(Ty::Map(..))
+        ) {
+            refuse(
+                "`&mut` readback call returning a collection (the hoisted result rides the scalar channel)",
+                e.span(),
+            );
+        }
+    }
+    let saved = cx.mut_rw.replace(true);
+    let call_v = fn_call_expr(&callee, &c.args, if stmt { "fnCall" } else { "fnValue" }, cx);
+    cx.mut_rw.replace(saved);
+    let t = fresh_tmp(cx, "mr");
+    out.push(if stmt { expr_stmt(call_v) } else { assign_stmt(&t, call_v) });
+    for (an, pn, ty) in rw {
+        if matches!(ty, Ty::Arr(..)) {
+            out.push(assign_stmt(&an, array_items_call(&pn)));
+            for s in shadow_fill_stmts(cx, &format!("{an}__set"), &an) {
+                out.push(s);
+            }
+        } else {
+            out.push(assign_stmt(&an, get_var(&pn)));
+        }
+    }
+    if stmt {
+        (true, None)
+    } else {
+        (true, Some(assign_stmt(bind.unwrap_or(""), var_node(&t))))
+    }
+}
+
 fn tuple_elem(name: &str, ix: usize) -> Value {
     raw_elem(name, str_lit(&ix.to_string()))
 }
@@ -7191,6 +7508,14 @@ fn function_def(
         }
         seen.push(pname.clone());
         let pty = ty_from_type(&pt.ty, cx);
+        // A `&mut` parameter is NOT bound from its positional (v0.41): the
+        // caller owns the location — it writes the callee's slot before the
+        // call (copy-in) and reads it back after (copy-out) — so binding here
+        // would clobber it with the argument's text.
+        if matches!(&*pt.ty, syn::Type::Reference(r) if r.mutability.is_some()) {
+            cx.vars.borrow_mut().insert(pname.clone(), pty);
+            continue;
+        }
         // positional binding: param i <- getVar("i+1"), read as a VALUE for
         // a record parameter (`record_param_bind`) and as text otherwise.
         body.push(if is_record_ty(&pty) {
@@ -8704,6 +9029,40 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                         );
                     }
                 }
+            }
+            // `a.join(sep)` on a `Vec<String>` (v0.41): loop-composed with the
+            // Interpolate concat — no join member exists and none is invented.
+            // The separator goes BETWEEN elements and each contributes its
+            // stored text, which is byte-identical to Rust's `join`.
+            if rust_name.as_str() == "join" {
+                if arr_of_str(&recv_ty) {
+                    if m.args.len() != 1 {
+                        refuse("join with a non-single separator", m.span());
+                    }
+                    let sep = &m.args[0];
+                    if !matches!(infer_ty(sep, cx), Ty::Str) {
+                        refuse("join separator (only a proven string)", sep.span());
+                    }
+                    let arr = match &*m.receiver {
+                        syn::Expr::Path(rp) => single_path(rp).map(|s| s.to_string()),
+                        _ => None,
+                    };
+                    let Some(arr) = arr else {
+                        refuse(
+                            "join on a non-variable receiver (the element reads are name-keyed)",
+                            m.receiver.span(),
+                        );
+                    };
+                    return join_value(cx, &arr, value_expr(sep, cx));
+                }
+            }
+            // `n.is_power_of_two()` (v0.41): halve-while-even then `== 1`,
+            // exact for 0 and every width — see `pow2_value`.
+            if let (Ty::Int, "is_power_of_two") = (&recv_ty, rust_name.as_str()) {
+                if !m.args.is_empty() {
+                    refuse("is_power_of_two with arguments", m.span());
+                }
+                return pow2_value(cx, &m.receiver);
             }
             let js_name_raw = match (&recv_ty, rust_name.as_str()) {
                 (Ty::Str, "contains") => "includes",
