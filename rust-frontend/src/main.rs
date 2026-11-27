@@ -217,6 +217,16 @@ fn arith_bin(op: &str, lhs: Value, rhs: Value) -> Value {
 /// Minimal receiver types, enough to lower methods WITHOUT guessing:
 /// the store holds JS strings / numbers / booleans / native arrays, and
 /// a method's Rust semantics must map onto the exact JS the core renders.
+/// The iteration-order promise of an associative container. Rust makes it
+/// observable: `BTreeMap`/`BTreeSet` iterate in KEY order, `HashMap`/
+/// `HashSet` in an unspecified order (so the store's insertion order is a
+/// valid enumeration of them, and NO lowering may depend on it).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MapOrder {
+    Hash,
+    BTree,
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum Ty {
     Int,
@@ -241,10 +251,14 @@ enum Ty {
     /// with listGet, length with listLen (dynamic, runtime-trusted)
     List,
     /// HashMap/BTreeMap: a NAMED associative store (assocGet/assocSet),
-    /// keyed by the stringified key
-    Map(Box<Ty>, Box<Ty>),
-    /// HashSet/BTreeSet: an associative store whose keys are the elements
-    Set(Box<Ty>),
+    /// keyed by the stringified key. The third field is the ORDERING the
+    /// source container promises: `BTreeMap` ITERATES IN KEY ORDER (an
+    /// observable fact of the program's output) while `HashMap` promises
+    /// nothing, so insertion order is a valid enumeration for it.
+    Map(Box<Ty>, Box<Ty>, MapOrder),
+    /// HashSet/BTreeSet: an associative store whose keys are the elements.
+    /// Same ordering tag as `Map`: `BTreeSet` iterates in key order.
+    Set(Box<Ty>, MapOrder),
     /// a FUNCTION ITEM (`transforms::f`) — its store value is the
     /// REGISTERED lowered name; indirect calls dispatch by that name
     Fn(String),
@@ -360,6 +374,11 @@ fn ty_from_type(t: &syn::Type, cx: &Cx) -> Ty {
                 "bool" => Ty::Bool,
                 "AtomicBool" => Ty::AtomicBool,
                 "HashMap" | "BTreeMap" => {
+                    let order = if seg.ident == "BTreeMap" {
+                        MapOrder::BTree
+                    } else {
+                        MapOrder::Hash
+                    };
                     let args: Vec<Ty> = match &seg.arguments {
                         syn::PathArguments::AngleBracketed(a) => a
                             .args
@@ -374,9 +393,15 @@ fn ty_from_type(t: &syn::Type, cx: &Cx) -> Ty {
                     Ty::Map(
                         Box::new(args.first().cloned().unwrap_or(Ty::Unknown)),
                         Box::new(args.get(1).cloned().unwrap_or(Ty::Unknown)),
+                        order,
                     )
                 }
                 "HashSet" | "BTreeSet" => {
+                    let order = if seg.ident == "BTreeSet" {
+                        MapOrder::BTree
+                    } else {
+                        MapOrder::Hash
+                    };
                     let elem = match &seg.arguments {
                         syn::PathArguments::AngleBracketed(a) => {
                             a.args.iter().find_map(|arg| match arg {
@@ -388,7 +413,7 @@ fn ty_from_type(t: &syn::Type, cx: &Cx) -> Ty {
                         }
                         _ => None,
                     };
-                    Ty::Set(elem.unwrap_or(Box::new(Ty::Unknown)))
+                    Ty::Set(elem.unwrap_or(Box::new(Ty::Unknown)), order)
                 }
                 "Vec" | "VecDeque" | "Slice" => {
                     // Vec<T>: extract the element type when shape allows
@@ -1869,7 +1894,7 @@ fn lower_local(
     // is emitted (the guard's only effect is holding the lock, which a
     // single-threaded runtime does not model).
     if let Some((sname, inner)) = guard_handle(&init.expr, cx) {
-        if is_scalar_store_ty(&inner) || matches!(inner, Ty::Set(_) | Ty::Map(..)) {
+        if is_scalar_store_ty(&inner) || matches!(inner, Ty::Set(..) | Ty::Map(..)) {
             cx.guards.borrow_mut().insert(name.clone(), (sname, inner));
             return None;
         }
@@ -1950,7 +1975,7 @@ fn lower_local(
             out.push(assoc_empty_stmt(&name));
             cx.vars.borrow_mut().insert(
                 name.clone(),
-                Ty::Map(Box::new(Ty::Str), Box::new(Ty::Int)),
+                Ty::Map(Box::new(Ty::Str), Box::new(Ty::Int), MapOrder::Hash),
             );
             out.push(json!({
                 "type": "While",
@@ -2193,12 +2218,12 @@ fn infer_ty(e: &syn::Expr, cx: &Cx) -> Ty {
             // single-threaded runtime erases the wrapper
             if let Some((_, inner)) = static_guard(&m.receiver, cx) {
                 match (&inner, m.method.to_string().as_str()) {
-                    (Ty::Set(_), "contains" | "insert" | "remove" | "is_empty")
+                    (Ty::Set(..), "contains" | "insert" | "remove" | "is_empty")
                     | (Ty::Map(..), "contains_key" | "is_empty") => return Ty::Bool,
-                    (Ty::Map(_, v), "get" | "insert" | "remove") => {
+                    (Ty::Map(_, v, _), "get" | "insert" | "remove") => {
                         return Ty::Opt(v.clone())
                     }
-                    (Ty::Set(_), "len") | (Ty::Map(..), "len") => return Ty::Int,
+                    (Ty::Set(..), "len") | (Ty::Map(..), "len") => return Ty::Int,
                     _ => {}
                 }
             }
@@ -2221,15 +2246,15 @@ fn infer_ty(e: &syn::Expr, cx: &Cx) -> Ty {
                 "as_deref" => rty,
                 "is_some" | "is_none" | "is_ok" | "is_err" => Ty::Bool,
                 "get" => match &rty {
-                    Ty::Map(_, v) => Ty::Opt(v.clone()),
+                    Ty::Map(_, v, _) => Ty::Opt(v.clone()),
                     _ => Ty::Unknown,
                 },
                 "keys" => match &rty {
-                    Ty::Map(k, _) => Ty::Arr(Some(k.clone()), None),
+                    Ty::Map(k, _, _) => Ty::Arr(Some(k.clone()), None),
                     _ => Ty::Unknown,
                 },
                 "values" => match &rty {
-                    Ty::Map(_, v) => Ty::Arr(Some(v.clone()), None),
+                    Ty::Map(_, v, _) => Ty::Arr(Some(v.clone()), None),
                     _ => Ty::Unknown,
                 },
                 "split" => Ty::List,
@@ -2498,7 +2523,7 @@ fn lower_expr_stmt(e: &syn::Expr, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) ->
             // `NAME.lock().unwrap().clear();` — an empty assoc store
             if m.method == "clear" && m.args.is_empty() {
                 if let Some((sname, inner)) = static_guard(&m.receiver, cx) {
-                    if matches!(inner, Ty::Set(_) | Ty::Map(..)) {
+                    if matches!(inner, Ty::Set(..) | Ty::Map(..)) {
                         return Some(assoc_empty_stmt(&sname));
                     }
                     refuse("clear on a non-collection static", m.span());
@@ -3010,14 +3035,36 @@ fn for_stmt(fl: &syn::ExprForLoop, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) -
     // exact. Elements read RAW (`arrayItems(v).at(i)`) so tuple/record
     // elements survive destructuring.
     // MAP / SET iteration: keys come from assocKeys (a native array),
-    // values from assocGet per key. HashMap order is unspecified in
-    // Rust, so insertion order is a valid enumeration.
-    if let Some((vname, mode)) = map_iter_mode(&fl.expr, cx) {
+    // values from assocGet per key.
+    //
+    // ORDER is part of the program's OUTPUT for a `BTreeMap`: rustc
+    // enumerates it in KEY order (Ord on the key type), while the store's
+    // assoc keeps insertion order. A BTreeMap receiver therefore SORTS the
+    // key array before iterating — `assocKeys(m).sort()`, the same
+    // lexicographic array sort the shell path emits for `$(… | sort)`.
+    // `HashMap`/`HashSet` promise no order at all, so their insertion
+    // order is a valid enumeration and nothing about them changes.
+    //
+    // Exactness domain of `.sort()`: JS compares UTF-16 code units and
+    // Rust compares UTF-8 BYTES, which agree for every key whose
+    // characters are all in U+0000..U+FFFF (all ASCII, Latin-1, CJK, …);
+    // they can differ only when one key's first difference involves an
+    // astral (supplementary) character against one in U+E000..U+FFFF.
+    // Measured on `t124_btreemap_order` (ASCII + Latin-1 + CJK keys).
+    if let Some((vname, mode, order)) = map_iter_mode(&fl.expr, cx) {
         let ks = fresh_tmp(cx, "mk");
-        out.push(store_stmt(
-            &ks,
-            assoc_call("assocKeys", vec![str_lit(&vname)]),
-        ));
+        let keys = assoc_call("assocKeys", vec![str_lit(&vname)]);
+        let keys = if order == MapOrder::BTree {
+            json!({
+                "type": "MethodCall",
+                "object": keys,
+                "method": "sort",
+                "args": []
+            })
+        } else {
+            keys
+        };
+        out.push(store_stmt(&ks, keys));
         let idx = fresh_tmp(cx, "i");
         let lenv = fresh_tmp(cx, "l");
         out.push(assign_stmt(&lenv, array_len_call(&ks)));
@@ -4150,7 +4197,7 @@ fn static_init_stmt(name: &str, ty: &Ty, init: Option<&syn::Expr>, cx: &Cx) -> V
     match inner {
         // a collection lives in the NAMED associative store, never in the
         // scalar value slot
-        Ty::Set(_) | Ty::Map(..) => assoc_empty_stmt(name),
+        Ty::Set(..) | Ty::Map(..) => assoc_empty_stmt(name),
         // a Vec static is a native array (setVar preserves the array)
         Ty::Arr(..) => set_array_stmt(name, Vec::new()),
         _ => {
@@ -4230,7 +4277,7 @@ fn static_guard_method(name: &str, inner: &Ty, m: &syn::ExprMethodCall, cx: &Cx)
     let meth = m.method.to_string();
     let assoc_get = |key: Value| assoc_call("assocGet", vec![str_lit(name), key]);
     match inner {
-        Ty::Set(_) => match meth.as_str() {
+        Ty::Set(..) => match meth.as_str() {
             "contains" if m.args.len() == 1 => {
                 let key = ref_arg(&m.args[0], cx);
                 let g = fresh_tmp(cx, "k");
@@ -4301,7 +4348,7 @@ fn static_guard_method(name: &str, inner: &Ty, m: &syn::ExprMethodCall, cx: &Cx)
             }
             _ => None,
         },
-        Ty::Map(_, _) => match meth.as_str() {
+        Ty::Map(..) => match meth.as_str() {
             "contains_key" if m.args.len() == 1 => {
                 let key = ref_arg(&m.args[0], cx);
                 let g = fresh_tmp(cx, "k");
@@ -4493,17 +4540,22 @@ fn map_ctor(e: &syn::Expr, cx: &Cx) -> Option<(Ty, Vec<(Value, Value)>)> {
             let prev = p.path.segments[n - 2].ident.to_string();
             let is_map = matches!(prev.as_str(), "HashMap" | "BTreeMap");
             let is_set = matches!(prev.as_str(), "HashSet" | "BTreeSet");
+            let order = if prev == "BTreeMap" {
+                MapOrder::BTree
+            } else {
+                MapOrder::Hash
+            };
             if !is_map && !is_set {
                 return None;
             }
             if last == "new" || last == "with_capacity" {
                 return Some(if is_map {
                     (
-                        Ty::Map(Box::new(Ty::Unknown), Box::new(Ty::Unknown)),
+                        Ty::Map(Box::new(Ty::Unknown), Box::new(Ty::Unknown), order),
                         Vec::new(),
                     )
                 } else {
-                    (Ty::Set(Box::new(Ty::Unknown)), Vec::new())
+                    (Ty::Set(Box::new(Ty::Unknown), order), Vec::new())
                 });
             }
             if last != "from" {
@@ -4515,7 +4567,7 @@ fn map_ctor(e: &syn::Expr, cx: &Cx) -> Option<(Ty, Vec<(Value, Value)>)> {
                 for el in arr {
                     out.push((value_expr(el, cx), str_lit("1")));
                 }
-                return Some((Ty::Set(Box::new(Ty::Unknown)), out));
+                return Some((Ty::Set(Box::new(Ty::Unknown), order), out));
             }
             for el in arr {
                 let syn::Expr::Tuple(t) = el else {
@@ -4527,7 +4579,7 @@ fn map_ctor(e: &syn::Expr, cx: &Cx) -> Option<(Ty, Vec<(Value, Value)>)> {
                 out.push((value_expr(&t.elems[0], cx), value_expr(&t.elems[1], cx)));
             }
             return Some((
-                Ty::Map(Box::new(Ty::Unknown), Box::new(Ty::Unknown)),
+                Ty::Map(Box::new(Ty::Unknown), Box::new(Ty::Unknown), order),
                 out,
             ));
         }
@@ -4541,13 +4593,18 @@ fn map_ctor(e: &syn::Expr, cx: &Cx) -> Option<(Ty, Vec<(Value, Value)>)> {
     if last != "new" && last != "with_capacity" {
         return None;
     }
+    let order = if prev == "BTreeMap" {
+        MapOrder::BTree
+    } else {
+        MapOrder::Hash
+    };
     Some(if is_map {
         (
-            Ty::Map(Box::new(Ty::Unknown), Box::new(Ty::Unknown)),
+            Ty::Map(Box::new(Ty::Unknown), Box::new(Ty::Unknown), order),
             Vec::new(),
         )
     } else {
-        (Ty::Set(Box::new(Ty::Unknown)), Vec::new())
+        (Ty::Set(Box::new(Ty::Unknown), order), Vec::new())
     })
 }
 
@@ -4555,7 +4612,7 @@ fn map_ctor(e: &syn::Expr, cx: &Cx) -> Option<(Ty, Vec<(Value, Value)>)> {
 /// Only NAMED map/set variables have an associative-store representation.
 fn map_value_ty(name: &str, cx: &Cx) -> Ty {
     match cx.vars.borrow().get(name) {
-        Some(Ty::Map(_, v)) => (**v).clone(),
+        Some(Ty::Map(_, v, _)) => (**v).clone(),
         _ => Ty::Unknown,
     }
 }
@@ -4564,11 +4621,11 @@ fn map_value_ty(name: &str, cx: &Cx) -> Ty {
 fn is_composite_ty(t: &Ty) -> bool {
     matches!(
         t,
-        Ty::Struct(_) | Ty::Tuple(_) | Ty::Arr(..) | Ty::Enum(_) | Ty::Map(..) | Ty::Set(_)
+        Ty::Struct(_) | Ty::Tuple(_) | Ty::Arr(..) | Ty::Enum(_) | Ty::Map(..) | Ty::Set(..)
     )
 }
 
-fn map_iter_mode(e: &syn::Expr, cx: &Cx) -> Option<(String, &'static str)> {
+fn map_iter_mode(e: &syn::Expr, cx: &Cx) -> Option<(String, &'static str, MapOrder)> {
     let base = match e {
         syn::Expr::Reference(r) => &*r.expr,
         e => e,
@@ -4588,10 +4645,12 @@ fn map_iter_mode(e: &syn::Expr, cx: &Cx) -> Option<(String, &'static str)> {
     };
     let rt = cx.vars.borrow().get(&n).cloned()?;
     match (rt, explicit) {
-        (Ty::Set(_), None) => Some((n, "set")),
-        (Ty::Set(_), Some(_)) => None,
-        (Ty::Map(..), Some(m)) => Some((n, m)),
-        (Ty::Map(..), None) => Some((n, "entries")),
+        // `BTreeSet` has the same key-order promise as `BTreeMap`; the
+        // store keeps sets as assoc arrays too, so the SAME sort applies.
+        (Ty::Set(_, order), None) => Some((n, "set", order)),
+        (Ty::Set(..), Some(_)) => None,
+        (Ty::Map(_, _, order), Some(m)) => Some((n, m, order)),
+        (Ty::Map(_, _, order), None) => Some((n, "entries", order)),
         _ => None,
     }
 }

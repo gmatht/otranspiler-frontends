@@ -652,13 +652,14 @@ Three exactness bugs found by the pins, all fixed or documented:
    an array: materialising an array variable must go through
    `arrayItems(x)` (a copy), never `getVar(x)`, or a 3-element source
    arrives as `"aa,b,cc"` and a loop runs once.
-3. **`BTreeMap` iteration order is not modelled**: the store's assoc
-   arrays iterate in INSERTION order, rustc iterates a `BTreeMap` in KEY
-   order. Range-for over a map is exact for an insertion-ordered map
-   (`HashMap`-style use) but not for a `BTreeMap`. This is a pre-existing
-   runtime/representation limit, documented here instead of tuned away:
-   no pin iterates a `BTreeMap`, and `vulkan_backend.rs` only *builds* one
-   (`ext_idx`) — it never iterates it.
+3. ~~**`BTreeMap` iteration order is not modelled**~~ — **CLOSED in v0.37**
+   (see the v0.37 section above the Gate): the container's ordering is now
+   part of its `Ty`, and a `BTreeMap`/`BTreeSet` receiver sorts its key
+   array before the loop. The note is kept for the history: before v0.37
+   the store's assoc arrays iterated in INSERTION order while rustc
+   iterates a `BTreeMap` in KEY order, which made range-for over one
+   inexact (`vulkan_backend.rs` only *builds* one — `ext_idx` — and never
+   iterated it, so nothing pinned the divergence).
 
 One robustness fix this surfaced: the method-dispatch table's struct/enum
 receiver arms were `unreachable!`. A hoisted `if` condition can legitimately
@@ -1429,6 +1430,64 @@ refuse on a FEATURE (`trim_start_matches`, an interior-mutable `.with(..)`, a
 `Vec::with_capacity(n)` length the length model does not track) and the next
 wall is `crate::shir::ast_to_ir` — none of it stderr-shaped, so none of it
 moved.
+
+## v0.37 — `BTreeMap`/`BTreeSet` iteration is key-ordered
+
+The gap was documented, not guessed: the store keeps an assoc in INSERTION
+order, while `BTreeMap`/`BTreeSet` iterate in KEY order (`Ord` on the key
+type), so a range-for over one produced the wrong sequence. The ordering is
+now a fact of the type: `Ty::Map(..)` and `Ty::Set(..)` carry a `MapOrder`
+(`Hash` | `BTree`), set from the annotation (`let m: BTreeMap<K, V>`) and
+from the constructor (`BTreeMap::new()`, `BTreeSet::from([..])`).
+
+### The lowering
+
+A BTree receiver sorts its key array before the loop:
+
+```
+assocKeys(m).sort()     // shell path's `$(… | sort)` array sort, no new runtime member
+```
+
+`assocKeys` already returns a FRESH array, so the sort cannot reach the
+store — the map itself keeps whichever order writes created, and only the
+enumeration is ordered. `HashMap`/`HashSet` are untouched: Rust promises no
+order for them, so the insertion order is a valid enumeration (and no
+lowering may depend on it in the other direction either).
+
+Why no new runtime op was needed: the A1 expression language already
+renders `MethodCall{method:"sort"}` — that is the node the shell `sort`
+fold emits — and rendered callees stay inside the whitelisted `sh2.*` +
+array-method surface.
+
+### Proven by execution
+
+`t124_btreemap_order`: inserts `b, a, c` then iterates `m.keys()` and
+`for (k, v) in &m`, and a second map with `ä`, `Z`, `日` (two non-ASCII BMP
+keys), plus a `BTreeSet` with `y, x`. Native `rustc` and the JS run print the
+same bytes:
+
+```
+a|b|c|a=1|b=2|c=3|Z|ä|日|set x|set y|
+```
+
+`Z < ä < 日` holds in both, which is the point of including them.
+
+### Exactness domain (stated, not assumed)
+
+JS `.sort()` compares UTF-16 code units; Rust `String: Ord` compares UTF-8
+bytes (= code-point order). The two agree for every key whose characters
+all lie in `U+0000..U+FFFF` — ASCII, Latin-1, CJK, everything in the corpus
+fixtures. They can differ only when the first differing character is astral
+(supplementary) on one side and in `U+E000..U+FFFF` on the other, because
+UTF-16 puts the surrogates below `U+E000`. A fully general comparator would
+have to compare code POINTS (e.g. a runtime helper iterating `codePointAt`);
+until one exists, that narrow window is the documented boundary rather than
+a silent claim of universality.
+
+Gate: **82/114 -> 83/115 match, 0 FAIL, 32 SKIP**. Census over the 14
+`src/*_backend.rs` **1793 -> 1793**, `shir.rs` 758, `estree.rs` 92 — no unit
+in those files iterates a `BTreeMap`, so no unit completes; the change is a
+correctness fix for programs that do, not a census mover.
 
 ## Gate
 
