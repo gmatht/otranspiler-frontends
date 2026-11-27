@@ -889,6 +889,141 @@ Measured against `ae27361`:
   receiver, `&mut`, item macros), zero `internal error` / `panicked`
   lines, `vulkan_backend.rs` still `rc=0`.
 
+## v0.33 additions — the item-macro / global-state class
+
+The largest remaining first-blocker cluster was the one thing every
+backend does at the top of its file: declare mutable program state.
+
+```rust
+lazy_static::lazy_static! {
+    static ref NAMES: std::sync::Mutex<HashSet<String>> = Default::default();
+    static ref NOCASEMATCH: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+}
+static COUNT: AtomicUsize = AtomicUsize::new(0);
+thread_local! { static DEPTH: Cell<i64> = Cell::new(0); }
+```
+
+Three separate holes produced it: `ty_from_type` had no arm for the
+interior-mutability wrappers, so `Mutex<T>` was `Unknown`; `Mutex::new`,
+`Cell::new` and `AtomicUsize::new` were unknown call targets; and
+`static`/`lazy_static!`/`thread_local!` refused at the item. Every access
+to the state then refused as well, so each file stopped on line ~16-25.
+
+### The lowering: erase the wrapper, keep the state
+
+JS has one thread, so `Mutex`/`RwLock`/`Cell`/`RefCell` are vacuous and
+an atomic is a plain number. The *state* is real, and the A1 store is
+exactly a global mutable slot, so:
+
+- `Ty::Cel(inner)` — `Mutex<T>`, `RwLock<T>`, `Cell<T>`, `RefCell<T>`
+  (the wrapper erased, `T` kept); `Arc<T>`/`Rc<T>` are transparent;
+  `AtomicUsize`/`U64`/`U32`/`I64`/`I32`/`U8`/`I8`/`AtomicBool` map to
+  `Int`/`Bool`.
+- `Ty::Guard(inner)` — what `lock()`/`read()`/`write()`/`borrow()`/
+  `borrow_mut()` yields; `unwrap()` peels it, so `*S.lock().unwrap()`
+  has the static's type.
+- A static's lifetime IS a store global: the declaration emits one
+  initializer statement at program start (`static_init_stmt`), never a
+  per-call re-init. `static` items, `lazy_static!` (`static ref`) and
+  `thread_local!` (`static`) all register the same way; the macros are
+  parsed for their items and have no other effect.
+- Storage per type: `Set`/`Map` statics use the **named associative
+  store** (`assocEmpty`/`assocSet`/`assocGet`/`assocDel`/`arrayLen` —
+  the same store a `let mut m = HashSet::new()` uses), `Vec` statics a
+  native array, scalar statics their store slot. `Default::default()`
+  is the type's zero value (`0`, `false`, `""`, empty assoc).
+- `let g = S.lock().unwrap();` binds a **handle on the static**, not a
+  copy: `cx.guards` maps `g -> (S, T)` for the function's scope, so a
+  write through `g` is visible to the next `lock()` exactly like Rust.
+
+### The operations (each one Rust's own answer, not an approximation)
+
+| rust | lowered to |
+|---|---|
+| `S.lock().unwrap().insert(k)` | `assocSet(S,k,"1")`, value = "was it absent" |
+| `S.lock().unwrap().remove(k)` | read, `assocDel(S,k)`, value = previous |
+| `contains` / `contains_key` | `assocGet(S,k) != ""` |
+| `len` / `is_empty` | `arrayLen(S)` / `arrayLen(S) == 0` |
+| `clear()` | the assoc reset (empty store) |
+| `get(k)` | `assocGet(S,k)` (the `None ≡ ""` convention) |
+| `*g = v`, `*g += e`, `*g` | store assign / arithmetic update / store read |
+| `g == x`, `g.get()` | store read in a test / in arithmetic |
+| `a.load(o)` / `a.store(v,o)` | store read / store write |
+| `a.fetch_add(e,o)`, `fetch_sub`, `swap` | read into a temp, update, value = OLD |
+| `C.with(|c| c.get())` | store read |
+| `C.with(|c| c.set(v))` | store write |
+| `C.with(|c| c.replace(v))` | evaluate `v`, read old, write, value = old |
+
+The `Ordering` argument of an atomic has no observable effect with one
+thread (Rust constrains only cross-thread order), so it is dropped where
+rustc can observe nothing. Nothing else is guessed.
+
+### Kept refused, with the cause
+
+- **A static collection has no value form** (pin `t110`): `.clone()` of a
+  `Mutex<HashSet<..>>` static would need a deep copy of a *named* assoc
+  under a new name, and `.iter()` order is the store's insertion order,
+  not the set's — a HashSet has no order Rust can observe. Both refuse
+  (`clone/iter of a collection`) instead of producing a second store.
+  `Mutex<Option<T>>.take()`/`.as_ref()` chains refuse for the same
+  reason: an option-of-collection would need a copy.
+- **`include!(concat!(env!("OUT_DIR"), ..))`** in
+  `render_ext_estree/mod.rs` stays refused: the included code is
+  generated at build time and is not in the source, so there is nothing
+  to lower. That file keeps its 2 blocked units.
+
+### Two correctness fixes this required
+
+- `static` initializers used to be lowered with plain `value_expr`,
+  which is why `Mutex::new(0)` was an *unknown function* refusal even for
+  a legal static; they now go through `static_init_stmt`.
+- A function's **tail expression** dropped its hoisted statements, so an
+  atomic RMW in tail position read the temp before writing it (the
+  counter silently kept its old value). `function_def` now drains
+  `pending` before the `Return`.
+
+`const` items also fold integer expressions now (`1 << 53`, bit ops,
+checked), which removed the blocker that stood after this class on the
+JS path.
+
+### Measured
+
+Gate (`harness/frontend-stdout.sh rust`, native `rustc` vs A1→ESTree→JS):
+
+| pin | shape | native stdout |
+|---|---|---|
+| t107 | atomic statics: `fetch_add`/`fetch_sub`/`swap`/`store`/`load` in `main` and in a tail slot | `0 3 5 100 5` |
+| t108 | `Mutex<i64>`/`Mutex<bool>`: alias handle, `*g += n`, `*g = v`, `*g` read, `*g == v`, `if *g` | `5 7 on seven` |
+| t109 | `thread_local!` `Cell<i64>`: `with(\|c\| c.set(c.get()+1))`, `replace`, `get` | `2 10 42` |
+
+t110 is the refusal pin above. Gate: **73/97 match, 0 FAIL, 24 SKIP** ->
+**76/101 match, 0 FAIL, 25 SKIP**.
+
+`--census` over the 14 `src/*_backend.rs`: **1815 -> 1801** blocked units
+— `fish_backend.rs` 164 -> 159, `sh_backend.rs` 70 -> 66,
+`zsh_backend.rs` 78 -> 76, `rust_backend.rs` 352 -> 349, the other ten
+unchanged. No file's first blocker is `lazy_static!`/`thread_local!`/
+`Mutex::new`/`AtomicUsize::new` any more; they now stop on other classes
+(fish/sh/zsh on nested item declarations, rust on a condition operand,
+c on an enum receiver).
+
+The JS path itself moved the most: `shir.rs` refused at
+`Mutex::new` (line 25) in whole-program mode and now refuses at
+`unwrap_or` (line 45); `estree.rs` is unchanged (93, the
+iterator-length class).
+
+Whole-tree dogfood: **LOWERED 18/254**, `EXIT=0`, no `internal error`
+and no `panicked` line, and no `lazy_static!`/`thread_local!`/
+`Mutex::new`/`AtomicUsize::new` first blocker anywhere in the tree.
+
+What is *not* proven by execution: a `lazy_static!` set static cannot be
+compiled by the gate's rustc (no crates are available to it), so the
+collection branch is pinned by composition — the assoc primitives
+(`t81`) plus the handle layer (`t108`) — while the runnable pins cover
+atomics, `Mutex` scalars and `thread_local!` `Cell`. A candidate pin that
+re-locks a `Mutex` while the guard is alive deadlocks native rustc and
+was removed for that reason, not because the lowering failed.
+
 ## Gate
 
 `make test` = refusal pins + ingress acceptance (`debashc

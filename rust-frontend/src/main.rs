@@ -253,6 +253,13 @@ enum Ty {
     /// the runtime getVar's unset->""). Sound whenever no code
     /// distinguishes Some("") from None.
     Opt(Box<Ty>),
+    /// `Mutex<T>` / `RwLock<T>` / `Cell<T>` / `RefCell<T>` — interior
+    /// mutability. Single-threaded JS makes the wrapper vacuous, so the
+    /// static IS a mutable global; only its inner type is represented.
+    Cel(Box<Ty>),
+    /// what `.lock()` / `.borrow_mut()` / `.borrow()` yields: still the
+    /// wrapper's shape, peeled by `.unwrap()` (a guard is not a value).
+    Guard(Box<Ty>),
     Unknown,
 }
 
@@ -285,9 +292,48 @@ fn ty_from_type(t: &syn::Type, cx: &Cx) -> Ty {
                 };
                 return Ty::Opt(elem.unwrap_or(Box::new(Ty::Unknown)));
             }
+            // interior-mutability wrappers are erased: JS is single-
+            // threaded, so a Mutex/RwLock/Cell static IS a plain global.
+            // The wrapper's inner type is what the store carries.
+            if matches!(
+                seg.ident.to_string().as_str(),
+                "Mutex" | "RwLock" | "Cell" | "RefCell"
+            ) {
+                let inner = match &seg.arguments {
+                    syn::PathArguments::AngleBracketed(a) => a
+                        .args
+                        .iter()
+                        .find_map(|arg| match arg {
+                            syn::GenericArgument::Type(t) => Some(ty_from_type(t, cx)),
+                            _ => None,
+                        })
+                        .unwrap_or(Ty::Unknown),
+                    _ => Ty::Unknown,
+                };
+                return Ty::Cel(Box::new(inner));
+            }
+            // Arc/Rc are allocator wrappers (no alias hazard: a shared
+            // borrow cannot mutate through the original)
+            if matches!(seg.ident.to_string().as_str(), "Arc" | "Rc") {
+                return match &seg.arguments {
+                    syn::PathArguments::AngleBracketed(a) => a
+                        .args
+                        .iter()
+                        .find_map(|arg| match arg {
+                            syn::GenericArgument::Type(t) => Some(ty_from_type(t, cx)),
+                            _ => None,
+                        })
+                        .unwrap_or(Ty::Unknown),
+                    _ => Ty::Unknown,
+                };
+            }
             match seg.ident.to_string().as_str() {
                 "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32"
                 | "u64" | "u128" | "usize" => Ty::Int,
+                // atomic integers: single-threaded JS makes every
+                // ordering vacuous and the counter a plain number
+                "AtomicUsize" | "AtomicU64" | "AtomicU32" | "AtomicI64" | "AtomicI32"
+                | "AtomicU8" | "AtomicI8" => Ty::Int,
                 "str" | "String" | "Cow" => Ty::Str,
                 "bool" => Ty::Bool,
                 "AtomicBool" => Ty::AtomicBool,
@@ -374,6 +420,61 @@ fn const_str_array(e: &syn::Expr) -> Option<Vec<String>> {
 }
 
 /// A signature's declared return Ty (`-> T`), Unknown when unit/absent.
+/// One `static` read out of an item-level macro (`lazy_static!` /
+/// `thread_local!`), before it becomes a store global.
+struct MacroStatic {
+    name: String,
+    ty: Ty,
+    init: Option<syn::Expr>,
+}
+
+/// `lazy_static! { static ref NAME: TY = EXPR; .. }` — the macro's whole
+/// effect IS those items (a lazily-initialized static is a static), so
+/// reading them back out of the token stream is exact.
+struct LazyStatics(Vec<(syn::Ident, syn::Type, syn::Expr)>);
+
+impl syn::parse::Parse for LazyStatics {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        let mut v = Vec::new();
+        while !input.is_empty() {
+            // doc comments / attributes on the item (`/// ..`) are
+            // type-checker-invisible here but must parse
+            syn::Attribute::parse_outer(input)?;
+            input.parse::<syn::Token![static]>()?;
+            input.parse::<syn::Token![ref]>()?;
+            let name: syn::Ident = input.parse()?;
+            input.parse::<syn::Token![:]>()?;
+            let ty: syn::Type = input.parse()?;
+            input.parse::<syn::Token![=]>()?;
+            let init: syn::Expr = input.parse()?;
+            input.parse::<syn::Token![;]>()?;
+            v.push((name, ty, init));
+        }
+        Ok(LazyStatics(v))
+    }
+}
+
+/// `thread_local! { static NAME: TY = EXPR; .. }` (same shape, no `ref`).
+struct ThreadLocals(Vec<(syn::Ident, syn::Type, syn::Expr)>);
+
+impl syn::parse::Parse for ThreadLocals {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        let mut v = Vec::new();
+        while !input.is_empty() {
+            syn::Attribute::parse_outer(input)?;
+            input.parse::<syn::Token![static]>()?;
+            let name: syn::Ident = input.parse()?;
+            input.parse::<syn::Token![:]>()?;
+            let ty: syn::Type = input.parse()?;
+            input.parse::<syn::Token![=]>()?;
+            let init: syn::Expr = input.parse()?;
+            input.parse::<syn::Token![;]>()?;
+            v.push((name, ty, init));
+        }
+        Ok(ThreadLocals(v))
+    }
+}
+
 fn ret_ty(output: &syn::ReturnType, cx: &Cx) -> Ty {
     match output {
         syn::ReturnType::Default => Ty::Unknown,
@@ -555,6 +656,10 @@ struct Cx {
     /// None at module level and inside free fns, where `Self` is not a
     /// legal path in Rust either.
     self_ty: std::cell::RefCell<Option<String>>,
+    /// guard alias -> (static name, inner Ty): `let g = NAME.lock().
+    /// unwrap();` binds a HANDLE on the static, not a copy, so every use
+    /// of `g` reads/writes `NAME`. Per-function scope (cleared with vars).
+    guards: std::cell::RefCell<HashMap<String, (String, Ty)>>,
 }
 
 /// Const-evaluate an expression to i64 if possible (literal / -literal /
@@ -579,6 +684,27 @@ fn const_int(e: &syn::Expr, cx: &Cx) -> Option<i64> {
                 Some(v)
             } else {
                 None
+            }
+        }
+        // compile-time integer arithmetic, including the bit/shift ops a
+        // bound constant like `1 << 53` uses (checked, so an overflow is
+        // never silently wrapped)
+        syn::Expr::Binary(b) => {
+            use syn::BinOp::*;
+            let l = const_int(&b.left, cx)?;
+            let r = const_int(&b.right, cx)?;
+            match b.op {
+                Add(_) => l.checked_add(r),
+                Sub(_) => l.checked_sub(r),
+                Mul(_) => l.checked_mul(r),
+                Div(_) if r != 0 => l.checked_div(r),
+                Rem(_) if r != 0 => l.checked_rem(r),
+                Shl(_) if (0..64).contains(&r) => l.checked_shl(r as u32),
+                Shr(_) if (0..64).contains(&r) => l.checked_shr(r as u32),
+                BitAnd(_) => Some(l & r),
+                BitOr(_) => Some(l | r),
+                BitXor(_) => Some(l ^ r),
+                _ => None,
             }
         }
         _ => None,
@@ -1163,13 +1289,45 @@ fn main() {
     for item in &flat {
         match item {
             syn::Item::Const(c) => {
-                cx.globals.push(assign_stmt(&c.ident.to_string(), value_expr(&c.expr, &cx)));
+                // a CONST is its folded value: emitting the literal (never
+                // re-evaluating the expression at run time) is exact, and
+                // it is the text every folded use already reads
                 if let Some(v) = const_int(&c.expr, &cx) {
+                    cx.globals
+                        .push(assign_stmt(&c.ident.to_string(), str_lit(&v.to_string())));
                     cx.ints.insert(c.ident.to_string(), v);
+                } else {
+                    let ce = &c.expr;
+                    let lowered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        value_expr(ce, &cx)
+                    }));
+                    match lowered {
+                        Ok(v) => cx.globals.push(assign_stmt(&c.ident.to_string(), v)),
+                        Err(p) => census_hit("const", &c.ident.to_string(), p),
+                    }
                 }
                 if let Some(lits) = const_str_array(&c.expr) {
                     cx.const_arrays.insert(c.ident.to_string(), lits);
                 }
+            }
+            // item-level global-state macros: `lazy_static!` and
+            // `thread_local!` only DECLARE statics (with a lazy
+            // initializer); both are registered exactly like a plain
+            // `static`, and their accesses go through the guard layer.
+            syn::Item::Macro(m) => {
+                let mac = m
+                    .mac
+                    .path
+                    .segments
+                    .last()
+                    .map(|s| s.ident.to_string())
+                    .unwrap_or_default();
+                // `lazy_static!` / `thread_local!` only DECLARE statics;
+                // they are registered in the ITEM pass below (still
+                // before any function is lowered), so a malformed body
+                // is censused at its own item instead of aborting the
+                // whole unit.
+                let _ = (&mac, m);
             }
             syn::Item::Static(s) => {
                 if let Some(lits) = const_str_array(&s.expr) {
@@ -1178,8 +1336,12 @@ fn main() {
                 // the static's declared type persists in its own map
                 // (infer_ty consults it even after per-fn clears)
                 let ty = ty_from_type(&s.ty, &cx);
+                // the initializer goes through the STATIC rules: a wrapper
+                // ctor (`Mutex::new(v)`) is the wrapper's state, a
+                // collection is its named assoc store, a scalar its slot
+                let init = static_init_stmt(&s.ident.to_string(), &ty, Some(&s.expr), &cx);
                 cx.statics.borrow_mut().insert(s.ident.to_string(), ty);
-                cx.globals.push(assign_stmt(&s.ident.to_string(), value_expr(&s.expr, &cx)));
+                cx.globals.push(init);
                 if let Some(v) = const_int(&s.expr, &cx) {
                     cx.ints.insert(s.ident.to_string(), v);
                 }
@@ -1328,22 +1490,46 @@ fn main() {
             | syn::Item::Union(_)
             | syn::Item::Type(_)
             | syn::Item::Trait(_) => {}
-            // `macro_rules!` DEFINITIONS have no runtime effect; unknown
-            // INVOCATIONS still refuse at their site. Any other item-level
-            // macro (lazy_static! etc. creates state) refuses.
+            // `macro_rules!` DEFINITIONS have no runtime effect; the two
+            // state macros were registered in the pre-pass above. Unknown
+            // INVOCATIONS still refuse at their site (`include!` splices
+            // build-generated code — no source to lower).
             syn::Item::Macro(m) => {
-                let is_rules = m
+                let name = m
                     .mac
                     .path
                     .segments
                     .last()
-                    .map(|s| s.ident == "macro_rules")
-                    .unwrap_or(false);
-                if !is_rules {
-                    refuse(
+                    .map(|s| s.ident.to_string())
+                    .unwrap_or_default();
+                match name.as_str() {
+                    "macro_rules" => {}
+                    "lazy_static" | "thread_local" => {
+                        let items = if name == "lazy_static" {
+                            syn::parse2::<LazyStatics>(m.mac.tokens.clone())
+                                .unwrap_or_else(|e| refuse("lazy_static! body", e.span()))
+                                .0
+                        } else {
+                            syn::parse2::<ThreadLocals>(m.mac.tokens.clone())
+                                .unwrap_or_else(|e| refuse("thread_local! body", e.span()))
+                                .0
+                        };
+                        for (n, t, i) in items {
+                            // the static's store name is the Rust name; its
+                            // declared shape is what every access resolves
+                            // against (Ty::Cel for the wrappers)
+                            let sname = n.to_string();
+                            let ty = ty_from_type(&t, &cx);
+                            cx.statics.borrow_mut().insert(sname.clone(), ty.clone());
+                            cx.bindings.insert(sname.clone());
+                            let init = static_init_stmt(&sname, &ty, Some(&i), &cx);
+                            cx.globals.push(init);
+                        }
+                    }
+                    _ => refuse(
                         "item-level macro invocation (creates state / selects code)",
                         m.span(),
-                    );
+                    ),
                 }
             }
             syn::Item::Fn(f) => {
@@ -1642,6 +1828,16 @@ fn lower_local(
         // no-op in the store model, exactly like c-sh-go's dropped `int i;`.
         return None;
     };
+    // `let g = NAME.lock().unwrap();` binds a HANDLE on the static — not a
+    // copy — so every later use of `g` reads/writes `NAME`. No statement
+    // is emitted (the guard's only effect is holding the lock, which a
+    // single-threaded runtime does not model).
+    if let Some((sname, inner)) = guard_handle(&init.expr, cx) {
+        if is_scalar_store_ty(&inner) || matches!(inner, Ty::Set(_) | Ty::Map(..)) {
+            cx.guards.borrow_mut().insert(name.clone(), (sname, inner));
+            return None;
+        }
+    }
     // `let mut m = HashMap::new()` / `HashSet::from([..])` — a NAMED
     // associative store; an explicit type annotation supplies K/V.
     if let Some((mut ty, entries)) = map_ctor(&init.expr, cx) {
@@ -1936,6 +2132,33 @@ fn infer_ty(e: &syn::Expr, cx: &Cx) -> Ty {
         // method-call result types (the small proven family)
         syn::Expr::MethodCall(m) => {
             let rty = infer_ty(&m.receiver, cx);
+            // a static guard / an interior-mutability wrapper: the
+            // single-threaded runtime erases the wrapper
+            if let Some((_, inner)) = static_guard(&m.receiver, cx) {
+                match (&inner, m.method.to_string().as_str()) {
+                    (Ty::Set(_), "contains" | "insert" | "remove" | "is_empty")
+                    | (Ty::Map(..), "contains_key" | "is_empty") => return Ty::Bool,
+                    (Ty::Map(_, v), "get" | "insert" | "remove") => {
+                        return Ty::Opt(v.clone())
+                    }
+                    (Ty::Set(_), "len") | (Ty::Map(..), "len") => return Ty::Int,
+                    _ => {}
+                }
+            }
+            if let Ty::Cel(t) = &rty {
+                match m.method.to_string().as_str() {
+                    "lock" | "read" | "write" | "borrow" | "borrow_mut" => {
+                        return Ty::Guard(t.clone())
+                    }
+                    "get" | "replace" | "set" | "take" => return (**t).clone(),
+                    _ => {}
+                }
+            }
+            if let Ty::Guard(t) = &rty {
+                if m.method == "unwrap" {
+                    return (**t).clone();
+                }
+            }
             match m.method.to_string().as_str() {
                 // identity-shaped reads keep the receiver's option-ness
                 "as_deref" | "unwrap_or_default" => rty,
@@ -2145,7 +2368,12 @@ fn lower_expr_stmt(e: &syn::Expr, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) ->
             // `flag.store(v, Ordering::..)` on an AtomicBool static — a
             // plain assignment (single-threaded runtime: exact).
             if m.method == "store" {
-                if let Ty::AtomicBool = infer_ty(&m.receiver, cx) {
+                // an atomic BOOL or INT static: single-threaded, so the
+                // store IS the assignment (the ordering arg is unused)
+                if matches!(
+                    infer_ty(&m.receiver, cx),
+                    Ty::AtomicBool | Ty::Int
+                ) {
                     let Some(syn::Expr::Path(p)) = Some(m.receiver.as_ref()) else {
                         refuse("atomic store target path", m.receiver.span());
                     };
@@ -2160,6 +2388,27 @@ fn lower_expr_stmt(e: &syn::Expr, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) ->
                         &name.to_string(),
                         value_expr(val, cx),
                     ));
+                }
+            }
+            // `NAME.lock().unwrap().clear();` — an empty assoc store
+            if m.method == "clear" && m.args.is_empty() {
+                if let Some((sname, inner)) = static_guard(&m.receiver, cx) {
+                    if matches!(inner, Ty::Set(_) | Ty::Map(..)) {
+                        return Some(assoc_empty_stmt(&sname));
+                    }
+                    refuse("clear on a non-collection static", m.span());
+                }
+            }
+            // `NAME.with(|c| c.set(v));` — the Cell write
+            if m.method == "with" && m.args.len() == 1 {
+                if let syn::Expr::Path(p) = &*m.receiver {
+                    if let Some(n) = single_path(p).map(|i| i.to_string()) {
+                        if let Some(Ty::Cel(inner)) = cx.statics.borrow().get(&n).cloned() {
+                            if let Some(v) = cell_with(&n, &inner, &m.args[0], cx) {
+                                return Some(expr_stmt(v));
+                            }
+                        }
+                    }
                 }
             }
             // IMPURE statement-position mutators. Both are exactly
@@ -2291,6 +2540,22 @@ fn lower_expr_stmt(e: &syn::Expr, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) ->
 }
 
 fn plain_assign(a: &syn::ExprAssign, cx: &Cx, out: &mut Vec<Value>) -> Value {
+    // `*NAME.lock().unwrap() = v` — a write through a guard writes the
+    // static (the lock is vacuous single-threaded). Collections have no
+    // value form, so only scalar statics take this path.
+    if let syn::Expr::Unary(u) = &*a.left {
+        if matches!(u.op, syn::UnOp::Deref(_)) {
+            if let Some((sname, inner)) = static_guard(&u.expr, cx) {
+                if !is_scalar_store_ty(&inner) {
+                    refuse(
+                        "static collection has no value form (use its operations)",
+                        a.left.span(),
+                    );
+                }
+                return assign_stmt(&sname, value_expr(&a.right, cx));
+            }
+        }
+    }
     if let syn::Expr::Index(ix) = &*a.left {
         let Some(syn::Expr::Path(p)) = Some(&*ix.expr) else {
             refuse("element assignment on a non-variable array", ix.expr.span());
@@ -2376,6 +2641,33 @@ fn plain_assign(a: &syn::ExprAssign, cx: &Cx, out: &mut Vec<Value>) -> Value {
 }
 
 fn compound_assign(b: &syn::ExprBinary, cx: &Cx, out: &mut Vec<Value>) -> Value {
+    // `*NAME.lock().unwrap() += e` — the arithmetic on the static's slot
+    if let syn::Expr::Unary(u) = &*b.left {
+        if matches!(u.op, syn::UnOp::Deref(_)) {
+            if let Some((sname, inner)) = static_guard(&u.expr, cx) {
+                if !is_scalar_store_ty(&inner) {
+                    refuse(
+                        "static collection has no value form (use its operations)",
+                        b.left.span(),
+                    );
+                }
+                use syn::BinOp::*;
+                let op = match b.op {
+                    AddAssign(_) => "+",
+                    SubAssign(_) => "-",
+                    MulAssign(_) => "*",
+                    DivAssign(_) => "/",
+                    RemAssign(_) => "%",
+                    _ => refuse(
+                        "compound assignment operator on a static guard",
+                        b.op.span(),
+                    ),
+                };
+                let nv = arith_bin(op, arith_var(&sname), arith_expr(&b.right, cx));
+                return assign_stmt(&sname, nv);
+            }
+        }
+    }
     if let syn::Expr::Index(ix) = &*b.left {
         use syn::BinOp::*;
         let op = match b.op {
@@ -3617,6 +3909,370 @@ fn array_len_call(name: &str) -> Value {
 /// read, or a PURE method chain over those (store reads like
 /// `map.get(k).copied()`). Evaluating one twice — a marker test and the
 /// value branch — is the same read twice, so the result is identical.
+// ── interior-mutability statics (static / lazy_static! / thread_local!) ──
+//
+// JS is single-threaded, so `Mutex`/`RwLock`/`Cell`/`RefCell` are vacuous
+// wrappers and an atomic is a plain number: the static IS a mutable
+// global, which is exactly what the A1 store is. Every access shape below
+// is the store/assoc operation Rust performs — `insert` still answers
+// "was it absent", `remove`/`get` still answer the previous value, `len`
+// is the store's key count — so nothing is guessed. What has NO exact
+// form (iteration order of a HashSet, a clone of a named assoc, a Vec
+// static's build) refuses at its own site.
+
+/// Peel `const { e }` / `X::new(arg)` down to the initializer's value.
+fn static_init_value(e: &syn::Expr, cx: &Cx) -> Option<Value> {
+    match e {
+        syn::Expr::Call(c) => {
+            let syn::Expr::Path(p) = &*c.func else { return None };
+            let last = p.path.segments.last()?.ident.to_string();
+            // `Mutex::new(v)` / `Cell::new(v)` / `AtomicUsize::new(0)`:
+            // the wrapper's state is the argument
+            if last == "new" && c.args.len() == 1 {
+                return static_init_value(&c.args[0], cx);
+            }
+            None
+        }
+        syn::Expr::Block(b) => b
+            .block
+            .stmts
+            .last()
+            .and_then(|s| match s {
+                syn::Stmt::Expr(e, _) => Some(e),
+                _ => None,
+            })
+            .and_then(|e| static_init_value(e, cx)),
+        syn::Expr::Const(c) => c
+            .block
+            .stmts
+            .last()
+            .and_then(|s| match s {
+                syn::Stmt::Expr(e, _) => Some(e),
+                _ => None,
+            })
+            .and_then(|e| static_init_value(e, cx)),
+        syn::Expr::Lit(l) => match &l.lit {
+            syn::Lit::Bool(b) => Some(str_lit(if b.value() { "true" } else { "false" })),
+            syn::Lit::Int(i) => Some(str_lit(&int_text(i))),
+            syn::Lit::Str(s) => Some(str_lit(&s.value())),
+            _ => None,
+        },
+        syn::Expr::Path(p) => match single_path(p).map(|i| i.to_string()) {
+            Some(n) if n == "None" => Some(str_lit("")),
+            _ => None,
+        },
+        syn::Expr::Paren(p) => static_init_value(&p.expr, cx),
+        _ => None,
+    }
+}
+
+/// The type's zero value — what `Default::default()` means for a static.
+fn static_zero(ty: &Ty) -> Value {
+    match ty {
+        Ty::Bool | Ty::AtomicBool => str_lit("false"),
+        Ty::Int => str_lit("0"),
+        _ => str_lit(""),
+    }
+}
+
+/// `Option<T>` statics: `None` is the store's empty value, `Some(lit)` is
+/// the literal (the None≡"" convention every option read already uses).
+fn static_init_scalar(e: &syn::Expr, ty: &Ty, cx: &Cx) -> Option<Value> {
+    if matches!(ty, Ty::Opt(_)) {
+        if let syn::Expr::Call(c) = e {
+            if let syn::Expr::Path(p) = &*c.func {
+                if p.path.segments.last().map(|s| s.ident == "Some").unwrap_or(false)
+                    && c.args.len() == 1
+                {
+                    return static_init_value(&c.args[0], cx);
+                }
+            }
+        }
+    }
+    static_init_value(e, cx)
+}
+
+/// The program-start statement that gives a static its initial value.
+fn static_init_stmt(name: &str, ty: &Ty, init: Option<&syn::Expr>, cx: &Cx) -> Value {
+    let inner = match ty {
+        Ty::Cel(t) => t.as_ref(),
+        t => t,
+    };
+    match inner {
+        // a collection lives in the NAMED associative store, never in the
+        // scalar value slot
+        Ty::Set(_) | Ty::Map(..) => assoc_empty_stmt(name),
+        // a Vec static is a native array (setVar preserves the array)
+        Ty::Arr(..) => set_array_stmt(name, Vec::new()),
+        _ => {
+            let v = init
+                .and_then(|e| static_init_scalar(e, inner, cx))
+                .unwrap_or_else(|| static_zero(inner));
+            assign_stmt(name, v)
+        }
+    }
+}
+
+/// Types whose value the scalar store can carry (a guard read is the read).
+fn is_scalar_store_ty(t: &Ty) -> bool {
+    matches!(t, Ty::Int | Ty::Str | Ty::Bool | Ty::AtomicBool | Ty::Opt(_))
+}
+
+/// The static behind a guard expression: `NAME.lock().unwrap()`,
+/// `NAME.borrow_mut()`, `*GUARD`, or a guard ALIAS bound earlier.
+/// Returns (static store name, inner Ty).
+fn static_guard(e: &syn::Expr, cx: &Cx) -> Option<(String, Ty)> {
+    if let syn::Expr::Unary(u) = e {
+        if matches!(u.op, syn::UnOp::Deref(_)) {
+            return static_guard(&u.expr, cx);
+        }
+    }
+    guard_handle(e, cx)
+}
+
+/// The guard HANDLE itself (not a `*guard` read): an alias variable or a
+/// `NAME.lock().unwrap()` / `NAME.borrow_mut()` chain.
+fn guard_handle(e: &syn::Expr, cx: &Cx) -> Option<(String, Ty)> {
+    if let syn::Expr::Path(p) = e {
+        let n = single_path(p)?.to_string();
+        return cx.guards.borrow().get(&n).cloned();
+    }
+    let syn::Expr::MethodCall(m) = e else { return None };
+    // `guard.unwrap()` peels the guard wrapper
+    if m.method == "unwrap" && m.args.is_empty() {
+        return guard_handle(&m.receiver, cx);
+    }
+    if matches!(
+        m.method.to_string().as_str(),
+        "lock" | "read" | "write" | "borrow" | "borrow_mut"
+    ) && m.args.is_empty()
+    {
+        if let syn::Expr::Path(p) = &*m.receiver {
+            let n = single_path(p)?.to_string();
+            if let Some(Ty::Cel(inner)) = cx.statics.borrow().get(&n).cloned() {
+                return Some((n, *inner));
+            }
+        }
+    }
+    None
+}
+
+/// `&x` / `x` as a VALUE expression (the assoc helpers take values).
+fn ref_arg(e: &syn::Expr, cx: &Cx) -> Value {
+    match e {
+        syn::Expr::Reference(r) => value_expr(&r.expr, cx),
+        other => value_expr(other, cx),
+    }
+}
+
+/// A store temp holding `expr` (evaluates ONCE — Rust evaluates an
+/// argument once, and every helper that needs the key twice must too).
+fn hoist_value(expr: &syn::Expr, prefix: &str, cx: &Cx) -> String {
+    let t = fresh_tmp(cx, prefix);
+    cx.pending.borrow_mut().push(store_stmt(&t, value_expr(expr, cx)));
+    cx.vars.borrow_mut().insert(t.clone(), Ty::Str);
+    t
+}
+
+/// A method ON a static guard: the static's own store/assoc operation.
+/// None means "no exact form" — the caller falls through to the normal
+/// method table (which refuses).
+fn static_guard_method(name: &str, inner: &Ty, m: &syn::ExprMethodCall, cx: &Cx) -> Option<Value> {
+    let meth = m.method.to_string();
+    let assoc_get = |key: Value| assoc_call("assocGet", vec![str_lit(name), key]);
+    match inner {
+        Ty::Set(_) => match meth.as_str() {
+            "contains" if m.args.len() == 1 => {
+                let key = ref_arg(&m.args[0], cx);
+                let g = fresh_tmp(cx, "k");
+                cx.pending.borrow_mut().push(assign_stmt(&g, assoc_get(key)));
+                cx.vars.borrow_mut().insert(g.clone(), Ty::Str);
+                Some(cond_value(
+                    "c",
+                    format!("\"${g}\" != \"\""),
+                    str_lit("true"),
+                    str_lit("false"),
+                    cx,
+                ))
+            }
+            "insert" if m.args.len() == 1 => {
+                let kt = hoist_value(ref_arg_src(&m.args[0]), "q", cx);
+                let g = fresh_tmp(cx, "k");
+                cx.pending
+                    .borrow_mut()
+                    .push(assign_stmt(&g, assoc_get(get_var(&kt))));
+                cx.vars.borrow_mut().insert(g.clone(), Ty::Str);
+                cx.pending.borrow_mut().push(assoc_set_stmt(
+                    name,
+                    get_var(&kt),
+                    str_lit("1"),
+                ));
+                // newly inserted <=> the key was absent before
+                Some(cond_value(
+                    "c",
+                    format!("\"${g}\" = \"\""),
+                    str_lit("true"),
+                    str_lit("false"),
+                    cx,
+                ))
+            }
+            "remove" if m.args.len() == 1 => {
+                let kt = hoist_value(ref_arg_src(&m.args[0]), "q", cx);
+                let g = fresh_tmp(cx, "k");
+                cx.pending
+                    .borrow_mut()
+                    .push(assign_stmt(&g, assoc_get(get_var(&kt))));
+                cx.vars.borrow_mut().insert(g.clone(), Ty::Str);
+                cx.pending.borrow_mut().push(expr_stmt(assoc_call(
+                    "assocDel",
+                    vec![str_lit(name), get_var(&kt)],
+                )));
+                Some(cond_value(
+                    "c",
+                    format!("\"${g}\" != \"\""),
+                    str_lit("true"),
+                    str_lit("false"),
+                    cx,
+                ))
+            }
+            "len" if m.args.is_empty() => Some(array_len_call(name)),
+            "is_empty" if m.args.is_empty() => {
+                let g = fresh_tmp(cx, "n");
+                cx.pending
+                    .borrow_mut()
+                    .push(assign_stmt(&g, array_len_call(name)));
+                cx.vars.borrow_mut().insert(g.clone(), Ty::Int);
+                Some(cond_value(
+                    "c",
+                    format!("${g} -eq 0"),
+                    str_lit("true"),
+                    str_lit("false"),
+                    cx,
+                ))
+            }
+            _ => None,
+        },
+        Ty::Map(_, _) => match meth.as_str() {
+            "contains_key" if m.args.len() == 1 => {
+                let key = ref_arg(&m.args[0], cx);
+                let g = fresh_tmp(cx, "k");
+                cx.pending.borrow_mut().push(assign_stmt(&g, assoc_get(key)));
+                cx.vars.borrow_mut().insert(g.clone(), Ty::Str);
+                Some(cond_value(
+                    "c",
+                    format!("\"${g}\" != \"\""),
+                    str_lit("true"),
+                    str_lit("false"),
+                    cx,
+                ))
+            }
+            // HashMap::get answers Option<&V>: the stored text, or the
+            // absent marker (the None≡"" convention)
+            "get" if m.args.len() == 1 => Some(assoc_get(ref_arg(&m.args[0], cx))),
+            // insert/remove answer the PREVIOUS value (Option<V>)
+            "insert" if m.args.len() == 2 => {
+                let kt = hoist_value(ref_arg_src(&m.args[0]), "q", cx);
+                let vt = hoist_value(ref_arg_src(&m.args[1]), "v", cx);
+                let old = fresh_tmp(cx, "p");
+                cx.pending
+                    .borrow_mut()
+                    .push(assign_stmt(&old, assoc_get(get_var(&kt))));
+                cx.vars.borrow_mut().insert(old.clone(), Ty::Str);
+                cx.pending.borrow_mut().push(assoc_set_stmt(
+                    name,
+                    get_var(&kt),
+                    get_var(&vt),
+                ));
+                Some(get_var(&old))
+            }
+            "remove" if m.args.len() == 1 => {
+                let kt = hoist_value(ref_arg_src(&m.args[0]), "q", cx);
+                let old = fresh_tmp(cx, "p");
+                cx.pending
+                    .borrow_mut()
+                    .push(assign_stmt(&old, assoc_get(get_var(&kt))));
+                cx.vars.borrow_mut().insert(old.clone(), Ty::Str);
+                cx.pending.borrow_mut().push(expr_stmt(assoc_call(
+                    "assocDel",
+                    vec![str_lit(name), get_var(&kt)],
+                )));
+                Some(get_var(&old))
+            }
+            "len" if m.args.is_empty() => Some(array_len_call(name)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `&x` unwrapped for hoisting (the borrow erases).
+fn ref_arg_src(e: &syn::Expr) -> &syn::Expr {
+    match e {
+        syn::Expr::Reference(r) => &r.expr,
+        other => other,
+    }
+}
+
+/// `NAME.with(|c| c.get() / c.set(v) / c.replace(v))` on a Cell static.
+fn cell_with(name: &str, inner: &Ty, arg: &syn::Expr, cx: &Cx) -> Option<Value> {
+    let syn::Expr::Closure(cl) = arg else { return None };
+    if cl.inputs.len() != 1 {
+        return None;
+    }
+    let syn::Pat::Ident(pi) = &cl.inputs[0] else { return None };
+    let pname = pi.ident.to_string();
+    let body: &syn::Expr = match &*cl.body {
+        syn::Expr::Block(b) => {
+            let mut only: Option<&syn::Expr> = None;
+            for s in &b.block.stmts {
+                match s {
+                    syn::Stmt::Expr(e, _) => {
+                        if only.is_some() {
+                            return None;
+                        }
+                        only = Some(e);
+                    }
+                    _ => return None,
+                }
+            }
+            only?
+        }
+        e => e,
+    };
+    let syn::Expr::MethodCall(m) = body else { return None };
+    let syn::Expr::Path(rp) = &*m.receiver else { return None };
+    if single_path(rp).map(|i| i.to_string()).as_deref() != Some(pname.as_str()) {
+        return None;
+    }
+    // INSIDE the closure the param IS the Cell: `c.get()` reads the
+    // static, and any other use resolves through the same handle
+    cx.guards
+        .borrow_mut()
+        .insert(pname.clone(), (name.to_string(), inner.clone()));
+    let out = match m.method.to_string().as_str() {
+        "get" if m.args.is_empty() => Some(get_var(name)),
+        "set" if m.args.len() == 1 => {
+            let v = value_expr(&m.args[0], cx);
+            cx.pending.borrow_mut().push(assign_stmt(name, v));
+            Some(str_lit(""))
+        }
+        "replace" if m.args.len() == 1 => {
+            // the NEW value evaluates first, then the old one is read
+            let vt = hoist_value(&m.args[0], "v", cx);
+            let old = fresh_tmp(cx, "p");
+            cx.pending
+                .borrow_mut()
+                .push(assign_stmt(&old, get_var(name)));
+            cx.vars.borrow_mut().insert(old.clone(), Ty::Str);
+            cx.pending.borrow_mut().push(assign_stmt(name, get_var(&vt)));
+            Some(get_var(&old))
+        }
+        _ => None,
+    };
+    cx.guards.borrow_mut().remove(&pname);
+    out
+}
+
 fn pure_receiver(e: &syn::Expr) -> bool {
     match e {
         syn::Expr::Lit(_) => true,
@@ -5275,10 +5931,12 @@ fn hoist_cond_calls(e: &syn::Expr, cx: &Cx, out: &mut Vec<Value>) -> syn::Expr {
             // Arr: `${#v} == 0` via a hoisted param(len) read; Str: the
             // EXACT equality `$s = ""` (no encoding questions at all).
             let recv_ty = infer_ty(&m.receiver, cx);
+            // a static guard's `is_empty` is the STATIC's key count
             let name = match &*m.receiver {
                 syn::Expr::Path(p) => single_path(p).map(|i| i.to_string()),
                 _ => None,
-            };
+            }
+            .or_else(|| static_guard(&m.receiver, cx).map(|(s, _)| s));
             match (recv_ty, name.clone()) {
                 (Ty::Arr(_, _), Some(vname)) => {
                     out.push(assign_stmt(
@@ -5343,6 +6001,20 @@ fn hoist_cond_calls(e: &syn::Expr, cx: &Cx, out: &mut Vec<Value>) -> syn::Expr {
                 }
                 _ => refuse("is_empty on unproven receiver", m.method.span()),
             }
+        }
+        // a method ON a static guard (`X.lock().unwrap().contains(&k)`):
+        // the store operation evaluates ONCE into a temp, so the condition
+        // stays a plain test on that temp
+        syn::Expr::MethodCall(m) if static_guard(&m.receiver, cx).is_some() => {
+            let t = fresh_tmp(cx, "t");
+            let v = value_expr(e, cx);
+            let mut p: Vec<Value> = cx.pending.borrow_mut().drain(..).collect();
+            out.append(&mut p);
+            out.push(store_stmt(&t, v));
+            let ty = infer_ty(e, cx);
+            cx.vars.borrow_mut().insert(t.clone(), ty);
+            syn::parse_str::<syn::Expr>(&t)
+                .unwrap_or_else(|_| refuse("temporary name", e.span()))
         }
         // `matches!(EXPR, PAT)` with a COMPOUND subject: evaluate the
         // subject ONCE into a temp, then test the pattern on that temp.
@@ -5589,6 +6261,7 @@ fn function_def(
     let returns_value = !matches!(sig.output, syn::ReturnType::Default);
     // fresh variable-type scope per function (params re-seed it)
     cx.vars.borrow_mut().clear();
+    cx.guards.borrow_mut().clear();
     let mut body: Vec<Value> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
     for (i, input) in sig.inputs.iter().enumerate() {
@@ -5686,7 +6359,13 @@ fn function_def(
                         body.push(json!({"type": "Return", "value": arith_value(ast)}));
                         continue;
                     }
-                    body.push(json!({"type": "Return", "value": value_expr(e, cx)}));
+                    // the tail expression's hoisted statements (an
+                    // atomic RMW's read-then-write, a guard read) run
+                    // BEFORE the return that reads their temp
+                    let tv = value_expr(e, cx);
+                    let mut tp: Vec<Value> = cx.pending.borrow_mut().drain(..).collect();
+                    body.append(&mut tp);
+                    body.push(json!({"type": "Return", "value": tv}));
                 } else if let Some(v) = lower_stmt(stmt, cx, true, &mut body) {
                     body.push(v);
                 }
@@ -6015,6 +6694,17 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
             let Some(name) = single_path(p) else {
                 refuse("path expression", p.span());
             };
+            // a guard ALIAS reads the static's slot (a scalar; a
+            // collection has no value form)
+            if let Some((s, inner)) = cx.guards.borrow().get(&name.to_string()).cloned() {
+                if is_scalar_store_ty(&inner) {
+                    return get_var(&s);
+                }
+                refuse(
+                    "static collection has no value form (use its operations)",
+                    p.span(),
+                );
+            }
             // BARE `None` is the Option layer's ABSENT marker, whose store
             // value is the empty string (the None≡"" convention — the same
             // one `?`, Ty::Opt and the option methods use). It is NOT a
@@ -6238,10 +6928,85 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
             // Vec methods, bool-returning predicates, indexing...
             let recv_ty = infer_ty(&m.receiver, cx);
             let rust_name = m.method.to_string();
+            // A static's VALUE through its guard (`*NOCASEMATCH.lock().
+            // unwrap()`): the store read of the static's slot. A static
+            // COLLECTION has no value form (it is a named assoc store).
+            if let Some((sname, inner)) = static_guard(e, cx) {
+                if is_scalar_store_ty(&inner) {
+                    return get_var(&sname);
+                }
+                refuse(
+                    "static collection has no value form (use its operations)",
+                    m.span(),
+                );
+            }
+            // a method ON a static guard is the static's OWN operation
+            // (insert answers "was absent", remove the previous value)
+            if let Some((sname, inner)) = static_guard(&m.receiver, cx) {
+                // a scalar guard's `get()` (a Cell closure param, a
+                // MutexGuard read) is the store read
+                if rust_name == "get" && m.args.is_empty() && is_scalar_store_ty(&inner) {
+                    return get_var(&sname);
+                }
+                if let Some(v) = static_guard_method(&sname, &inner, m, cx) {
+                    return v;
+                }
+            }
+            // `NAME.with(|c| ..)` on a Cell static
+            if rust_name == "with" && m.args.len() == 1 {
+                if let syn::Expr::Path(p) = &*m.receiver {
+                    if let Some(n) = single_path(p) {
+                        let n = n.to_string();
+                        if let Some(Ty::Cel(inner)) = cx.statics.borrow().get(&n).cloned() {
+                            if let Some(v) = cell_with(&n, &inner, &m.args[0], cx) {
+                                return v;
+                            }
+                        }
+                    }
+                }
+            }
+            // ATOMIC statics: single-threaded, so a load IS the store read
+            // and an RMW IS read-then-assign (the previous value returned)
+            if let syn::Expr::Path(p) = &*m.receiver {
+                if let Some(n) = single_path(p).map(|i| i.to_string()) {
+                    if cx.statics.borrow().contains_key(&n) {
+                        match rust_name.as_str() {
+                            "load" => return get_var(&n),
+                            "fetch_add" | "fetch_sub" if !m.args.is_empty() => {
+                                let old = fresh_tmp(cx, "p");
+                                cx.pending.borrow_mut().push(assign_stmt(&old, get_var(&n)));
+                                cx.vars.borrow_mut().insert(old.clone(), Ty::Int);
+                                let op = if rust_name == "fetch_add" { "+" } else { "-" };
+                                let nv = arith_bin(op, arith_var(&n), arith_expr(&m.args[0], cx));
+                                cx.pending.borrow_mut().push(assign_stmt(&n, nv));
+                                return get_var(&old);
+                            }
+                            "swap" if !m.args.is_empty() => {
+                                let old = fresh_tmp(cx, "p");
+                                cx.pending.borrow_mut().push(assign_stmt(&old, get_var(&n)));
+                                cx.vars.borrow_mut().insert(old.clone(), Ty::Int);
+                                let nv = value_expr(&m.args[0], cx);
+                                cx.pending.borrow_mut().push(assign_stmt(&n, nv));
+                                return get_var(&old);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
             // MAP / SET methods on a NAMED associative store. `insert`
             // returns Option in Rust; it is lowered to the assocSet call
             // (exact when used as a statement, which is how it appears).
             if matches!(recv_ty, Ty::Map(..) | Ty::Set(..)) {
+                // a COLLECTION has no value form: `.clone()` of a named
+                // assoc would need a deep copy under a new name, and
+                // `.iter()`'s order is the store's, not the set's
+                if rust_name == "clone" || rust_name == "iter" {
+                    refuse(
+                        "clone/iter of a collection (a named assoc has no exact value copy, and its order is not the set's)",
+                        m.span(),
+                    );
+                }
                 let Some(vname) = recv_var_name(&m.receiver) else {
                     refuse("map/set method on a non-variable receiver", m.receiver.span());
                 };
@@ -6809,6 +7574,8 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                             Ty::Set(..) => "set ",
                             Ty::Fn(_) => "",
                             Ty::Opt(_) => "option ",
+                            Ty::Cel(_) => "interior-mutable ",
+                            Ty::Guard(_) => "guard ",
                             Ty::Unknown => "",
                         }
                     ),
@@ -7022,7 +7789,23 @@ fn arith_expr(e: &syn::Expr, cx: &Cx) -> Value {
             let Some(name) = single_path(p) else {
                 refuse("path in arithmetic", p.span());
             };
+            // a guard ALIAS (`*g` in arithmetic) is the static's slot
+            if let Some((s, _)) = cx.guards.borrow().get(&name.to_string()).cloned() {
+                return arith_var(&s);
+            }
             arith_var(&name.to_string())
+        }
+        // `GUARD.get()` (a Cell closure param, a guard alias) is the
+        // static's own slot in arithmetic
+        syn::Expr::MethodCall(m) if m.method == "get" && m.args.is_empty() => {
+            match static_guard(&m.receiver, cx) {
+                Some((s, inner)) if is_scalar_store_ty(&inner) => arith_var(&s),
+                Some(_) => refuse(
+                    "static collection has no value form (use its operations)",
+                    m.span(),
+                ),
+                None => refuse("method call in arithmetic", m.span()),
+            }
         }
         syn::Expr::Binary(b) => arith_from_binary(b, cx),
         syn::Expr::Unary(u) => arith_from_unary(u, cx),
@@ -7181,6 +7964,12 @@ fn matches_cond(
 /// A boolean condition -> the `test` STRING grammar the runtime parses
 /// (`$x -gt 1`, `-a`/`-o` chains, `!`, parens) — the c-sh-go shapes.
 fn test_string(e: &syn::Expr, cx: &Cx) -> String {
+    // a BOOL static read through its guard is the plain store test
+    if let Some((s, inner)) = static_guard(e, cx) {
+        if matches!(inner, Ty::Bool | Ty::AtomicBool) {
+            return format!("${s} = \"true\"");
+        }
+    }
     match e {
         // `if matches!(x, PAT)` / `while matches!(..)` — the same exact
         // conversion the value-position path uses (shared helper)
@@ -7269,6 +8058,11 @@ fn test_string(e: &syn::Expr, cx: &Cx) -> String {
 /// exact by construction and needs no parser support.
 fn test_string_neg(e: &syn::Expr, cx: &Cx) -> String {
     use syn::BinOp::*;
+    if let Some((s, inner)) = static_guard(e, cx) {
+        if matches!(inner, Ty::Bool | Ty::AtomicBool) {
+            return format!("${s} != \"true\"");
+        }
+    }
     match e {
         syn::Expr::Binary(b) => match b.op {
             Eq(_) => bin_test("!=", &b.left, &b.right, cx),
@@ -7374,6 +8168,10 @@ fn operand(e: &syn::Expr, cx: &Cx, str_eq: bool) -> String {
             };
             if let Some(v) = cx.ints.get(&name.to_string()) {
                 return v.to_string();
+            }
+            // a guard ALIAS compares the STATIC it holds
+            if let Some((s, _)) = cx.guards.borrow().get(&name.to_string()).cloned() {
+                return format!("${s}");
             }
             format!("${name}")
         }
