@@ -703,6 +703,19 @@ struct Cx {
     /// None at module level and inside free fns, where `Self` is not a
     /// legal path in Rust either.
     self_ty: std::cell::RefCell<Option<String>>,
+    // Nested `fn` items are hoisted to top-level definitions named
+    // `<parent>__<local>` (Rust's own symbol shape for them). This maps the
+    // local spelling visible INSIDE one enclosing function to that mangled
+    // name, so a bare `inner(x)` call resolves; it is reset per function.
+    fn_alias: std::cell::RefCell<HashMap<String, String>>,
+    // per-DEFINITION alias frame: `<def name>` -> the local names visible in
+    // its body (its own nested `fn`s plus the sibling ones inherited from the
+    // enclosing scope — Rust's items are visible to the whole scope)
+    fn_scopes: std::cell::RefCell<HashMap<String, HashMap<String, String>>>,
+    // how many `&&`/`||` levels deep the condition being lowered is: Rust
+    // SHORT-CIRCUITS there, so hoisting a CALL out of an operand would run it
+    // when Rust would not. The hoists refuse inside a chain instead.
+    sc_depth: std::cell::Cell<u32>,
     /// guard alias -> (static name, inner Ty): `let g = NAME.lock().
     /// unwrap();` binds a HANDLE on the static, not a copy, so every use
     /// of `g` reads/writes `NAME`. Per-function scope (cleared with vars).
@@ -1431,6 +1444,64 @@ fn main() {
             _ => {}
         }
     }
+    // nested `fn` items (legal anywhere in a body, capturing nothing) are
+    // hoisted to top-level defs named `<parent>__<local>`. Collect and
+    // register EVERY one before ANY body lowers: a nested fn is visible to
+    // its whole enclosing scope, including textually above its definition.
+    let mut nested: Vec<(String, &syn::ItemFn)> = Vec::new();
+    {
+        let mut scopes: HashMap<String, HashMap<String, String>> = HashMap::new();
+        let empty: HashMap<String, String> = HashMap::new();
+        for item in &flat {
+            match item {
+                syn::Item::Fn(f) => {
+                    collect_nested_fns(
+                        &f.block,
+                        &f.sig.ident.to_string(),
+                        &empty,
+                        &mut nested,
+                        &mut scopes,
+                    );
+                }
+                syn::Item::Impl(i) => {
+                    if let Some(ty) = type_ident(&i.self_ty) {
+                        for ii in &i.items {
+                            if let syn::ImplItem::Fn(m) = ii {
+                                let parent = format!("{}_{}", ty, m.sig.ident);
+                                collect_nested_fns(
+                                    &m.block, &parent, &empty, &mut nested, &mut scopes,
+                                );
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (n, f) in &nested {
+            cx.fns.push(n.clone());
+            cx.fn_rets.insert(n.clone(), ret_ty(&f.sig.output, &cx));
+        }
+        *cx.fn_scopes.borrow_mut() = scopes;
+    }
+    // Lower the hoisted definitions before their parents so every call site
+    // already has a definition to point at. A nested `fn` is NOT its own
+    // censused unit (it belongs to the enclosing function): when it cannot
+    // lower the name is dropped, so every call site refuses rather than
+    // calling a function that was never emitted.
+    let mut nested_defs: Vec<Value> = Vec::new();
+    for (n, f) in &nested {
+        let lowered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            function_def(n.clone(), &f.attrs, &f.sig, &f.block, None, &cx)
+        }));
+        match lowered {
+            Ok(v) => nested_defs.push(v),
+            Err(_) => {
+                cx.fns.retain(|x| x != n);
+                cx.fn_rets.remove(n);
+            }
+        }
+    }
     // DEMAND-PULLED definitions: register + lower BEFORE the entry so
     // its calls resolve. A body that refuses is REMOVED from the call
     // set (the call site then refuses, exactly as before the pull).
@@ -1596,6 +1667,11 @@ fn main() {
                 // type the last method_def left behind, so an invalid
                 // source can never resolve a `Self::` call here.
                 *cx.self_ty.borrow_mut() = None;
+                // hoisted nested `fn`s of `main`'s own body
+                {
+                    let frame = cx.fn_scopes.borrow().get("main").cloned().unwrap_or_default();
+                    *cx.fn_alias.borrow_mut() = frame;
+                }
                 cx.vars.borrow_mut().clear();
                 lower_block(&f.block, &cx, false, &mut stmts);
             }
@@ -1610,6 +1686,9 @@ fn main() {
     // only) — the program body is then empty. The stdout oracle never
     // sees such a file (testdata examples are all runnable).
     let mut all_stmts = std::mem::take(&mut cx.globals);
+    // hoisted nested `fn` definitions first (they are ordinary defs: nothing
+    // runs them until a call, and any order among defs is equivalent)
+    all_stmts.extend(nested_defs);
     all_stmts.extend(demand_defs);
     // function definitions FIRST — runtime def-before-use order (the A1
     // Function statement lowers to a definition executed in stmt order).
@@ -1696,6 +1775,13 @@ fn lower_stmt(stmt: &syn::Stmt, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) -> O
     match stmt {
         syn::Stmt::Local(local) => lower_local(local, cx, in_fn, out),
         syn::Stmt::Expr(e, _semi) => lower_expr_stmt(e, cx, in_fn, out),
+        // a nested `fn` was HOISTED to a top-level definition by the
+        // pre-pass: a `fn` item captures nothing and is visible in the whole
+        // enclosing body (even textually above its own definition), so the
+        // hoist is exact — the same shape Rust itself gives it. A `use`
+        // inside a body only names paths and has no runtime meaning.
+        syn::Stmt::Item(syn::Item::Fn(_)) => None,
+        syn::Stmt::Item(syn::Item::Use(_)) => None,
         syn::Stmt::Item(item) => refuse("nested item declarations", item.span()),
         syn::Stmt::Macro(m) => Some(lower_print_macro(&m.mac, cx)),
     }
@@ -2467,7 +2553,7 @@ fn lower_expr_stmt(e: &syn::Expr, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) ->
             Some(json!({"type": "Exit", "value": value_expr(status, cx)}))
         }
         syn::Expr::If(ie) => Some(if_stmt(ie, cx, in_fn, out)),
-        syn::Expr::While(w) => Some(while_stmt(w, cx, in_fn)),
+        syn::Expr::While(w) => Some(while_stmt(w, cx, in_fn, out)),
         syn::Expr::ForLoop(fl) => Some(for_stmt(fl, cx, in_fn, out)),
         syn::Expr::Return(r) => {
             if in_fn {
@@ -2893,7 +2979,17 @@ fn compound_assign(b: &syn::ExprBinary, cx: &Cx, out: &mut Vec<Value>) -> Value 
         RemAssign(_) => "%",
         _ => refuse("compound assignment operator", b.op.span()),
     };
-    // `i += 1` lowers to `i = i + 1` — the c-sh-go compound shape
+    // `i += 1` lowers to `i = i + 1` — the c-sh-go compound shape. A call
+    // (or field read) on the right is hoisted first, so it runs exactly once,
+    // before the arithmetic — Rust evaluates the RHS of `+=` exactly once.
+    // (`+=` IS arithmetic, so its RHS is an arithmetic spine by definition:
+    // a bare call RHS must be hoisted too, exactly once, before the add)
+    if arith_contains_field(&b.right) || arith_operand_needs_hoist(&b.right) {
+        let mut ctr = cx.tmp.borrow_mut();
+        let ast = hoisted_arith(&b.right, cx, out, &mut ctr);
+        drop(ctr);
+        return assign_stmt(&name, arith_bin(op, arith_var(&name), ast));
+    }
     assign_stmt(&name, arith_bin(op, arith_var(&name), arith_expr(&b.right, cx)))
 }
 
@@ -2978,11 +3074,13 @@ fn if_stmt(ie: &syn::ExprIf, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) -> Valu
     json!({"cond": cond, "then": then, "elsifs": [], "else": else_stmts, "type": "If"})
 }
 
-fn while_stmt(w: &syn::ExprWhile, cx: &Cx, in_fn: bool) -> Value {
+fn while_stmt(w: &syn::ExprWhile, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) -> Value {
     if w.label.is_some() {
         refuse("labeled while", w.span());
     }
-    let cond = test_call(&test_string(&w.cond, cx));
+    // the condition's hoists are STATEMENTS that must run before the loop
+    let cond_expr = hoist_cond_calls(&w.cond, cx, out);
+    let cond = test_call(&test_string(&cond_expr, cx));
     let mut body = Vec::new();
     lower_block(&w.body, cx, in_fn, &mut body);
     json!({"cond": cond, "body": body, "type": "While"})
@@ -3352,10 +3450,14 @@ fn for_stmt(fl: &syn::ExprForLoop, cx: &Cx, in_fn: bool, out: &mut Vec<Value>) -
         });
     }
     // RANGES need a plain binding (a range element has no structure).
-    let syn::Pat::Ident(pi) = fl.pat.as_ref() else {
-        refuse("for-loop pattern (destructuring not supported)", fl.pat.span());
+    // `for _ in 0..n` is the SAME loop with nobody reading the counter, so it
+    // binds an unread temp: writing it is unobservable, the iteration count
+    // and order are identical.
+    let name = match fl.pat.as_ref() {
+        syn::Pat::Ident(pi) => pi.ident.to_string(),
+        syn::Pat::Wild(_) => fresh_tmp(cx, "fw"),
+        _ => refuse("for-loop pattern (destructuring not supported)", fl.pat.span()),
     };
-    let name = pi.ident.to_string();
     let (start, end, inclusive) = match &*fl.expr {
         syn::Expr::Range(r) => {
             let start = match &r.start {
@@ -3892,7 +3994,10 @@ fn call_target(p: &syn::ExprPath, cx: &Cx) -> Option<String> {
             if known(&n) {
                 Some(n)
             } else {
-                None
+                // a HOISTED nested `fn` of the enclosing function — and only
+                // if it lowered (a refused definition must make every call
+                // site refuse, never emit a call to a missing function)
+                cx.fn_alias.borrow().get(&n).cloned().filter(|m| known(m))
             }
         }
         2 if segs.iter().all(|s| s.arguments.is_none()) => {
@@ -3948,6 +4053,10 @@ where
 /// Does e contain a field read inside its ARITHMETIC spine? Field reads
 /// cannot be Arith operands (the A1 arith AST has no field form), so such
 /// exprs need temporary hoisting.
+/// Does this arithmetic expression have a leaf the raw arith AST cannot
+/// spell — a FIELD read (the AST has no field operand) or a CALL (which must
+/// run exactly once, in Rust's left-to-right operand order)? Those leaves are
+/// hoisted into temporaries by `hoisted_arith` and read back as variables.
 fn arith_contains_field(e: &syn::Expr) -> bool {
     match e {
         syn::Expr::Binary(b) => {
@@ -3955,7 +4064,7 @@ fn arith_contains_field(e: &syn::Expr) -> bool {
             if matches!(b.op, Eq(_) | Ne(_) | Lt(_) | Le(_) | Gt(_) | Ge(_) | And(_) | Or(_)) {
                 false // comparison spine lowers via the test grammar
             } else {
-                arith_contains_field(&b.left) || arith_contains_field(&b.right)
+                arith_operand_needs_hoist(&b.left) || arith_operand_needs_hoist(&b.right)
             }
         }
         syn::Expr::Unary(u) => arith_contains_field(&u.expr),
@@ -3967,7 +4076,30 @@ fn arith_contains_field(e: &syn::Expr) -> bool {
                 false
             }
         }
+        // a bare CALL at the top of an initializer (`let v = Vec::new()`) is
+        // NOT arithmetic — it must keep its own value/type form. Only a call
+        // INSIDE an arithmetic spine is a hoistable operand.
         syn::Expr::Field(_) => true,
+        _ => false,
+    }
+}
+
+/// The same question one level INSIDE an arithmetic spine: there a CALL is
+/// also a leaf that must be hoisted (it has to run exactly once, at Rust's
+/// left-to-right operand order), and so is a field read.
+fn arith_operand_needs_hoist(e: &syn::Expr) -> bool {
+    match e {
+        syn::Expr::Binary(b) => {
+            use syn::BinOp::*;
+            if matches!(b.op, Eq(_) | Ne(_) | Lt(_) | Le(_) | Gt(_) | Ge(_) | And(_) | Or(_)) {
+                false
+            } else {
+                arith_operand_needs_hoist(&b.left) || arith_operand_needs_hoist(&b.right)
+            }
+        }
+        syn::Expr::Unary(u) => arith_operand_needs_hoist(&u.expr),
+        syn::Expr::Paren(p) => arith_operand_needs_hoist(&p.expr),
+        syn::Expr::Field(_) | syn::Expr::Call(_) => true,
         _ => false,
     }
 }
@@ -4043,6 +4175,21 @@ fn hoisted_arith(
                 }),
             ));
             arith_var(&temp)
+        }
+        // A CALL as an arithmetic operand: hoisted into a temp FIRST, so the
+        // call happens exactly once, at Rust's left-to-right operand order.
+        // Exact for any Rust program that compiles: Rust's arithmetic
+        // operators need numeric operands, so a call here cannot yield a bool
+        // or a text value whose store form would differ. The callee's value
+        // form is the same one a `let` initializer uses (`value_expr`), so an
+        // impure/unknown callee still refuses there.
+        syn::Expr::Call(_) => {
+            let v = value_expr(e, cx);
+            *ctr += 1;
+            let t = format!("__sh2a{}", ctr);
+            cx.vars.borrow_mut().insert(t.clone(), Ty::Int);
+            stmts.push(assign_stmt(&t, v));
+            arith_var(&t)
         }
         other => refuse("expression in arithmetic", other.span()),
     }
@@ -6295,6 +6442,26 @@ fn hoist_cond_calls(e: &syn::Expr, cx: &Cx, out: &mut Vec<Value>) -> syn::Expr {
             syn::parse_str::<syn::Expr>(&temp)
                 .unwrap_or_else(|_| refuse("temporary name", e.span()))
         }
+        // A CALL as the WHOLE condition (`if pred(x) {`): evaluated ONCE
+        // into a temp, then tested as the store's boolean — exactly what
+        // `let b = pred(x); if b` already lowers to (same value, same test).
+        // Under `&&`/`||` the RIGHT operand is skipped by Rust when the left
+        // decides the answer, so a call there REFUSES instead of running
+        // unconditionally.
+        syn::Expr::Call(_) => {
+            if cx.sc_depth.get() > 0 {
+                refuse(
+                    "call condition inside a short-circuit chain (Rust skips it; \
+                     a hoisted call would always run)",
+                    e.span(),
+                );
+            }
+            let t = fresh_tmp(cx, "cd");
+            out.push(store_stmt(&t, value_expr(e, cx)));
+            cx.vars.borrow_mut().insert(t.clone(), Ty::Bool);
+            syn::parse_str::<syn::Expr>(&t)
+                .unwrap_or_else(|_| refuse("temporary name", e.span()))
+        }
         syn::Expr::MethodCall(m) => {
             let v = value_expr(e, cx);
             let mut ctr = cx.tmp.borrow_mut();
@@ -6314,9 +6481,46 @@ fn hoist_cond_calls(e: &syn::Expr, cx: &Cx, out: &mut Vec<Value>) -> syn::Expr {
                 .unwrap_or_else(|_| refuse("temporary name", e.span()))
         }
         syn::Expr::Binary(b) => {
+            use syn::BinOp::*;
+            let cmp = matches!(b.op, Eq(_) | Ne(_) | Lt(_) | Le(_) | Gt(_) | Ge(_));
+            // a COMPARISON operand the test grammar cannot spell (`n % 2`,
+            // `f(x)`, `a.len()`) becomes a temp first: the condition still
+            // evaluates it exactly once, in Rust's operand order, and the
+            // comparison then reads a $variable.
+            let mut hoist_operand = |e: &syn::Expr, cx: &Cx, out: &mut Vec<Value>| -> syn::Expr {
+                if cmp && arith_operand_needs_hoist(e) {
+                    if cx.sc_depth.get() > 0 && contains_call(e) {
+                        refuse(
+                            "call operand inside a short-circuit chain (Rust \
+                             skips it; a hoisted call would always run)",
+                            e.span(),
+                        );
+                    }
+                    let t = fresh_tmp(cx, "op");
+                    let ty = infer_ty(e, cx);
+                    let ty = if matches!(ty, Ty::Unknown) { Ty::Int } else { ty };
+                    out.push(store_stmt(&t, value_expr(e, cx)));
+                    cx.vars.borrow_mut().insert(t.clone(), ty);
+                    return syn::parse_str::<syn::Expr>(&t)
+                        .unwrap_or_else(|_| refuse("temporary name", e.span()));
+                }
+                e.clone()
+            };
             let mut b2 = b.clone();
-            b2.left = Box::new(hoist_cond_calls(&b.left, cx, out));
-            b2.right = Box::new(hoist_cond_calls(&b.right, cx, out));
+            b2.left = Box::new(hoist_operand(&b.left, cx, out));
+            let saved = cx.sc_depth.get();
+            if matches!(b.op, And(_) | Or(_)) {
+                cx.sc_depth.set(saved + 1);
+            }
+            b2.right = Box::new(hoist_operand(&b.right, cx, out));
+            cx.sc_depth.set(saved);
+            b2.left = Box::new(hoist_cond_calls(&b2.left, cx, out));
+            cx.sc_depth.set(saved);
+            if matches!(b.op, And(_) | Or(_)) {
+                cx.sc_depth.set(saved + 1);
+            }
+            b2.right = Box::new(hoist_cond_calls(&b2.right, cx, out));
+            cx.sc_depth.set(saved);
             syn::Expr::Binary(b2)
         }
         syn::Expr::Unary(u) => {
@@ -6681,6 +6885,90 @@ fn unit_tail(e: &syn::Expr) -> bool {
 /// c-sh-go protocol: positional params copied from getVar("1")... at
 /// entry; calls dispatch via fnCall (void) / fnValue (value). `name` is
 /// the free-fn ident or the mangled `Type_method` for impl methods.
+/// Every `fn` item nested in `block` — at any depth of `if`/`while`/`for`/
+/// `loop`/`match`/block — collected with the mangled name it is hoisted
+/// under. A Rust `fn` item captures nothing, so hoisting it to the top level
+/// preserves its semantics exactly; only the NAME has to be kept unique,
+/// which the `<parent>__<local>` path does.
+fn collect_nested_fns<'a>(
+    block: &'a syn::Block,
+    parent: &str,
+    inherited: &HashMap<String, String>,
+    acc: &mut Vec<(String, &'a syn::ItemFn)>,
+    scopes: &mut HashMap<String, HashMap<String, String>>,
+) {
+    // every `fn` item of THIS block (at any nesting depth of if/for/…): they
+    // are all visible to the whole block, so they share one scope
+    let mut mine: Vec<String> = Vec::new();
+    collect_fn_items(block, parent, acc, &mut mine);
+    let mut scope = inherited.clone();
+    for m in &mine {
+        let local = m.rsplit_once("__").map(|x| x.1).unwrap_or(m).to_string();
+        scope.insert(local, m.clone());
+    }
+    scopes.entry(parent.to_string()).or_insert_with(HashMap::new);
+    scopes.insert(parent.to_string(), scope.clone());
+    // each hoisted def's own body inherits this scope and adds its children
+    let children: Vec<(String, &'a syn::ItemFn)> = acc
+        .iter()
+        .filter(|(n, _)| n.rsplit_once("__").map(|x| x.0 == parent).unwrap_or(false))
+        .map(|(n, f)| (n.clone(), *f))
+        .collect();
+    for (name, f) in children {
+        collect_nested_fns(&f.block, &name, &scope, acc, scopes);
+    }
+}
+
+fn collect_fn_items<'a>(
+    block: &'a syn::Block,
+    parent: &str,
+    acc: &mut Vec<(String, &'a syn::ItemFn)>,
+    mine: &mut Vec<String>,
+) {
+    for stmt in &block.stmts {
+        match stmt {
+            syn::Stmt::Item(syn::Item::Fn(f)) => {
+                let name = format!("{}__{}", parent, f.sig.ident);
+                mine.push(name.clone());
+                acc.push((name, f));
+            }
+            syn::Stmt::Expr(e, _) => collect_fn_items_expr(e, parent, acc, mine),
+            syn::Stmt::Local(l) => {
+                if let Some(init) = &l.init {
+                    collect_fn_items_expr(&init.expr, parent, acc, mine);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_fn_items_expr<'a>(
+    e: &'a syn::Expr,
+    parent: &str,
+    acc: &mut Vec<(String, &'a syn::ItemFn)>,
+    mine: &mut Vec<String>,
+) {
+    match e {
+        syn::Expr::If(i) => {
+            collect_fn_items(&i.then_branch, parent, acc, mine);
+            if let Some((_, el)) = &i.else_branch {
+                collect_fn_items_expr(el, parent, acc, mine);
+            }
+        }
+        syn::Expr::While(w) => collect_fn_items(&w.body, parent, acc, mine),
+        syn::Expr::ForLoop(f) => collect_fn_items(&f.body, parent, acc, mine),
+        syn::Expr::Loop(l) => collect_fn_items(&l.body, parent, acc, mine),
+        syn::Expr::Block(b) => collect_fn_items(&b.block, parent, acc, mine),
+        syn::Expr::Match(m) => {
+            for arm in &m.arms {
+                collect_fn_items_expr(&arm.body, parent, acc, mine);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn function_def(
     name: String,
     attrs: &[syn::Attribute],
@@ -6694,6 +6982,12 @@ fn function_def(
     }
     // the enclosing impl type for `Self::m` resolution (None in a free fn)
     *cx.self_ty.borrow_mut() = self_ty.map(|s| s.to_string());
+    // hoisted nested `fn`s visible in THIS body (its own plus the siblings
+    // inherited from the enclosing scope): local name -> mangled def name
+    {
+        let frame = cx.fn_scopes.borrow().get(&name).cloned().unwrap_or_default();
+        *cx.fn_alias.borrow_mut() = frame;
+    }
     // LIFETIME generics erase unconditionally — they are borrow-checker
     // metadata with zero runtime meaning (`fn f<'a>(x: &'a T)` IS
     // `fn f(x: &T)` at runtime). Type/const generics refuse.
@@ -7194,6 +7488,17 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                 // Operands are ints/int-vars (string comparison refuses
                 // in the test grammar — loud, not guessed).
                 test_call(&test_string(e, cx))
+            } else if arith_contains_field(e) {
+                // a call operand must run ONCE, before the arithmetic; its
+                // temp goes to `pending`, which the enclosing statement
+                // lowering flushes ahead of the statement that reads it
+                let mut buf: Vec<Value> = Vec::new();
+                let ast = {
+                    let mut ctr = cx.tmp.borrow_mut();
+                    hoisted_arith(e, cx, &mut buf, &mut ctr)
+                };
+                cx.pending.borrow_mut().extend(buf);
+                arith_value(ast)
             } else {
                 // multi-operator arithmetic composes RAW nodes; the outer
                 // Arith wrapper goes here exactly once
@@ -8653,6 +8958,52 @@ fn parse_matches_args(
     (subj, pat, guard)
 }
 
+/// Does this expression contain a CALL (something that can have effects)?
+/// Used to keep condition hoists exact under `&&`/`||`, where Rust skips the
+/// right operand entirely and a hoisted call would always run.
+fn contains_call(e: &syn::Expr) -> bool {
+    match e {
+        syn::Expr::Call(_) => true,
+        syn::Expr::MethodCall(m) => m.args.iter().any(contains_call) || contains_call(&m.receiver),
+        syn::Expr::Binary(b) => contains_call(&b.left) || contains_call(&b.right),
+        syn::Expr::Unary(u) => contains_call(&u.expr),
+        syn::Expr::Paren(p) => contains_call(&p.expr),
+        syn::Expr::Field(f) => contains_call(&f.base),
+        syn::Expr::Index(i) => contains_call(&i.expr) || contains_call(&i.index),
+        syn::Expr::Reference(r) => contains_call(&r.expr),
+        syn::Expr::Cast(c) => contains_call(&c.expr),
+        syn::Expr::Macro(_) => true,
+        _ => false,
+    }
+}
+
+/// The `matches!` SUBJECT as a variable name the test grammar can read. A
+/// plain path is already one; a compound subject (`matches!(f.as_str(), ..)`)
+/// is evaluated ONCE into a temp — Rust evaluates the scrutinee exactly once,
+/// and the temp is what the test then reads. The hoist goes on `cx.pending`,
+/// which the enclosing statement lowering flushes BEFORE the statement whose
+/// condition reads it.
+fn matches_subject(subj: &syn::Expr, cx: &Cx) -> Option<String> {
+    match subj {
+        syn::Expr::Path(p) if p.qself.is_none() => single_path(p).map(|i| i.to_string()),
+        _ => {
+            if cx.sc_depth.get() > 0 && contains_call(subj) {
+                refuse(
+                    "`matches!` subject with a call inside a short-circuit chain \
+                     (Rust skips it; a hoisted call would always run)",
+                    subj.span(),
+                );
+            }
+            let ty = infer_ty(subj, cx);
+            let v = value_expr(subj, cx);
+            let t = fresh_tmp(cx, "ms");
+            cx.vars.borrow_mut().insert(t.clone(), ty);
+            cx.pending.borrow_mut().push(assign_stmt(&t, v));
+            Some(t)
+        }
+    }
+}
+
 fn matches_cond_neg(
     tokens: proc_macro2::TokenStream,
     span: proc_macro2::Span,
@@ -8662,11 +9013,8 @@ fn matches_cond_neg(
     if guard.is_some() {
         return None;
     }
-    let Some(sv) = (match &subj {
-        syn::Expr::Path(p) if p.qself.is_none() => single_path(p).map(|i| i.to_string()),
-        _ => None,
-    }) else {
-        refuse("`matches!` on a compound subject in negated position", span);
+    let Some(sv) = matches_subject(&subj, cx) else {
+        refuse("`matches!` subject", span);
     };
     arm_cond_neg(&sv, &pat, cx)
 }
@@ -8680,16 +9028,8 @@ fn matches_cond(
     if guard.is_some() {
         return None;
     }
-    let Some(sv) = (match &subj {
-        syn::Expr::Path(p) if p.qself.is_none() => single_path(p).map(|i| i.to_string()),
-        _ => None,
-    }) else {
-        refuse(
-            "`matches!` on a compound subject in value/condition position \
-             (the test grammar reads a $variable; re-evaluating the subject \
-             would not be exact)",
-            span,
-        );
+    let Some(sv) = matches_subject(&subj, cx) else {
+        refuse("`matches!` subject", span);
     };
     arm_cond(&sv, &pat, cx)
 }
@@ -8745,8 +9085,26 @@ fn test_string(e: &syn::Expr, cx: &Cx) -> String {
                 Ge(_) => bin_test("-ge", &b.left, &b.right, cx),
                 // the runtime's test parser binds -a tighter than -o,
                 // matching Rust's && before ||
-                And(_) => format!("{} -a {}", test_string(&b.left, cx), test_string(&b.right, cx)),
-                Or(_) => format!("{} -o {}", test_string(&b.left, cx), test_string(&b.right, cx)),
+                // `&&`/`||` become `-a`/`-o`, and the TEST evaluates both
+                // sides: a hoisted operand with a CALL would run where Rust's
+                // short-circuit would not. `sc_depth` makes the hoists refuse
+                // on the right instead of quietly changing behaviour.
+                And(_) => {
+                    let l = test_string(&b.left, cx);
+                    let saved = cx.sc_depth.get();
+                    cx.sc_depth.set(saved + 1);
+                    let r = test_string(&b.right, cx);
+                    cx.sc_depth.set(saved);
+                    format!("{} -a {}", l, r)
+                }
+                Or(_) => {
+                    let l = test_string(&b.left, cx);
+                    let saved = cx.sc_depth.get();
+                    cx.sc_depth.set(saved + 1);
+                    let r = test_string(&b.right, cx);
+                    cx.sc_depth.set(saved);
+                    format!("{} -o {}", l, r)
+                }
                 _ => refuse("binary operator in condition", b.op.span()),
             }
         }
@@ -8804,16 +9162,22 @@ fn test_string_neg(e: &syn::Expr, cx: &Cx) -> String {
             Le(_) => bin_test("-gt", &b.left, &b.right, cx),
             Gt(_) => bin_test("-le", &b.left, &b.right, cx),
             Ge(_) => bin_test("-lt", &b.left, &b.right, cx),
-            And(_) => format!(
-                "{} -o {}",
-                test_string_neg(&b.left, cx),
-                test_string_neg(&b.right, cx)
-            ),
-            Or(_) => format!(
-                "{} -a {}",
-                test_string_neg(&b.left, cx),
-                test_string_neg(&b.right, cx)
-            ),
+            And(_) => {
+                let l = test_string_neg(&b.left, cx);
+                let saved = cx.sc_depth.get();
+                cx.sc_depth.set(saved + 1);
+                let r = test_string_neg(&b.right, cx);
+                cx.sc_depth.set(saved);
+                format!("{} -o {}", l, r)
+            }
+            Or(_) => {
+                let l = test_string_neg(&b.left, cx);
+                let saved = cx.sc_depth.get();
+                cx.sc_depth.set(saved + 1);
+                let r = test_string_neg(&b.right, cx);
+                cx.sc_depth.set(saved);
+                format!("{} -a {}", l, r)
+            }
             _ => refuse("negated binary condition operator", b.op.span()),
         },
         syn::Expr::Unary(u) => match u.op {
@@ -8939,6 +9303,37 @@ fn operand(e: &syn::Expr, cx: &Cx, str_eq: bool) -> String {
             syn::Lit::Char(lc) if str_eq => format!("\"{}\"", lc.value()),
             other => refuse("literal in condition operand", other.span()),
         },
+        // a PARENTHESIZED operand is the operand itself
+        syn::Expr::Paren(p) => operand(&p.expr, cx, str_eq),
+        // An ARITHMETIC operand in a NUMERIC comparison (`n % 2 == 0`,
+        // `f(x) > 3`, `a.len() + 1 < b`): hoisted into a temp, so it runs
+        // exactly once, in Rust's left-to-right operand order, and the test
+        // grammar reads a $variable. Deliberately NOT for STRING equality:
+        // there the compared value must be the expression's own string form,
+        // which a value lowering need not reproduce.
+        other
+            if !str_eq
+                && matches!(
+                    other,
+                    syn::Expr::Binary(_)
+                        | syn::Expr::Unary(_)
+                        | syn::Expr::Call(_)
+                        | syn::Expr::MethodCall(_)
+                ) =>
+        {
+            if cx.sc_depth.get() > 0 && contains_call(other) {
+                refuse(
+                    "call operand inside a short-circuit chain (Rust skips it; \
+                     a hoisted call would always run)",
+                    other.span(),
+                );
+            }
+            let v = value_expr(other, cx);
+            let t = fresh_tmp(cx, "op");
+            cx.vars.borrow_mut().insert(t.clone(), Ty::Int);
+            cx.pending.borrow_mut().push(assign_stmt(&t, v));
+            format!("${t}")
+        }
         other => refuse(
             "condition operand (variable or integer literal only)",
             other.span(),

@@ -1553,6 +1553,122 @@ insertion order (Rust promises none), and the `BTreeMap`/`BTreeSet`
 key-order lowering with its `U+0000..U+FFFF` exactness boundary is
 untouched.
 
+## v0.39 — nested `fn` hoisting, calls as operands/conditions
+
+The dogfood census's top real lowering gap was the NESTED-ITEM class, and the
+closest refused units were single refusals in that family. Five changes, all
+inside the existing Ty/expr machinery:
+
+### 1. Nested `fn` items are HOISTED (`collect_nested_fns`)
+
+A `fn` item inside a body — at any depth of `if`/`while`/`for`/`loop`/`match`
+— becomes a TOP-LEVEL definition named `<parent>__<local>`: Rust's own symbol
+shape for it. Exact by construction: a `fn` item captures nothing, is visible
+to its whole enclosing scope (even textually ABOVE its own definition), and
+cannot see the enclosing function's variables. The collector runs before any
+body lowers, so a call may precede the definition; `function_def` sets the
+alias frame (`cx.fn_alias`) per function from `cx.fn_scopes`, which carries
+each definition's OWN nested names plus the SIBLINGS inherited from its
+enclosing scope (`outer__inner` calling `outer__helper` resolves). A refusal
+inside a nested definition is not its own censused unit — it belongs to the
+enclosing function — and the name is DROPPED, so every call site refuses
+("unknown function") instead of calling something that was never emitted.
+
+### 2. `use` inside a body is dropped
+
+A nested `use` only names paths; it has no runtime effect (same rule the
+top-level pre-pass already applied).
+
+### 3. A CALL as an arithmetic operand
+
+`free_double(x) + 10` refused with "expression in arithmetic". The call is
+hoisted into a temp (`__sh2aN`) on the arithmetic buffer, so it runs exactly
+once, at Rust's left-to-right operand order, and the arithmetic reads a
+variable. Exact for any program that compiles: Rust's arithmetic operators
+require numeric operands, and the callee's value form is the same one a `let`
+initializer already uses.
+
+### 4. An ARITHMETIC/CALL operand in a numeric comparison
+
+`n % 2 == 0`, `(a - b) <= 1`, `f(x) > 3` refused with "condition operand
+(variable or integer literal only)". A parenthesized operand is now
+transparent, and an operand that needs it is hoisted exactly once
+(`__sh2opN`). In a STATEMENT condition the hoist goes through
+`hoist_cond_calls` (statements emitted before the `if`/`while`); in a value
+position (a `let`, a returned tail) it goes on `cx.pending`, which
+`lower_block`/`lower_fn_stmt` flush ahead of the statement that reads it.
+`while_stmt` now takes that same sink (`hoist_cond_calls(&w.cond, cx, out)`),
+so a loop condition cannot evaluate its operand after the loop starts.
+
+**Short-circuit boundary (exactness, not a shortcut).** Rust's `&&`/`||` skip
+the right operand; the flat `-a`/`-o` test evaluates both. So a hoist that
+would introduce a CALL under a short-circuit — `if f(x) > 1 && g(y)` — now
+REFUSES ("call operand inside a short-circuit chain") via `cx.sc_depth`, and
+`contains_call` decides. Pure operands (`a.len()`, `n % 2`) still hoist: they
+cannot be observed. Nothing about `-a`/`-o` shape changed.
+
+### 5. `matches!` on a compound subject, `for _ in`, calls as conditions
+
+- `matches!(f.as_str(), "x" | "y")` hoists the subject once (`__sh2msN`) and
+  tests the temp — Rust evaluates the scrutinee exactly once.
+- `for _ in 0..n` binds an unread temp: same iteration count and order, and
+  the counter write is unobservable.
+- `if pred(x) {` / `while ready() {` hoist the call into a temp
+  (`__sh2cdN`) and test it as the store's boolean — exactly what
+  `let b = pred(x); if b` already lowers to, i.e. the same value and the same
+  test. Refused under `&&`/`||` for the short-circuit reason above.
+
+### Proven by execution
+
+`t126_nested_fn_hoist` covers every shape above and matches native `rustc`
+byte for byte:
+
+```
+11|317|0|true false true|true|
+```
+
+— a nested `fn` called ABOVE its own definition, a nested `fn` calling a
+sibling, a nested `fn` declared inside an `if` block calling a free function,
+`needs_separator` (the `stmts.len() > 1` body), `is_even` (`n % 2 == 0`),
+`near` (`(a - b) <= 1 && ra < rb + 3`) and `acc += rank(*it)` (a call on the
+right of `+=`).
+
+### Measured
+
+Gate: **84/116 -> 85/117 match, 0 FAIL, 32 SKIP** (no new SKIP).
+Census over the 14 `src/*_backend.rs`: **1793 -> 1783** (`c_backend.rs`
+598 -> 593, `lint_backend.rs` 16 -> 15, `rust_backend.rs` 349 -> 346,
+`fish_backend.rs` 157, `vulkan_backend.rs` 0). Whole-tree dogfood:
+**EXIT=0, no `internal error`, no `panicked`**, LOWERED **19/254**
+(unchanged: no file's LAST refusal was in these classes — see below).
+`DOGFOOD_BLOCKERS.tsv` regenerated from this tree.
+
+### Why no file flipped
+
+Every file that still refuses now first-blocks on something the lowering
+cannot supply on its own, and the machines are the same for all of them:
+
+- **cross-module symbols** (the largest class: `super::all_nodes::*`,
+  `crate::shir::expr_to_estree_pub`, `crate::ir::exec_word_args`,
+  `MirCommand::Simple`, `census`, …) — these need a module/symbol resolver,
+  not a lowering rule;
+- **cross-module STRUCT FIELD types** (`ctx.out.push_str`, `node.keys.len()`,
+  `p.words.is_empty()`, `ctx.indent`, `self.lifted_numeric.contains`) — the
+  field-type table is per-file, so an imported `RenderCtx`/`Pipe`/`MapLiteral`
+  has no fields; `infer_ty` already reads `cx.structs` when the struct IS in
+  the file;
+- **`*slot = value` / `*tmp += 1`** (deref assignment through a `&mut` or a
+  static guard holding a COLLECTION) — the store has no aliasing model, so
+  this is the ownership/aliasing decision the mission names;
+- `str::parse::<i64>()`, `str::chars`, iterator chains (`.position`,
+  `.skip`, `.collect` on options), `expect`/`unwrap` on `Result`, and
+  `{:?}` on non-integers — each would need semantics sh2perl does not define
+  (a Rust-exact integer parser, Result payloads, iterator adapters).
+
+The narrowest of these (`words == ["-L"]`, slice equality against an array
+literal) would need a deep-equality RUNTIME MEMBER; none exists, so the tsv
+records it as the top wall rather than inventing one.
+
 ## Gate
 
 `make test` = refusal pins + ingress acceptance (`debashc
