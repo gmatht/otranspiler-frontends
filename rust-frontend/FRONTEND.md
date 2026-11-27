@@ -672,6 +672,103 @@ Scoreboard: **LOWERED 17 → 18 / 254**; `src/vulkan_backend.rs` moves from
 20 SKIP** (was 57/75). Pinned by t85–t88 (executed stdout vs native
 `rustc`) and the refusal boundary pins t89/t90.
 
+## v0.30 additions — cuda_backend.rs frontier: 7 → 5, two registry bugs
+
+The next-smallest backend file after v0.29 was `src/cuda_backend.rs`
+(7 blocked units, first `assignment target` at line 214). Two of those
+units were not Rust-idiom gaps at all — they were **registry bugs** in the
+frontend that also silently weakened every other file:
+
+1. **Self-referential types were dropped as `ambiguous`.** `ty_from_type`
+   classifies a path by looking its name up in the enum/struct registry, so
+   the field `body: Vec<CuSeqStmt>` inside `enum CuSeqStmt` typed as
+   `Unknown` on the first registration pass and as `Arr(Enum)` on a later
+   one (the same declaration is registered from the entry file, from the
+   flattened mod tree and from the crate-wide declaration index). Two
+   differing shapes for ONE declaration read as a real name collision, so
+   `register_enum` removed the enum and marked it ambiguous — every
+   `CuSeqStmt::While { .. }` pattern then refused with `struct pattern
+   path`. A name is a declaration fact, so `predeclare_item` /
+   `predeclare_types` now declare every enum and struct NAME (recursing
+   into inline mods) before ANY shape is computed, in all three funnels.
+   Resolution is order-independent; genuine collisions (same name, two
+   different declarations) still go ambiguous and still refuse.
+2. **`#[cfg(test)]` items with doc comments were not dropped.** The
+   predicate required EVERY attribute to be `cfg(test)`, but `///`
+   arrives in `attrs` as `#[doc = "..."]`, so a documented test helper
+   looked like a semantic attribute and refused (`semantic attribute on a
+   function`). `cfg_test_only` now accepts inert metadata (`doc`, `test`,
+   `macro_export`, `allow`, `inline`, `deprecated`) beside the gate. The
+   drop is applied at every funnel that can resurrect a test-only item:
+   `flatten_items` (the flat item list), `defined_names` (call resolution),
+   `collect_calls_in_items` (the demand set), the demand-pull extraction,
+   `index_items` (the crate declaration index) and `predeclare_item`.
+   This is exactly rustc's non-test behavior — such an item does not exist
+   in the build we compile — and any call to one keeps refusing as an
+   unknown function instead of reaching a missing definition.
+
+`src/cuda_backend.rs` now clears `seq_lane_targets` and `undeclared_regs`
+(the `#[cfg(test)]` register guard plus its `#[cfg(test)] mod tests`, which
+has `#[test]` children and a `use super::*`). The remaining five units are
+ALL the same wall, and it is a real one: `arith` / `divmod` / `seq_stmt`
+(`*tmp += 1`, `*qlab += 1`), `seq_stmt`'s callers and `shir_to_cu_compute`
+(`arith(..., &mut tmp, &mut used, &mut vlines)`) and `shir_to_cu_reduce`
+(`for st in &spec.seq_prelude` then `seq_stmt(..., &mut qlab)`). The file's
+whole API is `tmp: &mut u32`, `used: &mut BTreeSet<String>`, `out: &mut
+Vec<String>`; the value store has no reference layer, so mutation through
+a borrow keeps its own refusal (`&mut` borrow / `assignment target`).
+`join` on an array receiver and `is_power_of_two` are the next first-blockers
+beyond that, and neither can finish a unit while `&mut` is refused
+(`divmod` hits `*tmp += 1` right after `is_power_of_two`, `shir_to_cu_compute`
+hits `&mut` arguments right after `join`), so they stay refusals rather
+than half-classes.
+
+Measured (same repo state, binaries built from `17e7a5a` and from this
+tree, `--census` over the 14 `src/*_backend.rs` files):
+
+| file | before | after |
+|---|---|---|
+| `c_backend.rs` | 609 | 608 |
+| `cuda_backend.rs` | 7 | **5** |
+| `fish_backend.rs` | 164 | 164 |
+| `glsl_backend.rs` | 90 | 90 |
+| `go_backend.rs` | 125 | 125 |
+| `java_backend.rs` | 67 | 64 |
+| `lint_backend.rs` | 16 | 16 |
+| `perl_backend.rs` | 49 | 49 |
+| `python_backend.rs` | 140 | 140 |
+| `rust_backend.rs` | 358 | 358 |
+| `sh_backend.rs` | 70 | 70 |
+| `vulkan_backend.rs` | 0 | 0 |
+| `zig_backend.rs` | 63 | 63 |
+| `zsh_backend.rs` | 78 | 78 |
+| **total** | **1836** | **1830** |
+
+Whole-tree dogfood unchanged at **LOWERED 18/254 (7.1%)** — `vulkan_backend.rs`
+still `rc=0`, `cuda_backend.rs` still refuses, zero `internal error` /
+`panicked` lines. Frontend-stdout gate **63/84 match, 0 FAIL, 21 SKIP**
+(was 61/81, 0 FAIL, 20 SKIP). Pinned by t91 (self-referential enum struct
+patterns, executed stdout vs native `rustc`) and t92 (documented
+`#[cfg(test)]` helper + test mod dropped), with refusal pin t93 (`cfg`
+that is not `cfg(test)` still refuses — it selects code for a build
+configuration we cannot know).
+
+### Known inexactness found while pinning t91 (documented, not fixed)
+
+A **struct or enum value does not survive a free-function parameter
+boundary**: `fn get(p: &P) -> i64 { p.x }` + `get(&P{x:5})` prints `0`
+where rustc prints `5`, and an enum argument makes `match` fall through to
+`undefined`. The parameter prologue binds `param <- getVar("i+1")`, which
+the emitter inlines as `String(sh2.positional[i] ?? "")` — text. Arrays
+(`arrayLen`/`arrayItems` by name) and `&self` method dispatch are fine;
+only record payloads are stringified. This is PRE-EXISTING and orthogonal
+to lowering: it does not change a single refusal, but it means LOWERED is
+not a fidelity claim for a file whose functions pass structs/enums (e.g.
+`vulkan_backend.rs` calls `arith(&st.value, &ext_idx)`), which is why no
+pin in this suite passes a record across a call. Making positional reads
+non-stringifying is core-emitter work (a separate tranche), so it is
+recorded here rather than guessed around.
+
 ## Gate
 
 `make test` = refusal pins + ingress acceptance (`debashc

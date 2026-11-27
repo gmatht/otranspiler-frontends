@@ -670,6 +670,52 @@ fn enum_shape(e: &syn::ItemEnum, cx: &Cx) -> HashMap<String, VariantShape> {
     vs
 }
 
+/// Declare every enum/struct NAME before any shape is computed.
+/// `ty_from_type` classifies a path by looking the name up in the
+/// registry, so a self-referential field (`Vec<CuSeqStmt>` inside
+/// `CuSeqStmt`) resolved to `Unknown` on the first registration pass and
+/// to `Arr(Enum(..))` on a later one. Two differing shapes for ONE
+/// declaration read as a real name collision, so the enum was dropped as
+/// ambiguous and every `CuSeqStmt::While { .. }` pattern refused. A name
+/// is a declaration fact, so declaring names up front makes shape
+/// resolution order-independent while genuine collisions stay ambiguous.
+fn predeclare_item(item: &syn::Item, cx: &mut Cx) {
+    if cfg_test_only(item_attrs(item)) {
+        return;
+    }
+    match item {
+        syn::Item::Enum(e) => {
+            let name = e.ident.to_string();
+            if !cx.enums.iter().any(|x| *x == name) {
+                cx.enums.push(name);
+            }
+        }
+        syn::Item::Struct(s) => {
+            let name = s.ident.to_string();
+            if let syn::Fields::Unnamed(f) = &s.fields {
+                let arity = f.unnamed.len();
+                cx.tuple_structs
+                    .entry(name)
+                    .or_insert_with(|| vec![Ty::Unknown; arity]);
+            } else {
+                cx.structs.borrow_mut().entry(name).or_default();
+            }
+        }
+        syn::Item::Mod(m) => {
+            if let Some((_, inner)) = &m.content {
+                predeclare_types(inner, cx);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn predeclare_types(items: &[syn::Item], cx: &mut Cx) {
+    for item in items {
+        predeclare_item(item, cx);
+    }
+}
+
 fn register_enum(e: &syn::ItemEnum, cx: &mut Cx) {
     let name = e.ident.to_string();
     let vs = enum_shape(e, cx);
@@ -754,6 +800,10 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 
 fn index_items(items: &[syn::Item], cx: &mut Cx) {
     for item in items {
+        // test-only declarations are not part of a normal build's name set
+        if cfg_test_only(item_attrs(item)) {
+            continue;
+        }
         match item {
             syn::Item::Enum(e) => register_enum(e, cx),
             syn::Item::Struct(s) => register_struct(s, cx),
@@ -770,6 +820,7 @@ fn index_items(items: &[syn::Item], cx: &mut Cx) {
 fn index_declarations(root: &Path, cx: &mut Cx) {
     let mut files = Vec::new();
     collect_rs_files(root, &mut files);
+    let mut asts: Vec<syn::File> = Vec::new();
     for f in files {
         let Ok(text) = std::fs::read_to_string(&f) else {
             continue;
@@ -777,6 +828,14 @@ fn index_declarations(root: &Path, cx: &mut Cx) {
         let Ok(ast) = syn::parse_file(&text) else {
             continue;
         };
+        asts.push(ast);
+    }
+    // NAMES FIRST: a shape must not depend on which file was read first
+    // (see `predeclare_item` — self-referential fields).
+    for ast in &asts {
+        predeclare_types(&ast.items, cx);
+    }
+    for ast in &asts {
         index_items(&ast.items, cx);
     }
 }
@@ -826,7 +885,10 @@ fn main() {
     });
 
     let mut cx = Cx::default();
-    // type registries first — resolution consults them
+    // type registries first — resolution consults them. NAMES first, then
+    // shapes, so a self-referential field resolves the same way in every
+    // pass (`predeclare_item`).
+    predeclare_types(&ast.items, &mut cx);
     for item in &ast.items {
         match item {
             syn::Item::Struct(s) => {
@@ -934,6 +996,11 @@ fn main() {
                 let mut progress = false;
                 for ast in &dirty {
                     for item in &ast.items {
+                        // demand-pulling a test-only fn would lower code
+                        // that a normal build does not contain
+                        if cfg_test_only(item_attrs(item)) {
+                            continue;
+                        }
                         match item {
                             syn::Item::Fn(f)
                                 if missing.contains(&f.sig.ident.to_string()) =>
@@ -986,6 +1053,11 @@ fn main() {
     // qualified paths resolve only for `Type::method` call targets).
     let mut flat: Vec<&syn::Item> = Vec::new();
     flatten_items(&roots, &mut flat);
+    // NAMES before shapes over the expanded tree too: a module's enum must
+    // not look different from the entry file's copy of it.
+    for item in &flat {
+        predeclare_item(item, &mut cx);
+    }
     // EXPANDED-TREE type registry: the pre-pass above sees only the entry
     // file's top level, but the module closure contributes structs/enums
     // too (`BraceExpansion` lives beside mir.rs). Declared field types
@@ -2842,6 +2914,11 @@ fn collect_calls_in_items(items: &[syn::Item], out: &mut HashSet<String>) {
     }
     let mut c = C(out);
     for it in items {
+        // calls inside a `#[cfg(test)]` subtree are not part of a normal
+        // build — they must not pull anything into the demand set
+        if cfg_test_only(item_attrs(it)) {
+            continue;
+        }
         c.visit_item(it);
     }
 }
@@ -2850,6 +2927,10 @@ fn collect_calls_in_items(items: &[syn::Item], out: &mut HashSet<String>) {
 fn defined_names(items: &[syn::Item]) -> HashSet<String> {
     fn walk(items: &[syn::Item], out: &mut HashSet<String>) {
         for it in items {
+            // a test-only definition is not callable from a normal build
+            if cfg_test_only(item_attrs(it)) {
+                continue;
+            }
             match it {
                 syn::Item::Fn(f) => {
                     out.insert(f.sig.ident.to_string());
@@ -2923,15 +3004,31 @@ fn collect_mod_files(items: &[syn::Item], base: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// The attribute list of any item kind (empty for kinds that carry none).
+fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
+    match item {
+        syn::Item::Const(i) => &i.attrs,
+        syn::Item::Enum(i) => &i.attrs,
+        syn::Item::Fn(i) => &i.attrs,
+        syn::Item::Impl(i) => &i.attrs,
+        syn::Item::Mod(i) => &i.attrs,
+        syn::Item::Static(i) => &i.attrs,
+        syn::Item::Struct(i) => &i.attrs,
+        syn::Item::Trait(i) => &i.attrs,
+        syn::Item::Type(i) => &i.attrs,
+        syn::Item::Use(i) => &i.attrs,
+        _ => &[],
+    }
+}
+
 fn flatten_items<'a>(items: &'a [syn::Item], out: &mut Vec<&'a syn::Item>) {
     for item in items {
-        // a `#[cfg(test)]`-gated inline mod contributes NOTHING to a
-        // normal build — do not descend into it (its children must not
-        // re-enter the flat list as standalone items).
-        if let syn::Item::Mod(m) = item {
-            if cfg_test_only(&m.attrs) {
-                continue;
-            }
+        // `#[cfg(test)]`-gated items exist only under `cargo test`; a
+        // normal build drops them exactly as rustc does — including the
+        // whole inline `mod` subtree (its children must not re-enter the
+        // flat list as standalone items).
+        if cfg_test_only(item_attrs(item)) {
+            continue;
         }
         out.push(item);
         if let syn::Item::Mod(m) = item {
@@ -2974,11 +3071,36 @@ fn type_ident(ty: &syn::Type) -> Option<String> {
 /// test-harness-only code that does not exist in a normal build, so
 /// dropping it (with its whole subtree) is semantics-preserving.
 fn cfg_test_only(attrs: &[syn::Attribute]) -> bool {
-    !attrs.is_empty()
-        && attrs.iter().all(|a| {
-            a.path().is_ident("cfg")
-                && a.meta.require_list().map(|l| l.tokens.to_string()).map(|t| t.trim() == "test").unwrap_or(false)
-        })
+    let mut saw_test = false;
+    for a in attrs {
+        if a.path().is_ident("cfg")
+            && a.meta
+                .require_list()
+                .map(|l| l.tokens.to_string())
+                .map(|t| t.trim() == "test")
+                .unwrap_or(false)
+        {
+            saw_test = true;
+            continue;
+        }
+        // Inert metadata carries no configuration: a doc comment (`///`
+        // arrives here as `#[doc = "..."]`) or `#[test]` beside the gate
+        // does not change WHICH build the item belongs to.
+        let name = a
+            .path()
+            .segments
+            .last()
+            .map(|s| s.ident.to_string())
+            .unwrap_or_default();
+        if matches!(
+            name.as_str(),
+            "test" | "macro_export" | "allow" | "inline" | "deprecated" | "doc"
+        ) {
+            continue;
+        }
+        return false;
+    }
+    saw_test
 }
 
 /// Inert attributes: compile-time-only metadata with NO runtime effect
