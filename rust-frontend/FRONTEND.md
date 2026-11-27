@@ -1794,6 +1794,39 @@ and `for .. in &spec.seq_prelude` / `used.iter()` (iterating a parameter's
 collection whose length is unproven). `join`, `is_power_of_two` and the
 differing-name `&mut` call sites in `cuda_backend.rs` now LOWER.
 
+## v0.42 — variable integer casts and `position(..).unwrap_or(D)`
+
+**`x as uN/iN` for a RUNTIME value** is Rust's modulo 2^bits, emitted as pure
+arithmetics: unsigned `(x % M + M) % M` (so `-1 as u8` is 255), signed
+`((x + H) % M + M) % M - H` (so `300 as i8` is 44 and `-300 as i8` is -44),
+with M = 2^bits and H = 2^(bits-1). Every intermediate is an integer below
+2^54, so doubles carry it exactly — the store's whole integer range. 64-bit
+targets are the identity: rustc's wrap of a negative operand is >= 2^63, a
+magnitude no double holds, so over the representable range the cast is the
+value itself. A 128-bit runtime cast refuses (2^128 wraps never fit).
+
+**`coll.iter().position(|e| COND).unwrap_or(D)`** is fused into ONE scan —
+`r = D; while i < len { e = coll[i]; if COND { r = i; break } }` — because
+`position`'s `Option<usize>` None is the store's empty string, which a
+numeric read cannot tell from the index 0. First match and the default are
+both exactly Rust's.
+
+Pins: t137 (cast table, rustc `255 44 212 / -1 -44 / 1 1 / -2147483648 0`),
+t138 (`position` found/not-found/first, rustc `1 9 0`), t139 (128-bit runtime
+cast refusal).
+
+Measured: gate **90/127 -> 92/130 match, 0 FAIL, 38 SKIP**; census over the
+14 `src/*_backend.rs`: **1763 -> 1763** (unchanged, cuda still 3);
+whole-tree dogfood: **EXIT=0, no `internal error`, no `panicked`**, LOWERED
+**19/254** — `cuda_backend.rs` still does NOT flip. Its `(*d as u64)` and
+`position(..).unwrap_or(0)` are gone; the remaining walls are deeper and
+different: a condition whose operands are STRUCT FIELDS
+(`if st.index_a == 1 && st.index_b == 0` -> "condition operand (variable or
+integer literal only)"), iterating a PARAMETER's collections
+(`for st in &spec.stores`, `used.iter().collect()` -> "iterator source
+length unproven"), and a bool-typed condition the frontend cannot prove
+("boolean variable as a condition (type not proven)").
+
 ## Gate
 
 `make test` = refusal pins + ingress acceptance (`debashc

@@ -6046,7 +6046,86 @@ fn join_value(cx: &Cx, arr: &str, sep: Value) -> Value {
     for s in stmts {
         cx.pending.borrow_mut().push(s);
     }
+    cx.vars.borrow_mut().insert(acc.clone(), Ty::Str);
+    cx.vars.borrow_mut().insert(i.clone(), Ty::Int);
+    cx.vars.borrow_mut().insert(n.clone(), Ty::Int);
     var_node(&acc)
+}
+
+/// `coll.iter().position(|e| COND).unwrap_or(D)` (v0.42). `position` returns
+/// `Option<usize>`, but the store's None is its empty string — which would be
+/// indistinguishable from the INDEX 0 in a numeric read — so the chain is
+/// fused into one scan: `r = D; while i < len { e = coll[i]; if COND { r = i;
+/// break } }`. First-match semantics and the default are exactly Rust's.
+fn position_unwrap_value(pos: &syn::ExprMethodCall, def: &syn::Expr, cx: &Cx) -> Value {
+    let src = match &*pos.receiver {
+        syn::Expr::MethodCall(inner) if inner.method == "iter" && inner.args.is_empty() => {
+            &*inner.receiver
+        }
+        e => e,
+    };
+    let src = match src {
+        syn::Expr::Reference(r) => &*r.expr,
+        e => e,
+    };
+    let Some(name) = (match src {
+        syn::Expr::Path(p) => single_path(p).map(|s| s.to_string()),
+        _ => None,
+    }) else {
+        refuse("position over a non-variable collection", src.span());
+    };
+    let Ty::Arr(Some(elem), _) = infer_ty(src, cx) else {
+        refuse("position over an unproven array", src.span());
+    };
+    let elem = (*elem).clone();
+    let syn::Expr::Closure(cl) = &pos.args[0] else {
+        refuse("position predicate (only a closure)", pos.args[0].span());
+    };
+    let param = match &cl.inputs[0] {
+        syn::Pat::Ident(pi) if pi.subpat.is_none() => pi.ident.to_string(),
+        other => refuse("position closure parameter (plain binding)", other.span()),
+    };
+    let body: syn::Expr = match &*cl.body {
+        syn::Expr::Block(b) => block_value(&b.block)
+            .cloned()
+            .unwrap_or_else(|| refuse("position closure block value", b.block.span())),
+        e => e.clone(),
+    };
+    let saved = cx.vars.borrow().clone();
+    cx.vars.borrow_mut().insert(param.clone(), elem);
+    let cond = test_string(&body, cx);
+    *cx.vars.borrow_mut() = saved;
+    let r = fresh_tmp(cx, "po");
+    let i = fresh_tmp(cx, "pi");
+    let n = fresh_tmp(cx, "pn");
+    let mut stmts = vec![
+        store_stmt(&r, value_expr(def, cx)),
+        assign_stmt(&i, str_lit("0")),
+        assign_stmt(&n, array_len_call(&name)),
+    ];
+    let body_stmts = vec![
+        store_stmt(&param, raw_elem(&name, var_node(&i))),
+        json!({
+            "type": "If",
+            "cond": test_call(&cond),
+            "then": [store_stmt(&r, get_var(&i)), json!({"type": "Break"})],
+            "elsifs": [],
+            "else": [],
+        }),
+        assign_stmt(&i, arith_bin("+", arith_var(&i), arith_num(1))),
+    ];
+    stmts.push(json!({
+        "type": "While",
+        "cond": test_call(&format!("${i} -lt ${n}")),
+        "body": body_stmts,
+    }));
+    for s in stmts {
+        cx.pending.borrow_mut().push(s);
+    }
+    cx.vars.borrow_mut().insert(r.clone(), Ty::Int);
+    cx.vars.borrow_mut().insert(i.clone(), Ty::Int);
+    cx.vars.borrow_mut().insert(n.clone(), Ty::Int);
+    get_var(&r)
 }
 
 /// `n.is_power_of_two()` (v0.41) — exact without bitwise ops, which the
@@ -6091,6 +6170,10 @@ fn pow2_value(cx: &Cx, recv: &syn::Expr) -> Value {
     for s in stmts {
         cx.pending.borrow_mut().push(s);
     }
+    // the result IS a bool: a condition that reads it must type as one
+    cx.vars.borrow_mut().insert(r.clone(), Ty::Bool);
+    cx.vars.borrow_mut().insert(v.clone(), Ty::Int);
+    cx.vars.borrow_mut().insert(m.clone(), Ty::Int);
     var_node(&r)
 }
 
@@ -9056,6 +9139,16 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                     return join_value(cx, &arr, value_expr(sep, cx));
                 }
             }
+            // `coll.iter().position(|e| COND).unwrap_or(D)` (v0.42): one scan
+            // that keeps the FIRST matching index and the default otherwise —
+            // exact for both arms, with no Option value in the store.
+            if rust_name == "unwrap_or" && m.args.len() == 1 {
+                if let syn::Expr::MethodCall(posm) = &*m.receiver {
+                    if posm.method == "position" && posm.args.len() == 1 {
+                        return position_unwrap_value(posm, &m.args[0], cx);
+                    }
+                }
+            }
             // `n.is_power_of_two()` (v0.41): halve-while-even then `== 1`,
             // exact for 0 and every width — see `pow2_value`.
             if let (Ty::Int, "is_power_of_two") = (&recv_ty, rust_name.as_str()) {
@@ -9234,17 +9327,17 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
         // refuses — a runtime value can wrap (a u64 wrap is unrepresentable
         // in the decimal store) and a float/pointer cast has no store value.
         syn::Expr::Cast(c) => {
-            let Some((text, val)) = const_int_cast_operand(&c.expr, cx) else {
-                refuse(
-                    "cast (`as`) of a non-constant expression (only compile-time integer values are exact)",
-                    c.span(),
-                )
-            };
             let Some((bits, signed)) = int_ty_bits(&c.ty) else {
                 refuse(
                     "cast (`as`) to a non-integer type (no exact JS equivalent yet)",
                     c.ty.span(),
                 )
+            };
+            let Some((text, val)) = const_int_cast_operand(&c.expr, cx) else {
+                // A RUNTIME value (v0.41): exact for every 8/16/32-bit target
+                // by MODULAR arithmetic, which is exactly what rustc's `as`
+                // does — see `int_cast_value`.
+                return int_cast_value(c, bits, signed, cx);
             };
             let ok = match val {
                 Some(v) => int_cast_range_ok(v, bits, signed),
@@ -9266,6 +9359,52 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
             other.span(),
         ),
     }
+}
+
+/// `x as iN/uN` for a RUNTIME value (v0.41). Rust's integer cast is the
+/// value modulo 2^bits, mapped into the target's range; that is pure
+/// arithmetic, so it is expressible exactly for every double-ish value:
+///
+/// * unsigned, bits <= 32: `(x % M + M) % M` — positive x stays, negative x
+///   wraps up (`-1 as u8` -> 255).
+/// * signed, bits <= 32: `((x + H) % M + M) % M - H` with H = 2^(bits-1),
+///   which is the same modular value folded into [-H, H) (`2^31 as i32` ->
+///   -2^31). Every intermediate is an integer below 2^54, so IEEE doubles
+///   carry it exactly — the store's whole integer range is covered.
+/// * 64-bit targets: rustc's wrap of a NEGATIVE operand is >= 2^63, a
+///   magnitude no double can hold, so for the store's representable range
+///   the cast is the identity and that is what is emitted (the unrepresentable
+///   half cannot be printed correctly by ANY lowering here).
+/// * 128-bit targets from a runtime value: refused (2^128 wraps never fit).
+fn int_cast_value(c: &syn::ExprCast, bits: u32, signed: bool, cx: &Cx) -> Value {
+    if bits >= 128 {
+        refuse(
+            "cast (`as`) to a 128-bit type from a runtime value (its wrapped magnitude never fits the store's numbers)",
+            c.span(),
+        );
+    }
+    if bits > 32 {
+        // identity over the representable range (see above)
+        return value_expr(&c.expr, cx);
+    }
+    let m = 1i64 << bits;
+    let half = 1i64 << (bits - 1);
+    let x = fresh_tmp(cx, "cv");
+    let mut stmts = vec![assign_stmt(&x, value_expr(&c.expr, cx))];
+    if signed {
+        stmts.push(assign_stmt(&x, arith_bin("+", arith_var(&x), arith_num(half))));
+    }
+    stmts.push(assign_stmt(&x, arith_bin("%", arith_var(&x), arith_num(m))));
+    stmts.push(assign_stmt(&x, arith_bin("+", arith_var(&x), arith_num(m))));
+    stmts.push(assign_stmt(&x, arith_bin("%", arith_var(&x), arith_num(m))));
+    if signed {
+        stmts.push(assign_stmt(&x, arith_bin("-", arith_var(&x), arith_num(half))));
+    }
+    for s in stmts {
+        cx.pending.borrow_mut().push(s);
+    }
+    cx.vars.borrow_mut().insert(x.clone(), Ty::Int);
+    var_node(&x)
 }
 
 /// A stable name for an expression variant — refusal diagnostics only.
