@@ -1863,6 +1863,35 @@ gone, the function now refuses on `trailing_zeros` at **line 255**); dogfood
 cuda, whose remaining walls are `trailing_zeros` (255), the field-operand
 condition (356) and param-collection iteration (716).
 
+## v0.44 — `trailing_zeros` by halving, width from the pinned cast
+
+`x.trailing_zeros()` lowers to a halving count: for a NON-ZERO operand, halve
+while even, counting the halvings (each halving of a non-zero even integer
+reaches an odd one, so the loop terminates). A ZERO operand answers the
+RECEIVER'S WIDTH, so the width has to be pinned: the lowering accepts a
+receiver that is a cast to a primitive integer type (`(*d as u64)`, parens
+unwrapped) and reads the width from that type. Any other receiver still
+refuses — "trailing_zeros on a receiver whose integer width is not pinned" —
+because a guessed width would be wrong exactly at zero. A 128-bit receiver
+refuses: a zero operand answers 128, which the store's numbers cannot hold.
+
+Exact over the store's whole integer range: halving and `% 2` are exact for
+every double-representable integer, signed operands included (truncating
+division of a negative even value halves exactly). Both widths are pinned:
+64 from `as u64` in divmod's shape, 32 in the u32 half of the pin.
+
+Pin: t141, node == rustc byte-identical for `0 1 2 3 8 12 1024 255 2^40`
+(64-bit, so `0 -> 64`) and `0 1 2 0x80000000 0xFFFFFFFF` (32-bit, so
+`0 -> 32`, high bit -> 31, all-ones -> 0):
+`64 0 1 0 3 2 10 0 40 32 0 1 31 0` from both.
+
+Measured: gate **93/131 -> 94/132 match, 0 FAIL, 38 SKIP**; cuda blocked
+units **3 -> 2** — `divmod` is no longer a refused unit; the remaining two
+are the untouched `shir_to_cu_compute` field-operand condition (line 356) and
+`shir_to_cu_reduce` param-collection iteration (line 716); dogfood `EXIT=0`,
+no `internal error`, no `panicked`, **LOWERED 19/254** (cuda still listed as
+refused: those two functions are unchanged work).
+
 ## Gate
 
 `make test` = refusal pins + ingress acceptance (`debashc

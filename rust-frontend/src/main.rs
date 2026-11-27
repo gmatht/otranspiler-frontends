@@ -6152,6 +6152,56 @@ fn position_unwrap_value(pos: &syn::ExprMethodCall, def: &syn::Expr, cx: &Cx) ->
 /// false, and so does every negative value (Rust's own answer). Exact for
 /// every width: the store's numbers are IEEE doubles, so the integers it can
 /// hold are |n| < 2^53, and powers of two above that halve exactly as well.
+/// `x.trailing_zeros()` (v0.44): halve while the value is even and non-zero,
+/// counting the halvings. Exact for every value the store can hold: each
+/// halving of a non-zero even integer eventually reaches an odd one, and a
+/// zero operand answers the receiver's WIDTH (passed in, and only ever
+/// supplied from a pinned cast).
+fn tz_value(cx: &Cx, recv: &syn::Expr, width: u32) -> Value {
+    let t = fresh_tmp(cx, "tz");
+    let r = fresh_tmp(cx, "tzr");
+    let m = fresh_tmp(cx, "tzm");
+    // Non-zero: halve while even, counting halvings; the loop exits on an odd
+    // value. Zero is handled after it (a zero operand answers the WIDTH).
+    let loop_stmts = vec![
+        assign_stmt(&m, arith_bin("%", arith_var(&t), arith_num(2))),
+        json!({
+            "type": "While",
+            "cond": test_call(&format!("${m} -eq 0")),
+            "body": [
+                assign_stmt(&t, arith_bin("/", arith_var(&t), arith_num(2))),
+                assign_stmt(&r, arith_bin("+", arith_var(&r), arith_num(1))),
+                assign_stmt(&m, arith_bin("%", arith_var(&t), arith_num(2))),
+            ],
+        }),
+    ];
+    let mut stmts = vec![
+        assign_stmt(&t, value_expr(recv, cx)),
+        assign_stmt(&r, arith_bin("+", arith_num(0), arith_num(0))),
+    ];
+    stmts.push(json!({
+        "type": "If",
+        "cond": test_call(&format!("${t} -ne 0")),
+        "then": loop_stmts,
+        "elsifs": [],
+        "else": [],
+    }));
+    stmts.push(json!({
+        "type": "If",
+        "cond": test_call(&format!("${t} -eq 0")),
+        "then": [assign_stmt(&r, arith_bin("+", arith_num(width as i64), arith_num(0)))],
+        "elsifs": [],
+        "else": [],
+    }));
+    for st in stmts {
+        cx.pending.borrow_mut().push(st);
+    }
+    cx.vars.borrow_mut().insert(t.clone(), Ty::Int);
+    cx.vars.borrow_mut().insert(r.clone(), Ty::Int);
+    cx.vars.borrow_mut().insert(m.clone(), Ty::Int);
+    var_node(&r)
+}
+
 fn pow2_value(cx: &Cx, recv: &syn::Expr) -> Value {
     let v = fresh_tmp(cx, "pt");
     let m = fresh_tmp(cx, "pm");
@@ -9190,6 +9240,37 @@ fn value_expr(e: &syn::Expr, cx: &Cx) -> Value {
                     refuse("is_power_of_two with arguments", m.span());
                 }
                 return pow2_value(cx, &m.receiver);
+            }
+            // `x.trailing_zeros()` (v0.44): the number of trailing ZERO bits.
+            // Exact by counting halvings, but a ZERO operand answers the
+            // RECEIVER'S WIDTH, so the width must be pinned by a cast to a
+            // primitive integer type (`(*d as u64).trailing_zeros()`); any
+            // other receiver keeps refusing rather than guessing a width.
+            if let (Ty::Int, "trailing_zeros") = (&recv_ty, rust_name.as_str()) {
+                if !m.args.is_empty() {
+                    refuse("trailing_zeros with arguments", m.span());
+                }
+                let mut recv: &syn::Expr = &m.receiver;
+                while let syn::Expr::Paren(p) = recv {
+                    recv = &*p.expr;
+                }
+                if let syn::Expr::Cast(c) = recv {
+                    if let Some((bits, _signed)) = int_ty_bits(&c.ty) {
+                        if bits < 128 {
+                            return tz_value(cx, recv, bits);
+                        }
+                        refuse(
+                            "trailing_zeros on a 128-bit receiver (a zero operand answers a \
+                             width the store's numbers cannot hold)",
+                            m.span(),
+                        );
+                    }
+                }
+                refuse(
+                    "trailing_zeros on a receiver whose integer width is not pinned \
+                     (a zero operand answers the width, so the type must be a cast to uN/iN)",
+                    m.span(),
+                );
             }
             let js_name_raw = match (&recv_ty, rust_name.as_str()) {
                 (Ty::Str, "contains") => "includes",
