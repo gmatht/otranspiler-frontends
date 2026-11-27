@@ -185,6 +185,19 @@ fn arith_var(name: &str) -> Value {
 /// primitive gets (argv entries are text) and the object itself for a
 /// record. Only RECORD-typed parameters use this; primitives, arrays and
 /// `&self` receivers keep the text read they take today.
+///
+/// WHY IT IS EXACT: a numeric name reaches the runtime's `default:` branch,
+/// which resolves a DIGIT name (and `1` coerces to `"1"`) as
+/// `positional[n-1]` — the digit-named branch. That branch first asks
+/// `name in this.vars`, so a store variable LITERALLY named `"1"` would
+/// shadow the positional and this read would answer that variable instead.
+/// This frontend never creates one: every name it binds is a Rust
+/// identifier (never all-digit) or a `__sh2*` temp, so the shadow case is
+/// unreachable and the call is the positional read it claims to be. The
+/// old inline read (`String(sh2.positional[i-1] ?? "")`) had no such
+/// caveat because it never consulted the store at all — this note is the
+/// price of going through the general read, and it is why the frontend must
+/// keep digit-only names out of the store.
 fn record_param_bind(name: &str, pos: usize) -> Value {
     assign_stmt(
         name,

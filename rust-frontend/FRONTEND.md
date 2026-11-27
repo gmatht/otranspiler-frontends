@@ -796,7 +796,11 @@ are text anyway) and the object itself for a record. Every other parameter
 keeps today's text read byte for byte: primitives, arrays, maps,
 `Option<scalar>`, shared references to primitives and `&self` method
 receivers (`self` is still bound by the receiver branch's own read, so
-method dispatch is untouched). `Option<record>` moves too — its `None` is
+method dispatch is untouched). It is exact because `getVar(1)` reaches the
+runtime's digit-named branch (`positional[0]`) — a store variable literally
+named `"1"` would shadow the positional, and this frontend never creates
+one, so the read equals the old inline one, which (never consulting the
+store) had no such caveat. `Option<record>` moves too — its `None` is
 the store's empty value, where a text read and a value read agree — because
 leaving it behind would have kept the same silent wrongness for half the
 record shapes.
